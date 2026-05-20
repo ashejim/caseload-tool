@@ -46,18 +46,20 @@ signed with a known publisher certificate. The fix is one of:
 We're working on a signed build (via SignPath for open-source projects)
 that will remove this step.
 
-### 3. First-run setup — Caseload URL
+### 3. First-run setup — Caseload URL (only if needed)
 
-The launcher opens directly to Caseload, but it needs to know your
-specific URL. Edit `%APPDATA%\caseload-notes\.env` (you may need to
-create it) and add:
+The launcher opens to the standard WGU Caseload page by default. Most
+users won't need to do anything here.
+
+If for some reason the launcher lands on the wrong page (e.g., your
+campus uses a different Salesforce instance), create
+`%APPDATA%\caseload-notes\.env` and add:
 
 ```
-CASELOAD_URL=https://srm.lightning.force.com/lightning/n/Caseload_App_Page
+CASELOAD_URL=https://your-custom.lightning.force.com/lightning/n/Your_Page
 ```
 
-Adjust the URL to match what you see in your browser when on the
-Caseload page.
+Restart the launcher and it'll use the new URL.
 
 ### 4. First-run setup — sign in
 

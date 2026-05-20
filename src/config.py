@@ -64,7 +64,10 @@ NOTES_YAML = USER_CONFIG_DIR / "notes.yaml"
 BROWSER_DATA_DIR = USER_CONFIG_DIR / "browser_data"
 SCREENSHOTS_DIR = USER_CONFIG_DIR / "screenshots"
 
-CASELOAD_URL = os.getenv("CASELOAD_URL", "").strip()
+# Default to WGU's standard Caseload page. Override via .env in the user
+# config dir if your campus / org uses a different Salesforce instance.
+DEFAULT_CASELOAD_URL = "https://srm.lightning.force.com/lightning/n/Caseload_App_Page"
+CASELOAD_URL = os.getenv("CASELOAD_URL", DEFAULT_CASELOAD_URL).strip()
 
 
 def _seed_user_notes_yaml() -> None:
