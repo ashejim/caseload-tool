@@ -36,12 +36,13 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import email_template
+from src import caseload_filter, email_template
 from src.browser import persistent_context
 from src.config import CASELOAD_URL, NOTE_LOG_CSV, TEMPLATES_DIR
 from src.note_form import NoteData
 from src.scenarios import (
-    NOTES_YAML, EmailConfig, ScenarioConfig, load_scenarios, run_scenario,
+    NOTES_YAML, BatchConfig, EmailConfig, ScenarioConfig,
+    load_scenarios, run_scenario,
 )
 from src.student_lookup import (
     click_caseload_row,
@@ -186,10 +187,15 @@ class BrowserWorker:
         course_code_override: str,
         clipboard: str = "",
         custom_bodies: Optional[dict[int, str]] = None,
+        on_done: Optional[Callable[[], None]] = None,
     ) -> None:
+        """Queue a scenario for the worker to fill notes against the
+        active student. `on_done()` is called from the worker thread
+        when the run finishes (success or error) — used by the batch
+        loop to step through students sequentially."""
         self.q.put((
             "RUN", scenario, course_code_override, clipboard,
-            custom_bodies or {},
+            custom_bodies or {}, on_done,
         ))
 
     def submit_find_student(self, query: str) -> None:
@@ -224,6 +230,40 @@ class BrowserWorker:
         not be open yet (e.g. straight after a find-first navigation).
         `on_done(info_dict_or_None)` is called from the worker."""
         self.q.put(("GET_STUDENT_CONTEXT", on_done, name_hint))
+
+    def submit_read_caseload_columns(
+        self, on_done: Callable[[list[dict]], None],
+    ) -> None:
+        """Navigate to Caseload (if not already there) and return the
+        list of visible columns + a sniffed type per column. Each
+        entry: `{"name": str, "type": "text"|"date"|"number"}`. Used
+        by the editor's filter-column dropdown."""
+        self.q.put(("READ_CASELOAD_COLUMNS", on_done))
+
+    def submit_read_all_caseload_rows(
+        self,
+        on_done: Callable[[list[dict]], None],
+        on_progress: Optional[Callable[[int], None]] = None,
+    ) -> None:
+        """Scroll the Caseload table to load every row, then return
+        them as a list of dicts keyed by column name. Calls
+        `on_progress(row_count)` periodically during the scroll loop."""
+        self.q.put(("READ_ALL_CASELOAD_ROWS", on_done, on_progress))
+
+    def submit_click_match_by_filter(
+        self,
+        query: str,
+        on_done: Callable[[bool], None],
+        expected_name: str = "",
+    ) -> None:
+        """Fast batch click: type `query` into Salesforce's row filter,
+        wait for the table to narrow, then click the single matching
+        row. If `expected_name` is set and the filter returns more
+        than one row, only clicks if that name matches one — otherwise
+        aborts. ~1.5s per call vs ~25s for the full DOM scan."""
+        self.q.put((
+            "CLICK_MATCH_BY_FILTER", query, expected_name, on_done,
+        ))
 
     def shutdown(self) -> None:
         self.q.put(self.SHUTDOWN)
@@ -264,11 +304,15 @@ class BrowserWorker:
                     if cmd is self.SHUTDOWN:
                         return
                     if cmd[0] == "RUN":
-                        _, scenario, override, clipboard, custom_bodies = cmd
-                        self._handle_run(
-                            ctx, scenario, override, clipboard,
-                            custom_bodies=custom_bodies,
-                        )
+                        _, scenario, override, clipboard, custom_bodies, on_done = cmd
+                        try:
+                            self._handle_run(
+                                ctx, scenario, override, clipboard,
+                                custom_bodies=custom_bodies,
+                            )
+                        finally:
+                            if on_done is not None:
+                                on_done()
                     elif cmd[0] == "FIND":
                         _, query = cmd
                         self._handle_find(ctx, query)
@@ -300,6 +344,38 @@ class BrowserWorker:
                             info = self._read_student_context(ctx, name_hint)
                         finally:
                             on_done(info)
+                    elif cmd[0] == "READ_CASELOAD_COLUMNS":
+                        _, on_done = cmd
+                        cols: list[dict] = []
+                        try:
+                            cols = self._read_caseload_columns(ctx)
+                        finally:
+                            on_done(cols)
+                    elif cmd[0] == "READ_ALL_CASELOAD_ROWS":
+                        _, on_done, on_progress = cmd
+                        rows: list[dict] = []
+                        try:
+                            rows = self._read_all_caseload_rows(
+                                ctx, on_progress=on_progress,
+                            )
+                        finally:
+                            on_done(rows)
+                    elif cmd[0] == "CLICK_MATCH_BY_FILTER":
+                        _, query, expected_name, on_done = cmd
+                        success = False
+                        try:
+                            success = self._click_match_by_filter(
+                                ctx, query, expected_name=expected_name,
+                            )
+                            if success:
+                                tgt = ctx.pages[-1] if ctx.pages else None
+                                if tgt is not None:
+                                    try:
+                                        tgt.wait_for_timeout(2000)
+                                    except Exception:
+                                        pass
+                        finally:
+                            on_done(success)
         except Exception as e:
             self.on_status(f"Browser worker crashed: {e}")
 
@@ -545,6 +621,99 @@ class BrowserWorker:
         self.on_status(f"Click failed: {name!r} not in last results.")
         return False
 
+    def _click_match_by_filter(
+        self, ctx, query: str, expected_name: str = "",
+    ) -> bool:
+        """Skip the slow full-table DOM scan: type `query` into
+        Salesforce's row filter, wait, then click the (one) result.
+        For batches with known-unique Student IDs this is ~10x faster
+        than _list_matches + _click_match_by_name."""
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return False
+        self.on_status(f"Fast-find: filtering Caseload by {query!r}...")
+        try:
+            filter_input = target.locator(
+                'input[placeholder="Search All Rows..."]'
+            ).filter(visible=True).first
+            if filter_input.count() == 0:
+                self.on_status("No row filter input; can't fast-find.")
+                return False
+            filter_input.click()
+            filter_input.fill("")
+            filter_input.fill(query)
+            filter_input.press("Enter")
+            target.wait_for_timeout(800)
+        except Exception as e:
+            self.on_status(f"Fast-find filter failed for {query!r}: {e}")
+            return False
+
+        # Resolve Name column index on the filtered table.
+        headers_raw = table.locator("th").all_text_contents()
+        name_idx = next(
+            (j for j, h in enumerate(headers_raw) if h.strip() == "Name"),
+            None,
+        )
+        if name_idx is None:
+            name_idx = next(
+                (
+                    j for j, h in enumerate(headers_raw)
+                    if h.strip().startswith("Name")
+                ),
+                None,
+            )
+        if name_idx is None:
+            self.on_status("Fast-find: no Name column found.")
+            return False
+
+        # Collect matching rows from the filtered table.
+        rows_loc = table.locator("tr")
+        n_rows = rows_loc.count()
+        candidates: list[tuple] = []
+        for r in range(1, n_rows):
+            row = rows_loc.nth(r)
+            try:
+                cells = row.locator("td").all_text_contents()
+            except Exception:
+                continue
+            if not cells or name_idx >= len(cells):
+                continue
+            cname = cells[name_idx].strip()
+            if cname:
+                candidates.append((row, cname, name_idx))
+
+        if not candidates:
+            self.on_status(f"Fast-find: {query!r} returned 0 rows.")
+            return False
+
+        # Disambiguate via expected_name (the row we matched in main).
+        if expected_name:
+            chosen = next(
+                (c for c in candidates if c[1] == expected_name), None,
+            )
+            if chosen is None:
+                self.on_status(
+                    f"Fast-find {query!r}: {len(candidates)} rows but "
+                    f"none named {expected_name!r}; skipping."
+                )
+                return False
+        elif len(candidates) > 1:
+            names = ", ".join(c[1] for c in candidates)
+            self.on_status(
+                f"Fast-find {query!r}: {len(candidates)} ambiguous rows "
+                f"({names}); skipping (no expected_name to disambiguate)."
+            )
+            return False
+        else:
+            chosen = candidates[0]
+
+        row, cname, name_idx = chosen
+        if click_caseload_row(row, cname, name_idx, on_status=self.on_status):
+            self.on_status(f"Fast-find navigated to {cname!r}.")
+            return True
+        self.on_status(f"Fast-find: click on {cname!r} failed.")
+        return False
+
     def _read_student_context(self, ctx, name_hint: str = "") -> Optional[dict]:
         """Build the variable dict used to render emails and notes.
         `name_hint` lets the caller supply the name we just navigated
@@ -566,6 +735,158 @@ class BrowserWorker:
             "pm_name": info.get("pm_name", ""),
             "pm_email": info.get("pm_email", ""),
         }
+
+    def _open_caseload_table(self, ctx):
+        """Common helper: navigate to Caseload (if not already there)
+        and return a locator for the data table. Skipping the goto
+        when the page is already on Caseload saves ~3–5s per batch
+        iteration."""
+        target = ctx.pages[-1] if ctx.pages else None
+        if target is None:
+            return None, None
+        # Only navigate if we're not already on caseload — Salesforce's
+        # URLs can include hash/query suffixes, so use a substring
+        # match against the Caseload page path.
+        try:
+            current_url = target.url or ""
+        except Exception:
+            current_url = ""
+        if CASELOAD_URL and "Caseload_App_Page" not in current_url:
+            try:
+                target.goto(CASELOAD_URL, wait_until="domcontentloaded")
+            except Exception as e:
+                self.on_status(f"  [debug] goto caseload: {e}")
+        try:
+            tables = (
+                target.locator("table")
+                .filter(has=target.locator('th:has-text("Course Code")'))
+                .filter(has=target.locator('th:has-text("Name")'))
+            )
+            tables.first.wait_for(state="visible", timeout=20_000)
+            return target, tables.first
+        except Exception as e:
+            self.on_status(f"Caseload table didn't load: {e}")
+            return target, None
+
+    @staticmethod
+    def _clean_caseload_headers(table) -> list[str]:
+        """Strip the 'sorting options' / 'column actions' UI noise off
+        Lightning's <th> text and dedupe, returning a clean list of
+        column names in left-to-right order."""
+        import re as _re
+        raw = table.locator("th").all_text_contents()
+        out: list[str] = []
+        for h in raw:
+            h = h.strip()
+            if not h or h.startswith("Sort by:"):
+                continue
+            h = _re.sub(
+                r"\s*(sorting options|column actions).*$",
+                "", h, flags=_re.IGNORECASE,
+            ).strip()
+            if h and h not in out:
+                out.append(h)
+        return out
+
+    def _read_caseload_columns(self, ctx) -> list[dict]:
+        """Return list of `{name, type}` dicts for every visible column
+        in the user's caseload list view. Type is sniffed from a sample
+        of cells in each column."""
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return []
+        headers = self._clean_caseload_headers(table)
+        if not headers:
+            return []
+        rows = table.locator("tr")
+        n_rows = min(rows.count(), 11)  # 1 header + up to 10 data rows
+        samples: list[list[str]] = [[] for _ in headers]
+        for r in range(1, n_rows):
+            try:
+                cells = rows.nth(r).locator("td").all_text_contents()
+            except Exception:
+                continue
+            for i in range(len(headers)):
+                if i < len(cells):
+                    v = cells[i].strip()
+                    if v:
+                        samples[i].append(v)
+        self.on_status(f"Caseload columns refreshed: {len(headers)} visible.")
+        return [
+            {"name": h, "type": caseload_filter.sniff_column_type(s)}
+            for h, s in zip(headers, samples)
+        ]
+
+    def _read_all_caseload_rows(
+        self, ctx,
+        on_progress: Optional[Callable[[int], None]] = None,
+    ) -> list[dict]:
+        """Scroll the caseload table to load every row, then return
+        them as a list of `{column_name: cell_text}` dicts. Lightning
+        lazy-loads rows on scroll; we drive the last `<tr>` into view
+        in a loop until the row count is stable for two checks.
+        Skips rows that are entirely empty (placeholder shells)."""
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return []
+        # Clear any active row filter so we see the whole caseload.
+        try:
+            fi = target.locator(
+                'input[placeholder="Search All Rows..."]'
+            ).filter(visible=True).first
+            if fi.count() > 0:
+                fi.click(); fi.fill("")
+                fi.press("Enter")
+                target.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        last_count = 0
+        stable = 0
+        MAX_ITERS = 200
+        for _ in range(MAX_ITERS):
+            rows = table.locator("tr")
+            count = rows.count()
+            if on_progress:
+                try:
+                    on_progress(max(count - 1, 0))  # subtract header
+                except Exception:
+                    pass
+            if count == last_count:
+                stable += 1
+                if stable >= 2:
+                    break
+            else:
+                stable = 0
+            last_count = count
+            try:
+                last_row = rows.nth(count - 1)
+                last_row.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            try:
+                target.wait_for_timeout(400)
+            except Exception:
+                pass
+
+        headers = self._clean_caseload_headers(table)
+        if not headers:
+            return []
+        rows = table.locator("tr")
+        n_rows = rows.count()
+        out: list[dict] = []
+        for r in range(1, n_rows):
+            try:
+                cells = rows.nth(r).locator("td").all_text_contents()
+            except Exception:
+                continue
+            row_dict = {}
+            for i, h in enumerate(headers):
+                row_dict[h] = cells[i].strip() if i < len(cells) else ""
+            if any(v for v in row_dict.values()):
+                out.append(row_dict)
+        self.on_status(f"Caseload loaded: {len(out)} rows.")
+        return out
 
     def _handle_run(
         self, ctx, scenario: ScenarioConfig, override: str,
@@ -770,6 +1091,7 @@ _DIALOG_GEOMETRY: dict[str, str] = {}
 _DIALOG_DEFAULTS: dict[str, str] = {
     "find_and_pick": "480x440",
     "additional_text": "640x420",
+    "batch_review": "720x560",
 }
 
 
@@ -1014,6 +1336,100 @@ def prompt_additional_text(parent, label: str, prefilled: str) -> Optional[str]:
     return result["value"]
 
 
+def prompt_batch_review(
+    parent,
+    scenario_name: str,
+    rows: list[dict],
+    display_columns: list[str],
+) -> Optional[list[dict]]:
+    """Show matched students before a batch fires. Returns the subset
+    the user kept checked + confirmed, or None on cancel.
+
+    `display_columns` is the in-order list of fields shown per row;
+    the first column is usually 'Name' so the student is easy to
+    identify, followed by whatever fields the scenario filtered on."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title(f"Batch: {scenario_name}")
+    _restore_dialog_geometry(dialog, "batch_review")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+
+    result: dict = {"value": None}
+
+    header_label = ctk.CTkLabel(
+        dialog,
+        text=(
+            f"{len(rows)} students matched. Uncheck anyone to skip, "
+            "then click Confirm to start."
+        ),
+        anchor="w", justify="left",
+    )
+    header_label.pack(fill="x", padx=12, pady=(12, 4))
+
+    cols_label = ctk.CTkLabel(
+        dialog,
+        text=" · ".join(display_columns),
+        anchor="w", justify="left",
+        font=ctk.CTkFont(size=12, weight="bold"),
+    )
+    cols_label.pack(fill="x", padx=12, pady=(0, 4))
+
+    scroll = ctk.CTkScrollableFrame(dialog)
+    scroll.pack(fill="both", expand=True, padx=12, pady=4)
+
+    checked_vars: list[ctk.BooleanVar] = []
+
+    def update_count_label() -> None:
+        n = sum(1 for v in checked_vars if v.get())
+        confirm_btn.configure(text=f"Confirm {n}")
+
+    for row in rows:
+        v = ctk.BooleanVar(value=True)
+        checked_vars.append(v)
+        text = " · ".join(
+            (row.get(c, "") or "")[:60] for c in display_columns
+        )
+        cb = ctk.CTkCheckBox(
+            scroll, text=text, variable=v, command=update_count_label,
+        )
+        cb.pack(fill="x", padx=4, pady=1, anchor="w")
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(pady=(4, 12))
+
+    def confirm(_event=None) -> None:
+        selected = [rows[i] for i, v in enumerate(checked_vars) if v.get()]
+        result["value"] = selected
+        _save_dialog_geometry(dialog, "batch_review")
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    def cancel(_event=None) -> None:
+        _save_dialog_geometry(dialog, "batch_review")
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    confirm_btn = ctk.CTkButton(
+        btn_row, text=f"Confirm {len(rows)}", command=confirm, width=140,
+    )
+    confirm_btn.pack(side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text="Cancel", command=cancel, width=90,
+        fg_color="transparent", border_width=1,
+    ).pack(side="left", padx=4)
+
+    dialog.bind("<Escape>", cancel)
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+
+    parent.wait_window(dialog)
+    return result["value"]
+
+
 # ============================================================
 # Note editor — one note section inside a scenario tab.
 # ============================================================
@@ -1215,10 +1631,11 @@ class ScenarioEditor:
     def __init__(self, parent, scenario: ScenarioConfig, capture_handler=None):
         self.scenario_name = scenario.name
         self.close_tab_after = scenario.close_tab_after
-        # Pass-through: the editor doesn't expose the email block in
-        # the UI yet (build step #7), but we round-trip it so a Save
-        # doesn't wipe a hand-edited `email:` section in notes.yaml.
+        # Pass-through: the editor doesn't expose the email/batch
+        # blocks in the UI yet (build step #7), but we round-trip them
+        # so a Save doesn't wipe a hand-edited block in notes.yaml.
         self._email_config = scenario.email
+        self._batch_config = scenario.batch
         self.capture_handler = capture_handler  # callable(on_done)
         self.frame = ctk.CTkScrollableFrame(parent)
         self.frame.grid_columnconfigure(0, weight=1)
@@ -1346,6 +1763,7 @@ class ScenarioEditor:
         self.hotkey_entry.insert(0, scenario.hotkey)
         self.find_first_var.set(scenario.find_first)
         self._email_config = scenario.email
+        self._batch_config = scenario.batch
         for ne, note in zip(self.note_editors, scenario.notes):
             ne.load(note)
 
@@ -1363,6 +1781,12 @@ class ScenarioEditor:
                 "body_html_file": self._email_config.body_html_file,
                 "inline_images": list(self._email_config.inline_images),
                 "cc_pm": self._email_config.cc_pm,
+            }
+        if self._batch_config is not None:
+            # Round-trip the batch block until the editor UI lands.
+            out["batch"] = {
+                "filters": [dict(f) for f in self._batch_config.filters],
+                "preview": self._batch_config.preview,
             }
         return out
 
@@ -1799,6 +2223,12 @@ class App:
         override = self.course_var.get().strip()
         self._append_log(f"--- Firing {scenario.name!r} ---")
 
+        # Batch scenarios have their own driver — load the caseload,
+        # apply filters, show a review/confirm dialog, then loop.
+        if scenario.batch is not None:
+            self._fire_batch(scenario, override)
+            return
+
         # Step 1: find + pick (if enabled). Combined dialog lets the
         # user retype if the first query was wrong or surfaces too
         # many candidates. Worker handles search; fuzzy fallback kicks
@@ -1853,6 +2283,169 @@ class App:
             custom_bodies=custom_bodies,
         )
 
+    def _fire_batch(self, scenario: ScenarioConfig, override: str) -> None:
+        """Drive a batch scenario end-to-end: load caseload, filter,
+        review/confirm, then loop email→note per selected student.
+        The activity log is the progress display; cancellation is via
+        any modal Cancel button (which aborts the batch from that
+        point on)."""
+        from tkinter import messagebox
+
+        # Step 1: load all caseload rows. The worker emits a
+        # "Caseload loaded: N rows" status of its own when done, so
+        # we don't duplicate it here.
+        self._append_log(
+            f"Batch {scenario.name!r}: loading caseload "
+            "(this can take 5–30s for a full caseload)..."
+        )
+        rows = self._read_all_caseload_rows_blocking()
+        if not rows:
+            self._append_log("Batch aborted: couldn't load caseload rows.")
+            return
+
+        # Step 2: apply filters.
+        filters = list(scenario.batch.filters)
+        matched = caseload_filter.apply_filters(filters, rows)
+        if not matched:
+            messagebox.showinfo(
+                "No matches",
+                f"No students match the filters for {scenario.name!r}.",
+            )
+            self._append_log("Batch: no matches; nothing to do.")
+            return
+        self._append_log(f"Filters matched {len(matched)} students.")
+
+        # Step 3: pick the display columns for the review dialog —
+        # Name + Student ID (so the user can verify identity at a
+        # glance) + every column referenced in the filters (in
+        # filter order, deduped).
+        display_columns = ["Name", "Student ID"]
+        for f in filters:
+            col = f.get("column", "")
+            if col and col not in display_columns:
+                display_columns.append(col)
+
+        # Step 4: review-and-confirm dialog (unless preview is off).
+        if scenario.batch.preview:
+            confirmed = prompt_batch_review(
+                self.root, scenario.name, matched, display_columns,
+            )
+            if confirmed is None:
+                self._append_log("Batch cancelled.")
+                return
+            if not confirmed:
+                self._append_log("Batch: 0 students confirmed; nothing to do.")
+                return
+        else:
+            confirmed = matched
+
+        # Step 5: one-time per-batch prompts — `enter_additional_text`
+        # on any note prompts once and applies the same text to every
+        # student in the batch. Per-call summaries are inappropriate
+        # for batch; this is for generic add-ons (e.g. a one-time PS).
+        custom_bodies: dict[int, str] = {}
+        for i, n in enumerate(scenario.notes):
+            if not n.enter_additional_text:
+                continue
+            label = f"Note {i + 1} (applies to all {len(confirmed)} students)"
+            edited = prompt_additional_text(self.root, label, n.body)
+            if edited is None:
+                self._append_log(f"{label}: cancelled; batch not started.")
+                return
+            custom_bodies[i] = edited
+
+        # Clipboard is read once at the start of the batch — Tk + PIL
+        # aren't safe to call from the worker thread.
+        clipboard = ""
+        if any(n.append_clipboard for n in scenario.notes):
+            clipboard = self._read_clipboard_content()
+
+        # Step 6: loop. For each student, navigate via fast-find,
+        # then run the email + note sequence. For email batches the
+        # FIRST student is a template preview (user reviews + sends
+        # in Outlook); the remaining students auto-send through
+        # Outlook with no further user prompts. Cancelling the
+        # template preview aborts the entire batch.
+        processed = 0
+        skipped: list[tuple[str, str]] = []
+        total = len(confirmed)
+        has_email = scenario.email is not None
+        first_email_done = False  # set after the user previews + sends #1
+        for idx, row in enumerate(confirmed, start=1):
+            student_name = row.get("Name", "")
+            student_id = row.get("Student ID", "")
+            self._append_log(
+                f"--- batch {idx}/{total}: {student_name!r} ---"
+            )
+
+            # 6a. Fast-find: type Student ID (or Name) into Caseload's
+            # row filter, then click the single matching row. ~3s vs
+            # ~25s for the full DOM scan find-first uses.
+            query = student_id or student_name
+            if not self._click_match_by_filter_blocking(
+                query, expected_name=student_name,
+            ):
+                self._append_log(
+                    f"Skipping {student_name!r}: fast-find failed."
+                )
+                skipped.append((student_name, "find/click failed"))
+                continue
+
+            # 6b. Email step (if configured).
+            if has_email:
+                ctx_info = self._get_student_context_blocking(
+                    name_hint=student_name,
+                )
+                if ctx_info is None:
+                    self._append_log(
+                        f"Skipping {student_name!r}: couldn't read context."
+                    )
+                    skipped.append((student_name, "no context"))
+                    continue
+                if not first_email_done:
+                    # First student → template review with modal.
+                    # Remaining = total - idx (this many will auto-send).
+                    batch_remaining = total - idx
+                    ok = self._send_scenario_email(
+                        scenario.email, ctx_info,
+                        auto_send=False,
+                        batch_remaining=batch_remaining,
+                    )
+                    if not ok:
+                        self._append_log(
+                            "Batch aborted at email-template preview."
+                        )
+                        # Count the rest as skipped so the summary is honest.
+                        for r in confirmed[idx - 1:]:
+                            skipped.append((
+                                r.get("Name", ""),
+                                "batch cancelled at preview",
+                            ))
+                        break
+                    first_email_done = True
+                else:
+                    # Auto-send. Failures skip the note but don't
+                    # halt the batch.
+                    if not self._send_scenario_email(
+                        scenario.email, ctx_info, auto_send=True,
+                    ):
+                        skipped.append((student_name, "auto-send failed"))
+                        continue
+
+            # 6c. Notes — block until the worker finishes this RUN.
+            self._submit_scenario_blocking(
+                scenario, override, clipboard, custom_bodies,
+            )
+            processed += 1
+
+        self._append_log(
+            f"Batch {scenario.name!r} complete: "
+            f"{processed}/{total} processed, {len(skipped)} skipped."
+        )
+        if skipped:
+            for name, reason in skipped:
+                self._append_log(f"  skipped: {name!r} ({reason})")
+
     def _list_matches_blocking(self, query: str) -> list[str]:
         """Run a LIST_MATCHES on the worker and block until results.
         wait_variable spins a nested mainloop so the dialog stays
@@ -1894,6 +2487,30 @@ class App:
         self.root.wait_variable(done_var)
         return holder["success"]
 
+    def _click_match_by_filter_blocking(
+        self, query: str, expected_name: str = "",
+    ) -> bool:
+        """Batch fast path: type the unique value into Caseload's row
+        filter and click the result. Returns True on success."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"success": False}
+
+        def on_done(success: bool) -> None:
+            def set_main() -> None:
+                holder["success"] = success
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["success"] = success
+                done_var.set(True)
+
+        self.worker.submit_click_match_by_filter(
+            query, on_done, expected_name=expected_name,
+        )
+        self.root.wait_variable(done_var)
+        return holder["success"]
+
     def _get_student_context_blocking(self, name_hint: str = "") -> Optional[dict]:
         """Ask the worker to read the active student's context (email,
         course code, PM, etc.) and block on the main thread until it
@@ -1916,12 +2533,93 @@ class App:
         self.root.wait_variable(done_var)
         return holder["info"]
 
+    def _read_all_caseload_rows_blocking(self) -> list[dict]:
+        """Scroll the Caseload table to load all rows and return them
+        as dicts. Blocks the main thread (nested mainloop via
+        wait_variable) so the activity log stays responsive."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"rows": []}
+
+        def on_done(rows: list[dict]) -> None:
+            def set_main() -> None:
+                holder["rows"] = rows
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["rows"] = rows
+                done_var.set(True)
+
+        self.worker.submit_read_all_caseload_rows(on_done)
+        self.root.wait_variable(done_var)
+        return holder["rows"]
+
+    def _read_caseload_columns_blocking(self) -> list[dict]:
+        """Read the Caseload list view's column headers + sniffed types.
+        Returns list of `{name, type}` dicts. Used by the editor's
+        filter UI (build step #7)."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"cols": []}
+
+        def on_done(cols: list[dict]) -> None:
+            def set_main() -> None:
+                holder["cols"] = cols
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["cols"] = cols
+                done_var.set(True)
+
+        self.worker.submit_read_caseload_columns(on_done)
+        self.root.wait_variable(done_var)
+        return holder["cols"]
+
+    def _submit_scenario_blocking(
+        self, scenario: ScenarioConfig, override: str,
+        clipboard: str, custom_bodies: dict[int, str],
+    ) -> None:
+        """Queue a scenario RUN and block until the worker reports
+        completion. Used by the batch loop to file notes
+        sequentially."""
+        done_var = tk.BooleanVar(value=False)
+
+        def on_done() -> None:
+            def set_main() -> None:
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                done_var.set(True)
+
+        self.worker.submit_scenario(
+            scenario, override, clipboard,
+            custom_bodies=custom_bodies, on_done=on_done,
+        )
+        self.root.wait_variable(done_var)
+
     def _send_scenario_email(
-        self, email_cfg: EmailConfig, student_ctx: dict,
+        self,
+        email_cfg: EmailConfig,
+        student_ctx: dict,
+        *,
+        auto_send: bool = False,
+        batch_remaining: int = 0,
     ) -> bool:
-        """Render the template, open the draft in Outlook for review,
-        then ask the user to confirm before the notes fire. Returns
-        True to proceed with notes; False to abort the scenario."""
+        """Render the template and either Display() the draft for
+        review (default) or Send() it programmatically (`auto_send`).
+
+        Args:
+            auto_send: skip the Outlook window and the "Done with the
+                email?" modal; just send through Outlook. Used by the
+                batch driver for every student after the first.
+            batch_remaining: when previewing the first email of a
+                batch, this is the count of students that will be
+                auto-sent after this one. Used to make the modal text
+                explicit about what Yes/No does.
+
+        Returns True to proceed with the note step (or, in
+        auto_send mode, True if Send() succeeded). False aborts."""
         from tkinter import messagebox
         from src import outlook_email
 
@@ -1975,9 +2673,22 @@ class App:
                 return False
             return True  # skip the email, but file the note
 
-        self._append_log(
-            f"Opening Outlook for {student_ctx.get('full_name') or to}..."
-        )
+        full_name = student_ctx.get("full_name") or to
+
+        if auto_send:
+            self._append_log(f"Auto-sending email to {full_name}...")
+            try:
+                outlook_email.compose_email(
+                    to=to, cc=cc, subject=subject,
+                    html_body=body_html, inline_images=inline_images,
+                    auto_send=True,
+                )
+            except Exception as e:
+                self._append_log(f"Auto-send failed for {full_name}: {e}")
+                return False
+            return True
+
+        self._append_log(f"Opening Outlook draft for {full_name}...")
         try:
             outlook_email.compose_email(
                 to=to, cc=cc, subject=subject,
@@ -1991,14 +2702,28 @@ class App:
                 "Proceed with the note only?",
             )
 
-        return messagebox.askyesno(
-            "Email reviewed?",
-            f"A draft is open in Outlook for "
-            f"{student_ctx.get('full_name') or to}.\n\n"
-            "Click Yes after you've sent (or chosen not to send) the "
-            "email and want the note filed.\n"
-            "Click No to abort — no note will be filed.",
-        )
+        if batch_remaining > 0:
+            modal_text = (
+                f"This draft is the email for {full_name} — the first of "
+                f"{batch_remaining + 1} students in this batch.\n\n"
+                "▸ Review and Send this email in Outlook.\n"
+                f"▸ Editing the draft here only affects {full_name}; "
+                f"the remaining {batch_remaining} students will get the "
+                "un-edited template.\n"
+                "▸ Click Yes after sending — the remaining "
+                f"{batch_remaining} will then auto-send through Outlook "
+                "with no further review.\n\n"
+                "Click No to cancel the whole batch (no further emails "
+                "sent, no further notes filed)."
+            )
+        else:
+            modal_text = (
+                f"A draft is now open in Outlook for {full_name}.\n\n"
+                "▸ Send the email yourself from Outlook (or discard it).\n"
+                "▸ Then click Yes to file the Salesforce note.\n\n"
+                "Click No to skip the note for this student and move on."
+            )
+        return messagebox.askyesno("Done with the email?", modal_text)
 
     def _read_clipboard_content(self) -> str:
         """Pull text from clipboard. If image data is also present,

@@ -77,8 +77,14 @@ def compose_email(
     subject: str = "",
     html_body: str = "",
     inline_images: Optional[dict[str, Path]] = None,
+    *,
+    auto_send: bool = False,
 ) -> None:
-    """Build a draft MailItem in Outlook and Display() it for review.
+    """Build a MailItem in Outlook. By default opens it for the user
+    to review and send (`Display(False)`). When `auto_send=True`,
+    sends it through Outlook programmatically (`Send()`) with no
+    further user interaction — used by the batch driver for students
+    2..N after the user has previewed the template on student 1.
 
     Args:
         to: primary recipient(s); semicolon-separated.
@@ -90,9 +96,13 @@ def compose_email(
         inline_images: CID name → file path. Missing files are
             silently skipped; the rest of the email still goes
             through (the broken image just appears as missing).
+        auto_send: when True, `Send()` the mail instead of showing
+            it. Outlook may prompt for a "Programmatic Access"
+            warning if the user's security settings demand it.
 
     Raises:
-        OSError: if Outlook can't be reached via COM.
+        OSError: if Outlook can't be reached via COM, or (when
+            auto_send=True) if Send() itself fails.
     """
     import win32com.client
     from pywintypes import com_error
@@ -137,6 +147,12 @@ def compose_email(
                 # is otherwise intact. Best-effort behavior.
                 pass
 
+    if auto_send:
+        try:
+            mail.Send()
+        except com_error as e:
+            raise OSError(f"Outlook Send() failed: {e}") from e
+        return
     # Non-modal so the launcher window stays usable while the user
     # reviews and sends the email in Outlook.
     mail.Display(False)

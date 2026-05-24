@@ -347,10 +347,20 @@ def gather_fuzzy_caseload_matches(
 def click_caseload_row(row, name: str, name_idx: int, on_status=None) -> bool:
     """Click into the named student's row (in the Name cell). Tries
     several click targets because Lightning's data grid name cells use
-    custom Aura components, not native anchors."""
+    custom Aura components, not native anchors.
+
+    Scrolls the row into view first — after the batch driver's
+    scroll-to-load-all the table can be parked at the bottom; rows
+    near the top stay in the DOM but Lightning won't render them as
+    visible, and Playwright refuses to click invisible elements."""
     def diag(msg: str) -> None:
         if on_status:
             on_status(msg)
+
+    try:
+        row.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
 
     name_cell = row.locator("td").nth(name_idx)
     for sub_locator in (

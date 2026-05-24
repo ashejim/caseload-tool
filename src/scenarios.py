@@ -53,12 +53,26 @@ class EmailConfig:
 
 
 @dataclass
+class BatchConfig:
+    """Batch-mode config for a scenario. When present, find_first is
+    ignored — the batch driver picks students by applying `filters`
+    against the live Caseload rows.
+
+    Each filter dict has keys: `column`, `op`, and (for most ops)
+    `value`. See `src/caseload_filter.py` for the operator vocabulary
+    and date/number value formats. Filters AND together."""
+    filters: list[dict] = field(default_factory=list)
+    preview: bool = True  # show review/confirm dialog before running
+
+
+@dataclass
 class ScenarioConfig:
     name: str
     hotkey: str
     close_tab_after: bool
     find_first: bool = False
     email: Optional[EmailConfig] = None
+    batch: Optional[BatchConfig] = None
     notes: list[NoteData] = field(default_factory=list)
 
 
@@ -87,6 +101,15 @@ def _email_from_dict(d: Optional[dict]) -> Optional[EmailConfig]:
     )
 
 
+def _batch_from_dict(d: Optional[dict]) -> Optional[BatchConfig]:
+    if d is None:  # `batch:` key absent — not a batch scenario
+        return None
+    return BatchConfig(
+        filters=list(d.get("filters") or []),
+        preview=bool(d.get("preview", True)),
+    )
+
+
 def load_scenarios(path: Path = NOTES_YAML) -> dict[str, ScenarioConfig]:
     """Load all scenarios from notes.yaml, keyed by name."""
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -106,6 +129,7 @@ def load_scenarios(path: Path = NOTES_YAML) -> dict[str, ScenarioConfig]:
             close_tab_after=bool(cfg.get("close_tab_after", True)),
             find_first=bool(cfg.get("find_first", False)),
             email=_email_from_dict(cfg.get("email")),
+            batch=_batch_from_dict(cfg.get("batch")),
             notes=notes,
         )
     return out
