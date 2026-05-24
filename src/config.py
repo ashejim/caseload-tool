@@ -64,6 +64,8 @@ NOTES_YAML = USER_CONFIG_DIR / "notes.yaml"
 BROWSER_DATA_DIR = USER_CONFIG_DIR / "browser_data"
 SCREENSHOTS_DIR = USER_CONFIG_DIR / "screenshots"
 NOTE_LOG_CSV = USER_CONFIG_DIR / "note_log.csv"
+TEMPLATES_DIR = USER_CONFIG_DIR / "templates"
+TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 
 # Default to WGU's standard Caseload page. Override via .env in the user
 # config dir if your campus / org uses a different Salesforce instance.
@@ -81,4 +83,19 @@ def _seed_user_notes_yaml() -> None:
         NOTES_YAML.write_bytes(bundled_default.read_bytes())
 
 
+def _seed_user_templates() -> None:
+    """First-run convenience: copy bundled starter email templates into
+    the user's templates dir if it's empty. Doesn't overwrite existing
+    files."""
+    if any(TEMPLATES_DIR.iterdir()):
+        return
+    src = (_bundle / "templates") if _bundle is not None else (PROJECT_ROOT / "templates")
+    if not src.exists():
+        return
+    for f in src.iterdir():
+        if f.is_file():
+            (TEMPLATES_DIR / f.name).write_bytes(f.read_bytes())
+
+
 _seed_user_notes_yaml()
+_seed_user_templates()

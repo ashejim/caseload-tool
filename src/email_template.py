@@ -1,0 +1,70 @@
+"""Render HTML email templates with variable substitution.
+
+Templates are HTML files with {{variable}} placeholders. Two
+substitution modes:
+
+- **Plain** (default): the value is HTML-escaped and inserted as-is.
+  Right for single-line strings like a name or course code.
+- **Smart** (used for prompt-supplied multi-line text): HTML-escape,
+  convert blank lines to paragraph breaks, single newlines to <br/>.
+  Renders user-typed plain text the way they expect it to look —
+  paragraphs preserved, no Markdown required.
+
+Unknown placeholders are LEFT in place so the user sees them in the
+draft. Easier to spot a typo'd variable than silent omission.
+"""
+import html
+import re
+from pathlib import Path
+from typing import Optional
+
+
+_VAR_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+
+
+def smart_format_for_html(text: str) -> str:
+    """Plain text → HTML chunk preserving paragraphs and line breaks.
+    Blank line = paragraph break; single newline = <br/>. HTML-escapes
+    special chars first. Returns empty string for empty/whitespace-only
+    input."""
+    if not text or not text.strip():
+        return ""
+    escaped = html.escape(text)
+    escaped = escaped.replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = [p for p in re.split(r"\n\s*\n", escaped) if p.strip()]
+    rendered = [p.replace("\n", "<br/>") for p in paragraphs]
+    return "".join(f"<p>{p}</p>" for p in rendered)
+
+
+def render(
+    template_text: str,
+    variables: dict,
+    *,
+    smart_format_vars: Optional[set[str]] = None,
+) -> str:
+    """Substitute {{name}} placeholders in `template_text`.
+
+    Variables named in `smart_format_vars` go through
+    smart_format_for_html (paragraph/break preservation). All other
+    variables are HTML-escaped only. Unknown placeholders are left
+    untouched so they're visible in the draft for debugging."""
+    smart = smart_format_vars or set()
+
+    def replace(match: re.Match) -> str:
+        name = match.group(1)
+        if name not in variables:
+            return match.group(0)
+        value = variables[name]
+        if value is None:
+            value = ""
+        value = str(value)
+        if name in smart:
+            return smart_format_for_html(value)
+        return html.escape(value)
+
+    return _VAR_RE.sub(replace, template_text)
+
+
+def load_template(path: Path) -> str:
+    """Read a UTF-8 template file."""
+    return Path(path).read_text(encoding="utf-8")

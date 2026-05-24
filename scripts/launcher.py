@@ -36,14 +36,18 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src import email_template
 from src.browser import persistent_context
-from src.config import CASELOAD_URL, NOTE_LOG_CSV
+from src.config import CASELOAD_URL, NOTE_LOG_CSV, TEMPLATES_DIR
 from src.note_form import NoteData
-from src.scenarios import NOTES_YAML, ScenarioConfig, load_scenarios, run_scenario
+from src.scenarios import (
+    NOTES_YAML, EmailConfig, ScenarioConfig, load_scenarios, run_scenario,
+)
 from src.student_lookup import (
     click_caseload_row,
     find_and_click_student,
     gather_caseload_matches,
+    gather_fuzzy_caseload_matches,
     get_active_student_name,
     lookup_caseload_student,
 )
@@ -135,6 +139,25 @@ def activities_disabled_for(fmt: str, typ: str) -> bool:
 # Browser worker — owns Playwright in its own thread.
 # ============================================================
 
+
+def _typo_variants(query: str) -> list[str]:
+    """All adjacent-transposition variants of `query`. Most natural
+    one-typo cases (e.g. 'jsoh' for 'josh') are a single adjacent
+    swap, so trying each against Salesforce's row filter often
+    surfaces the right student even when fuzzy doesn't have enough
+    of the table in view."""
+    out: list[str] = []
+    seen = {query}
+    for i in range(len(query) - 1):
+        chars = list(query)
+        chars[i], chars[i + 1] = chars[i + 1], chars[i]
+        v = "".join(chars)
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 class BrowserWorker:
     SHUTDOWN = object()
 
@@ -148,6 +171,9 @@ class BrowserWorker:
         self.on_status = on_status
         self.on_note_filed = on_note_filed
         self.on_multiple_matches = on_multiple_matches
+        # Most recent LIST_MATCHES result, used by CLICK_MATCH to map a
+        # chosen name back to its row locator.
+        self._last_matches: list[tuple] = []
         self.ready_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -159,11 +185,45 @@ class BrowserWorker:
         scenario: ScenarioConfig,
         course_code_override: str,
         clipboard: str = "",
+        custom_bodies: Optional[dict[int, str]] = None,
     ) -> None:
-        self.q.put(("RUN", scenario, course_code_override, clipboard))
+        self.q.put((
+            "RUN", scenario, course_code_override, clipboard,
+            custom_bodies or {},
+        ))
 
     def submit_find_student(self, query: str) -> None:
         self.q.put(("FIND", query))
+
+    def submit_list_matches(
+        self, query: str, on_results: Callable[[list[str]], None],
+    ) -> None:
+        """Search Caseload for matching names without clicking anything.
+        Stores the matches on the worker so a later CLICK_MATCH can
+        resolve a chosen name back to its row. `on_results(names)` is
+        called from the worker thread when done."""
+        self.q.put(("LIST_MATCHES", query, on_results))
+
+    def submit_click_match(
+        self, name: str, on_done: Callable[[bool], None],
+    ) -> None:
+        """Click the row from the most recent LIST_MATCHES whose name
+        equals `name`. Includes a brief settle-wait after navigation.
+        `on_done(success)` is called from the worker thread."""
+        self.q.put(("CLICK_MATCH", name, on_done))
+
+    def submit_get_student_context(
+        self,
+        on_done: Callable[[Optional[dict]], None],
+        name_hint: str = "",
+    ) -> None:
+        """Read the currently-active student's context (name, email,
+        course code, PM email, etc.) from the open note panel and/or
+        the Caseload table. `name_hint` is used when the caller knows
+        which student they just navigated to but the note panel may
+        not be open yet (e.g. straight after a find-first navigation).
+        `on_done(info_dict_or_None)` is called from the worker."""
+        self.q.put(("GET_STUDENT_CONTEXT", on_done, name_hint))
 
     def shutdown(self) -> None:
         self.q.put(self.SHUTDOWN)
@@ -204,11 +264,42 @@ class BrowserWorker:
                     if cmd is self.SHUTDOWN:
                         return
                     if cmd[0] == "RUN":
-                        _, scenario, override, clipboard = cmd
-                        self._handle_run(ctx, scenario, override, clipboard)
+                        _, scenario, override, clipboard, custom_bodies = cmd
+                        self._handle_run(
+                            ctx, scenario, override, clipboard,
+                            custom_bodies=custom_bodies,
+                        )
                     elif cmd[0] == "FIND":
                         _, query = cmd
                         self._handle_find(ctx, query)
+                    elif cmd[0] == "LIST_MATCHES":
+                        _, query, on_results = cmd
+                        names: list[str] = []
+                        try:
+                            names = self._list_matches(ctx, query)
+                        finally:
+                            on_results(names)
+                    elif cmd[0] == "CLICK_MATCH":
+                        _, name, on_done = cmd
+                        success = False
+                        try:
+                            success = self._click_match_by_name(ctx, name)
+                            if success:
+                                tgt = ctx.pages[-1] if ctx.pages else None
+                                if tgt is not None:
+                                    try:
+                                        tgt.wait_for_timeout(2000)
+                                    except Exception:
+                                        pass
+                        finally:
+                            on_done(success)
+                    elif cmd[0] == "GET_STUDENT_CONTEXT":
+                        _, on_done, name_hint = cmd
+                        info: Optional[dict] = None
+                        try:
+                            info = self._read_student_context(ctx, name_hint)
+                        finally:
+                            on_done(info)
         except Exception as e:
             self.on_status(f"Browser worker crashed: {e}")
 
@@ -322,11 +413,173 @@ class BrowserWorker:
         except Exception as e:
             self.on_status(f"Search after filter failed: {e}")
 
-    def _handle_run(self, ctx, scenario: ScenarioConfig, override: str, clipboard: str = "") -> None:
+    def _list_matches(self, ctx, query: str) -> list[str]:
+        """Multi-pass search: returns matching names without clicking.
+        Stores rows on self._last_matches so CLICK_MATCH can resolve.
+        Order:
+          1. exact on current DOM
+          2. reload Caseload, exact
+          3. row-filter (Salesforce 'Search All Rows…'), exact with query
+          4. row-filter with adjacent-transposition variants ('jsoh' →
+             try 'sjoh', 'josh', 'jsho'). Catches the most common
+             single-typo case using Salesforce's own search, which can
+             see all rows (fuzzy is stuck with the ~10 visible ones).
+          5. clear row-filter, fuzzy as a last resort
+        """
+        target = ctx.pages[-1] if ctx.pages else None
+        if target is None:
+            self.on_status("No browser pages open.")
+            self._last_matches = []
+            return []
+        self.on_status(f"Find: searching Caseload for {query!r}...")
+
+        matches = gather_caseload_matches(target, query, on_status=self.on_status)
+        if matches:
+            self._last_matches = matches
+            return [m[2] for m in matches]
+
+        filter_input = None  # set in step 2 so step 4 can clear it
+        if CASELOAD_URL:
+            self.on_status("Caseload not in DOM — reloading and retrying...")
+            try:
+                target.goto(CASELOAD_URL, wait_until="domcontentloaded")
+            except Exception as e:
+                self.on_status(f"  [debug] goto note: {e}")
+            try:
+                list_table = (
+                    target.locator("table")
+                    .filter(has=target.locator('th:has-text("Course Code")'))
+                    .filter(has=target.locator('th:has-text("Name")'))
+                )
+                list_table.first.wait_for(state="visible", timeout=20_000)
+            except Exception as e:
+                self.on_status(f"Caseload table didn't load: {e}")
+                self._last_matches = []
+                return []
+            matches = gather_caseload_matches(target, query, on_status=self.on_status)
+            if matches:
+                self._last_matches = matches
+                return [m[2] for m in matches]
+
+            self.on_status("Not in visible rows; using Caseload's row filter...")
+            try:
+                filter_input = target.locator(
+                    'input[placeholder="Search All Rows..."]'
+                ).filter(visible=True).first
+                if filter_input.count() == 0:
+                    filter_input = None
+            except Exception as e:
+                self.on_status(f"Filter lookup failed: {e}")
+                filter_input = None
+
+            def _try_filter(text: str) -> list[tuple]:
+                """Fill the row filter and gather exact matches against
+                `text`. Returns the raw match tuples (empty on any
+                failure or zero results)."""
+                if filter_input is None:
+                    return []
+                try:
+                    filter_input.click()
+                    filter_input.fill("")
+                    filter_input.fill(text)
+                    filter_input.press("Enter")
+                    target.wait_for_timeout(1500)
+                except Exception as e:
+                    self.on_status(f"  [debug] filter {text!r}: {e}")
+                    return []
+                return gather_caseload_matches(
+                    target, text, on_status=self.on_status,
+                )
+
+            # Step 3: original query.
+            matches = _try_filter(query)
+            if matches:
+                self._last_matches = matches
+                return [m[2] for m in matches]
+
+            # Step 4: adjacent-transposition typo variants.
+            if len(query) >= 3 and filter_input is not None:
+                for variant in _typo_variants(query):
+                    self.on_status(f"Trying typo correction {variant!r}...")
+                    matches = _try_filter(variant)
+                    if matches:
+                        self.on_status(
+                            f"Found via typo-correction {variant!r} "
+                            f"(you typed {query!r})."
+                        )
+                        self._last_matches = matches
+                        return [m[2] for m in matches]
+
+        # Step 5: clear the row filter (if we set it) so fuzzy sees the
+        # full caseload again, then fuzzy-match.
+        if filter_input is not None:
+            try:
+                self.on_status("Clearing row filter for fuzzy search...")
+                filter_input.click()
+                filter_input.fill("")
+                filter_input.press("Enter")
+                target.wait_for_timeout(1500)
+            except Exception as e:
+                self.on_status(f"  [debug] clear filter: {e}")
+
+        self.on_status(f"No exact match for {query!r}; trying fuzzy...")
+        fuzzy = gather_fuzzy_caseload_matches(
+            target, query, on_status=self.on_status,
+        )
+        self._last_matches = fuzzy
+        return [m[2] for m in fuzzy]
+
+    def _click_match_by_name(self, ctx, name: str) -> bool:
+        target = ctx.pages[-1] if ctx.pages else None
+        if target is None:
+            self.on_status("No browser pages open.")
+            return False
+        for m in self._last_matches:
+            if m[2] == name:
+                _, row, mname, name_idx = m
+                if click_caseload_row(row, mname, name_idx, on_status=self.on_status):
+                    self.on_status(f"Navigated to {mname!r}.")
+                    return True
+                self.on_status(f"Click on {mname!r} failed.")
+                return False
+        self.on_status(f"Click failed: {name!r} not in last results.")
+        return False
+
+    def _read_student_context(self, ctx, name_hint: str = "") -> Optional[dict]:
+        """Build the variable dict used to render emails and notes.
+        `name_hint` lets the caller supply the name we just navigated
+        to (e.g. from find-first) when the note panel hasn't been
+        opened yet so get_active_student_name() would return ''."""
+        target = ctx.pages[-1] if ctx.pages else None
+        if target is None:
+            return None
+        name = name_hint or (get_active_student_name(target) or "")
+        info = lookup_caseload_student(target, name) if name else {}
+        first, _, last = name.partition(" ")
+        return {
+            "full_name": name,
+            "first_name": first,
+            "last_name": last,
+            "student_email": info.get("student_email", ""),
+            "student_id": info.get("student_id", ""),
+            "course_code": info.get("course_code", ""),
+            "pm_name": info.get("pm_name", ""),
+            "pm_email": info.get("pm_email", ""),
+        }
+
+    def _handle_run(
+        self, ctx, scenario: ScenarioConfig, override: str,
+        clipboard: str = "",
+        custom_bodies: Optional[dict[int, str]] = None,
+    ) -> None:
         target = ctx.pages[-1] if ctx.pages else None
         if target is None:
             self.on_status("No browser pages open.")
             return
+        # Note: when scenario.find_first is True, the main thread has
+        # already driven the LIST_MATCHES + CLICK_MATCH sequence before
+        # queueing this RUN — so by the time we get here, the active
+        # student is already loaded.
         # Always try to capture student name — used for auto-detect and
         # for the session log entry on success.
         student = get_active_student_name(target)
@@ -355,7 +608,8 @@ class BrowserWorker:
         try:
             all_submitted = run_scenario(
                 target, scenario, course_code,
-                clipboard=clipboard, on_status=self.on_status,
+                clipboard=clipboard, custom_bodies=custom_bodies,
+                on_status=self.on_status,
             )
             tail = "" if all_submitted else "  (left open — submit unchecked)"
             self.on_status(f"Done: {scenario.name!r} (course {course_code!r}).{tail}")
@@ -509,6 +763,257 @@ def open_hotkey_capture(parent, on_done: Callable[[str], None]) -> None:
     dialog.focus_set()
 
 
+# Remembers each user-movable dialog's last geometry across opens so
+# they reopen where the user last placed/sized them. Persists only
+# within a launcher session (intentional — restart resets to defaults).
+_DIALOG_GEOMETRY: dict[str, str] = {}
+_DIALOG_DEFAULTS: dict[str, str] = {
+    "find_and_pick": "480x440",
+    "additional_text": "640x420",
+}
+
+
+def _restore_dialog_geometry(dialog, key: str) -> None:
+    geom = _DIALOG_GEOMETRY.get(key, _DIALOG_DEFAULTS.get(key, ""))
+    if geom:
+        try:
+            dialog.geometry(geom)
+        except Exception:
+            dialog.geometry(_DIALOG_DEFAULTS.get(key, "400x300"))
+
+
+def _save_dialog_geometry(dialog, key: str) -> None:
+    try:
+        _DIALOG_GEOMETRY[key] = dialog.geometry()
+    except Exception:
+        pass
+
+
+def prompt_find_and_pick(
+    parent,
+    do_search: Callable[[str], list[str]],
+) -> Optional[str]:
+    """Combined find-and-pick dialog: search entry on top, results list
+    below. Workflow: user types query → Enter → results appear below;
+    user can retype to refine, OR click a name to commit. Returns the
+    selected name, or None on cancel.
+
+    `do_search(query)` runs on the main thread but is expected to
+    block (via wait_variable inside) while the worker performs the
+    actual search. Returns the list of matching names (exact tiers
+    first, then fuzzy fallback as the worker decides).
+
+    The dialog reopens at its last on-screen size/position within the
+    session (key 'find_and_pick')."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Find student")
+    _restore_dialog_geometry(dialog, "find_and_pick")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+
+    result: dict = {"value": None}
+
+    ctk.CTkLabel(
+        dialog,
+        text="Type the student's name and press Enter. Matches appear below.",
+        justify="left",
+    ).pack(padx=12, pady=(12, 4), anchor="w")
+
+    entry = ctk.CTkEntry(dialog, placeholder_text="e.g. Joshua Jacobs")
+    entry.pack(fill="x", padx=12, pady=(0, 6))
+    entry.focus_force()
+    dialog.after(50, entry.focus_force)
+
+    results_frame = ctk.CTkScrollableFrame(dialog, label_text="Matches")
+    results_frame.pack(fill="both", expand=True, padx=12, pady=4)
+
+    current_widgets: list = []
+    searching = {"in_flight": False}
+    pending_cancel = {"value": False}
+
+    def alive() -> bool:
+        try:
+            return bool(dialog.winfo_exists())
+        except Exception:
+            return False
+
+    def clear_results() -> None:
+        for w in current_widgets:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        current_widgets.clear()
+
+    def populate(names: list[str], query: str) -> None:
+        if not alive():
+            return
+        clear_results()
+        if not names:
+            lbl = ctk.CTkLabel(
+                results_frame,
+                text=(
+                    f"No matches for {query!r}. Try a different "
+                    "spelling, or use the full name."
+                ),
+                anchor="w", justify="left",
+            )
+            lbl.pack(fill="x", padx=4, pady=8)
+            current_widgets.append(lbl)
+            return
+        for n in names:
+            btn = ctk.CTkButton(
+                results_frame, text=n, anchor="w", height=32,
+                command=lambda nm=n: finish(nm),
+            )
+            btn.pack(fill="x", pady=2)
+            current_widgets.append(btn)
+
+    def run_search(_event=None):
+        if searching["in_flight"]:
+            return
+        query = entry.get().strip()
+        if not query:
+            return
+        searching["in_flight"] = True
+        clear_results()
+        msg = ctk.CTkLabel(
+            results_frame, text=f"Searching for {query!r}…",
+            anchor="w", justify="left",
+        )
+        msg.pack(fill="x", padx=4, pady=8)
+        current_widgets.append(msg)
+        # Disable the entry so a second Enter while searching can't
+        # stack a second wait_variable on top of the first.
+        try:
+            entry.configure(state="disabled")
+        except Exception:
+            pass
+        dialog.update_idletasks()
+        try:
+            names = do_search(query)
+        finally:
+            searching["in_flight"] = False
+            if alive():
+                try:
+                    entry.configure(state="normal")
+                    entry.focus_force()
+                except Exception:
+                    pass
+        if pending_cancel["value"]:
+            finish(None)
+            return
+        populate(names, query)
+
+    def finish(name: Optional[str]) -> None:
+        result["value"] = name
+        _save_dialog_geometry(dialog, "find_and_pick")
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    def cancel(_event=None) -> None:
+        # Cancel during an in-flight search defers the close until the
+        # worker reports back — we can't kill the search mid-flight.
+        if searching["in_flight"]:
+            pending_cancel["value"] = True
+            return
+        finish(None)
+
+    entry.bind("<Return>", run_search)
+    dialog.bind("<Escape>", cancel)
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(pady=(4, 10))
+    ctk.CTkButton(btn_row, text="Search", command=run_search, width=110).pack(side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text="Cancel", command=cancel, width=90,
+        fg_color="transparent", border_width=1,
+    ).pack(side="left", padx=4)
+
+    parent.wait_window(dialog)
+    return result["value"]
+
+
+def prompt_additional_text(parent, label: str, prefilled: str) -> Optional[str]:
+    """Blocking modal: multi-line edit of a note body, pre-filled.
+    Returns the new body (no strip), or None if cancelled. Enter
+    submits, Shift+Enter inserts a newline, Esc cancels.
+
+    Pre-fill rule: if the body doesn't already end in whitespace, a
+    single trailing space is added so the user can start typing
+    immediately without manually inserting a separator. The cursor
+    is placed at end. Last on-screen position is remembered for the
+    rest of the session."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title(f"Edit body — {label}")
+    _restore_dialog_geometry(dialog, "additional_text")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+
+    result: dict = {"value": None}
+
+    ctk.CTkLabel(
+        dialog,
+        text=(
+            f"{label}: edit or add to the body. "
+            "Enter = submit · Shift+Enter = newline · Esc = cancel"
+        ),
+        justify="left",
+    ).pack(padx=12, pady=(10, 4), anchor="w")
+
+    text_box = ctk.CTkTextbox(dialog, wrap="word")
+    text_box.pack(fill="both", expand=True, padx=12, pady=4)
+    content = prefilled
+    if content and content[-1] not in (" ", "\n", "\t"):
+        content += " "
+    text_box.insert("1.0", content)
+    text_box.focus_force()
+    dialog.after(50, text_box.focus_force)
+    text_box.mark_set("insert", "end-1c")
+
+    def submit(_event=None):
+        result["value"] = text_box.get("1.0", "end-1c")
+        _save_dialog_geometry(dialog, "additional_text")
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+        return "break"
+
+    def cancel(_event=None):
+        _save_dialog_geometry(dialog, "additional_text")
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+        return "break"
+
+    def insert_newline(_event):
+        text_box.insert("insert", "\n")
+        return "break"
+
+    text_box.bind("<Return>", submit)
+    text_box.bind("<Shift-Return>", insert_newline)
+    dialog.bind("<Escape>", cancel)
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(pady=(4, 10))
+    ctk.CTkButton(btn_row, text="Submit", command=submit, width=110).pack(side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text="Cancel", command=cancel, width=90,
+        fg_color="transparent", border_width=1,
+    ).pack(side="left", padx=4)
+
+    parent.wait_window(dialog)
+    return result["value"]
+
+
 # ============================================================
 # Note editor — one note section inside a scenario tab.
 # ============================================================
@@ -607,6 +1112,16 @@ class NoteEditor:
         self.body_text = ctk.CTkTextbox(content, height=80, wrap="word")
         self.body_text.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 4))
 
+        # Prompt-for-extra-text toggle. When on, firing the scenario
+        # pops a dialog pre-filled with this body so the user can edit
+        # / paste before it's submitted (same size cap applies).
+        row += 1
+        self.enter_additional_text_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            content, text="Enter additional text at fire time",
+            variable=self.enter_additional_text_var,
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
+
         # Append-clipboard toggle. When on, the clipboard at fire time
         # is read on the main thread and appended after the body
         # (capped at 200 lines / 25000 chars total — images replaced
@@ -675,6 +1190,7 @@ class NoteEditor:
         self.body_text.insert("1.0", note.body)
         self.submit_var.set(note.submit)
         self.append_clipboard_var.set(note.append_clipboard)
+        self.enter_additional_text_var.set(note.enter_additional_text)
         self._update_activity_state()
 
     def serialize(self) -> dict:
@@ -687,6 +1203,7 @@ class NoteEditor:
             ],
             "submit": self.submit_var.get(),
             "append_clipboard": self.append_clipboard_var.get(),
+            "enter_additional_text": self.enter_additional_text_var.get(),
         }
 
 
@@ -698,6 +1215,10 @@ class ScenarioEditor:
     def __init__(self, parent, scenario: ScenarioConfig, capture_handler=None):
         self.scenario_name = scenario.name
         self.close_tab_after = scenario.close_tab_after
+        # Pass-through: the editor doesn't expose the email block in
+        # the UI yet (build step #7), but we round-trip it so a Save
+        # doesn't wipe a hand-edited `email:` section in notes.yaml.
+        self._email_config = scenario.email
         self.capture_handler = capture_handler  # callable(on_done)
         self.frame = ctk.CTkScrollableFrame(parent)
         self.frame.grid_columnconfigure(0, weight=1)
@@ -731,6 +1252,18 @@ class ScenarioEditor:
         ctk.CTkButton(
             hotkey_row, text="Press to set", width=110, command=self._start_capture,
         ).pack(side="left", padx=(8, 0))
+
+        # Find-student-first toggle. When on, firing the scenario pops
+        # an entry dialog asking for the student name; the worker
+        # navigates to them before filling notes. All notes in a
+        # scenario target the same student.
+        row += 1
+        self.find_first_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            self.frame,
+            text="Find student first (prompt at fire time)",
+            variable=self.find_first_var,
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
 
         # Notes live in their own container so add/delete can just
         # pack/destroy children without disturbing the outer grid rows.
@@ -811,15 +1344,27 @@ class ScenarioEditor:
         self.name_entry.insert(0, scenario.name)
         self.hotkey_entry.delete(0, "end")
         self.hotkey_entry.insert(0, scenario.hotkey)
+        self.find_first_var.set(scenario.find_first)
+        self._email_config = scenario.email
         for ne, note in zip(self.note_editors, scenario.notes):
             ne.load(note)
 
     def serialize(self) -> dict:
-        return {
+        out: dict = {
             "hotkey": self.hotkey_entry.get().strip(),
             "close_tab_after": self.close_tab_after,
+            "find_first": self.find_first_var.get(),
             "notes": [ne.serialize() for ne in self.note_editors],
         }
+        if self._email_config is not None:
+            # Round-trip the email block until the editor UI lands.
+            out["email"] = {
+                "subject": self._email_config.subject,
+                "body_html_file": self._email_config.body_html_file,
+                "inline_images": list(self._email_config.inline_images),
+                "cc_pm": self._email_config.cc_pm,
+            }
+        return out
 
 
 # ============================================================
@@ -1254,13 +1799,206 @@ class App:
         override = self.course_var.get().strip()
         self._append_log(f"--- Firing {scenario.name!r} ---")
 
-        # Read clipboard on the main thread (Tk + PIL aren't thread-safe)
-        # only if at least one note in this scenario asked for it.
+        # Step 1: find + pick (if enabled). Combined dialog lets the
+        # user retype if the first query was wrong or surfaces too
+        # many candidates. Worker handles search; fuzzy fallback kicks
+        # in if there are no exact matches.
+        chosen_name = ""
+        if scenario.find_first:
+            chosen = prompt_find_and_pick(self.root, self._list_matches_blocking)
+            if not chosen:
+                self._append_log("Find cancelled; scenario not fired.")
+                return
+            if not self._click_match_blocking(chosen):
+                self._append_log(
+                    f"Could not navigate to {chosen!r}; scenario not fired."
+                )
+                return
+            chosen_name = chosen
+
+        # Step 2: body edits. The user is committed to a student now,
+        # so the dialogs are filled with the right context in mind.
+        custom_bodies: dict[int, str] = {}
+        for i, n in enumerate(scenario.notes):
+            if not n.enter_additional_text:
+                continue
+            label = f"Note {i + 1}"
+            edited = prompt_additional_text(self.root, label, n.body)
+            if edited is None:
+                self._append_log(f"{label} edit cancelled; scenario not fired.")
+                return
+            custom_bodies[i] = edited
+
+        # Step 3: clipboard (main-thread read; Tk + PIL aren't thread-safe).
         clipboard = ""
         if any(n.append_clipboard for n in scenario.notes):
             clipboard = self._read_clipboard_content()
 
-        self.worker.submit_scenario(scenario, override, clipboard)
+        # Step 4: email (if scenario has one). Opens an Outlook draft for
+        # FERPA review; user reviews + sends from Outlook, then confirms
+        # before the note fires. Cancelling here aborts the whole fire.
+        if scenario.email is not None:
+            student_ctx = self._get_student_context_blocking(name_hint=chosen_name)
+            if student_ctx is None:
+                self._append_log(
+                    "Couldn't read student context for email; scenario not fired."
+                )
+                return
+            if not self._send_scenario_email(scenario.email, student_ctx):
+                self._append_log("Email step aborted; note not filed.")
+                return
+
+        self.worker.submit_scenario(
+            scenario, override, clipboard,
+            custom_bodies=custom_bodies,
+        )
+
+    def _list_matches_blocking(self, query: str) -> list[str]:
+        """Run a LIST_MATCHES on the worker and block until results.
+        wait_variable spins a nested mainloop so the dialog stays
+        interactive while we wait."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"names": []}
+
+        def on_results(names: list[str]) -> None:
+            def set_main() -> None:
+                holder["names"] = names
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["names"] = names
+                done_var.set(True)
+
+        self.worker.submit_list_matches(query, on_results)
+        self.root.wait_variable(done_var)
+        return holder["names"]
+
+    def _click_match_blocking(self, name: str) -> bool:
+        """Click the chosen match on the worker and block until the
+        navigation has settled."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"success": False}
+
+        def on_done(success: bool) -> None:
+            def set_main() -> None:
+                holder["success"] = success
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["success"] = success
+                done_var.set(True)
+
+        self.worker.submit_click_match(name, on_done)
+        self.root.wait_variable(done_var)
+        return holder["success"]
+
+    def _get_student_context_blocking(self, name_hint: str = "") -> Optional[dict]:
+        """Ask the worker to read the active student's context (email,
+        course code, PM, etc.) and block on the main thread until it
+        comes back. Used by the email step before we hand off to
+        Outlook."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"info": None}
+
+        def on_done(info: Optional[dict]) -> None:
+            def set_main() -> None:
+                holder["info"] = info
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["info"] = info
+                done_var.set(True)
+
+        self.worker.submit_get_student_context(on_done, name_hint=name_hint)
+        self.root.wait_variable(done_var)
+        return holder["info"]
+
+    def _send_scenario_email(
+        self, email_cfg: EmailConfig, student_ctx: dict,
+    ) -> bool:
+        """Render the template, open the draft in Outlook for review,
+        then ask the user to confirm before the notes fire. Returns
+        True to proceed with notes; False to abort the scenario."""
+        from tkinter import messagebox
+        from src import outlook_email
+
+        # Augment student context with the launcher operator's identity
+        # (read from Outlook's profile). Templates that want to sign
+        # with *the sender's* name should use {{user_name}} — vs.
+        # {{pm_name}} which is the *student's* Program Mentor from the
+        # caseload row (only equals you when you ARE their PM).
+        user_info = outlook_email.get_user_info()
+        student_ctx = {
+            **student_ctx,
+            "user_name": user_info.get("name", ""),
+            "user_email": user_info.get("email", ""),
+        }
+
+        template_path = TEMPLATES_DIR / email_cfg.body_html_file
+        if not template_path.exists():
+            self._append_log(
+                f"Email template not found: {template_path}. Scenario aborted."
+            )
+            messagebox.showerror(
+                "Email template missing",
+                f"Couldn't find template:\n{template_path}\n\n"
+                "Check the scenario's body_html_file and the templates folder.",
+            )
+            return False
+
+        try:
+            template_html = email_template.load_template(template_path)
+            body_html = email_template.render(template_html, student_ctx)
+            subject = email_template.render(email_cfg.subject, student_ctx)
+        except Exception as e:
+            self._append_log(f"Email template render failed: {e}")
+            return False
+
+        # CID auto-derived from filename stem (signature.png → 'signature').
+        inline_images = {
+            Path(fname).stem: TEMPLATES_DIR / fname
+            for fname in email_cfg.inline_images
+        }
+
+        to = student_ctx.get("student_email", "")
+        cc = student_ctx.get("pm_email", "") if email_cfg.cc_pm else ""
+        if not to:
+            if not messagebox.askyesno(
+                "No student email",
+                f"Couldn't find an email address for "
+                f"{student_ctx.get('full_name') or 'this student'!r}.\n\n"
+                "Proceed with the note only?",
+            ):
+                return False
+            return True  # skip the email, but file the note
+
+        self._append_log(
+            f"Opening Outlook for {student_ctx.get('full_name') or to}..."
+        )
+        try:
+            outlook_email.compose_email(
+                to=to, cc=cc, subject=subject,
+                html_body=body_html, inline_images=inline_images,
+            )
+        except Exception as e:
+            self._append_log(f"Outlook compose failed: {e}")
+            return messagebox.askyesno(
+                "Email failed",
+                f"Couldn't open the email in Outlook:\n\n{e}\n\n"
+                "Proceed with the note only?",
+            )
+
+        return messagebox.askyesno(
+            "Email reviewed?",
+            f"A draft is open in Outlook for "
+            f"{student_ctx.get('full_name') or to}.\n\n"
+            "Click Yes after you've sent (or chosen not to send) the "
+            "email and want the note filed.\n"
+            "Click No to abort — no note will be filed.",
+        )
 
     def _read_clipboard_content(self) -> str:
         """Pull text from clipboard. If image data is also present,

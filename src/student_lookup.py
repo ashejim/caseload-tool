@@ -6,6 +6,7 @@ was opened this session) tells us what course code to file the note
 under, the student's ID, and the email address from the row's
 'Email Student' action link.
 """
+import difflib
 import re
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlparse
@@ -253,6 +254,94 @@ def gather_caseload_matches(
 
     candidates.sort(key=lambda x: x[0])
     return candidates
+
+
+def gather_fuzzy_caseload_matches(
+    page: Page,
+    query: str,
+    on_status=None,
+    *,
+    cutoff: float = 0.65,
+    max_results: int = 10,
+) -> list[tuple]:
+    """Fallback when gather_caseload_matches returns nothing. Walks the
+    same caseload tables and returns rows whose name is close to the
+    query under difflib ratio. Useful for typos like 'Jsoh' → 'Joshua *'.
+
+    Comparison strategy per name (best of):
+      1. ratio(query, full lowercase name)
+      2. ratio(query, each whitespace/comma-delimited token)
+      3. ratio(query, token[:len(query)]) — fuzzy prefix match. Critical
+         for short typoed queries against long names: ratio("jsoh",
+         "joshua") ≈ 0.60 but ratio("jsoh", "josh") = 0.75.
+
+    Returns the same (priority, row, name, name_col_idx) tuple shape as
+    gather_caseload_matches, with priority=4 (below all exact tiers).
+    Sorted by best ratio descending."""
+    def diag(msg: str) -> None:
+        if on_status:
+            on_status(msg)
+
+    q = query.strip().lower()
+    if not q:
+        return []
+
+    candidates: list[tuple[int, object, str, int, float]] = []
+    tables = page.locator("table").filter(
+        has=page.locator("th", has_text="Course Code")
+    )
+    n_tables = tables.count()
+    n_scanned = 0
+    for i in range(n_tables):
+        table = tables.nth(i)
+        headers = table.locator("th").all_text_contents()
+        name_idx = next(
+            (j for j, h in enumerate(headers) if h.strip() == "Name"),
+            None,
+        )
+        if name_idx is None:
+            name_idx = next(
+                (j for j, h in enumerate(headers) if h.strip().startswith("Name")),
+                None,
+            )
+        if name_idx is None:
+            continue
+        rows = table.locator("tr")
+        n_rows = rows.count()
+        for r in range(1, n_rows):
+            row = rows.nth(r)
+            cells = row.locator("td").all_text_contents()
+            if not cells or name_idx >= len(cells):
+                continue
+            name = cells[name_idx].strip()
+            if not name:
+                continue
+            n_scanned += 1
+            name_lc = name.lower()
+            tokens = [t for t in re.split(r"[\s,]+", name_lc) if t]
+            best = difflib.SequenceMatcher(None, q, name_lc).ratio()
+            for t in tokens:
+                ratio = difflib.SequenceMatcher(None, q, t).ratio()
+                if ratio > best:
+                    best = ratio
+                # Fuzzy prefix: query vs token's same-length prefix.
+                if len(t) > len(q):
+                    prefix_ratio = difflib.SequenceMatcher(
+                        None, q, t[: len(q)],
+                    ).ratio()
+                    if prefix_ratio > best:
+                        best = prefix_ratio
+            if best >= cutoff:
+                candidates.append((4, row, name, name_idx, best))
+
+    candidates.sort(key=lambda x: -x[4])
+    diag(f"  [search] fuzzy: scanned {n_scanned} rows; "
+         f"{len(candidates)} above cutoff {cutoff:.2f}")
+    if candidates:
+        top = candidates[0]
+        diag(f"  [search] fuzzy top: {top[2]!r} @ {top[4]:.2f}")
+    candidates = candidates[:max_results]
+    return [(p, r, n, i) for (p, r, n, i, _) in candidates]
 
 
 def click_caseload_row(row, name: str, name_idx: int, on_status=None) -> bool:

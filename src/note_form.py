@@ -29,6 +29,7 @@ class NoteData:
     body: str = ""                         # rich-text body; "" = skip
     submit: bool = False                   # leave False while we dial in selectors
     append_clipboard: bool = False         # paste clipboard text after body at fire time
+    enter_additional_text: bool = False    # prompt user for body edits at fire time
 
 
 def _screenshot_failure(page: Page, tag: str) -> Path:
