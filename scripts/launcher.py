@@ -174,6 +174,23 @@ class BrowserWorker:
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 if CASELOAD_URL:
                     page.goto(CASELOAD_URL)
+                    # TODO: popups stuck at about:blank on fresh launch.
+                    # In a Playwright-launched Chromium/Edge, user clicks
+                    # that spawn popups (window.open) hang at about:blank
+                    # with a "loading…" spinner until *any* Playwright-
+                    # driven action runs against the page — e.g. the
+                    # first time _handle_find calls goto/click/fill,
+                    # popups start working for the rest of the session.
+                    # Things we've tried that DON'T fix it:
+                    #   - User-initiated Ctrl+R on the parent tab
+                    #   - page.bring_to_front()
+                    #   - page.reload() right here
+                    #   - page.keyboard.press("F19") (synthetic key)
+                    #   - --disable-features=CalculateNativeWinOcclusion
+                    #     and other throttling-related Chromium flags
+                    #   - Monkey-patching window.open in the page
+                    # Workaround documented in README: middle-click or
+                    # right-click → "Open link in new tab".
                 self.on_status("Browser ready.")
                 self.ready_event.set()
                 while True:

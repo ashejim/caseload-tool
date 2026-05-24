@@ -10,17 +10,18 @@ Tradeoffs vs PyInstaller (build.py):
   isn't available (we pass --assume-yes-for-downloads to allow that).
 - Smaller startup time at runtime, real compiled binaries.
 
-Output layout matches build.py for symmetry:
+Output layout:
     dist-nuitka/CaseloadNotes/
         CaseloadNotes.exe
-        ms-playwright/        <- bundled Chromium
         notes.yaml            <- default presets
         ... (Nuitka runtime libs)
+
+The browser is Microsoft Edge (preinstalled on Windows 10/11), so we no
+longer bundle Chromium — the build is ~30-50 MB instead of ~800 MB.
 
 Usage:
     .venv\\Scripts\\python.exe build_nuitka.py
 """
-import os
 import shutil
 import subprocess
 import sys
@@ -30,25 +31,12 @@ DIST_PARENT = "dist-nuitka"
 FINAL_NAME = "CaseloadNotes"
 
 
-def find_chromium_root() -> Path:
-    base = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
-    if not base:
-        base = str(Path.home() / "AppData" / "Local" / "ms-playwright")
-    return Path(base)
-
-
 def folder_size_mb(p: Path) -> float:
     return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / 1024 / 1024
 
 
 def main() -> None:
     project_root = Path(__file__).resolve().parent
-    chromium_src = find_chromium_root()
-    if not chromium_src.exists():
-        sys.exit(
-            f"Playwright Chromium not found at {chromium_src}\n"
-            "Install: python -m playwright install chromium"
-        )
 
     dist_parent = project_root / DIST_PARENT
     if dist_parent.exists():
@@ -83,14 +71,11 @@ def main() -> None:
     nuitka_out.rename(final_dir)
     print(f"Renamed {nuitka_out.name} -> {final_dir.name}")
 
-    chromium_dst = final_dir / "ms-playwright"
-    print(f"Copying Chromium -> {chromium_dst}")
-    shutil.copytree(chromium_src, chromium_dst)
-
     print()
     print(f"Build complete: {final_dir}  ({folder_size_mb(final_dir):.1f} MB)")
     print(f"Run:            {final_dir / (FINAL_NAME + '.exe')}")
     print(f"Distribute:     zip the {FINAL_NAME}/ folder and share")
+    print("Recipients need Microsoft Edge installed (default on Win10/11).")
 
 
 if __name__ == "__main__":

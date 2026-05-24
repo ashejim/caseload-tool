@@ -162,6 +162,13 @@ or restart.
 - **Multi-tab DOM**: if you have many open Salesforce app tabs, the
   launcher targets the visible note panel. Don't have a stale note
   panel open in the background while filling — close those first.
+- **Links stuck at about:blank**: on a fresh launch, clicking a link
+  that opens in a new tab may hang at `about:blank` with a spinning
+  icon and never load. **Workaround:** middle-click the link, or
+  right-click → **Open link in new tab** — both bypass the page's JS
+  handler and use the link's URL directly. Once you've used the
+  launcher's **Find student** once in a session, normal clicks also
+  start working for the rest of that session.
 
 ## Developer setup
 
