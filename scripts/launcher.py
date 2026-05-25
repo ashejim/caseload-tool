@@ -1607,6 +1607,103 @@ def prompt_batch_review(
 # Note editor — one note section inside a scenario tab.
 # ============================================================
 
+# Op labels shown in the Filter editor dropdown. Stored verbatim
+# in the YAML; the filter engine accepts both these long forms and
+# the short forms via caseload_filter.normalize_op().
+FILTER_OPS = (
+    "is empty",
+    "is not empty",
+    "is",
+    "is not",
+    "contains",
+    "does not contain",
+    "is before",
+    "is after",
+    "is on",
+    "is within",
+    "more than",
+    "less than",
+    "at least",
+    "at most",
+)
+
+# Reverse map: when loading a YAML scenario that uses the short
+# (engine-internal) op form, translate to the long UI label so the
+# dropdown displays it correctly.
+_OP_SHORT_TO_LONG = {
+    "empty": "is empty",
+    "not_empty": "is not empty",
+    "equals": "is",
+    "not_equals": "is not",
+    "not_contains": "does not contain",
+    "before": "is before",
+    "after": "is after",
+    "on": "is on",
+    "within": "is within",
+    "gt": "more than",
+    "lt": "less than",
+    "gte": "at least",
+    "lte": "at most",
+}
+
+
+class FilterRow:
+    """One filter inside a batch scenario's Filters section. A row is
+    `<column dropdown>  <op dropdown>  <value entry>  ✕`."""
+
+    def __init__(self, parent, columns: list[str], on_delete: Callable):
+        self.frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.frame.grid_columnconfigure(2, weight=1)
+        self.column_combo = ctk.CTkComboBox(
+            self.frame,
+            values=columns if columns else ["(refresh columns)"],
+            width=180,
+        )
+        self.column_combo.grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
+        self.op_combo = ctk.CTkComboBox(
+            self.frame, values=list(FILTER_OPS), width=140, state="readonly",
+        )
+        self.op_combo.set("is")
+        self.op_combo.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=2)
+        self.value_entry = ctk.CTkEntry(
+            self.frame,
+            placeholder_text="value (this month, today-7d, Pass, …)",
+        )
+        self.value_entry.grid(row=0, column=2, sticky="ew", padx=(0, 4), pady=2)
+        ctk.CTkButton(
+            self.frame, text="✕", width=28, height=28,
+            fg_color="transparent", border_width=1,
+            command=lambda: on_delete(self),
+        ).grid(row=0, column=3, padx=(4, 0), pady=2)
+
+    def set_columns(self, columns: list[str]) -> None:
+        """Replace the column dropdown's option list. Preserves the
+        currently-selected value if it's still in the new list."""
+        current = self.column_combo.get()
+        new_values = columns if columns else ["(refresh columns)"]
+        self.column_combo.configure(values=new_values)
+        if current in new_values:
+            self.column_combo.set(current)
+
+    def load(self, filt: dict) -> None:
+        self.column_combo.set(filt.get("column", ""))
+        op = filt.get("op", "")
+        self.op_combo.set(_OP_SHORT_TO_LONG.get(op, op))
+        value = filt.get("value", "")
+        if isinstance(value, list):
+            value = ", ".join(str(v) for v in value)
+        self.value_entry.delete(0, "end")
+        if value:
+            self.value_entry.insert(0, str(value))
+
+    def serialize(self) -> dict:
+        return {
+            "column": self.column_combo.get().strip(),
+            "op": self.op_combo.get(),
+            "value": self.value_entry.get(),
+        }
+
+
 class NoteEditor:
     """Widgets for editing a single note. Mirrors the Caseload form:
     Interaction Format, Interaction Type, Academic Activities, Body.
@@ -1801,15 +1898,23 @@ class NoteEditor:
 # ============================================================
 
 class ScenarioEditor:
-    def __init__(self, parent, scenario: ScenarioConfig, capture_handler=None):
+    def __init__(
+        self, parent, scenario: ScenarioConfig,
+        capture_handler=None,
+        get_columns: Optional[Callable[[], list[str]]] = None,
+        refresh_columns: Optional[Callable[[], list[str]]] = None,
+    ):
         self.scenario_name = scenario.name
         self.close_tab_after = scenario.close_tab_after
-        # Pass-through: the editor doesn't expose the email/batch
-        # blocks in the UI yet (build step #7), but we round-trip them
-        # so a Save doesn't wipe a hand-edited block in notes.yaml.
-        self._email_config = scenario.email
-        self._batch_config = scenario.batch
+        # `email` is now fully exposed via the editor; `batch.preview`
+        # still rides as a passive round-trip field for now.
+        self._batch_preview = scenario.batch.preview if scenario.batch else True
         self.capture_handler = capture_handler  # callable(on_done)
+        # Caseload-column hooks for the Filters section. `get_columns`
+        # returns whatever's cached now; `refresh_columns` triggers a
+        # fresh CSV download (blocking) and returns the updated list.
+        self._get_columns = get_columns or (lambda: [])
+        self._refresh_columns = refresh_columns or (lambda: [])
         self.frame = ctk.CTkScrollableFrame(parent)
         self.frame.grid_columnconfigure(0, weight=1)
 
@@ -1843,17 +1948,34 @@ class ScenarioEditor:
             hotkey_row, text="Press to set", width=110, command=self._start_capture,
         ).pack(side="left", padx=(8, 0))
 
+        # Batch-mode toggle. When on, find-first is hidden (mutually
+        # exclusive) and the Filters section appears underneath.
+        row += 1
+        self.batch_mode_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            self.frame,
+            text="Batch mode (apply to all matching students)",
+            variable=self.batch_mode_var,
+            command=self._on_batch_mode_toggled,
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
+        row += 1
+        self._batch_section_row = row
+        self._build_batch_section()
+        # Visibility set by load() based on scenario.batch != None.
+
         # Find-student-first toggle. When on, firing the scenario pops
         # an entry dialog asking for the student name; the worker
-        # navigates to them before filling notes. All notes in a
-        # scenario target the same student.
+        # navigates to them before filling notes. Hidden when batch
+        # mode is on (mutually exclusive).
         row += 1
+        self._find_first_row = row
         self.find_first_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
+        self.find_first_checkbox = ctk.CTkCheckBox(
             self.frame,
             text="Find student first (prompt at fire time)",
             variable=self.find_first_var,
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
+        )
+        self.find_first_checkbox.grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
 
         # Send-email toggle + email section (sub-frame visible only
         # when toggle is on). Toggle commands grid_remove/.grid so
@@ -1904,6 +2026,86 @@ class ScenarioEditor:
                 self.hotkey_entry.insert(0, combo)
 
         self.capture_handler(apply)
+
+    # ----- Batch / Filters section -----
+
+    def _build_batch_section(self) -> None:
+        """Construct the Filters container + action buttons. Always
+        created — visibility toggled by `_on_batch_mode_toggled`."""
+        frame = ctk.CTkFrame(self.frame)
+        frame.grid_columnconfigure(0, weight=1)
+        self._batch_section = frame
+
+        ctk.CTkLabel(
+            frame, text="Filters",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(6, 0))
+
+        self.filters_container = ctk.CTkFrame(frame, fg_color="transparent")
+        self.filters_container.grid(
+            row=1, column=0, sticky="ew", padx=4, pady=(0, 4),
+        )
+        self.filters_container.grid_columnconfigure(0, weight=1)
+        self.filter_rows: list[FilterRow] = []
+
+        action_row = ctk.CTkFrame(frame, fg_color="transparent")
+        action_row.grid(row=2, column=0, sticky="w", padx=4, pady=(0, 8))
+        ctk.CTkButton(
+            action_row, text="+ Add filter",
+            width=110, command=self._add_filter_row,
+        ).pack(side="left")
+        ctk.CTkButton(
+            action_row, text="↻ Refresh columns",
+            width=140, command=self._refresh_batch_columns,
+            fg_color="transparent", border_width=1,
+        ).pack(side="left", padx=(8, 0))
+
+    def _add_filter_row(self, prefilled: Optional[dict] = None) -> FilterRow:
+        cols = self._get_columns() or []
+        row = FilterRow(
+            self.filters_container, cols, on_delete=self._delete_filter_row,
+        )
+        row.frame.pack(fill="x", padx=4, pady=2)
+        if prefilled:
+            row.load(prefilled)
+        self.filter_rows.append(row)
+        return row
+
+    def _delete_filter_row(self, row: FilterRow) -> None:
+        try:
+            self.filter_rows.remove(row)
+        except ValueError:
+            return
+        try:
+            row.frame.destroy()
+        except Exception:
+            pass
+
+    def _refresh_batch_columns(self) -> None:
+        """Trigger a fresh CSV download (blocks the UI with the busy
+        spinner), then push the new column list to every filter row."""
+        cols = self._refresh_columns()
+        for row in self.filter_rows:
+            row.set_columns(cols)
+
+    def _on_batch_mode_toggled(self) -> None:
+        """Show/hide the Filters section; mutually exclusive with the
+        find-first checkbox."""
+        if self.batch_mode_var.get():
+            self._batch_section.grid(
+                row=self._batch_section_row, column=0,
+                sticky="ew", padx=8, pady=(0, 6),
+            )
+            self.find_first_checkbox.grid_remove()
+            # Force-off find_first so a hidden checkbox can't still
+            # save to YAML via serialize().
+            self.find_first_var.set(False)
+        else:
+            self._batch_section.grid_remove()
+            self.find_first_checkbox.grid(
+                row=self._find_first_row, column=0,
+                sticky="w", padx=8, pady=(0, 8),
+            )
 
     # ----- Email section -----
 
@@ -2064,7 +2266,19 @@ class ScenarioEditor:
         self.hotkey_entry.delete(0, "end")
         self.hotkey_entry.insert(0, scenario.hotkey)
         self.find_first_var.set(scenario.find_first)
-        self._batch_config = scenario.batch
+        # Batch config — populate filter rows + visibility.
+        self._batch_preview = scenario.batch.preview if scenario.batch else True
+        for r in list(self.filter_rows):
+            try: r.frame.destroy()
+            except Exception: pass
+        self.filter_rows = []
+        if scenario.batch is not None:
+            self.batch_mode_var.set(True)
+            for filt in scenario.batch.filters:
+                self._add_filter_row(filt)
+        else:
+            self.batch_mode_var.set(False)
+        self._on_batch_mode_toggled()
         # Email config drives the section's visibility + widget values.
         self.send_email_var.set(scenario.email is not None)
         if scenario.email is not None:
@@ -2112,11 +2326,10 @@ class ScenarioEditor:
                 "inline_images": inline_images,
                 "cc_pm": self.email_cc_pm_var.get(),
             }
-        if self._batch_config is not None:
-            # Round-trip the batch block until the editor UI lands.
+        if self.batch_mode_var.get():
             out["batch"] = {
-                "filters": [dict(f) for f in self._batch_config.filters],
-                "preview": self._batch_config.preview,
+                "filters": [r.serialize() for r in self.filter_rows],
+                "preview": self._batch_preview,
             }
         return out
 
@@ -2339,7 +2552,12 @@ class App:
             tab = self.tabview.add(name)
             tab.grid_columnconfigure(0, weight=1)
             tab.grid_rowconfigure(0, weight=1)
-            editor = ScenarioEditor(tab, sc, capture_handler=self._capture_hotkey)
+            editor = ScenarioEditor(
+                tab, sc,
+                capture_handler=self._capture_hotkey,
+                get_columns=self._get_caseload_columns,
+                refresh_columns=self._refresh_caseload_columns_for_editor,
+            )
             editor.frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
             self.scenario_editors[name] = editor
 
@@ -3315,6 +3533,23 @@ class App:
             self.root.after(90, self._tick_spinner)
         except Exception:
             pass
+
+    def _get_caseload_columns(self) -> list[str]:
+        """Current cached caseload column names (CSV header keys).
+        Empty list when no CSV has been loaded yet. Wired into
+        ScenarioEditor so the Filters dropdown can populate live."""
+        if not self._caseload_rows:
+            return []
+        return list(self._caseload_rows[0].keys())
+
+    def _refresh_caseload_columns_for_editor(self) -> list[str]:
+        """↻ Refresh columns button in the filter editor: forces a
+        fresh CSV download, then returns the new column list. Routes
+        through _on_caseload_refresh_clicked so the busy spinner +
+        button-disable behavior is identical to clicking the
+        toolbar ↻ Caseload button."""
+        self._on_caseload_refresh_clicked()
+        return self._get_caseload_columns()
 
     def _reload_caseload_cache(self, *, silent: bool = False) -> bool:
         """Read CASELOAD_CSV_PATH into self._caseload_rows. Returns
