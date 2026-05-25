@@ -189,12 +189,13 @@ class BrowserWorker:
         course_code_override: str,
         clipboard: str = "",
         custom_bodies: Optional[dict[int, str]] = None,
-        on_done: Optional[Callable[[], None]] = None,
+        on_done: Optional[Callable[[bool], None]] = None,
     ) -> None:
         """Queue a scenario for the worker to fill notes against the
-        active student. `on_done()` is called from the worker thread
-        when the run finishes (success or error) — used by the batch
-        loop to step through students sequentially."""
+        active student. `on_done(success)` is called from the worker
+        thread when the run finishes; `success` is True iff the run
+        completed without errors (used by the batch loop to track
+        processed-vs-skipped honestly)."""
         self.q.put((
             "RUN", scenario, course_code_override, clipboard,
             custom_bodies or {}, on_done,
@@ -355,14 +356,15 @@ class BrowserWorker:
         wait_variable forever."""
         if cmd[0] == "RUN":
             _, scenario, override, clipboard, custom_bodies, on_done = cmd
+            success = False
             try:
-                self._handle_run(
+                success = self._handle_run(
                     ctx, scenario, override, clipboard,
                     custom_bodies=custom_bodies,
                 )
             finally:
                 if on_done is not None:
-                    on_done()
+                    on_done(success)
         elif cmd[0] == "FIND":
             _, query = cmd
             self._handle_find(ctx, query)
@@ -1050,11 +1052,14 @@ class BrowserWorker:
         self, ctx, scenario: ScenarioConfig, override: str,
         clipboard: str = "",
         custom_bodies: Optional[dict[int, str]] = None,
-    ) -> None:
+    ) -> bool:
+        """Return True iff the note ran without errors (regardless of
+        whether all sub-notes were auto-submitted). The batch driver
+        uses the return value to track processed-vs-skipped honestly."""
         target = self._active_page(ctx)
         if target is None:
             self.on_status("No browser pages open.")
-            return
+            return False
         # Note: when scenario.find_first is True, the main thread has
         # already driven the LIST_MATCHES + CLICK_MATCH sequence before
         # queueing this RUN — so by the time we get here, the active
@@ -1072,7 +1077,7 @@ class BrowserWorker:
                 f"No visible note panel (page state issue: {e}). "
                 "Open one and try again."
             )
-            return
+            return False
         # Look up the Caseload row once: gets course code, student ID,
         # and email in a single pass. Tolerates the same kind of
         # transient page-state error — fall back to empty info.
@@ -1088,14 +1093,14 @@ class BrowserWorker:
         else:
             if not student:
                 self.on_status("No visible note panel. Open one and try again.")
-                return
+                return False
             self.on_status(f"Active student: {student}")
             detected = info.get("course_code", "")
             if not detected:
                 self.on_status(
                     f"Could not auto-detect for {student}. Type a code in the field."
                 )
-                return
+                return False
             course_code = detected
             self.on_status(f"Auto-detected course code: {course_code}")
         self.on_status(f"Running {scenario.name!r}...")
@@ -1118,8 +1123,10 @@ class BrowserWorker:
                 pm_email=info.get("pm_email", ""),
                 submitted=all_submitted,
             ))
+            return True
         except RuntimeError as e:
             self.on_status(f"Failed: {e}")
+            return False
 
 
 # ============================================================
@@ -3066,10 +3073,14 @@ class App:
                     continue
 
             # 7c. Notes — block until the worker finishes this RUN.
-            self._submit_scenario_blocking(
+            # Worker returns True iff the run completed without
+            # errors; only count those as truly processed.
+            if self._submit_scenario_blocking(
                 scenario, override, clipboard, custom_bodies,
-            )
-            processed += 1
+            ):
+                processed += 1
+            else:
+                skipped.append((student_name, "note fill failed"))
 
         self._append_log(
             f"Batch {scenario.name!r} complete: "
@@ -3235,18 +3246,22 @@ class App:
     def _submit_scenario_blocking(
         self, scenario: ScenarioConfig, override: str,
         clipboard: str, custom_bodies: dict[int, str],
-    ) -> None:
+    ) -> bool:
         """Queue a scenario RUN and block until the worker reports
-        completion. Used by the batch loop to file notes
-        sequentially."""
+        completion. Returns True iff the run completed without
+        errors — the batch loop uses this for honest processed-vs-
+        skipped accounting."""
         done_var = tk.BooleanVar(value=False)
+        holder: dict = {"success": False}
 
-        def on_done() -> None:
+        def on_done(success: bool) -> None:
             def set_main() -> None:
+                holder["success"] = success
                 done_var.set(True)
             try:
                 self.root.after(0, set_main)
             except Exception:
+                holder["success"] = success
                 done_var.set(True)
 
         self.worker.submit_scenario(
@@ -3254,6 +3269,7 @@ class App:
             custom_bodies=custom_bodies, on_done=on_done,
         )
         self.root.wait_variable(done_var)
+        return holder["success"]
 
     def _show_template_preview(
         self, email_cfg: EmailConfig, n_students: int,
