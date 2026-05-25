@@ -309,96 +309,132 @@ class BrowserWorker:
                     #     to a user-driven later action.
                     # Workaround documented in README: middle-click or
                     # right-click → "Open link in new tab".
+
+                # Close any tabs left over from a previous session
+                # (Edge persists tabs across runs in the user-data
+                # dir). Stale tabs frequently start in a bad state
+                # — about:blank popup hang, half-navigated — and
+                # cause "Target page closed" errors when
+                # _active_page picks the wrong one. The session
+                # cookies / login state are preserved by the
+                # persistent profile; only tab state is reset.
+                for extra in list(ctx.pages):
+                    if extra is page:
+                        continue
+                    try:
+                        extra.close()
+                    except Exception:
+                        pass
                 self.on_status("Browser ready.")
                 self.ready_event.set()
                 while True:
                     cmd = self.q.get()
                     if cmd is self.SHUTDOWN:
                         return
-                    if cmd[0] == "RUN":
-                        _, scenario, override, clipboard, custom_bodies, on_done = cmd
-                        try:
-                            self._handle_run(
-                                ctx, scenario, override, clipboard,
-                                custom_bodies=custom_bodies,
-                            )
-                        finally:
-                            if on_done is not None:
-                                on_done()
-                    elif cmd[0] == "FIND":
-                        _, query = cmd
-                        self._handle_find(ctx, query)
-                    elif cmd[0] == "LIST_MATCHES":
-                        _, query, on_results = cmd
-                        names: list[str] = []
-                        try:
-                            names = self._list_matches(ctx, query)
-                        finally:
-                            on_results(names)
-                    elif cmd[0] == "CLICK_MATCH":
-                        _, name, on_done = cmd
-                        success = False
-                        try:
-                            success = self._click_match_by_name(ctx, name)
-                            if success:
-                                tgt = self._active_page(ctx)
-                                if tgt is not None:
-                                    try:
-                                        tgt.wait_for_timeout(2000)
-                                    except Exception:
-                                        pass
-                        finally:
-                            on_done(success)
-                    elif cmd[0] == "GET_STUDENT_CONTEXT":
-                        _, on_done, name_hint = cmd
-                        info: Optional[dict] = None
-                        try:
-                            info = self._read_student_context(ctx, name_hint)
-                        finally:
-                            on_done(info)
-                    elif cmd[0] == "READ_CASELOAD_COLUMNS":
-                        _, on_done = cmd
-                        cols: list[dict] = []
-                        try:
-                            cols = self._read_caseload_columns(ctx)
-                        finally:
-                            on_done(cols)
-                    elif cmd[0] == "READ_ALL_CASELOAD_ROWS":
-                        _, on_done, on_progress = cmd
-                        rows: list[dict] = []
-                        try:
-                            rows = self._read_all_caseload_rows(
-                                ctx, on_progress=on_progress,
-                            )
-                        finally:
-                            on_done(rows)
-                    elif cmd[0] == "CLICK_MATCH_BY_FILTER":
-                        _, query, expected_name, on_done = cmd
-                        success = False
-                        try:
-                            success = self._click_match_by_filter(
-                                ctx, query, expected_name=expected_name,
-                            )
-                            if success:
-                                tgt = self._active_page(ctx)
-                                if tgt is not None:
-                                    try:
-                                        tgt.wait_for_timeout(2000)
-                                    except Exception:
-                                        pass
-                        finally:
-                            on_done(success)
-                    elif cmd[0] == "DOWNLOAD_CASELOAD_CSV":
-                        _, save_path, on_done = cmd
-                        success, message = False, ""
-                        try:
-                            success, message = self._download_caseload_csv(
-                                ctx, save_path,
-                            )
-                        finally:
-                            on_done(success, message)
+                    # Outer try/except: any uncaught exception from a
+                    # command handler used to kill the entire worker
+                    # (next user action would hang forever). Now each
+                    # command is sandboxed — the worker logs the
+                    # failure and keeps processing future commands.
+                    try:
+                        self._dispatch_command(ctx, cmd)
+                    except Exception as e:
+                        self.on_status(
+                            f"Command {cmd[0]!r} failed: {e}. "
+                            "Worker still running; you may need to "
+                            "restart the launcher if the browser is "
+                            "in a bad state."
+                        )
         except Exception as e:
             self.on_status(f"Browser worker crashed: {e}")
+
+    def _dispatch_command(self, ctx, cmd) -> None:
+        """Dispatch one queued command. Each branch is responsible for
+        firing any callbacks it owes the caller (in a try/finally) so
+        a partial failure doesn't leave the main thread waiting on a
+        wait_variable forever."""
+        if cmd[0] == "RUN":
+            _, scenario, override, clipboard, custom_bodies, on_done = cmd
+            try:
+                self._handle_run(
+                    ctx, scenario, override, clipboard,
+                    custom_bodies=custom_bodies,
+                )
+            finally:
+                if on_done is not None:
+                    on_done()
+        elif cmd[0] == "FIND":
+            _, query = cmd
+            self._handle_find(ctx, query)
+        elif cmd[0] == "LIST_MATCHES":
+            _, query, on_results = cmd
+            names: list[str] = []
+            try:
+                names = self._list_matches(ctx, query)
+            finally:
+                on_results(names)
+        elif cmd[0] == "CLICK_MATCH":
+            _, name, on_done = cmd
+            success = False
+            try:
+                success = self._click_match_by_name(ctx, name)
+                if success:
+                    tgt = self._active_page(ctx)
+                    if tgt is not None:
+                        try:
+                            tgt.wait_for_timeout(2000)
+                        except Exception:
+                            pass
+            finally:
+                on_done(success)
+        elif cmd[0] == "GET_STUDENT_CONTEXT":
+            _, on_done, name_hint = cmd
+            info: Optional[dict] = None
+            try:
+                info = self._read_student_context(ctx, name_hint)
+            finally:
+                on_done(info)
+        elif cmd[0] == "READ_CASELOAD_COLUMNS":
+            _, on_done = cmd
+            cols: list[dict] = []
+            try:
+                cols = self._read_caseload_columns(ctx)
+            finally:
+                on_done(cols)
+        elif cmd[0] == "READ_ALL_CASELOAD_ROWS":
+            _, on_done, on_progress = cmd
+            rows: list[dict] = []
+            try:
+                rows = self._read_all_caseload_rows(
+                    ctx, on_progress=on_progress,
+                )
+            finally:
+                on_done(rows)
+        elif cmd[0] == "CLICK_MATCH_BY_FILTER":
+            _, query, expected_name, on_done = cmd
+            success = False
+            try:
+                success = self._click_match_by_filter(
+                    ctx, query, expected_name=expected_name,
+                )
+                if success:
+                    tgt = self._active_page(ctx)
+                    if tgt is not None:
+                        try:
+                            tgt.wait_for_timeout(2000)
+                        except Exception:
+                            pass
+            finally:
+                on_done(success)
+        elif cmd[0] == "DOWNLOAD_CASELOAD_CSV":
+            _, save_path, on_done = cmd
+            success, message = False, ""
+            try:
+                success, message = self._download_caseload_csv(
+                    ctx, save_path,
+                )
+            finally:
+                on_done(success, message)
 
     def _try_match_or_navigate(self, target, query: str) -> bool:
         """Look for matches in the current DOM. If exactly one
@@ -767,13 +803,24 @@ class BrowserWorker:
 
     @staticmethod
     def _active_page(ctx):
-        """Return the most-recent non-closed page in `ctx`, or None.
-        Defensive against stale closed pages — e.g. download-capture
-        tabs that Playwright hasn't yet cleaned out of ctx.pages."""
+        """Return the most-recent responsive page in `ctx`, or None.
+        Defensive against:
+         - stale closed pages (e.g. download-capture tabs Playwright
+           hasn't yet cleaned out of ctx.pages),
+         - pages where is_closed() returns False but the underlying
+           target is mid-teardown,
+         - zombie pages that pass both is_closed() AND .url access
+           but raise "Target page closed" the moment a locator query
+           runs. We do a cheap `locator("html").count()` probe to
+           filter these — same kind of operation that subsequent
+           callers will run anyway."""
         for page in reversed(ctx.pages):
             try:
-                if not page.is_closed():
-                    return page
+                if page.is_closed():
+                    continue
+                _ = page.url
+                _ = page.locator("html").count()  # responsive probe
+                return page
             except Exception:
                 continue
         return None
@@ -1013,11 +1060,26 @@ class BrowserWorker:
         # queueing this RUN — so by the time we get here, the active
         # student is already loaded.
         # Always try to capture student name — used for auto-detect and
-        # for the session log entry on success.
-        student = get_active_student_name(target)
+        # for the session log entry on success. Defensive try/except:
+        # the page can race-die between _active_page's liveness check
+        # and the locator query (especially right after the auto-
+        # download download-tab closed). Treat any failure as "no
+        # student visible" rather than crashing the run.
+        try:
+            student = get_active_student_name(target)
+        except Exception as e:
+            self.on_status(
+                f"No visible note panel (page state issue: {e}). "
+                "Open one and try again."
+            )
+            return
         # Look up the Caseload row once: gets course code, student ID,
-        # and email in a single pass.
-        info = lookup_caseload_student(target, student) if student else {}
+        # and email in a single pass. Tolerates the same kind of
+        # transient page-state error — fall back to empty info.
+        try:
+            info = lookup_caseload_student(target, student) if student else {}
+        except Exception:
+            info = {}
         if override:
             course_code = override
             self.on_status(f"Using course code (manual): {course_code}")
@@ -1793,6 +1855,22 @@ class ScenarioEditor:
             variable=self.find_first_var,
         ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
 
+        # Send-email toggle + email section (sub-frame visible only
+        # when toggle is on). Toggle commands grid_remove/.grid so
+        # the row collapses to nothing when emails aren't used.
+        row += 1
+        self.send_email_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            self.frame,
+            text="Send email (open Outlook draft before filing notes)",
+            variable=self.send_email_var,
+            command=self._on_send_email_toggled,
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
+        row += 1
+        self._email_section_row = row
+        self._build_email_section()
+        # Visibility set by load() based on scenario.email != None.
+
         # Notes live in their own container so add/delete can just
         # pack/destroy children without disturbing the outer grid rows.
         row += 1
@@ -1826,6 +1904,119 @@ class ScenarioEditor:
                 self.hotkey_entry.insert(0, combo)
 
         self.capture_handler(apply)
+
+    # ----- Email section -----
+
+    def _build_email_section(self) -> None:
+        """Construct the email-config widgets inside a sub-frame.
+        Always created — visibility is toggled by `_on_send_email_toggled`."""
+        from src import outlook_signature
+
+        frame = ctk.CTkFrame(self.frame)
+        frame.grid_columnconfigure(1, weight=1)
+        self._email_section = frame
+
+        # Subject
+        ctk.CTkLabel(frame, text="Subject").grid(
+            row=0, column=0, sticky="w", padx=8, pady=(6, 0),
+        )
+        self.email_subject_entry = ctk.CTkEntry(
+            frame, placeholder_text="e.g. Welcome to {{course_code}}, {{first_name}}",
+        )
+        self.email_subject_entry.grid(
+            row=0, column=1, sticky="ew", padx=8, pady=(6, 0),
+        )
+
+        # Body template (dropdown over TEMPLATES_DIR + Open button)
+        ctk.CTkLabel(frame, text="Body template").grid(
+            row=1, column=0, sticky="w", padx=8, pady=(4, 0),
+        )
+        tpl_row = ctk.CTkFrame(frame, fg_color="transparent")
+        tpl_row.grid(row=1, column=1, sticky="ew", padx=8, pady=(4, 0))
+        tpl_row.grid_columnconfigure(0, weight=1)
+        template_names = self._available_template_files()
+        self.email_body_combo = ctk.CTkComboBox(
+            tpl_row, values=template_names or ["(none in templates folder)"],
+            state="readonly" if template_names else "normal",
+        )
+        self.email_body_combo.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(
+            tpl_row, text="Open", width=70,
+            command=self._open_template_file,
+        ).grid(row=0, column=1, padx=(6, 0))
+
+        # To override (variable substitution allowed)
+        ctk.CTkLabel(frame, text="To override").grid(
+            row=2, column=0, sticky="w", padx=8, pady=(4, 0),
+        )
+        self.email_to_entry = ctk.CTkEntry(
+            frame, placeholder_text="empty = {{student_email}}; or e.g. test{{first_name}}{{last_name}}@wgu.edu",
+        )
+        self.email_to_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=(4, 0))
+
+        # Signature (dropdown over %APPDATA%\Microsoft\Signatures)
+        ctk.CTkLabel(frame, text="Signature").grid(
+            row=3, column=0, sticky="w", padx=8, pady=(4, 0),
+        )
+        sig_names = [""] + outlook_signature.list_signature_names()
+        self.email_signature_combo = ctk.CTkComboBox(
+            frame, values=sig_names or [""],
+            state="readonly" if sig_names else "normal",
+        )
+        self.email_signature_combo.grid(
+            row=3, column=1, sticky="ew", padx=8, pady=(4, 0),
+        )
+
+        # Inline images (comma-separated filenames)
+        ctk.CTkLabel(frame, text="Inline images").grid(
+            row=4, column=0, sticky="w", padx=8, pady=(4, 0),
+        )
+        self.email_images_entry = ctk.CTkEntry(
+            frame, placeholder_text="e.g. signature.png, banner.png",
+        )
+        self.email_images_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=(4, 0))
+
+        # CC Program Mentor
+        self.email_cc_pm_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            frame, text="CC Program Mentor",
+            variable=self.email_cc_pm_var,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 8))
+
+    @staticmethod
+    def _available_template_files() -> list[str]:
+        """List the .html templates in the user's templates dir, in
+        sorted order. Empty list if folder is missing or unreadable."""
+        try:
+            return sorted(p.name for p in TEMPLATES_DIR.glob("*.html"))
+        except Exception:
+            return []
+
+    def _on_send_email_toggled(self) -> None:
+        """Show or hide the email section based on the checkbox."""
+        if self.send_email_var.get():
+            self._email_section.grid(
+                row=self._email_section_row, column=0,
+                sticky="ew", padx=8, pady=(0, 8),
+            )
+        else:
+            self._email_section.grid_remove()
+
+    def _open_template_file(self) -> None:
+        """Open the currently-selected body template in the user's
+        default editor. Windows: os.startfile. Quiet no-op if file
+        is missing."""
+        import os
+        name = self.email_body_combo.get().strip()
+        if not name or "(none" in name:
+            return
+        path = TEMPLATES_DIR / name
+        if not path.exists():
+            return
+        try:
+            os.startfile(str(path))  # Windows-only; falls through on other OSes
+        except Exception:
+            pass
 
     def _add_note_editor(self, note_data: NoteData) -> NoteEditor:
         ne = NoteEditor(
@@ -1873,8 +2064,28 @@ class ScenarioEditor:
         self.hotkey_entry.delete(0, "end")
         self.hotkey_entry.insert(0, scenario.hotkey)
         self.find_first_var.set(scenario.find_first)
-        self._email_config = scenario.email
         self._batch_config = scenario.batch
+        # Email config drives the section's visibility + widget values.
+        self.send_email_var.set(scenario.email is not None)
+        if scenario.email is not None:
+            self.email_subject_entry.delete(0, "end")
+            self.email_subject_entry.insert(0, scenario.email.subject)
+            if scenario.email.body_html_file:
+                self.email_body_combo.set(scenario.email.body_html_file)
+            self.email_to_entry.delete(0, "end")
+            self.email_to_entry.insert(0, scenario.email.to)
+            self.email_signature_combo.set(scenario.email.signature_file)
+            self.email_images_entry.delete(0, "end")
+            self.email_images_entry.insert(0, ", ".join(scenario.email.inline_images))
+            self.email_cc_pm_var.set(scenario.email.cc_pm)
+        else:
+            # Clear out so an old scenario's leftover values don't show.
+            self.email_subject_entry.delete(0, "end")
+            self.email_to_entry.delete(0, "end")
+            self.email_signature_combo.set("")
+            self.email_images_entry.delete(0, "end")
+            self.email_cc_pm_var.set(False)
+        self._on_send_email_toggled()
         for ne, note in zip(self.note_editors, scenario.notes):
             ne.load(note)
 
@@ -1885,15 +2096,21 @@ class ScenarioEditor:
             "find_first": self.find_first_var.get(),
             "notes": [ne.serialize() for ne in self.note_editors],
         }
-        if self._email_config is not None:
-            # Round-trip the email block until the editor UI lands.
+        if self.send_email_var.get():
+            tpl = self.email_body_combo.get().strip()
+            if "(none" in tpl:  # placeholder for empty templates folder
+                tpl = ""
+            inline_csv = self.email_images_entry.get().strip()
+            inline_images = [
+                s.strip() for s in inline_csv.split(",") if s.strip()
+            ]
             out["email"] = {
-                "subject": self._email_config.subject,
-                "body_html_file": self._email_config.body_html_file,
-                "to": self._email_config.to,
-                "signature_file": self._email_config.signature_file,
-                "inline_images": list(self._email_config.inline_images),
-                "cc_pm": self._email_config.cc_pm,
+                "subject": self.email_subject_entry.get(),
+                "body_html_file": tpl,
+                "to": self.email_to_entry.get(),
+                "signature_file": self.email_signature_combo.get(),
+                "inline_images": inline_images,
+                "cc_pm": self.email_cc_pm_var.get(),
             }
         if self._batch_config is not None:
             # Round-trip the batch block until the editor UI lands.
