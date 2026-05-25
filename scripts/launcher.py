@@ -40,6 +40,7 @@ from src import caseload_csv, caseload_filter, email_template
 from src.browser import persistent_context
 from src.config import (
     CASELOAD_CSV_PATH, CASELOAD_URL, NOTE_LOG_CSV, TEMPLATES_DIR,
+    USER_CONFIG_DIR,
 )
 from src.note_form import NoteData
 from src.scenarios import (
@@ -177,6 +178,14 @@ class BrowserWorker:
         # Most recent LIST_MATCHES result, used by CLICK_MATCH to map a
         # chosen name back to its row locator.
         self._last_matches: list[tuple] = []
+        # Network-capture mode (for discovering Salesforce's REST API
+        # endpoint without speculation). When `_capture_active` is True,
+        # the request listener appends every Salesforce-bound POST /
+        # PATCH / PUT into `_capture_log`. App drives start/stop +
+        # save-to-file. No PII safeguarding yet; user must scrub
+        # before sharing.
+        self._capture_active = False
+        self._capture_log: list[dict] = []
         self.ready_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -328,6 +337,14 @@ class BrowserWorker:
                         extra.close()
                     except Exception:
                         pass
+                # Hook the context-wide request listener so capture
+                # mode (when active) sees every page's Salesforce
+                # write traffic without us having to wire each page
+                # individually.
+                try:
+                    ctx.on("request", self._on_request)
+                except Exception:
+                    pass
                 self.on_status("Browser ready.")
                 self.ready_event.set()
                 while True:
@@ -805,6 +822,55 @@ class BrowserWorker:
             "pm_name": info.get("pm_name", ""),
             "pm_email": info.get("pm_email", ""),
         }
+
+    # ----- Network capture (for REST-API discovery) -----
+
+    def start_request_capture(self) -> None:
+        """Begin recording Salesforce-bound write requests. Call once
+        per discovery session; subsequent fires by the user populate
+        `_capture_log`."""
+        self._capture_active = True
+        self._capture_log = []
+
+    def stop_request_capture(self) -> list[dict]:
+        """Stop recording and return the accumulated log. Safe to call
+        even if capture wasn't running."""
+        self._capture_active = False
+        return list(self._capture_log)
+
+    def _on_request(self, request) -> None:
+        """Context-level request listener. Only records when capture
+        mode is active AND the request looks like a Salesforce data
+        write (POST / PATCH / PUT against a Salesforce host). Filters
+        out auth + asset traffic so the user doesn't drown in noise."""
+        if not self._capture_active:
+            return
+        try:
+            url = request.url or ""
+            method = request.method or ""
+        except Exception:
+            return
+        if method.upper() not in ("POST", "PATCH", "PUT"):
+            return
+        if not any(d in url for d in (
+            "salesforce.com", "force.com", "lightning.com",
+        )):
+            return
+        # Skip token/auth/session refresh chatter.
+        if any(skip in url for skip in (
+            "/auth/", "/oauth", "/token", "/session",
+            "/aura?aura.token", "/visualforce/session",
+        )):
+            return
+        try:
+            self._capture_log.append({
+                "url": url,
+                "method": method,
+                "headers": dict(request.headers),
+                "post_data": request.post_data,
+            })
+        except Exception:
+            pass
 
     @staticmethod
     def _active_page(ctx):
@@ -2491,6 +2557,17 @@ class App:
             width=110, command=self._on_open_templates_folder,
             fg_color="transparent", border_width=1,
         ).pack(side="left", padx=(8, 0))
+        # Discovery: capture Salesforce's note-submission network
+        # traffic so we can later replay it via REST API instead of
+        # driving the UI. One-click toggle; on stop, writes the
+        # captured requests to a JSON file in the user config dir.
+        self._capture_active = False
+        self.capture_btn = ctk.CTkButton(
+            toggle_frame, text="🔬 Capture",
+            width=100, command=self._on_capture_toggle,
+            fg_color="transparent", border_width=1,
+        )
+        self.capture_btn.pack(side="left", padx=(8, 0))
         # Busy indicator — right-aligned spinner + text. Empty when
         # idle; high-contrast yellow background when active so it's
         # impossible to miss in the row of action buttons.
@@ -3559,6 +3636,49 @@ class App:
                 pass
 
         self.worker.submit_download_caseload_csv(CASELOAD_CSV_PATH, on_done)
+
+    def _on_capture_toggle(self) -> None:
+        """Toggle network capture for Salesforce REST-API discovery.
+        Starts the worker's request listener; on stop, dumps the
+        accumulated log to a timestamped JSON file in the user
+        config dir."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        if not self._capture_active:
+            self.worker.start_request_capture()
+            self._capture_active = True
+            self.capture_btn.configure(text="⏹ Stop capture")
+            self._append_log(
+                "Network capture STARTED. Fire a note manually (use a "
+                "scenario or click Submit in Salesforce yourself). "
+                "Click ⏹ Stop capture when done."
+            )
+            return
+        log = self.worker.stop_request_capture()
+        self._capture_active = False
+        self.capture_btn.configure(text="🔬 Capture")
+        if not log:
+            self._append_log("Capture stopped; no Salesforce write requests recorded.")
+            return
+        import json
+        from datetime import datetime
+        out_path = (
+            USER_CONFIG_DIR / f"capture-{datetime.now():%Y%m%d-%H%M%S}.json"
+        )
+        try:
+            out_path.write_text(
+                json.dumps(log, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            self._append_log(f"Capture stopped but save failed: {e}")
+            return
+        self._append_log(
+            f"Capture stopped. {len(log)} request(s) saved to "
+            f"{out_path.name} in {USER_CONFIG_DIR}. Scrub auth tokens "
+            "from the headers before sharing."
+        )
 
     def _on_open_templates_folder(self) -> None:
         """Open the user's templates directory in Explorer / Finder.
