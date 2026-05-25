@@ -30,3 +30,8 @@ note_log.csv
 
 # Cached caseload export — student PII, FERPA, never commit.
 caseload.csv
+
+# Network-capture dumps from the 🔬 Capture button. Contain
+# Salesforce session cookies + aura.token (active credentials)
+# AND student PII inside the request bodies. Never commit.
+capture-*.json
