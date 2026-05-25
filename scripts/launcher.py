@@ -2464,6 +2464,11 @@ class App:
             fg_color="transparent", border_width=1,
         )
         self.caseload_refresh_btn.pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            toggle_frame, text="📁 Templates",
+            width=110, command=self._on_open_templates_folder,
+            fg_color="transparent", border_width=1,
+        ).pack(side="left", padx=(8, 0))
         # Busy indicator — right-aligned spinner + text. Empty when
         # idle; high-contrast yellow background when active so it's
         # impossible to miss in the row of action buttons.
@@ -3489,6 +3494,27 @@ class App:
                 pass
 
         self.worker.submit_download_caseload_csv(CASELOAD_CSV_PATH, on_done)
+
+    def _on_open_templates_folder(self) -> None:
+        """Open the user's templates directory in Explorer / Finder.
+        Lets the user drop in new .html templates or signature images
+        without restarting the launcher (the body-template dropdown
+        repopulates on next ScenarioEditor rebuild — Save / Revert /
+        scenario tab switch all rebuild)."""
+        import os
+        try:
+            os.startfile(str(TEMPLATES_DIR))
+        except AttributeError:
+            # os.startfile is Windows-only — fall back for future
+            # Mac/Linux support.
+            import subprocess, sys
+            opener = {"darwin": "open"}.get(sys.platform, "xdg-open")
+            try:
+                subprocess.Popen([opener, str(TEMPLATES_DIR)])
+            except Exception as e:
+                self._append_log(f"Couldn't open templates folder: {e}")
+        except Exception as e:
+            self._append_log(f"Couldn't open templates folder: {e}")
 
     def _on_caseload_refresh_clicked(self) -> None:
         """Manual caseload-CSV refresh from the toolbar button. Blocks
