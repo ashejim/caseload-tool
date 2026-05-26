@@ -1390,11 +1390,62 @@ _TEMPLATE_INSERT_VARS_USER = [
 ]
 
 
+def _open_in_edge(uri: str) -> bool:
+    """Launch Microsoft Edge with `uri`. If Edge is already running,
+    the URL opens as a new tab (standard Edge behavior on Windows);
+    otherwise a fresh Edge process opens. Returns True on success.
+
+    We try in order: explicit msedge.exe path → shell `start msedge`
+    → fall through to the user's default browser. The standard-
+    install paths cover the vast majority of Windows machines; the
+    `start` fallback handles Edge installed somewhere unusual but
+    still registered with the shell."""
+    import subprocess
+    edge_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for exe in edge_paths:
+        if Path(exe).exists():
+            try:
+                subprocess.Popen([exe, uri])
+                return True
+            except Exception:
+                continue
+    try:
+        # `start` lets the shell resolve msedge from registered apps;
+        # works for portable installs and non-default locations.
+        subprocess.Popen(["cmd", "/c", "start", "", "msedge", uri], shell=False)
+        return True
+    except Exception:
+        pass
+    return False
+
+
+def _open_externally(path: Path) -> tuple[bool, str]:
+    """Open `path` in whatever app the OS has associated with the
+    file type (`os.startfile` on Windows). Lets users pick their
+    own HTML editor — set VS Code / Notepad++ / Sublime / etc. as
+    the default for .html in Windows Settings and clicks here will
+    route there. Returns (success, message)."""
+    try:
+        import os
+        os.startfile(str(path))
+        return True, "Opened in default app."
+    except Exception as e:
+        return False, f"Couldn't open file: {e}"
+
+
 def _open_template_in_word(path: Path) -> tuple[bool, str]:
     """Launch MS Word (via COM) opened to `path`. Returns
     (success, message). Falls back gracefully when Word isn't
     installed — caller can fall back to os.startfile or just
-    show the message."""
+    show the message.
+
+    NOTE: kept for backward-compat and as an escape-hatch path,
+    but the main editor flow now uses `_open_externally` which is
+    more reliable and lets users pick any editor via the .html
+    file association."""
     try:
         import win32com.client
         word = win32com.client.Dispatch("Word.Application")
@@ -1838,21 +1889,18 @@ def prompt_html_template_editor(
         saved["value"] = True
         messagebox.showinfo("Saved", f"Saved as {new_name}.")
 
-    def do_open_in_word() -> None:
+    def do_open_externally() -> None:
+        """Save buffer + hand the file to whatever app Windows has
+        associated with .html (VS Code if user sets it, Notepad++,
+        Sublime, etc.). Replaces the previous Word-via-COM flow,
+        which was unreliable for some users."""
         if not write_to_disk():
             return
         saved["value"] = True
-        ok, msg = _open_template_in_word(current["path"])
+        ok, msg = _open_externally(current["path"])
         if not ok:
-            try:
-                import os
-                os.startfile(str(current["path"]))
-            except Exception as e:
-                messagebox.showerror(
-                    "Couldn't open file",
-                    f"{msg}\n\nAnd OS-default open failed: {e}",
-                )
-                return
+            messagebox.showerror("Couldn't open file", msg)
+            return
         _save_dialog_geometry(dialog, "html_template_editor")
         try: dialog.grab_release()
         except Exception: pass
@@ -1908,9 +1956,16 @@ def prompt_html_template_editor(
         try:
             TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
             preview_path.write_text(shell, encoding="utf-8")
-            webbrowser.open(preview_path.as_uri(), new=2)
         except Exception as e:
             messagebox.showerror("Preview failed", str(e))
+            return
+        uri = preview_path.as_uri()
+        # Prefer Edge so the preview always lands in a known, stable
+        # renderer (matches the runtime Playwright Edge). If Edge
+        # isn't reachable, fall back to the user's default browser
+        # so the preview still appears somewhere reasonable.
+        if not _open_in_edge(uri):
+            webbrowser.open(uri, new=2)
 
     btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
     btn_row.pack(fill="x", padx=8, pady=(0, 8))
@@ -1926,8 +1981,8 @@ def prompt_html_template_editor(
         **SECONDARY_BTN_KWARGS,
     ).pack(side="left", padx=4)
     ctk.CTkButton(
-        btn_row, text="Save & Open in MS Word",
-        command=do_open_in_word, width=180,
+        btn_row, text="Save & Open externally",
+        command=do_open_externally, width=180,
         **SECONDARY_BTN_KWARGS,
     ).pack(side="left", padx=4)
     ctk.CTkButton(
@@ -3171,8 +3226,8 @@ class ScenarioEditor:
             **SECONDARY_BTN_KWARGS,
         ).grid(row=0, column=2, padx=(4, 0))
         ctk.CTkButton(
-            tpl_row, text="Word", width=56,
-            command=self._open_template_in_word,
+            tpl_row, text="Open", width=56,
+            command=self._open_template_externally,
             **SECONDARY_BTN_KWARGS,
         ).grid(row=0, column=3, padx=(4, 0))
 
@@ -3378,15 +3433,17 @@ class ScenarioEditor:
         self.email_images_entry.delete(0, "end")
         self.email_images_entry.insert(0, ", ".join(existing))
 
-    def _open_template_in_word(self) -> None:
-        """Launch the selected template directly in MS Word (via COM),
-        falling back to the OS-default opener if Word isn't installed."""
+    def _open_template_externally(self) -> None:
+        """Hand the selected template to whatever app Windows has
+        associated with .html — VS Code, Notepad++, Word, Notepad,
+        whatever the user has set as default. Replaces the previous
+        Word-via-COM flow, which was unreliable for some setups."""
         from tkinter import messagebox
         path = self._selected_template_path()
         if path is None:
             messagebox.showinfo(
                 "Pick a template first",
-                "Select a body template before clicking Word.",
+                "Select a body template before clicking Open.",
             )
             return
         if not path.exists():
@@ -3396,16 +3453,9 @@ class ScenarioEditor:
                 "again.",
             )
             return
-        ok, msg = _open_template_in_word(path)
+        ok, msg = _open_externally(path)
         if not ok:
-            try:
-                import os
-                os.startfile(str(path))
-            except Exception as e:
-                messagebox.showerror(
-                    "Couldn't open file",
-                    f"{msg}\n\nAnd OS-default open also failed: {e}",
-                )
+            messagebox.showerror("Couldn't open file", msg)
 
     def _open_template_file(self) -> None:
         """Legacy: open the selected template in the OS-default editor.
