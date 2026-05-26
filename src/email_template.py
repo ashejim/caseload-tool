@@ -148,5 +148,27 @@ def wrap_with_font(html: str, font_family: str, font_size: int) -> str:
 
 
 def load_template(path: Path) -> str:
-    """Read a UTF-8 template file."""
-    return Path(path).read_text(encoding="utf-8")
+    """Read a template file, tolerating non-UTF-8 encodings.
+
+    Word's "Save as Web Page (Filtered)" defaults to Windows-1252,
+    which fails a strict UTF-8 decode the moment it hits a smart
+    quote or em dash. We try the encodings most likely to round-trip
+    cleanly, in order:
+
+    - utf-8 / utf-8-sig — what the in-app editor writes (with or
+      without a BOM).
+    - windows-1252 — Word's default Western-European output.
+    - latin-1 — last-resort byte-for-byte fallback (every byte maps
+      to a code point, so this never raises).
+
+    If everything raises, decode UTF-8 with replacement so the user
+    sees the template (with mojibake on the bad bytes) instead of a
+    hard failure mid-fire.
+    """
+    raw = Path(path).read_bytes()
+    for enc in ("utf-8", "utf-8-sig", "windows-1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
