@@ -1339,6 +1339,20 @@ def open_hotkey_capture(parent, on_done: Callable[[str], None]) -> None:
 # Remembers each user-movable dialog's last geometry across opens so
 # they reopen where the user last placed/sized them. Persists only
 # within a launcher session (intentional — restart resets to defaults).
+# Secondary-button styling. Previously many call sites used
+# `fg_color="transparent", border_width=1` which renders the text in
+# the same gray as the dark-mode panel background — unreadable until
+# hovered. Explicit fg/text/border colors here give high contrast in
+# both light and dark mode.
+SECONDARY_BTN_KWARGS = dict(
+    fg_color=("gray82", "gray28"),
+    text_color=("gray10", "gray95"),
+    hover_color=("gray72", "gray38"),
+    border_width=1,
+    border_color=("gray60", "gray45"),
+)
+
+
 _DIALOG_GEOMETRY: dict[str, str] = {}
 _DIALOG_DEFAULTS: dict[str, str] = {
     "find_and_pick": "480x440",
@@ -1391,13 +1405,18 @@ def prompt_html_template_editor(
     custom_var_names: Optional[list[str]] = None,
 ) -> bool:
     """Modal HTML editor for an email body template. Returns True if
-    the file was saved (either via Save or "Save & Open in Word"),
-    False on Cancel.
+    the file was saved (Save, Save as, or Save & Open in MS Word).
 
-    Toolbar buttons insert `{{var}}` placeholders at the cursor so
-    users don't have to remember the syntax. `custom_var_names`
-    extends the standard list with any vars defined in the current
-    scenario's prompts: block."""
+    Features:
+    - Toolbar with "Insert variable" buttons grouped by category;
+      one click drops the corresponding `{{var}}` at the cursor.
+    - Font family + size dropdowns (display-only — affects the
+      editor view, not the rendered email which uses its own CSS /
+      Outlook's defaults).
+    - Ctrl+MouseWheel and Ctrl+= / Ctrl+- to zoom.
+    - Save as button for cloning a template under a new name.
+    - Save & Open in MS Word opens via COM, falls back to the OS
+      default if Word isn't installed."""
     from tkinter import messagebox
 
     dialog = ctk.CTkToplevel(parent)
@@ -1407,9 +1426,16 @@ def prompt_html_template_editor(
     dialog.attributes("-topmost", True)
     dialog.grab_set()
 
+    # Holders so closures can mutate. `current["path"]` lets Save-as
+    # change which file subsequent Saves write to.
     saved = {"value": False}
+    current = {
+        "path": Path(path),
+        "font_family": "Calibri",
+        "font_size": 11,
+    }
 
-    # ---- Toolbar — two rows of "Insert variable" buttons. ----
+    # ---- Toolbar — insert-variable rows + font/size selectors. ----
     toolbar = ctk.CTkFrame(dialog, fg_color="transparent")
     toolbar.pack(fill="x", padx=8, pady=(8, 0))
 
@@ -1417,63 +1443,100 @@ def prompt_html_template_editor(
         text_box.insert("insert", f"{{{{{var}}}}}")
         text_box.focus_force()
 
-    def _row(parent_frame, label: str, items: list[tuple[str, str]]):
-        row = ctk.CTkFrame(parent_frame, fg_color="transparent")
+    def _make_row(label: str, items: list[tuple[str, str]],
+                  highlight: bool = False):
+        row = ctk.CTkFrame(toolbar, fg_color="transparent")
         row.pack(fill="x", pady=2)
         ctk.CTkLabel(
             row, text=label, width=70, anchor="w",
             font=ctk.CTkFont(size=11, weight="bold"),
         ).pack(side="left", padx=(0, 4))
         for display, var in items:
+            kwargs = dict(SECONDARY_BTN_KWARGS)
+            if highlight:
+                kwargs["fg_color"] = ("#fff3c4", "#5a4500")
+                kwargs["text_color"] = ("gray10", "gray95")
             ctk.CTkButton(
                 row, text=display, width=92, height=24,
                 command=lambda v=var: insert_var(v),
-                fg_color="transparent", border_width=1,
                 font=ctk.CTkFont(size=11),
+                **kwargs,
             ).pack(side="left", padx=2)
 
-    _row(
-        toolbar, "Student:",
-        _TEMPLATE_INSERT_VARS_STUDENT,
+    _make_row("Student:", _TEMPLATE_INSERT_VARS_STUDENT)
+    _make_row(
+        "Mentor:",
+        _TEMPLATE_INSERT_VARS_PM + _TEMPLATE_INSERT_VARS_USER,
     )
-    pm_user_row = ctk.CTkFrame(toolbar, fg_color="transparent")
-    pm_user_row.pack(fill="x", pady=2)
+    if custom_var_names:
+        _make_row(
+            "Prompts:",
+            [(v, v) for v in custom_var_names],
+            highlight=True,
+        )
+
+    # Font row — family + size dropdowns. Affects the editor's text
+    # display ONLY; the rendered email uses whatever CSS lives in the
+    # HTML (or Outlook's defaults if none).
+    font_row = ctk.CTkFrame(toolbar, fg_color="transparent")
+    font_row.pack(fill="x", pady=(6, 2))
     ctk.CTkLabel(
-        pm_user_row, text="Mentor:", width=70, anchor="w",
+        font_row, text="View font:", width=70, anchor="w",
         font=ctk.CTkFont(size=11, weight="bold"),
     ).pack(side="left", padx=(0, 4))
-    for display, var in _TEMPLATE_INSERT_VARS_PM + _TEMPLATE_INSERT_VARS_USER:
-        ctk.CTkButton(
-            pm_user_row, text=display, width=92, height=24,
-            command=lambda v=var: insert_var(v),
-            fg_color="transparent", border_width=1,
-            font=ctk.CTkFont(size=11),
-        ).pack(side="left", padx=2)
 
-    if custom_var_names:
-        custom_row = ctk.CTkFrame(toolbar, fg_color="transparent")
-        custom_row.pack(fill="x", pady=2)
-        ctk.CTkLabel(
-            custom_row, text="Prompts:", width=70, anchor="w",
-            font=ctk.CTkFont(size=11, weight="bold"),
-        ).pack(side="left", padx=(0, 4))
-        for var in custom_var_names:
-            ctk.CTkButton(
-                custom_row, text=var, width=92, height=24,
-                command=lambda v=var: insert_var(v),
-                fg_color=("#fff3c4", "#5a4500"),
-                border_width=1,
-                font=ctk.CTkFont(size=11),
-            ).pack(side="left", padx=2)
+    def apply_font() -> None:
+        try:
+            text_box.configure(font=ctk.CTkFont(
+                family=current["font_family"],
+                size=current["font_size"],
+            ))
+        except Exception:
+            pass
+
+    def on_family_change(value: str) -> None:
+        current["font_family"] = value
+        apply_font()
+
+    def on_size_change(value: str) -> None:
+        try:
+            current["font_size"] = max(8, min(40, int(value)))
+        except (ValueError, TypeError):
+            return
+        apply_font()
+
+    family_combo = ctk.CTkComboBox(
+        font_row,
+        values=[
+            "Calibri", "Arial", "Segoe UI",
+            "Times New Roman", "Georgia", "Verdana",
+            "Consolas", "Courier New",
+        ],
+        width=160, command=on_family_change,
+    )
+    family_combo.set("Calibri")
+    family_combo.pack(side="left", padx=(0, 6))
+    size_combo = ctk.CTkComboBox(
+        font_row, values=["8", "9", "10", "11", "12", "14", "16", "18", "22"],
+        width=70, command=on_size_change,
+    )
+    size_combo.set("11")
+    size_combo.pack(side="left")
+    ctk.CTkLabel(
+        font_row, text="(editor view only — emails use the HTML's own styling)",
+        font=ctk.CTkFont(size=10), text_color=("gray45", "gray65"),
+    ).pack(side="left", padx=(10, 0))
 
     # ---- Text editor. ----
     text_box = ctk.CTkTextbox(
         dialog, wrap="word",
-        font=ctk.CTkFont(family="Consolas", size=12),
+        font=ctk.CTkFont(
+            family=current["font_family"], size=current["font_size"],
+        ),
     )
     text_box.pack(fill="both", expand=True, padx=8, pady=6)
     try:
-        content = path.read_text(encoding="utf-8")
+        content = current["path"].read_text(encoding="utf-8")
     except FileNotFoundError:
         content = ""
     except Exception as e:
@@ -1482,11 +1545,29 @@ def prompt_html_template_editor(
     text_box.focus_force()
     text_box.mark_set("insert", "1.0")
 
+    # Ctrl+MouseWheel and Ctrl+= / Ctrl+- to zoom the editor view.
+    def zoom(delta: int) -> str:
+        new_size = max(8, min(40, current["font_size"] + delta))
+        if new_size != current["font_size"]:
+            current["font_size"] = new_size
+            size_combo.set(str(new_size))
+            apply_font()
+        return "break"  # prevent default scroll
+
+    text_box.bind(
+        "<Control-MouseWheel>",
+        lambda e: zoom(1 if e.delta > 0 else -1),
+    )
+    text_box.bind("<Control-plus>", lambda _e: zoom(1))
+    text_box.bind("<Control-equal>", lambda _e: zoom(1))  # Ctrl+= (no shift)
+    text_box.bind("<Control-minus>", lambda _e: zoom(-1))
+
     # ---- Action row. ----
-    def write_to_disk() -> bool:
+    def write_to_disk(target_path: Optional[Path] = None) -> bool:
+        tgt = target_path or current["path"]
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
+            tgt.parent.mkdir(parents=True, exist_ok=True)
+            tgt.write_text(
                 text_box.get("1.0", "end-1c"), encoding="utf-8",
             )
             return True
@@ -1503,22 +1584,46 @@ def prompt_html_template_editor(
             try: dialog.destroy()
             except Exception: pass
 
+    def do_save_as() -> None:
+        sub = ctk.CTkInputDialog(
+            text="Save current content under filename (without .html):",
+            title="Save as",
+        )
+        raw = sub.get_input()
+        if not raw or not raw.strip():
+            return
+        new_name = raw.strip()
+        if not new_name.lower().endswith(".html"):
+            new_name += ".html"
+        new_path = current["path"].parent / new_name
+        if new_path.exists():
+            if not messagebox.askyesno(
+                "Overwrite?",
+                f"{new_name} already exists. Overwrite?",
+            ):
+                return
+        if not write_to_disk(new_path):
+            return
+        # Switch the editor's working file to the new path so further
+        # Saves go there too.
+        current["path"] = new_path
+        dialog.title(f"Edit template — {new_path.name}")
+        saved["value"] = True
+        messagebox.showinfo("Saved", f"Saved as {new_name}.")
+
     def do_open_in_word() -> None:
-        # Save first so Word sees the user's latest edits.
         if not write_to_disk():
             return
         saved["value"] = True
-        ok, msg = _open_template_in_word(path)
+        ok, msg = _open_template_in_word(current["path"])
         if not ok:
-            # Fall back to OS default rather than failing silently.
             try:
                 import os
-                os.startfile(str(path))
-                msg = "Opened in default editor (Word not available)."
+                os.startfile(str(current["path"]))
             except Exception as e:
                 messagebox.showerror(
                     "Couldn't open file",
-                    f"{msg}\n\nAnd fallback failed: {e}",
+                    f"{msg}\n\nAnd OS-default open failed: {e}",
                 )
                 return
         _save_dialog_geometry(dialog, "html_template_editor")
@@ -1537,16 +1642,20 @@ def prompt_html_template_editor(
     btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
     btn_row.pack(fill="x", padx=8, pady=(0, 8))
     ctk.CTkButton(
-        btn_row, text="Save", command=do_save, width=120,
+        btn_row, text="Save", command=do_save, width=100,
+    ).pack(side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text="Save as…", command=do_save_as, width=100,
+        **SECONDARY_BTN_KWARGS,
     ).pack(side="left", padx=4)
     ctk.CTkButton(
         btn_row, text="Save & Open in MS Word",
         command=do_open_in_word, width=180,
-        fg_color="transparent", border_width=1,
+        **SECONDARY_BTN_KWARGS,
     ).pack(side="left", padx=4)
     ctk.CTkButton(
         btn_row, text="Cancel", command=do_cancel, width=90,
-        fg_color="transparent", border_width=1,
+        **SECONDARY_BTN_KWARGS,
     ).pack(side="right", padx=4)
 
     dialog.bind("<Escape>", lambda _e: do_cancel())
@@ -1714,7 +1823,7 @@ def prompt_find_and_pick(
     ctk.CTkButton(btn_row, text="Search", command=run_search, width=110).pack(side="left", padx=4)
     ctk.CTkButton(
         btn_row, text="Cancel", command=cancel, width=90,
-        fg_color="transparent", border_width=1,
+        **SECONDARY_BTN_KWARGS,
     ).pack(side="left", padx=4)
 
     parent.wait_window(dialog)
@@ -1790,7 +1899,7 @@ def prompt_additional_text(parent, label: str, prefilled: str) -> Optional[str]:
     ctk.CTkButton(btn_row, text="Submit", command=submit, width=110).pack(side="left", padx=4)
     ctk.CTkButton(
         btn_row, text="Cancel", command=cancel, width=90,
-        fg_color="transparent", border_width=1,
+        **SECONDARY_BTN_KWARGS,
     ).pack(side="left", padx=4)
 
     parent.wait_window(dialog)
@@ -1881,7 +1990,7 @@ def prompt_batch_review(
     confirm_btn.pack(side="left", padx=4)
     ctk.CTkButton(
         btn_row, text="Cancel", command=cancel, width=90,
-        fg_color="transparent", border_width=1,
+        **SECONDARY_BTN_KWARGS,
     ).pack(side="left", padx=4)
 
     dialog.bind("<Escape>", cancel)
@@ -1960,7 +2069,7 @@ class FilterRow:
         self.value_entry.grid(row=0, column=2, sticky="ew", padx=(0, 4), pady=2)
         ctk.CTkButton(
             self.frame, text="✕", width=28, height=28,
-            fg_color="transparent", border_width=1,
+            **SECONDARY_BTN_KWARGS,
             command=lambda: on_delete(self),
         ).grid(row=0, column=3, padx=(4, 0), pady=2)
 
@@ -2020,7 +2129,7 @@ class PromptRow:
         ).grid(row=0, column=2, sticky="w", padx=(0, 4), pady=2)
         ctk.CTkButton(
             self.frame, text="✕", width=28, height=28,
-            fg_color="transparent", border_width=1,
+            **SECONDARY_BTN_KWARGS,
             command=lambda: on_delete(self),
         ).grid(row=0, column=3, padx=(4, 0), pady=2)
 
@@ -2403,7 +2512,7 @@ class ScenarioEditor:
         ctk.CTkButton(
             action_row, text="↻ Refresh columns",
             width=140, command=self._refresh_batch_columns,
-            fg_color="transparent", border_width=1,
+            **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
 
     def _add_filter_row(self, prefilled: Optional[dict] = None) -> FilterRow:
@@ -2536,14 +2645,19 @@ class ScenarioEditor:
         )
         self.email_body_combo.grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(
-            tpl_row, text="Edit", width=58,
+            tpl_row, text="Edit", width=56,
             command=self._edit_template_in_app,
         ).grid(row=0, column=1, padx=(6, 0))
         ctk.CTkButton(
-            tpl_row, text="Word", width=58,
-            command=self._open_template_in_word,
-            fg_color="transparent", border_width=1,
+            tpl_row, text="New", width=56,
+            command=self._new_template,
+            **SECONDARY_BTN_KWARGS,
         ).grid(row=0, column=2, padx=(4, 0))
+        ctk.CTkButton(
+            tpl_row, text="Word", width=56,
+            command=self._open_template_in_word,
+            **SECONDARY_BTN_KWARGS,
+        ).grid(row=0, column=3, padx=(4, 0))
 
         # To override (variable substitution allowed)
         ctk.CTkLabel(frame, text="To override").grid(
@@ -2647,6 +2761,50 @@ class ScenarioEditor:
             except Exception as e:
                 messagebox.showerror("Couldn't create file", str(e))
                 return
+        prompt_html_template_editor(
+            self.frame.winfo_toplevel(),
+            path,
+            custom_var_names=self._current_prompt_var_names(),
+        )
+
+    def _new_template(self) -> None:
+        """Create a fresh `.html` template under TEMPLATES_DIR. Asks
+        for a filename, seeds the file with a minimal stub, refreshes
+        the body-template dropdown, selects the new file, and opens
+        the in-app editor on it."""
+        from tkinter import messagebox
+        dialog = ctk.CTkInputDialog(
+            text="Filename for new template (without .html):",
+            title="New template",
+        )
+        raw = dialog.get_input()
+        if not raw or not raw.strip():
+            return
+        name = raw.strip()
+        if not name.lower().endswith(".html"):
+            name += ".html"
+        path = TEMPLATES_DIR / name
+        if path.exists():
+            if not messagebox.askyesno(
+                "File exists",
+                f"{name} already exists. Open it for editing instead?",
+            ):
+                return
+        else:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    "<p>Hi {{first_name}},</p>\n\n<p></p>\n",
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                messagebox.showerror("Couldn't create file", str(e))
+                return
+        # Refresh dropdown values so the new file shows up, then
+        # select it so subsequent Edit / Word click the right file.
+        new_values = self._available_template_files()
+        self.email_body_combo.configure(values=new_values)
+        self.email_body_combo.set(name)
         prompt_html_template_editor(
             self.frame.winfo_toplevel(),
             path,
@@ -2945,13 +3103,13 @@ class App:
         self.caseload_refresh_btn = ctk.CTkButton(
             toggle_frame, text="↻ Caseload",
             width=120, command=self._on_caseload_refresh_clicked,
-            fg_color="transparent", border_width=1,
+            **SECONDARY_BTN_KWARGS,
         )
         self.caseload_refresh_btn.pack(side="left", padx=(8, 0))
         ctk.CTkButton(
             toggle_frame, text="📁 Templates",
             width=110, command=self._on_open_templates_folder,
-            fg_color="transparent", border_width=1,
+            **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
         # Discovery: capture Salesforce's note-submission network
         # traffic so we can later replay it via REST API instead of
@@ -2961,7 +3119,7 @@ class App:
         self.capture_btn = ctk.CTkButton(
             toggle_frame, text="🔬 Capture",
             width=100, command=self._on_capture_toggle,
-            fg_color="transparent", border_width=1,
+            **SECONDARY_BTN_KWARGS,
         )
         self.capture_btn.pack(side="left", padx=(8, 0))
         # Busy indicator — right-aligned spinner + text. Empty when
@@ -3038,7 +3196,7 @@ class App:
         ctk.CTkButton(
             save_frame, text="Delete scenario",
             command=self._delete_scenario, width=140, height=34,
-            fg_color="transparent", border_width=1,
+            **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=4, pady=2)
         ctk.CTkButton(
             save_frame, text="Save changes",
@@ -3047,7 +3205,7 @@ class App:
         ctk.CTkButton(
             save_frame, text="Revert",
             command=self._revert_editor, width=100, height=34,
-            fg_color="transparent", border_width=1,
+            **SECONDARY_BTN_KWARGS,
         ).pack(side="right", padx=4, pady=2)
 
     def _rebuild_editor_tabs(self) -> None:
@@ -4391,7 +4549,7 @@ class App:
         ctk.CTkButton(
             tab, text="Remove this tab",
             command=lambda k=tab_key: self._remove_note_tab(k),
-            fg_color="transparent", border_width=1, width=140,
+            **SECONDARY_BTN_KWARGS, width=140,
         ).grid(row=1, column=0, padx=4, pady=(0, 4), sticky="e")
         self.note_tabs[tab_key] = {"frame": tab, "list": list_frame, "row": 0}
         self.log_tabview.set(tab_key)  # auto-focus the new tab
@@ -4441,7 +4599,7 @@ class App:
 
         ctk.CTkButton(
             dialog, text="Cancel", command=dialog.destroy,
-            fg_color="transparent", border_width=1, width=90,
+            **SECONDARY_BTN_KWARGS, width=90,
         ).pack(pady=10)
 
     def _on_match_picked(self, name: str, dialog) -> None:
