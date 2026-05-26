@@ -1866,6 +1866,52 @@ def prompt_html_template_editor(
         try: dialog.destroy()
         except Exception: pass
 
+    def do_preview() -> None:
+        """Render the current buffer to a temp HTML file and open it
+        in the default browser. Read-only — for layout / styling
+        review only. `{{var}}` placeholders are swapped for human-
+        readable `<LABEL>` text so the user can see where values
+        will land. CID image references are rewritten to relative
+        filenames so the browser can load images from TEMPLATES_DIR
+        (where the preview itself is written)."""
+        import webbrowser
+        import re as _re
+        buffer = text_box.get("1.0", "end-1c")
+        rendered = email_template.render_with_placeholders(buffer)
+
+        def _fix_cid(m: _re.Match) -> str:
+            stem = m.group(1)
+            for f in sorted(TEMPLATES_DIR.glob(f"{stem}.*")):
+                if f.suffix.lower() != ".html":
+                    return f'src="{f.name}"'
+            return m.group(0)  # leave alone if no matching file
+
+        rendered = _re.sub(r'src="cid:([^"]+)"', _fix_cid, rendered)
+        # Light browser-side styling for the preview pane only —
+        # gives the email a readable margin instead of butting up
+        # against the viewport edge. None of this CSS ships in the
+        # actual sent email.
+        shell = (
+            '<!DOCTYPE html>\n<html><head>'
+            '<meta charset="utf-8"><title>Template preview</title>'
+            '<style>body { max-width: 720px; margin: 24px auto; '
+            'padding: 0 24px; font-family: Segoe UI, sans-serif; }'
+            '.preview-banner { background:#fff3c4; color:#5a4500; '
+            'padding:8px 12px; border-radius:6px; margin-bottom:16px; '
+            'font-size:12px; }</style></head><body>'
+            '<div class="preview-banner">Preview — read-only · '
+            '<code>{{vars}}</code> shown as <code>&lt;LABEL&gt;</code> · '
+            'cid: refs rewritten to filenames · close the tab when done.'
+            '</div>\n' + rendered + '\n</body></html>'
+        )
+        preview_path = TEMPLATES_DIR / "_preview.html"
+        try:
+            TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+            preview_path.write_text(shell, encoding="utf-8")
+            webbrowser.open(preview_path.as_uri(), new=2)
+        except Exception as e:
+            messagebox.showerror("Preview failed", str(e))
+
     btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
     btn_row.pack(fill="x", padx=8, pady=(0, 8))
     ctk.CTkButton(
@@ -1873,6 +1919,10 @@ def prompt_html_template_editor(
     ).pack(side="left", padx=4)
     ctk.CTkButton(
         btn_row, text="Save as…", command=do_save_as, width=100,
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text="Preview", command=do_preview, width=100,
         **SECONDARY_BTN_KWARGS,
     ).pack(side="left", padx=4)
     ctk.CTkButton(
