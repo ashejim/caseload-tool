@@ -1344,7 +1344,216 @@ _DIALOG_DEFAULTS: dict[str, str] = {
     "find_and_pick": "480x440",
     "additional_text": "640x420",
     "batch_review": "720x560",
+    "html_template_editor": "900x640",
 }
+
+
+# Variables exposed in the in-app HTML editor's "Insert variable"
+# toolbar. Display label → variable name (so users see the friendly
+# name but the inserted `{{var}}` matches what the renderer accepts).
+_TEMPLATE_INSERT_VARS_STUDENT = [
+    ("First name", "first_name"),
+    ("Last name", "last_name"),
+    ("Full name", "full_name"),
+    ("Student email", "student_email"),
+    ("Student ID", "student_id"),
+    ("Course code", "course_code"),
+    ("Program name", "program_name"),
+]
+_TEMPLATE_INSERT_VARS_PM = [
+    ("PM name", "pm_name"),
+    ("PM email", "pm_email"),
+]
+_TEMPLATE_INSERT_VARS_USER = [
+    ("Your name", "user_name"),
+    ("Your email", "user_email"),
+]
+
+
+def _open_template_in_word(path: Path) -> tuple[bool, str]:
+    """Launch MS Word (via COM) opened to `path`. Returns
+    (success, message). Falls back gracefully when Word isn't
+    installed — caller can fall back to os.startfile or just
+    show the message."""
+    try:
+        import win32com.client
+        word = win32com.client.Dispatch("Word.Application")
+        word.Documents.Open(str(path))
+        word.Visible = True
+        return True, "Opened in Word."
+    except Exception as e:
+        return False, f"Word not available: {e}"
+
+
+def prompt_html_template_editor(
+    parent,
+    path: Path,
+    custom_var_names: Optional[list[str]] = None,
+) -> bool:
+    """Modal HTML editor for an email body template. Returns True if
+    the file was saved (either via Save or "Save & Open in Word"),
+    False on Cancel.
+
+    Toolbar buttons insert `{{var}}` placeholders at the cursor so
+    users don't have to remember the syntax. `custom_var_names`
+    extends the standard list with any vars defined in the current
+    scenario's prompts: block."""
+    from tkinter import messagebox
+
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title(f"Edit template — {path.name}")
+    _restore_dialog_geometry(dialog, "html_template_editor")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+
+    saved = {"value": False}
+
+    # ---- Toolbar — two rows of "Insert variable" buttons. ----
+    toolbar = ctk.CTkFrame(dialog, fg_color="transparent")
+    toolbar.pack(fill="x", padx=8, pady=(8, 0))
+
+    def insert_var(var: str) -> None:
+        text_box.insert("insert", f"{{{{{var}}}}}")
+        text_box.focus_force()
+
+    def _row(parent_frame, label: str, items: list[tuple[str, str]]):
+        row = ctk.CTkFrame(parent_frame, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ctk.CTkLabel(
+            row, text=label, width=70, anchor="w",
+            font=ctk.CTkFont(size=11, weight="bold"),
+        ).pack(side="left", padx=(0, 4))
+        for display, var in items:
+            ctk.CTkButton(
+                row, text=display, width=92, height=24,
+                command=lambda v=var: insert_var(v),
+                fg_color="transparent", border_width=1,
+                font=ctk.CTkFont(size=11),
+            ).pack(side="left", padx=2)
+
+    _row(
+        toolbar, "Student:",
+        _TEMPLATE_INSERT_VARS_STUDENT,
+    )
+    pm_user_row = ctk.CTkFrame(toolbar, fg_color="transparent")
+    pm_user_row.pack(fill="x", pady=2)
+    ctk.CTkLabel(
+        pm_user_row, text="Mentor:", width=70, anchor="w",
+        font=ctk.CTkFont(size=11, weight="bold"),
+    ).pack(side="left", padx=(0, 4))
+    for display, var in _TEMPLATE_INSERT_VARS_PM + _TEMPLATE_INSERT_VARS_USER:
+        ctk.CTkButton(
+            pm_user_row, text=display, width=92, height=24,
+            command=lambda v=var: insert_var(v),
+            fg_color="transparent", border_width=1,
+            font=ctk.CTkFont(size=11),
+        ).pack(side="left", padx=2)
+
+    if custom_var_names:
+        custom_row = ctk.CTkFrame(toolbar, fg_color="transparent")
+        custom_row.pack(fill="x", pady=2)
+        ctk.CTkLabel(
+            custom_row, text="Prompts:", width=70, anchor="w",
+            font=ctk.CTkFont(size=11, weight="bold"),
+        ).pack(side="left", padx=(0, 4))
+        for var in custom_var_names:
+            ctk.CTkButton(
+                custom_row, text=var, width=92, height=24,
+                command=lambda v=var: insert_var(v),
+                fg_color=("#fff3c4", "#5a4500"),
+                border_width=1,
+                font=ctk.CTkFont(size=11),
+            ).pack(side="left", padx=2)
+
+    # ---- Text editor. ----
+    text_box = ctk.CTkTextbox(
+        dialog, wrap="word",
+        font=ctk.CTkFont(family="Consolas", size=12),
+    )
+    text_box.pack(fill="both", expand=True, padx=8, pady=6)
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        content = ""
+    except Exception as e:
+        content = f"<!-- failed to load: {e} -->"
+    text_box.insert("1.0", content)
+    text_box.focus_force()
+    text_box.mark_set("insert", "1.0")
+
+    # ---- Action row. ----
+    def write_to_disk() -> bool:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                text_box.get("1.0", "end-1c"), encoding="utf-8",
+            )
+            return True
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+            return False
+
+    def do_save() -> None:
+        if write_to_disk():
+            saved["value"] = True
+            _save_dialog_geometry(dialog, "html_template_editor")
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+    def do_open_in_word() -> None:
+        # Save first so Word sees the user's latest edits.
+        if not write_to_disk():
+            return
+        saved["value"] = True
+        ok, msg = _open_template_in_word(path)
+        if not ok:
+            # Fall back to OS default rather than failing silently.
+            try:
+                import os
+                os.startfile(str(path))
+                msg = "Opened in default editor (Word not available)."
+            except Exception as e:
+                messagebox.showerror(
+                    "Couldn't open file",
+                    f"{msg}\n\nAnd fallback failed: {e}",
+                )
+                return
+        _save_dialog_geometry(dialog, "html_template_editor")
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    def do_cancel() -> None:
+        _save_dialog_geometry(dialog, "html_template_editor")
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(fill="x", padx=8, pady=(0, 8))
+    ctk.CTkButton(
+        btn_row, text="Save", command=do_save, width=120,
+    ).pack(side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text="Save & Open in MS Word",
+        command=do_open_in_word, width=180,
+        fg_color="transparent", border_width=1,
+    ).pack(side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text="Cancel", command=do_cancel, width=90,
+        fg_color="transparent", border_width=1,
+    ).pack(side="right", padx=4)
+
+    dialog.bind("<Escape>", lambda _e: do_cancel())
+    dialog.protocol("WM_DELETE_WINDOW", do_cancel)
+
+    parent.wait_window(dialog)
+    return saved["value"]
 
 
 def _restore_dialog_geometry(dialog, key: str) -> None:
@@ -2327,9 +2536,14 @@ class ScenarioEditor:
         )
         self.email_body_combo.grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(
-            tpl_row, text="Open", width=70,
-            command=self._open_template_file,
+            tpl_row, text="Edit", width=58,
+            command=self._edit_template_in_app,
         ).grid(row=0, column=1, padx=(6, 0))
+        ctk.CTkButton(
+            tpl_row, text="Word", width=58,
+            command=self._open_template_in_word,
+            fg_color="transparent", border_width=1,
+        ).grid(row=0, column=2, padx=(4, 0))
 
         # To override (variable substitution allowed)
         ctk.CTkLabel(frame, text="To override").grid(
@@ -2388,10 +2602,90 @@ class ScenarioEditor:
         else:
             self._email_section.grid_remove()
 
+    def _current_prompt_var_names(self) -> list[str]:
+        """Return the live list of `var` names from the prompts
+        section, so the in-app HTML editor can offer them as
+        insert-buttons even before the scenario is saved."""
+        out: list[str] = []
+        for pr in self.prompt_rows:
+            v = pr.var_entry.get().strip()
+            if v and v not in out:
+                out.append(v)
+        return out
+
+    def _selected_template_path(self) -> Optional[Path]:
+        """Return the absolute path of the currently-selected body
+        template, or None if the dropdown is empty / pointing at the
+        '(none …)' placeholder."""
+        name = self.email_body_combo.get().strip()
+        if not name or "(none" in name:
+            return None
+        return TEMPLATES_DIR / name
+
+    def _edit_template_in_app(self) -> None:
+        """Open the in-app HTML editor for the selected template.
+        Creates the file if it doesn't exist (so a freshly-typed
+        name in the combo box works as 'new template')."""
+        from tkinter import messagebox
+        path = self._selected_template_path()
+        if path is None:
+            messagebox.showinfo(
+                "Pick a template first",
+                "Select a body template in the dropdown (or type a "
+                "new filename) before clicking Edit.",
+            )
+            return
+        if not path.exists():
+            # First-time create — seed with a minimal stub so the
+            # editor opens to something useful, then write it.
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    "<p>Hi {{first_name}},</p>\n\n<p></p>\n",
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                messagebox.showerror("Couldn't create file", str(e))
+                return
+        prompt_html_template_editor(
+            self.frame.winfo_toplevel(),
+            path,
+            custom_var_names=self._current_prompt_var_names(),
+        )
+
+    def _open_template_in_word(self) -> None:
+        """Launch the selected template directly in MS Word (via COM),
+        falling back to the OS-default opener if Word isn't installed."""
+        from tkinter import messagebox
+        path = self._selected_template_path()
+        if path is None:
+            messagebox.showinfo(
+                "Pick a template first",
+                "Select a body template before clicking Word.",
+            )
+            return
+        if not path.exists():
+            messagebox.showinfo(
+                "File doesn't exist yet",
+                "Click Edit first to create the template, then try "
+                "again.",
+            )
+            return
+        ok, msg = _open_template_in_word(path)
+        if not ok:
+            try:
+                import os
+                os.startfile(str(path))
+            except Exception as e:
+                messagebox.showerror(
+                    "Couldn't open file",
+                    f"{msg}\n\nAnd OS-default open also failed: {e}",
+                )
+
     def _open_template_file(self) -> None:
-        """Open the currently-selected body template in the user's
-        default editor. Windows: os.startfile. Quiet no-op if file
-        is missing."""
+        """Legacy: open the selected template in the OS-default editor.
+        Kept for parity with older code paths but unused by the email
+        section now (Edit + Word buttons replaced it)."""
         import os
         name = self.email_body_combo.get().strip()
         if not name or "(none" in name:
