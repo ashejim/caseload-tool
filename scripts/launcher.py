@@ -1405,10 +1405,211 @@ def _open_template_in_word(path: Path) -> tuple[bool, str]:
         return False, f"Word not available: {e}"
 
 
+def prompt_add_image_dialog(
+    parent, templates_dir: Path,
+) -> tuple[Optional[str], Optional[str]]:
+    """Modal dialog for adding an inline (CID-embedded) image to a
+    template. Walks the user through choosing a file, sizing it, and
+    optionally linking it; on Insert it copies the file into the
+    templates folder (if not already there) and builds an `<img
+    src="cid:STEM">` snippet for the editor to drop at the cursor.
+
+    Returns:
+        (html_snippet, filename) on Insert — caller drops the
+        snippet into the template AND registers `filename` in the
+        scenario's inline_images list so the runtime knows to
+        attach + bind the CID. Returns (None, None) on Cancel.
+
+    Pillow is used opportunistically to read natural dimensions when
+    the user picks a file, so width/height auto-populate."""
+    from tkinter import messagebox, filedialog
+    import shutil
+
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Add image")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    result = {"html": None, "filename": None}
+    state = {"src_path": None}
+
+    # Row 1: source file picker
+    file_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    file_row.pack(fill="x", padx=14, pady=(14, 4))
+    ctk.CTkLabel(file_row, text="Image file:", width=80, anchor="w").pack(side="left")
+    file_entry = ctk.CTkEntry(
+        file_row, placeholder_text="click Browse…", width=320,
+    )
+    file_entry.pack(side="left", padx=(4, 4))
+
+    def on_browse() -> None:
+        path = filedialog.askopenfilename(
+            parent=dialog,
+            title="Choose image",
+            filetypes=[
+                ("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        p = Path(path)
+        state["src_path"] = p
+        file_entry.delete(0, "end")
+        file_entry.insert(0, str(p))
+        # Auto-fill width/height from the image's natural dimensions.
+        # Failure (Pillow missing, file unreadable) is silent — the
+        # user can still type values manually.
+        try:
+            from PIL import Image
+            with Image.open(p) as im:
+                w, h = im.size
+            width_entry.delete(0, "end")
+            width_entry.insert(0, str(w))
+            height_entry.delete(0, "end")
+            height_entry.insert(0, str(h))
+        except Exception:
+            pass
+
+    ctk.CTkButton(
+        file_row, text="Browse…", width=90, command=on_browse,
+    ).pack(side="left", padx=(4, 0))
+
+    # Row 2: dimensions
+    dim_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    dim_row.pack(fill="x", padx=14, pady=4)
+    ctk.CTkLabel(dim_row, text="Width:", width=80, anchor="w").pack(side="left")
+    width_entry = ctk.CTkEntry(
+        dim_row, placeholder_text="px (auto)", width=100,
+    )
+    width_entry.pack(side="left", padx=(4, 12))
+    ctk.CTkLabel(dim_row, text="Height:").pack(side="left")
+    height_entry = ctk.CTkEntry(
+        dim_row, placeholder_text="px (auto)", width=100,
+    )
+    height_entry.pack(side="left", padx=(4, 0))
+
+    # Row 3: alt text
+    alt_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    alt_row.pack(fill="x", padx=14, pady=4)
+    ctk.CTkLabel(alt_row, text="Alt text:", width=80, anchor="w").pack(side="left")
+    alt_entry = ctk.CTkEntry(
+        alt_row, placeholder_text="shown if image fails / for accessibility",
+        width=380,
+    )
+    alt_entry.pack(side="left", padx=(4, 0))
+
+    # Row 4: optional clickable link
+    link_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    link_row.pack(fill="x", padx=14, pady=4)
+    ctk.CTkLabel(link_row, text="Link to:", width=80, anchor="w").pack(side="left")
+    link_entry = ctk.CTkEntry(
+        link_row,
+        placeholder_text="optional — clicking the image opens this URL",
+        width=380,
+    )
+    link_entry.pack(side="left", padx=(4, 0))
+
+    # Hint
+    ctk.CTkLabel(
+        dialog,
+        text="The image gets copied to your templates folder and "
+             "embedded via cid: so it travels with the email (no "
+             "remote-image warning on the recipient's side).",
+        font=ctk.CTkFont(size=11),
+        text_color=("gray45", "gray65"),
+        wraplength=480, justify="left",
+    ).pack(padx=14, pady=(6, 4), anchor="w")
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(fill="x", padx=14, pady=(8, 14))
+
+    def do_insert() -> None:
+        src = state["src_path"]
+        if not src or not Path(src).exists():
+            messagebox.showerror(
+                "No image selected",
+                "Click Browse… and choose an image file first.",
+                parent=dialog,
+            )
+            return
+        target = templates_dir / src.name
+        if src.resolve() != target.resolve():
+            try:
+                templates_dir.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    if not messagebox.askyesno(
+                        "Overwrite?",
+                        f"{src.name} already exists in your templates "
+                        f"folder. Overwrite with the new file?",
+                        parent=dialog,
+                    ):
+                        return
+                shutil.copyfile(src, target)
+            except Exception as e:
+                messagebox.showerror(
+                    "Copy failed",
+                    f"Couldn't copy the image into the templates folder:\n\n{e}",
+                    parent=dialog,
+                )
+                return
+        cid = target.stem
+        # html.escape would over-escape attribute values; for the
+        # subset of chars that matter inside an attribute (`"`) a
+        # simple replace is enough.
+        def _attr(s: str) -> str:
+            return s.replace("&", "&amp;").replace('"', "&quot;")
+        attrs = [f'src="cid:{cid}"']
+        alt = alt_entry.get().strip()
+        if alt:
+            attrs.append(f'alt="{_attr(alt)}"')
+        w = width_entry.get().strip()
+        if w:
+            attrs.append(f'width="{_attr(w)}"')
+        h = height_entry.get().strip()
+        if h:
+            attrs.append(f'height="{_attr(h)}"')
+        attrs.append('style="display:block; border:0;"')
+        img_tag = f"<img {' '.join(attrs)} />"
+        link = link_entry.get().strip()
+        if link:
+            snippet = f'<p>\n  <a href="{_attr(link)}">\n    {img_tag}\n  </a>\n</p>'
+        else:
+            snippet = f"<p>{img_tag}</p>"
+        result["html"] = snippet
+        result["filename"] = target.name
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    def do_cancel() -> None:
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    ctk.CTkButton(
+        btn_row, text="Insert", width=110, command=do_insert,
+    ).pack(side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text="Cancel", width=90, command=do_cancel,
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=4)
+    dialog.protocol("WM_DELETE_WINDOW", do_cancel)
+    dialog.bind("<Escape>", lambda _e: do_cancel())
+    dialog.lift()
+    dialog.focus_force()
+
+    parent.wait_window(dialog)
+    return result["html"], result["filename"]
+
+
 def prompt_html_template_editor(
     parent,
     path: Path,
     custom_var_names: Optional[list[str]] = None,
+    on_image_added: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """Modal HTML editor for an email body template. Returns True if
     the file was saved (Save, Save as, or Save & Open in MS Word).
@@ -1483,6 +1684,36 @@ def prompt_html_template_editor(
             [(v, v) for v in custom_var_names],
             highlight=True,
         )
+
+    # Insert-image button row. Opens the image dialog, copies the
+    # picked file into TEMPLATES_DIR (if not already there), drops a
+    # `<img src="cid:STEM">` snippet at the cursor, and registers
+    # the filename on the scenario's inline_images list via the
+    # `on_image_added` callback.
+    insert_row = ctk.CTkFrame(toolbar, fg_color="transparent")
+    insert_row.pack(fill="x", pady=(6, 2))
+    ctk.CTkLabel(
+        insert_row, text="Insert:", width=70, anchor="w",
+        font=ctk.CTkFont(size=11, weight="bold"),
+    ).pack(side="left", padx=(0, 4))
+
+    def on_add_image() -> None:
+        html, filename = prompt_add_image_dialog(dialog, TEMPLATES_DIR)
+        if html:
+            text_box.insert("insert", "\n" + html + "\n")
+            text_box.focus_force()
+            if on_image_added and filename:
+                try:
+                    on_image_added(filename)
+                except Exception:
+                    pass
+
+    ctk.CTkButton(
+        insert_row, text="🖼  Add image…", height=24,
+        command=on_add_image,
+        font=ctk.CTkFont(size=11),
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=2)
 
     # View-size row. EDITOR VIEW ONLY — the sent email's font/size is
     # set per-scenario in the email section of the editor (so it
@@ -3036,6 +3267,7 @@ class ScenarioEditor:
             self.frame.winfo_toplevel(),
             path,
             custom_var_names=self._current_prompt_var_names(),
+            on_image_added=self._add_inline_image,
         )
 
     def _new_template(self) -> None:
@@ -3080,7 +3312,21 @@ class ScenarioEditor:
             self.frame.winfo_toplevel(),
             path,
             custom_var_names=self._current_prompt_var_names(),
+            on_image_added=self._add_inline_image,
         )
+
+    def _add_inline_image(self, filename: str) -> None:
+        """Add `filename` to the email's Inline Images field, unless
+        already listed. Called by the HTML editor's image-insert
+        dialog so the runtime knows to attach this file + bind its
+        CID when the email composes."""
+        current = self.email_images_entry.get().strip()
+        existing = [s.strip() for s in current.split(",") if s.strip()]
+        if filename in existing:
+            return
+        existing.append(filename)
+        self.email_images_entry.delete(0, "end")
+        self.email_images_entry.insert(0, ", ".join(existing))
 
     def _open_template_in_word(self) -> None:
         """Launch the selected template directly in MS Word (via COM),
