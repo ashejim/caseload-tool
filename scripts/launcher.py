@@ -2041,8 +2041,10 @@ _OP_SHORT_TO_LONG = {
 
 
 class FilterRow:
-    """One filter inside a batch scenario's Filters section. A row is
-    `<column dropdown>  <op dropdown>  <value entry>  ✕`."""
+    """One filter inside a batch scenario's Filters section. Layout:
+    `<column ▾>  <op ▾>  <value ▾>  ✕`, plus a small hint label
+    below that updates with the chosen op to show expected value
+    formats (date shorthand, within-presets, numeric, etc.)."""
 
     def __init__(self, parent, columns: list[str], on_delete: Callable):
         self.frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -2050,24 +2052,89 @@ class FilterRow:
         self.column_combo = ctk.CTkComboBox(
             self.frame,
             values=columns if columns else ["(refresh columns)"],
-            width=180,
+            width=220,
         )
         self.column_combo.grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
         self.op_combo = ctk.CTkComboBox(
-            self.frame, values=list(FILTER_OPS), width=140, state="readonly",
+            self.frame, values=list(FILTER_OPS), width=140,
+            state="readonly", command=self._on_op_change,
         )
         self.op_combo.set("is")
         self.op_combo.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=2)
-        self.value_entry = ctk.CTkEntry(
-            self.frame,
-            placeholder_text="value (this month, today-7d, Pass, …)",
+        # Value is a combo (not entry) so we can dynamically populate
+        # `values=…` with suggestions per op — within-presets for "is
+        # within", relative-date shorthand for date ops, etc. State
+        # stays "normal" so the user can still type freeform values
+        # the suggestions don't cover.
+        self.value_combo = ctk.CTkComboBox(
+            self.frame, values=[""], width=200,
         )
-        self.value_entry.grid(row=0, column=2, sticky="ew", padx=(0, 4), pady=2)
+        self.value_combo.set("")
+        self.value_combo.grid(row=0, column=2, sticky="ew", padx=(0, 4), pady=2)
         ctk.CTkButton(
             self.frame, text="✕", width=28, height=28,
             **SECONDARY_BTN_KWARGS,
             command=lambda: on_delete(self),
         ).grid(row=0, column=3, padx=(4, 0), pady=2)
+        # Hint label spans under the row; text changes with op via
+        # `_on_op_change`. Lives in row=1 so it doesn't push the
+        # main controls around.
+        self.hint_label = ctk.CTkLabel(
+            self.frame, text="", font=ctk.CTkFont(size=10),
+            text_color=("gray40", "gray65"), anchor="w",
+            justify="left",
+        )
+        self.hint_label.grid(
+            row=1, column=0, columnspan=4,
+            sticky="w", padx=(2, 4), pady=(0, 2),
+        )
+        # Initialize hint + value-combo suggestions for the default op.
+        self._on_op_change("is")
+
+    def _on_op_change(self, op: str) -> None:
+        """Sync the value-field suggestions and hint label to `op`.
+        Called whenever the op dropdown selection changes (and once
+        at init / once during `load` to set the initial state)."""
+        date_ops = ("is before", "is after", "is on")
+        numeric_ops = ("more than", "less than", "at least", "at most")
+        text_ops = ("is", "is not", "contains", "does not contain")
+
+        if op in date_ops:
+            self.value_combo.configure(state="normal", values=[
+                "today", "today-7d", "today-30d",
+                "today+7d", "today+30d",
+            ])
+            self.hint_label.configure(
+                text="Date — pick a relative shorthand from the dropdown, "
+                     "or type 2026-05-21 / 5/21/2026.",
+            )
+        elif op == "is within":
+            self.value_combo.configure(
+                state="normal", values=list(caseload_filter.WITHIN_PRESETS),
+            )
+            self.hint_label.configure(
+                text="Pick a preset: "
+                     + ", ".join(caseload_filter.WITHIN_PRESETS) + ".",
+            )
+        elif op in numeric_ops:
+            self.value_combo.configure(state="normal", values=[""])
+            self.hint_label.configure(
+                text="Number — e.g. 0, 1.5, 12. The column's cell must "
+                     "also parse as a number.",
+            )
+        elif op in ("is empty", "is not empty"):
+            self.value_combo.set("")
+            self.value_combo.configure(state="disabled", values=[""])
+            self.hint_label.configure(text="(no value needed for this op)")
+        elif op in text_ops:
+            self.value_combo.configure(state="normal", values=[""])
+            self.hint_label.configure(
+                text="Text — type the value, or comma-separate for OR "
+                     "match (e.g. 'Pass, NoPass'). Case-insensitive.",
+            )
+        else:
+            self.value_combo.configure(state="normal", values=[""])
+            self.hint_label.configure(text="")
 
     def set_columns(self, columns: list[str]) -> None:
         """Replace the column dropdown's option list. Preserves the
@@ -2079,21 +2146,31 @@ class FilterRow:
             self.column_combo.set(current)
 
     def load(self, filt: dict) -> None:
-        self.column_combo.set(filt.get("column", ""))
+        # Translate stored column (could be raw CSV header or display
+        # name from prior saves) to display name for the dropdown.
+        # `resolve_column` at runtime maps either form back, so this
+        # is purely a UI-side display nicety.
+        self.column_combo.set(
+            caseload_csv.display_for_column(filt.get("column", "")),
+        )
         op = filt.get("op", "")
-        self.op_combo.set(_OP_SHORT_TO_LONG.get(op, op))
+        long_op = _OP_SHORT_TO_LONG.get(op, op)
+        self.op_combo.set(long_op)
+        # Run op-change BEFORE writing the value, since "is empty" /
+        # "is not empty" disables the value field and a write would
+        # be silently rejected.
+        self._on_op_change(long_op)
         value = filt.get("value", "")
         if isinstance(value, list):
             value = ", ".join(str(v) for v in value)
-        self.value_entry.delete(0, "end")
-        if value:
-            self.value_entry.insert(0, str(value))
+        if value and long_op not in ("is empty", "is not empty"):
+            self.value_combo.set(str(value))
 
     def serialize(self) -> dict:
         return {
             "column": self.column_combo.get().strip(),
             "op": self.op_combo.get(),
-            "value": self.value_entry.get(),
+            "value": self.value_combo.get(),
         }
 
 
@@ -4513,12 +4590,18 @@ class App:
             pass
 
     def _get_caseload_columns(self) -> list[str]:
-        """Current cached caseload column names (CSV header keys).
-        Empty list when no CSV has been loaded yet. Wired into
-        ScenarioEditor so the Filters dropdown can populate live."""
+        """Current caseload columns presented as user-facing display
+        names (e.g. 'Last Assigned CI Contact' instead of the raw CSV
+        header 'MyCourseContact'). Empty list when no CSV has been
+        loaded yet. The runtime filter engine reverses this via
+        `caseload_csv.resolve_column`, so the dropdown can save the
+        display name and still match the CSV at fire time."""
         if not self._caseload_rows:
             return []
-        return list(self._caseload_rows[0].keys())
+        return [
+            caseload_csv.display_for_column(h)
+            for h in self._caseload_rows[0].keys()
+        ]
 
     def _refresh_caseload_columns_for_editor(self) -> list[str]:
         """↻ Refresh columns button in the filter editor: forces a

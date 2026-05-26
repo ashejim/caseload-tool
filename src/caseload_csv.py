@@ -66,6 +66,23 @@ def resolve_column(name: str, csv_headers: list[str]) -> str:
     return DISPLAY_TO_CSV.get(name, name)
 
 
+# Reverse direction: CSV header → display name. Used by the editor's
+# Filters dropdown to show "Last Assigned CI Contact" instead of the
+# raw "MyCourseContact". Unmapped headers pass through unchanged
+# (the CSV may carry columns we haven't catalogued).
+CSV_TO_DISPLAY: dict[str, str] = {v: k for k, v in DISPLAY_TO_CSV.items()}
+
+
+def display_for_column(csv_header: str) -> str:
+    """Companion to `resolve_column` — CSV header → user-facing label.
+    Returns the input unchanged when we don't have a mapping (so
+    custom CSV columns still show up in the dropdown, just under
+    their raw names)."""
+    if not csv_header:
+        return csv_header
+    return CSV_TO_DISPLAY.get(csv_header, csv_header)
+
+
 def load_caseload_csv(path: Path) -> list[dict]:
     """Read a Salesforce caseload CSV export. Returns a list of dicts
     keyed by CSV header name. Trailing-empty-column rows (Salesforce
