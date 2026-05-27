@@ -34,6 +34,12 @@ caseload.csv
 # Browser-preview temp written by the HTML editor's Preview button.
 _preview.html
 
+# User-specific email templates — only the canonical sample ships
+# with the repo. Real students' emails contain identifiable
+# correspondence; keep them out of source control (FERPA).
+templates/*
+!templates/sample_followup.html
+
 # Network-capture dumps from the 🔬 Capture button. Contain
 # Salesforce session cookies + aura.token (active credentials)
 # AND student PII inside the request bodies. Never commit.
