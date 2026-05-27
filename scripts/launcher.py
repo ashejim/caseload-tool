@@ -2306,6 +2306,148 @@ def _save_dialog_geometry(dialog, key: str) -> None:
         pass
 
 
+def prompt_calendar_pick(parent, initial_date=None):
+    """Small monthly calendar picker. Click a day → returns that
+    `datetime.date`. Returns None on cancel. Built from CTk widgets
+    + Python's stdlib `calendar` module — no third-party deps.
+
+    Used by FilterRow's date operators (is before / is after / is
+    on) so users can click a date instead of typing the format."""
+    import calendar as _cal
+    from datetime import date as _date
+
+    today = _date.today()
+    base = initial_date if initial_date else today
+    state = {"year": base.year, "month": base.month, "selected": None}
+
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Pick a date")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.geometry("280x300")
+    # Topmost-claw-back (same pattern as our other modals so a busy
+    # background window can't bury it).
+    dialog.lift()
+    dialog.focus_force()
+    dialog.after(120, lambda: (dialog.lift(), dialog.focus_force()))
+
+    # Header: ◀ Month Year ▶
+    header = ctk.CTkFrame(dialog, fg_color="transparent")
+    header.pack(fill="x", padx=8, pady=(8, 0))
+
+    def _change_month(delta: int) -> None:
+        m = state["month"] + delta
+        y = state["year"]
+        while m > 12:
+            m -= 12
+            y += 1
+        while m < 1:
+            m += 12
+            y -= 1
+        state["month"] = m
+        state["year"] = y
+        _refresh()
+
+    ctk.CTkButton(
+        header, text="◀", width=32, height=28,
+        command=lambda: _change_month(-1),
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="left")
+    month_label = ctk.CTkLabel(
+        header, text="", font=ctk.CTkFont(size=13, weight="bold"),
+    )
+    month_label.pack(side="left", expand=True)
+    ctk.CTkButton(
+        header, text="▶", width=32, height=28,
+        command=lambda: _change_month(1),
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="right")
+
+    # Day grid
+    grid = ctk.CTkFrame(dialog, fg_color="transparent")
+    grid.pack(padx=8, pady=4)
+    # Sunday-first matches the US convention WGU students likely
+    # use. (Tk's calendar.firstweekday=6 starts on Sunday.)
+    dow_labels = ("Su", "Mo", "Tu", "We", "Th", "Fr", "Sa")
+    for i, d in enumerate(dow_labels):
+        ctk.CTkLabel(
+            grid, text=d, width=32, anchor="center",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray40", "gray70"),
+        ).grid(row=0, column=i, padx=1, pady=1)
+
+    day_buttons: list[ctk.CTkButton] = []
+
+    def _select(day: int) -> None:
+        state["selected"] = _date(state["year"], state["month"], day)
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    def _refresh() -> None:
+        month_label.configure(
+            text=_date(state["year"], state["month"], 1).strftime("%B %Y")
+        )
+        for b in day_buttons:
+            try: b.destroy()
+            except Exception: pass
+        day_buttons.clear()
+        cal_iter = _cal.Calendar(firstweekday=6).monthdayscalendar(
+            state["year"], state["month"],
+        )
+        for row_idx, week in enumerate(cal_iter, start=1):
+            for col_idx, day in enumerate(week):
+                if day == 0:
+                    continue
+                btn_kwargs = dict(SECONDARY_BTN_KWARGS)
+                # Highlight today in the primary accent color so it's
+                # easy to find on the grid.
+                if (state["year"], state["month"], day) == (
+                    today.year, today.month, today.day
+                ):
+                    btn_kwargs.pop("fg_color", None)
+                    btn_kwargs.pop("text_color", None)
+                btn = ctk.CTkButton(
+                    grid, text=str(day), width=32, height=28,
+                    command=lambda d=day: _select(d),
+                    font=ctk.CTkFont(size=11),
+                    **btn_kwargs,
+                )
+                btn.grid(row=row_idx, column=col_idx, padx=1, pady=1)
+                day_buttons.append(btn)
+
+    # Bottom: jump-to-today + cancel.
+    bottom = ctk.CTkFrame(dialog, fg_color="transparent")
+    bottom.pack(fill="x", padx=8, pady=(4, 8))
+
+    def _jump_today() -> None:
+        state["year"] = today.year
+        state["month"] = today.month
+        _refresh()
+
+    ctk.CTkButton(
+        bottom, text="Today", width=70, height=26,
+        command=_jump_today, **SECONDARY_BTN_KWARGS,
+    ).pack(side="left")
+    ctk.CTkButton(
+        bottom, text="Cancel", width=70, height=26,
+        command=lambda: (
+            dialog.grab_release() if dialog.winfo_exists() else None,
+            dialog.destroy() if dialog.winfo_exists() else None,
+        ),
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="right")
+
+    dialog.bind("<Escape>", lambda _e: dialog.destroy())
+    dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+
+    _refresh()
+    parent.wait_window(dialog)
+    return state["selected"]
+
+
 def prompt_find_and_pick(
     parent,
     do_search: Callable[[str], list[str]],
@@ -3387,11 +3529,22 @@ class FilterRow:
         )
         self.value_combo.set("")
         self.value_combo.grid(row=0, column=2, sticky="ew", padx=(0, 4), pady=2)
+        # Calendar pick button — visible only for date ops, toggled
+        # in `_on_op_change`. Lives between value and ✕ so the date
+        # ops show: [column] [op] [value] [📅] [✕]; other ops show
+        # the same row minus the 📅 cell.
+        self.cal_btn = ctk.CTkButton(
+            self.frame, text="📅", width=32, height=28,
+            command=self._open_calendar_picker,
+            **SECONDARY_BTN_KWARGS,
+        )
+        # Don't grid here — _on_op_change decides whether to show it
+        # based on the initial op.
         ctk.CTkButton(
             self.frame, text="✕", width=28, height=28,
             **SECONDARY_BTN_KWARGS,
             command=lambda: on_delete(self),
-        ).grid(row=0, column=3, padx=(4, 0), pady=2)
+        ).grid(row=0, column=4, padx=(4, 0), pady=2)
         # Hint label spans under the row; text changes with op via
         # `_on_op_change`. Lives in row=1 so it doesn't push the
         # main controls around.
@@ -3415,19 +3568,29 @@ class FilterRow:
         numeric_ops = ("more than", "less than", "at least", "at most")
         text_ops = ("is", "is not", "contains", "does not contain")
 
+        # Calendar button is date-only. Default to hidden; date branch
+        # below re-shows it. Wrapped in try so a partially-initialized
+        # FilterRow (e.g. during load) doesn't blow up if the button
+        # isn't laid out yet.
+        try:
+            self.cal_btn.grid_remove()
+        except Exception:
+            pass
+
         if op in date_ops:
             self.value_combo.configure(state="normal", values=[
                 "today",
                 "today-7d", "today-14d", "today-30d",
-                "today-60d", "today-90d",
                 "today+7d", "today+14d", "today+30d",
-                "today+60d", "today+90d",
             ])
             self.hint_label.configure(
-                text="Date — pick a preset from the dropdown OR type any "
-                     "offset like today-21d / today+45d, or an absolute "
-                     "date like 2026-05-21 / 5/21/2026.",
+                text="e.g. today, today-21d, today+45d, 5/21/2026, "
+                     "2026-05-21 — or click 📅",
             )
+            try:
+                self.cal_btn.grid(row=0, column=3, padx=(0, 4), pady=2)
+            except Exception:
+                pass
         elif op == "is within":
             self.value_combo.configure(
                 state="normal", values=list(caseload_filter.WITHIN_PRESETS),
@@ -3455,6 +3618,28 @@ class FilterRow:
         else:
             self.value_combo.configure(state="normal", values=[""])
             self.hint_label.configure(text="")
+
+    def _open_calendar_picker(self) -> None:
+        """Pop the small monthly calendar widget. If the field already
+        contains a parseable absolute date, the picker opens to that
+        month; otherwise it opens to the current month. The picked
+        date lands in the value combo as YYYY-MM-DD — the engine
+        accepts that format directly via _parse_date_cell."""
+        from datetime import datetime as _dt
+        current = (self.value_combo.get() or "").strip()
+        initial = None
+        if current and current != "today":
+            for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+                try:
+                    initial = _dt.strptime(current, fmt).date()
+                    break
+                except ValueError:
+                    continue
+        picked = prompt_calendar_pick(
+            self.frame.winfo_toplevel(), initial_date=initial,
+        )
+        if picked is not None:
+            self.value_combo.set(picked.isoformat())
 
     def set_columns(self, columns: list[str]) -> None:
         """Replace the column dropdown's option list. Preserves the
