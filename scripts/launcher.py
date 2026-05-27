@@ -1390,6 +1390,44 @@ _TEMPLATE_INSERT_VARS_USER = [
 ]
 
 
+# CSV column names we'll look for when building student context
+# from a caseload row (batch mode). Salesforce list-view exports
+# include whatever columns the user has on their view, and the
+# header names vary by configuration — these cover what we've
+# seen in the wild. Tried in order; first non-empty match wins.
+_CSV_STUDENT_EMAIL_COLS = [
+    "StudentEmail", "Student Email", "studentemail", "stuemail",
+    "PersonalEmail", "Personal Email", "Email",
+]
+_CSV_PM_EMAIL_COLS = [
+    "MentorEmail", "Mentor Email", "mentoremail",
+    "PMEmail", "PM Email",
+    "ProgramMentorEmail", "Program Mentor Email",
+]
+
+
+def _first_present_value(row: dict, candidates: list[str]) -> str:
+    """Pick the first non-empty value among `candidates` (a list of
+    possible column names). Returns "" if none of them exist or all
+    are blank. Used to be robust against CSV column-naming variance
+    without making the user remember the exact spelling."""
+    for c in candidates:
+        v = row.get(c, "")
+        if v is not None:
+            s = str(v).strip()
+            if s:
+                return s
+    return ""
+
+
+def _email_columns_present(row: dict) -> list[str]:
+    """Return every column name in `row` that looks like an email
+    column (case-insensitive 'email' substring). For diagnostic
+    logging when the known names didn't match — tells the user
+    which actual column header to add to our recognizer list."""
+    return [k for k in row.keys() if "email" in k.lower()]
+
+
 # Per-appearance-mode color palette for the HTML editor's syntax
 # highlighter. Picked to read clearly on each background without
 # requiring an exact theme match; close to VS Code defaults.
@@ -3762,6 +3800,11 @@ class App:
         # DOM-scroll scrape — slower but always works.
         self._caseload_rows: Optional[list[dict]] = None
         self._caseload_csv_mtime = None
+        # Latch for the per-session CSV-email-columns diagnostic. We
+        # log the helpful "your CSV doesn't have an email column we
+        # recognize, here's what IS there" message once per session
+        # rather than on every student in a batch.
+        self._email_diag_logged = False
         self._reload_caseload_cache(silent=True)
 
         # Busy-state guard so the user can't fire a second action
@@ -4515,15 +4558,37 @@ class App:
             # style placeholders in the email body / subject / to
             # resolve against the batch-wide prompt input.
             if has_email:
-                ctx_info = self._get_student_context_blocking(
-                    name_hint=student_name,
-                )
-                if ctx_info is None:
-                    self._append_log(
-                        f"Skipping {student_name!r}: couldn't read context."
-                    )
-                    skipped.append((student_name, "no context"))
-                    continue
+                # Build context from the CSV row directly. The earlier
+                # _get_student_context_blocking path scraped the
+                # Caseload table in the DOM — but after fast-find
+                # we're on the student's record page, that table
+                # isn't there, so the scrape always returned empty
+                # emails. The CSV has everything we need.
+                ctx_info = self._ctx_from_csv_row(row)
+                # One-time diagnostic the first time emails are
+                # missing: list what email-looking columns ARE in the
+                # CSV. Helps the user add the right column name to
+                # their Caseload list view in Salesforce.
+                if not ctx_info["student_email"] and not self._email_diag_logged:
+                    self._email_diag_logged = True
+                    present = _email_columns_present(row)
+                    if present:
+                        self._append_log(
+                            "CSV email columns found but not recognized: "
+                            + ", ".join(repr(c) for c in present) + ". "
+                            "Tell the launcher dev to add these names to "
+                            "the known list, or rename your Caseload view "
+                            "columns to one of: Student Email / "
+                            "Mentor Email."
+                        )
+                    else:
+                        self._append_log(
+                            "Your caseload CSV has no email columns. "
+                            "In Salesforce, add 'Student Email' and "
+                            "'Program Mentor Email' (or similar) columns "
+                            "to your Caseload list view, then click "
+                            "↻ Caseload to refresh."
+                        )
                 ctx_info = {**ctx_info, **prompt_vars}
                 if not self._send_scenario_email(
                     scenario.email, ctx_info, auto_send=True,
@@ -4638,6 +4703,45 @@ class App:
         )
         self.root.wait_variable(done_var)
         return holder["success"]
+
+    def _ctx_from_csv_row(self, row: dict) -> dict:
+        """Build the variable dict an email/note render needs, sourced
+        from a single caseload CSV row. Used in batch mode where the
+        DOM-scrape path would fail (after fast-find clicks a student
+        we're on their record page, not the Caseload list — the
+        scrape sees no Caseload table and returns blank emails).
+
+        Tries each catalogued column name (DISPLAY_TO_CSV pairs +
+        common display labels) and falls back to "" for any field
+        that isn't present. Emails go through the longer alias list
+        in `_CSV_STUDENT_EMAIL_COLS` / `_CSV_PM_EMAIL_COLS` since
+        their names vary the most across user-configured views.
+        `user_name` / `user_email` are NOT set here — _send_scenario_
+        email tops those up from Outlook's CurrentUser."""
+        def _first(*keys: str) -> str:
+            for k in keys:
+                v = row.get(k, "")
+                if v is not None:
+                    s = str(v).strip()
+                    if s:
+                        return s
+            return ""
+
+        name = _first("Name")
+        first, _, last = name.partition(" ")
+        return {
+            "full_name": name,
+            "first_name": first,
+            "last_name": last,
+            "student_email": _first_present_value(
+                row, _CSV_STUDENT_EMAIL_COLS,
+            ),
+            "student_id": _first("StudentID", "Student ID"),
+            "course_code": _first("CourseCode", "Course Code"),
+            "pm_name": _first("MentorName", "Program Mentor"),
+            "pm_email": _first_present_value(row, _CSV_PM_EMAIL_COLS),
+            "program_name": _first("ProgramName", "Program Name"),
+        }
 
     def _get_student_context_blocking(self, name_hint: str = "") -> Optional[dict]:
         """Ask the worker to read the active student's context (email,
@@ -4886,10 +4990,23 @@ class App:
             to = student_ctx.get("student_email", "")
         cc = student_ctx.get("pm_email", "") if email_cfg.cc_pm else ""
         if not to:
+            full_name = student_ctx.get('full_name') or 'this student'
+            if auto_send:
+                # Batch mode — popping a "no email" modal per student
+                # would force the user to click through every blank
+                # entry in a multi-student run. Just log + skip.
+                self._append_log(
+                    f"Skipping {full_name!r}: no student email in "
+                    "caseload row. Add a Student Email column to your "
+                    "Salesforce Caseload view and ↻ refresh."
+                )
+                return False
+            # Interactive (single-student) mode — keep the existing
+            # ask-and-proceed flow so the user can opt to file just
+            # the note without an email.
             if not messagebox.askyesno(
                 "No student email",
-                f"Couldn't find an email address for "
-                f"{student_ctx.get('full_name') or 'this student'!r}.\n\n"
+                f"Couldn't find an email address for {full_name!r}.\n\n"
                 "Proceed with the note only?",
             ):
                 return False
