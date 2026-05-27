@@ -56,7 +56,7 @@ from src.student_lookup import (
     get_active_student_name,
     lookup_caseload_student,
     _parse_mailto,
-    _extract_wgu_email,
+    scrape_student_email_from_page,
 )
 
 
@@ -189,6 +189,15 @@ class BrowserWorker:
         # before sharing.
         self._capture_active = False
         self._capture_log: list[dict] = []
+        # One-shot diagnostic latches for the batch-email scrape path
+        # in `_click_match_by_filter`. The first batch of the session
+        # logs WHAT the row mailto carried (or didn't), and WHAT the
+        # contact-card scrape found (or didn't), so users can paste
+        # the result here when emails aren't resolving. Quiet after
+        # that — chatty diagnostics on every student would drown the
+        # actual progress messages.
+        self._mailto_diag_logged = False
+        self._contact_card_diag_logged = False
         self.ready_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -446,16 +455,13 @@ class BrowserWorker:
             success = False
             row_info: dict = {"pm_email": "", "student_email": ""}
             try:
+                # _click_match_by_filter now owns the post-click
+                # settle wait (so its own contact-card scrape runs
+                # against a loaded page); the dispatch wrapper no
+                # longer adds a redundant second wait.
                 success, row_info = self._click_match_by_filter(
                     ctx, query, expected_name=expected_name,
                 )
-                if success:
-                    tgt = self._active_page(ctx)
-                    if tgt is not None:
-                        try:
-                            tgt.wait_for_timeout(2000)
-                        except Exception:
-                            pass
             finally:
                 on_done(success, row_info)
         elif cmd[0] == "DOWNLOAD_CASELOAD_CSV":
@@ -836,24 +842,67 @@ class BrowserWorker:
         except Exception:
             pass
 
+        # Quick diagnostic so the next layer (the batch loop) can
+        # see whether the mailto step succeeded vs. silently went
+        # empty. Only emit once per session — chatty otherwise.
+        if not self._mailto_diag_logged:
+            self._mailto_diag_logged = True
+            if row_info["pm_email"] or row_info["student_email"]:
+                self.on_status(
+                    f"Row mailto: pm_email={row_info['pm_email']!r}, "
+                    f"student_email={row_info['student_email']!r}"
+                )
+            else:
+                self.on_status(
+                    "Row had no mailto: link — Caseload view may be "
+                    "missing the 'Email Student' action column. Will "
+                    "try the contact card after navigation."
+                )
+
         if not click_caseload_row(row, cname, name_idx, on_status=self.on_status):
             self.on_status(f"Fast-find: click on {cname!r} failed.")
             return False, row_info
         self.on_status(f"Fast-find navigated to {cname!r}.")
 
-        # AFTER clicking: when the row's mailto didn't carry the
-        # student address (some Salesforce configs only put the PM
-        # there), try the contact card on the student's record page
-        # via _extract_wgu_email. The 2s wait downstream in the
-        # dispatch loop is the page-settling cue; this just runs as
-        # an opportunistic second pass.
-        if not row_info["student_email"]:
+        # Wait for the destination page to settle BEFORE scraping the
+        # contact card. (The dispatch wrapper used to do this 2s
+        # wait, but that ran AFTER this function returned — so the
+        # earlier post-click scrape was racing an unloaded page and
+        # always coming back empty.)
+        post_click_target = self._active_page(ctx)
+        if post_click_target is not None:
             try:
-                tgt = self._active_page(ctx)
-                if tgt is not None:
-                    found = _extract_wgu_email(tgt)
-                    if found:
-                        row_info["student_email"] = found
+                post_click_target.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+        # AFTER click + settle: try the contact card on the
+        # student's record page. Sweeps several common Salesforce
+        # email-field labels + a generic mailto fallback so this
+        # works regardless of whether the org calls the field
+        # "WGU Email", "Personal Email", "Student Email", etc.
+        if post_click_target is not None and not row_info["student_email"]:
+            try:
+                found = scrape_student_email_from_page(
+                    post_click_target,
+                    pm_email=row_info.get("pm_email", ""),
+                )
+                if found:
+                    row_info["student_email"] = found
+                    if not self._contact_card_diag_logged:
+                        self._contact_card_diag_logged = True
+                        self.on_status(
+                            f"Contact-card scrape found student email: {found}"
+                        )
+                elif not self._contact_card_diag_logged:
+                    self._contact_card_diag_logged = True
+                    self.on_status(
+                        "Contact-card scrape found no student email "
+                        "on the record page. The contact's email field "
+                        "may use an unusual label or be hidden — paste "
+                        "this log to the launcher dev along with the "
+                        "label text shown on the student's record."
+                    )
             except Exception:
                 pass
 

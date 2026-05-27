@@ -31,26 +31,91 @@ def _parse_mailto(href: str) -> tuple[str, str]:
 
 
 def _extract_wgu_email(page: Page) -> str:
-    """Read the student's email from a visible 'WGU Email' lightning
-    output field on the contact view. Salesforce's 'Email Student'
-    action link in the Caseload row mails the PM only — student email
-    isn't in that link — so we have to find it elsewhere when the
-    contact card is on screen."""
+    """Compatibility shim — the field label varied enough across
+    Salesforce configs that the original "WGU Email"-only locator
+    missed plenty of pages. Delegates to scrape_student_email_from_page
+    which sweeps every common label + any visible mailto: as a
+    last-resort fallback."""
+    return scrape_student_email_from_page(page)
+
+
+def scrape_student_email_from_page(page: Page, pm_email: str = "") -> str:
+    """Try multiple strategies to find the student's email on a
+    Salesforce contact / record page. Returns the first non-empty
+    address that isn't `pm_email` (so we don't accidentally hand back
+    the PM's address as the student's). Returns "" if nothing matches.
+
+    Strategies, in order:
+    1. lightning-output-field with a label among the common email
+       labels we've seen on WGU contact cards.
+    2. Generic [aria-label*='email' i] or [data-target-label*='email']
+       elements that carry a mailto: child.
+    3. Any visible mailto: link on the page that isn't `pm_email` —
+       catch-all for pages where the email is rendered without
+       a Lightning wrapper.
+    """
+    EMAIL_LABELS = (
+        "WGU Email", "Personal Email", "Student Email",
+        "Primary Email", "Email Address", "Email",
+    )
+    pm_lower = (pm_email or "").strip().lower()
+
+    def _addr_from_locator(loc) -> str:
+        try:
+            mailtos = loc.locator('a[href^="mailto:"]')
+            if mailtos.count() == 0:
+                return ""
+            href = mailtos.first.get_attribute("href") or ""
+            addr, _ = _parse_mailto(href)
+            return addr if "@" in addr else ""
+        except Exception:
+            return ""
+
     try:
-        fields = (
-            page.locator("lightning-output-field")
-            .filter(has_text="WGU Email")
-            .filter(visible=True)
-        )
-        if fields.count() == 0:
-            return ""
-        mailtos = fields.first.locator('a[href^="mailto:"]')
-        if mailtos.count() == 0:
-            return ""
-        href = mailtos.first.get_attribute("href") or ""
-        addr, _ = _parse_mailto(href)
-        if "@" in addr:
-            return addr
+        # Strategy 1: labeled lightning-output-field. Tried in
+        # specificity order — "WGU Email" before "Email" so a card
+        # that shows both keeps WGU Email as the canonical hit.
+        for label in EMAIL_LABELS:
+            fields = (
+                page.locator("lightning-output-field")
+                .filter(has_text=label)
+                .filter(visible=True)
+            )
+            for i in range(fields.count()):
+                addr = _addr_from_locator(fields.nth(i))
+                if addr and addr.lower() != pm_lower:
+                    return addr
+
+        # Strategy 2: aria/data-attribute hints. Some Lightning
+        # cards wrap email under an aria-label or data-target-label
+        # that mentions "email" instead of a literal text label.
+        for sel in (
+            "[aria-label*='email' i]",
+            "[data-target-label*='email' i]",
+            "[data-output-element-id*='email' i]",
+        ):
+            try:
+                fields = page.locator(sel).filter(visible=True)
+            except Exception:
+                continue
+            for i in range(fields.count()):
+                addr = _addr_from_locator(fields.nth(i))
+                if addr and addr.lower() != pm_lower:
+                    return addr
+
+        # Strategy 3: catch-all sweep of every visible mailto: link.
+        # Skip anything that matches the PM (passed in by the
+        # caller) — that's the "Email Student" action button which
+        # always points at the PM, not the student.
+        mailtos = page.locator('a[href^="mailto:"]').filter(visible=True)
+        for i in range(mailtos.count()):
+            try:
+                href = mailtos.nth(i).get_attribute("href") or ""
+                addr, _ = _parse_mailto(href)
+                if "@" in addr and addr.lower() != pm_lower:
+                    return addr
+            except Exception:
+                continue
     except Exception:
         pass
     return ""
