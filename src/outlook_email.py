@@ -38,11 +38,19 @@ _user_info_cache: Optional[dict] = None
 
 def get_user_info() -> dict:
     """Return the current Outlook user's display name and SMTP email
-    as `{"name": str, "email": str}`. Result is cached per process.
-    On any failure (Outlook unreachable, profile not configured, etc.)
-    returns empty strings rather than raising."""
+    as `{"name": str, "email": str}`.
+
+    Cached per process — but ONLY if we successfully read something.
+    Previously an empty result from a transient COM hiccup ("Server
+    execution failed" on the first dispatch, Outlook still warming
+    up, etc.) got cached as `{"name": "", "email": ""}`, and every
+    subsequent call returned the bad cache for the whole session.
+    Now an empty result skips the cache so the next call retries.
+    """
     global _user_info_cache
-    if _user_info_cache is not None:
+    if _user_info_cache is not None and (
+        _user_info_cache.get("name") or _user_info_cache.get("email")
+    ):
         return _user_info_cache
 
     info = {"name": "", "email": ""}
@@ -67,7 +75,12 @@ def get_user_info() -> dict:
     except Exception:
         pass
 
-    _user_info_cache = info
+    # Only memoize a successful read. An empty info dict means
+    # Outlook didn't surface either field this attempt; let the next
+    # caller try again rather than wedging the session on a bad
+    # cache.
+    if info.get("name") or info.get("email"):
+        _user_info_cache = info
     return info
 
 

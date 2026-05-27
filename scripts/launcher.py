@@ -1512,6 +1512,34 @@ _CSV_PM_EMAIL_COLS = [
 ]
 
 
+_NAME_TITLES = frozenset({
+    "dr", "mr", "mrs", "ms", "prof", "rev", "sir", "madam", "mx",
+})
+
+
+def _names_loosely_match(a: str, b: str) -> bool:
+    """Tolerant first/last-name comparison. Strips common titles
+    ('Dr.', 'Prof.', etc.), splits on whitespace + commas, lower-
+    cases, and checks for ≥2-token overlap.
+
+    Catches all the realistic shapes the same person's name takes
+    across Salesforce vs Outlook: 'Jim Ashe' vs 'Ashe, Jim',
+    'Dr. Jim Ashe' vs 'Jim Ashe', 'Jim Albert Ashe' vs 'Jim Ashe'
+    all match. 'Jim Smith' vs 'Bob Smith' does NOT (one-token
+    overlap)."""
+    def _tokens(s: str) -> set[str]:
+        out: set[str] = set()
+        for raw in (s or "").replace(",", " ").split():
+            t = raw.strip(".,()[]<>'\"").lower()
+            if t and t not in _NAME_TITLES:
+                out.add(t)
+        return out
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta or not tb:
+        return False
+    return len(ta & tb) >= 2
+
+
 def _first_present_value(row: dict, candidates: list[str]) -> str:
     """Pick the first non-empty value among `candidates` (a list of
     possible column names). Returns "" if none of them exist or all
@@ -5063,11 +5091,48 @@ class App:
         # {{pm_name}} which is the *student's* Program Mentor from the
         # caseload row (only equals you when you ARE their PM).
         user_info = outlook_email.get_user_info()
+        if not user_info.get("name") and not user_info.get("email"):
+            # Bad cache from a transient COM hiccup, OR Outlook isn't
+            # exposing CurrentUser on this profile. The get_user_info
+            # helper now skips caching empty reads, so the next call
+            # will retry. Log once so the user can spot template
+            # variables coming out blank.
+            self._append_log(
+                "Outlook didn't surface CurrentUser this attempt — "
+                "{{user_name}} / {{user_email}} may be blank in this "
+                "email. If it persists, restart Outlook before the "
+                "next batch."
+            )
         student_ctx = {
             **student_ctx,
             "user_name": user_info.get("name", ""),
             "user_email": user_info.get("email", ""),
         }
+
+        # PM email fallback: when the user has "CC Program Mentor"
+        # checked and we couldn't read pm_email from either the
+        # caseload row or the contact card scrape, AND the row's
+        # Program Mentor name loosely matches the launcher user's
+        # own name — they ARE the PM for this student, so the CC
+        # they want is themselves. Catches the very common faculty
+        # workflow of CCing their own caseload emails for record-
+        # keeping. Only fires when names match, so a different PM's
+        # email never gets quietly swapped for yours.
+        if (email_cfg.cc_pm
+                and not student_ctx.get("pm_email")
+                and student_ctx.get("pm_name")
+                and user_info.get("email")
+                and _names_loosely_match(
+                    student_ctx.get("pm_name", ""), user_info.get("name", "")
+                )):
+            student_ctx["pm_email"] = user_info["email"]
+            if not getattr(self, "_pm_self_cc_logged", False):
+                self._pm_self_cc_logged = True
+                self._append_log(
+                    f"PM email not in caseload — you are the PM "
+                    f"({user_info['name']!r}), so CCing your Outlook "
+                    f"address {user_info['email']!r}."
+                )
 
         template_path = TEMPLATES_DIR / email_cfg.body_html_file
         if not template_path.exists():
@@ -5139,15 +5204,34 @@ class App:
 
         if auto_send:
             self._append_log(f"Auto-sending email to {full_name}...")
-            try:
-                outlook_email.compose_email(
-                    to=to, cc=cc, subject=subject,
-                    html_body=body_html, inline_images=inline_images,
-                    auto_send=True,
-                    signature_name=email_cfg.signature_file,
-                )
-            except Exception as e:
-                self._append_log(f"Auto-send failed for {full_name}: {e}")
+            # Retry once on transient COM failures. Outlook can throw
+            # "Server execution failed" (-2146959355) mid-batch when
+            # it's busy launching a reminder popup, finishing a
+            # send-receive, or fielding another COM client. A short
+            # pause + one retry rescues the vast majority of these
+            # without escalating to a true skip.
+            import time as _time
+            last_err: Optional[Exception] = None
+            for attempt in (1, 2):
+                try:
+                    outlook_email.compose_email(
+                        to=to, cc=cc, subject=subject,
+                        html_body=body_html, inline_images=inline_images,
+                        auto_send=True,
+                        signature_name=email_cfg.signature_file,
+                    )
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt == 1:
+                        self._append_log(
+                            f"Outlook hiccup on {full_name}: {e}. "
+                            "Retrying in 2s…"
+                        )
+                        _time.sleep(2)
+            if last_err is not None:
+                self._append_log(f"Auto-send failed for {full_name}: {last_err}")
                 return False
             return True
 
