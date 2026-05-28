@@ -3859,12 +3859,15 @@ class NoteEditor:
         # is read on the main thread and appended after the body
         # (capped at 200 lines / 25000 chars total — images replaced
         # with [IMAGE NOT INCLUDED] placeholder).
+        # Advanced-only: hidden in basic mode unless the note already
+        # has it enabled.
         row += 1
         self.append_clipboard_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
+        self._append_clipboard_checkbox = ctk.CTkCheckBox(
             content, text="Append clipboard contents after body",
             variable=self.append_clipboard_var,
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
+        )
+        self._append_clipboard_checkbox.grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
 
         # Submit toggle. Unchecking leaves the form filled for manual
         # review — and the scenario's tab-close step is also skipped
@@ -3970,6 +3973,19 @@ class NoteEditor:
         self.enter_additional_text_var.set(note.enter_additional_text)
         self._update_activity_state()
 
+    def apply_advanced_visibility(self, advanced: bool) -> None:
+        """Hide the append-clipboard checkbox in basic mode unless
+        this note already has it enabled. Same "show if configured"
+        rule the ScenarioEditor uses for its advanced rows."""
+        try:
+            has_value = bool(self.append_clipboard_var.get())
+            if advanced or has_value:
+                self._append_clipboard_checkbox.grid()
+            else:
+                self._append_clipboard_checkbox.grid_remove()
+        except Exception:
+            pass
+
     def serialize(self) -> dict:
         return {
             "interaction_format": self.format_var.get(),
@@ -4047,16 +4063,20 @@ class ScenarioEditor:
         # below.
         row += 1
         self.use_vars_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
+        self._use_vars_checkbox = ctk.CTkCheckBox(
             self.frame,
             text="Use scenario variables (advanced — applies to email + notes below)",
             variable=self.use_vars_var,
             command=self._on_use_vars_toggled,
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(8, 4))
+        )
+        self._use_vars_checkbox_row = row
+        self._use_vars_checkbox.grid(row=row, column=0, sticky="w", padx=8, pady=(8, 4))
         row += 1
         self._vars_section_row = row
         self._build_vars_section()
         # Visibility set by load() based on scenario.prompts.
+        # The toggle checkbox + section are advanced-only — hidden in
+        # basic mode unless the scenario already defines variables.
 
         # Batch-mode toggle. When on, find-first is hidden (mutually
         # exclusive) and the Filters section appears underneath.
@@ -4340,7 +4360,10 @@ class ScenarioEditor:
         # Email override — the To: field on the outgoing message
         # (variable substitution allowed). Empty falls back to
         # {{student_email}} from the caseload row.
-        ctk.CTkLabel(frame, text="Email override").grid(
+        # Advanced-only: hidden in basic mode unless the scenario
+        # already has a value set.
+        self._email_to_label = ctk.CTkLabel(frame, text="Email override")
+        self._email_to_label.grid(
             row=2, column=0, sticky="w", padx=8, pady=(4, 0),
         )
         self.email_to_entry = ctk.CTkEntry(
@@ -4361,8 +4384,12 @@ class ScenarioEditor:
             row=3, column=1, sticky="ew", padx=8, pady=(4, 0),
         )
 
-        # Inline images (comma-separated filenames)
-        ctk.CTkLabel(frame, text="Inline images").grid(
+        # Inline images (comma-separated filenames).
+        # Advanced-only: hidden in basic mode unless the scenario
+        # already has one or more images configured. The 🖼 Add
+        # image dialog in the HTML editor still works to add them.
+        self._email_images_label = ctk.CTkLabel(frame, text="Inline images")
+        self._email_images_label.grid(
             row=4, column=0, sticky="w", padx=8, pady=(4, 0),
         )
         self.email_images_entry = ctk.CTkEntry(
@@ -4375,11 +4402,15 @@ class ScenarioEditor:
         # File > Options > Mail > Stationery and Fonts. Picking any
         # named font wraps the rendered HTML body in a styled div
         # before Send/Display.
-        ctk.CTkLabel(frame, text="Email font").grid(
+        # Advanced-only: hidden in basic mode unless the scenario has
+        # already pinned a non-default font.
+        self._email_font_label = ctk.CTkLabel(frame, text="Email font")
+        self._email_font_label.grid(
             row=5, column=0, sticky="w", padx=8, pady=(4, 0),
         )
         font_row = ctk.CTkFrame(frame, fg_color="transparent")
         font_row.grid(row=5, column=1, sticky="ew", padx=8, pady=(4, 0))
+        self._email_font_row = font_row
         self.email_font_family_combo = ctk.CTkComboBox(
             font_row,
             values=[
@@ -4444,16 +4475,76 @@ class ScenarioEditor:
 
     def apply_advanced_visibility(self, advanced: bool) -> None:
         """Show / hide advanced-only rows based on the global mode.
-        Rule of thumb: each advanced row stays visible if EITHER
-        the global mode is on, OR the scenario already has data in
-        that row (so users don't lose access to configured fields
-        on a basic-mode profile).
+        Rule: a row stays visible if EITHER the global mode is on,
+        OR the scenario already has a non-default value in that row
+        (so basic-mode users don't lose access to fields they've
+        already configured)."""
+        def _show_pair(label, widget, show: bool) -> None:
+            try:
+                if show:
+                    label.grid()
+                    widget.grid()
+                else:
+                    label.grid_remove()
+                    widget.grid_remove()
+            except Exception:
+                pass
 
-        Stub for commit 1 of the settings rollout; commit 2 fills
-        in per-row visibility decisions. Currently a no-op so the
-        App can call this without crashing while the rest of the
-        UI changes are being staged."""
-        pass
+        # --- Scenario variables toggle (+ section)
+        # Show the checkbox if advanced OR the scenario has any
+        # variables defined. The section follows the checkbox's own
+        # toggle state via _on_use_vars_toggled, so once we restore
+        # the checkbox the section comes back naturally if it was on.
+        has_vars = bool(self.prompt_rows)
+        try:
+            if advanced or has_vars or self.use_vars_var.get():
+                self._use_vars_checkbox.grid(
+                    row=self._use_vars_checkbox_row, column=0,
+                    sticky="w", padx=8, pady=(8, 4),
+                )
+            else:
+                self._use_vars_checkbox.grid_remove()
+                # Also hide the section if it was showing.
+                try: self._vars_section.grid_remove()
+                except Exception: pass
+        except Exception:
+            pass
+
+        # --- Email override row
+        has_email_to = bool(self.email_to_entry.get().strip())
+        _show_pair(self._email_to_label, self.email_to_entry,
+                   advanced or has_email_to)
+
+        # --- Inline images row
+        has_images = bool(self.email_images_entry.get().strip())
+        _show_pair(self._email_images_label, self.email_images_entry,
+                   advanced or has_images)
+
+        # --- Email font row
+        # "Configured" = a real font picked (not the sentinel) OR a
+        # non-empty size. Show the row in both cases regardless of
+        # advanced.
+        try:
+            family = self.email_font_family_combo.get().strip()
+        except Exception:
+            family = ""
+        try:
+            size = self.email_font_size_combo.get().strip()
+        except Exception:
+            size = ""
+        has_font_override = (
+            (family and family != EMAIL_FONT_DEFAULT_LABEL) or size
+        )
+        _show_pair(self._email_font_label, self._email_font_row,
+                   advanced or bool(has_font_override))
+
+        # --- Push the same call into every note editor so the
+        # append-clipboard checkbox follows the same rule.
+        for ne in self.note_editors:
+            try:
+                ne.apply_advanced_visibility(advanced)
+            except Exception:
+                pass
 
     def _selected_template_path(self) -> Optional[Path]:
         """Return the absolute path of the currently-selected body
