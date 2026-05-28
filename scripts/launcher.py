@@ -1189,10 +1189,29 @@ class BrowserWorker:
         what actually breaks.
 
         Returns (success, message). Message describes either the
-        success outcome or the specific step that failed."""
+        success outcome or the specific step that failed. On any
+        failure, a screenshot of the current page state is saved to
+        SCREENSHOTS_DIR for post-mortem inspection."""
         target, table = self._open_caseload_table(ctx)
         if table is None:
             return False, "caseload table didn't load"
+
+        def _fail(stage: str, msg: str) -> tuple[bool, str]:
+            """Helper: take a screenshot tagged with the failing
+            stage and return the failure tuple. Caller just returns
+            its value."""
+            try:
+                from src.config import SCREENSHOTS_DIR
+                SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+                from datetime import datetime as _dt
+                path = SCREENSHOTS_DIR / (
+                    f"{_dt.now():%Y%m%d-%H%M%S}-setup-fail-{stage}.png"
+                )
+                target.screenshot(path=str(path), full_page=True)
+                self.on_status(f"  📸 screenshot saved: {path.name}")
+            except Exception:
+                pass
+            return False, msg
 
         # ---- Step 1: open the list-view controls (disk icon). ----
         self.on_status("Setup [1/8]: clicking disk icon (List View Controls)…")
@@ -1219,10 +1238,10 @@ class BrowserWorker:
             except Exception:
                 continue
         if not clicked:
-            return False, (
+            return _fail("disk-icon", (
                 "couldn't find the disk-icon button. Tried selectors: "
                 + ", ".join(repr(s) for s in disk_selectors)
-            )
+            ))
         target.wait_for_timeout(800)
 
         # ---- Step 2: click 'Save As New List View' link in the popup. ----
@@ -1234,67 +1253,75 @@ class BrowserWorker:
             save_as_link.wait_for(state="visible", timeout=5000)
             save_as_link.click()
         except Exception as e:
-            return False, f"couldn't find 'Save As New List View' link: {e}"
+            return _fail("save-as-link", f"couldn't find 'Save As New List View' link: {e}")
         target.wait_for_timeout(800)
 
         # ---- Step 3: type the new list view name. ----
-        # After 'Save As New List View' is clicked, the popup
-        # transforms to show a "New List View Name" input. Wait for
-        # it to render, then scope to the visible modal first so
-        # generic input selectors don't accidentally match form
-        # elements elsewhere on the page.
+        # The 'Save As New List View' click might:
+        # (a) transform the existing popup with a new empty name
+        #     input, or
+        # (b) open a brand new modal, or
+        # (c) just enable an empty field that was previously hidden.
+        # Approach: wait, find ALL inputs in any visible modal, pick
+        # the first empty one as the name target. Last-ditch: try
+        # keyboard.type assuming Salesforce auto-focused the field.
         self.on_status("Setup [3/8]: typing 'Caseload Tool' as view name…")
-        target.wait_for_timeout(1000)
-        modal = None
+        target.wait_for_timeout(1500)
+
+        # Find all visible modals — there might be more than one
+        # if the old "Update Existing List View" popup is still in
+        # the DOM tree.
+        modals = []
         for msel in (
             'section[role="dialog"]',
-            'div.slds-modal',
             'div[role="dialog"]',
+            'div.slds-modal',
             'div.modal-container',
         ):
             try:
-                m = target.locator(msel).filter(visible=True).first
-                if m.count() > 0:
-                    modal = m
-                    self.on_status(f"  → modal scope: {msel}")
+                ms = target.locator(msel).filter(visible=True)
+                count = ms.count()
+                for i in range(count):
+                    modals.append((msel, ms.nth(i)))
+            except Exception:
+                continue
+        self.on_status(f"  → found {len(modals)} visible modal(s)")
+
+        # Strategy A: enumerate all visible inputs in each modal,
+        # pick the first empty text-ish one.
+        name_input = None
+        approach_used = ""
+        for msel, modal in modals:
+            try:
+                inputs = modal.locator(
+                    'input:not([type="hidden"])'
+                ).filter(visible=True)
+                n_inputs = inputs.count()
+                self.on_status(
+                    f"  → modal {msel!r}: {n_inputs} visible input(s)"
+                )
+                for i in range(n_inputs):
+                    inp = inputs.nth(i)
+                    try:
+                        val = (inp.input_value() or "").strip()
+                        itype = inp.get_attribute("type") or "text"
+                        # Skip clearly non-name inputs.
+                        if itype in ("checkbox", "radio", "submit"):
+                            continue
+                        if val == "":
+                            name_input = inp
+                            approach_used = (
+                                f"empty input #{i} in modal {msel!r}"
+                            )
+                            break
+                    except Exception:
+                        continue
+                if name_input is not None:
                     break
             except Exception:
                 continue
 
-        name_input = None
-        # Try label-based discovery first (most robust against
-        # Salesforce class-name changes).
-        if modal is not None:
-            for label_text in (
-                "New List View Name", "List View Name",
-                "List Name", "Name",
-            ):
-                try:
-                    inp = modal.get_by_label(
-                        label_text, exact=False,
-                    ).filter(visible=True).first
-                    if inp.count() > 0:
-                        name_input = inp
-                        self.on_status(f"  → label: {label_text!r}")
-                        break
-                except Exception:
-                    continue
-        # Fall back: any visible text-ish input inside the modal.
-        if name_input is None and modal is not None:
-            for sel in (
-                'input[type="text"]',
-                'lightning-input input',
-                'input:not([type])',
-            ):
-                try:
-                    inp = modal.locator(sel).filter(visible=True).first
-                    if inp.count() > 0:
-                        name_input = inp
-                        self.on_status(f"  → fallback: {sel}")
-                        break
-                except Exception:
-                    continue
-        # Last resort: page-wide label lookup.
+        # Strategy B: page-wide label lookup.
         if name_input is None:
             try:
                 inp = target.get_by_label(
@@ -1302,25 +1329,47 @@ class BrowserWorker:
                 ).filter(visible=True).first
                 if inp.count() > 0:
                     name_input = inp
-                    self.on_status("  → page-wide label fallback")
+                    approach_used = "page-wide label 'New List View Name'"
             except Exception:
                 pass
 
-        if name_input is None or name_input.count() == 0:
-            return False, (
-                "couldn't find the new-view name input. The 'Save As "
-                "New List View' popup may use a non-standard input — "
-                "look at the actual DOM and tell me the input's "
-                "aria-label, name, or placeholder."
+        # Strategy C: blind keyboard input (Salesforce often
+        # auto-focuses the name field on popup open).
+        typed_via_keyboard = False
+        if name_input is None:
+            self.on_status(
+                "  → no input element matched; trying blind keyboard.type"
             )
+            try:
+                target.keyboard.type("Caseload Tool", delay=40)
+                typed_via_keyboard = True
+                approach_used = "blind keyboard.type"
+            except Exception as e:
+                return _fail("name-input", (
+                    f"all approaches failed to type name. Last error: {e}. "
+                    "Inspect the input in Edge's DevTools (right-click → "
+                    "Inspect on the empty name field) and tell me its "
+                    "aria-label, name, placeholder, or any unique class."
+                ))
 
-        try:
-            name_input.click(timeout=3000)
-            name_input.fill("")  # clear any pre-fill
-            name_input.fill("Caseload Tool", timeout=3000)
-            self.on_status("  ✓ typed 'Caseload Tool'")
-        except Exception as e:
-            return False, f"couldn't type into name field: {e}"
+        if not typed_via_keyboard and name_input is not None:
+            try:
+                self.on_status(f"  → using approach: {approach_used}")
+                name_input.click(timeout=3000)
+                name_input.fill("")
+                name_input.fill("Caseload Tool", timeout=3000)
+            except Exception as e:
+                # Last fallback: try keyboard after focusing.
+                try:
+                    name_input.click()
+                    target.keyboard.type("Caseload Tool", delay=40)
+                    approach_used += " + keyboard.type after focus"
+                except Exception as e2:
+                    return _fail("name-type", (
+                        f"found input but couldn't type. fill error: {e}. "
+                        f"keyboard fallback error: {e2}"
+                    ))
+        self.on_status(f"  ✓ typed 'Caseload Tool' via: {approach_used}")
 
         # ---- Step 4: click Save to create the view. ----
         # Scope to the modal so we don't grab a stale Save button
