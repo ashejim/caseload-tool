@@ -1184,17 +1184,62 @@ class BrowserWorker:
         Step-by-step Playwright flow matching the user's screenshots
         of the WGU Salesforce UI. Each step logs to on_status BEFORE
         attempting the click so a failure log line points directly
-        at the step that broke. Selectors are best-guess on first
-        pass; expect 1–2 iterations of selector tuning after we see
-        what actually breaks.
+        at the step that broke.
 
         Returns (success, message). Message describes either the
         success outcome or the specific step that failed. On any
         failure, a screenshot of the current page state is saved to
         SCREENSHOTS_DIR for post-mortem inspection."""
-        target, table = self._open_caseload_table(ctx)
-        if table is None:
-            return False, "caseload table didn't load"
+        # Explicitly find the Caseload tab — don't rely on
+        # _active_page, which returns "most recently responsive"
+        # and can pick up a stale download tab or a Notes tab the
+        # user opened from a student row. The active_page approach
+        # caused the first round of failures (screenshots captured
+        # the wrong tab's content).
+        target = None
+        for page in ctx.pages:
+            try:
+                if page.is_closed():
+                    continue
+                if "Caseload_App_Page" in (page.url or ""):
+                    target = page
+                    self.on_status(
+                        f"  → found Caseload tab: {page.url[:80]}…"
+                    )
+                    break
+            except Exception:
+                continue
+
+        # If no Caseload tab is open, fall back to _open_caseload_table
+        # which will navigate the active page (or open a new one).
+        if target is None:
+            self.on_status(
+                "  → no existing Caseload tab; navigating active page"
+            )
+            target, table = self._open_caseload_table(ctx)
+            if table is None:
+                return False, "caseload table didn't load"
+        else:
+            # Verify the Caseload table is rendered before proceeding —
+            # the tab may be open but mid-navigation or stale.
+            try:
+                tables = (
+                    target.locator("table")
+                    .filter(has=target.locator('th:has-text("Course Code")'))
+                    .filter(has=target.locator('th:has-text("Name")'))
+                )
+                tables.first.wait_for(state="visible", timeout=15_000)
+                self.on_status("  ✓ Caseload table rendered")
+            except Exception as e:
+                return False, f"Caseload tab found but table didn't render: {e}"
+
+            # Bring the Caseload tab to front so any UI changes we
+            # trigger are visible to the user, and so the focus is
+            # on the right page for keyboard.type fallbacks.
+            try:
+                target.bring_to_front()
+            except Exception:
+                pass
 
         def _fail(stage: str, msg: str) -> tuple[bool, str]:
             """Helper: take a screenshot tagged with the failing
