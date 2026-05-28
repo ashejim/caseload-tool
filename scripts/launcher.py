@@ -1244,17 +1244,38 @@ class BrowserWorker:
             ))
         target.wait_for_timeout(800)
 
-        # ---- Step 2: click 'Save As New List View' link in the popup. ----
-        self.on_status("Setup [2/8]: clicking 'Save As New List View'…")
+        # ---- Step 2: route based on which popup opened. ----
+        # Two flavors of disk icon exist in Salesforce list view UI:
+        # (a) "Save" button → opens "Update Existing List View" popup,
+        #     which has a "Save As New List View" link we'd click to
+        #     get to the empty name field.
+        # (b) A separate button (in WGU's UI) opens "Create New List
+        #     View" popup directly — the empty name field is already
+        #     showing. No Save As link needed.
+        # Detect which popup we're in by looking for the Save As
+        # link; if absent, assume we're already on Create New.
+        self.on_status("Setup [2/8]: checking popup type…")
+        target.wait_for_timeout(800)
         try:
             save_as_link = target.get_by_text(
                 "Save As New List View", exact=False,
             ).filter(visible=True).first
-            save_as_link.wait_for(state="visible", timeout=5000)
-            save_as_link.click()
+            if save_as_link.count() > 0:
+                save_as_link.click(timeout=3000)
+                self.on_status("  ✓ clicked Save As link (Update popup → Create flow)")
+                target.wait_for_timeout(800)
+            else:
+                self.on_status(
+                    "  → no Save As link visible; popup is already "
+                    "'Create New List View' — proceeding directly"
+                )
         except Exception as e:
-            return _fail("save-as-link", f"couldn't find 'Save As New List View' link: {e}")
-        target.wait_for_timeout(800)
+            # Non-fatal — if we can't tell, assume we're already in
+            # the right state. Step 3 will fail explicitly if not.
+            self.on_status(
+                f"  → couldn't check for Save As link (assuming "
+                f"already on Create New): {e}"
+            )
 
         # ---- Step 3: type the new list view name. ----
         # The 'Save As New List View' click might:
