@@ -1437,35 +1437,76 @@ class BrowserWorker:
                     ))
         self.on_status(f"  ✓ typed 'Caseload Tool' via: {approach_used}")
 
-        # ---- Step 4: click Save to create the view. ----
-        # Scope to the modal so we don't grab a stale Save button
-        # from earlier in the page. Falls back to page-wide if the
-        # modal scope didn't resolve.
-        self.on_status("Setup [4/8]: clicking Save (create view)…")
+        # ---- Step 4: submit the form via Enter, fall back to Save
+        # button if the modal stays open. ----
+        # The keyboard.type in step 3 proved focus is inside the
+        # modal's name input. Salesforce forms submit on Enter when
+        # focus is on a text input — that's more reliable than
+        # trying to find a Save button in Lightning's shadow DOM
+        # (which is why the previous attempt left the modal open
+        # and blocked step 5).
+        self.on_status("Setup [4/8]: pressing Enter to save the new view…")
         try:
-            save_btn = None
-            if modal is not None:
-                save_btn = modal.get_by_role(
-                    "button", name="Save",
-                ).filter(visible=True).first
-                if save_btn.count() == 0:
-                    # Common variants
-                    for sel in (
-                        'button:has-text("Save")',
-                        'button[title="Save"]',
-                    ):
-                        b = modal.locator(sel).filter(visible=True).first
-                        if b.count() > 0:
-                            save_btn = b
-                            break
-            if save_btn is None or save_btn.count() == 0:
-                save_btn = target.get_by_role(
-                    "button", name="Save",
-                ).filter(visible=True).last
-            save_btn.click(timeout=5000)
+            target.keyboard.press("Enter")
         except Exception as e:
-            return False, f"couldn't click Save (create view): {e}"
-        target.wait_for_timeout(2500)
+            return _fail("save-create-view", f"couldn't press Enter: {e}")
+
+        # Wait for the modal to actually close — if it stays open,
+        # Enter didn't submit (focus may have moved off the input).
+        modal_closed = False
+        for _ in range(5):
+            target.wait_for_timeout(1000)
+            try:
+                still_open = target.locator(
+                    'section[role="dialog"], div.slds-modal'
+                ).filter(visible=True).count()
+                if still_open == 0:
+                    modal_closed = True
+                    break
+            except Exception:
+                continue
+
+        if not modal_closed:
+            self.on_status(
+                "  → modal still open after Enter; trying Save button"
+            )
+            # Fallback: try clicking a Save button. Prefer modal-
+            # scoped first, fall back to page-wide last.
+            try:
+                save_btn = None
+                if modal is not None:
+                    save_btn = modal.get_by_role(
+                        "button", name="Save",
+                    ).filter(visible=True).first
+                    if save_btn.count() == 0:
+                        save_btn = modal.locator(
+                            'button:has-text("Save")'
+                        ).filter(visible=True).first
+                if save_btn is None or save_btn.count() == 0:
+                    save_btn = target.get_by_role(
+                        "button", name="Save",
+                    ).filter(visible=True).last
+                save_btn.click(timeout=5000)
+                target.wait_for_timeout(2500)
+            except Exception as e:
+                return _fail("save-create-view", (
+                    f"Enter didn't close modal and Save button click "
+                    f"failed: {e}"
+                ))
+            # Re-check modal state.
+            try:
+                still_open = target.locator(
+                    'section[role="dialog"], div.slds-modal'
+                ).filter(visible=True).count()
+                if still_open > 0:
+                    return _fail("save-didnt-close", (
+                        "Save was triggered (Enter + button click) but "
+                        "the modal remained open. The new view may not "
+                        "have been created — check Salesforce manually."
+                    ))
+            except Exception:
+                pass
+        self.on_status("  ✓ modal closed; new view created")
 
         # ---- Step 5: open the column picker. ----
         self.on_status("Setup [5/8]: opening column picker…")
