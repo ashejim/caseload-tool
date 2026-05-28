@@ -3890,12 +3890,28 @@ class NoteEditor:
         # Submit toggle. Unchecking leaves the form filled for manual
         # review — and the scenario's tab-close step is also skipped
         # whenever any note in the scenario opted out of auto-submit.
+        # The warning label next to the checkbox makes the off state
+        # visible at a glance so a stray click doesn't silently leave
+        # notes unsubmitted across an entire batch.
         row += 1
+        submit_row = ctk.CTkFrame(content, fg_color="transparent")
+        submit_row.grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
         self.submit_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
-            content, text="Submit and close automatically",
+            submit_row, text="Submit and close automatically",
             variable=self.submit_var,
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
+            command=self._update_submit_warning,
+        ).pack(side="left")
+        self._submit_warning_label = ctk.CTkLabel(
+            submit_row, text="",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("#7a4f00", "#ffd166"),
+            fg_color=("#fff3c4", "#3a3520"),
+            corner_radius=4,
+        )
+        # Visibility managed by _update_submit_warning — packed only
+        # when the box is unchecked.
+        self._update_submit_warning()
 
     def set_index(self, index: int) -> None:
         """Renumber this note in-place (Note 1, Note 2, …). Called after
@@ -3987,6 +4003,7 @@ class NoteEditor:
         self.body_text.delete("1.0", "end")
         self.body_text.insert("1.0", note.body)
         self.submit_var.set(note.submit)
+        self._update_submit_warning()
         self.append_clipboard_var.set(note.append_clipboard)
         self.enter_additional_text_var.set(note.enter_additional_text)
         # Course code override (per-note, replaces the old main-window
@@ -3995,6 +4012,21 @@ class NoteEditor:
         if note.course_code_override:
             self.course_code_override_entry.insert(0, note.course_code_override)
         self._update_activity_state()
+
+    def _update_submit_warning(self) -> None:
+        """Show / hide the yellow warning chip next to the Submit
+        checkbox based on its current state. Called on init, on
+        every load, and on every checkbox click."""
+        try:
+            if self.submit_var.get():
+                self._submit_warning_label.pack_forget()
+            else:
+                self._submit_warning_label.configure(
+                    text="  ⚠  won't auto-submit — manual click in Salesforce",
+                )
+                self._submit_warning_label.pack(side="left", padx=(10, 0))
+        except Exception:
+            pass
 
     def apply_advanced_visibility(self, advanced: bool) -> None:
         """Hide the append-clipboard checkbox in basic mode unless
@@ -5252,9 +5284,61 @@ class App:
         self._rebuild_scenario_buttons()
         self._append_log("Editor reverted to saved YAML.")
 
+    def _scenarios_with_submit_off(
+        self, scenario: ScenarioConfig,
+    ) -> list[int]:
+        """Return 1-based indices of notes in `scenario` that have
+        submit=False. Used by the pre-fire warning to tell the user
+        WHICH notes will be left for manual review."""
+        return [
+            i + 1 for i, n in enumerate(scenario.notes)
+            if not n.submit
+        ]
+
+    def _confirm_submit_off_or_abort(
+        self, scenario: ScenarioConfig, *, batch: bool = False,
+    ) -> bool:
+        """Pop a topmost confirmation when any note in `scenario` has
+        Submit unchecked. Returns True to proceed, False to abort.
+        For batch fires, the warning frames the impact at scale
+        ("…across N students") so the user knows what they're about
+        to leave behind."""
+        off = self._scenarios_with_submit_off(scenario)
+        if not off:
+            return True
+        plural = "s" if len(off) > 1 else ""
+        notes_label = ", ".join(f"Note {n}" for n in off)
+        if batch:
+            msg = (
+                f"Heads up — {notes_label} in this scenario "
+                f"{'have' if len(off) > 1 else 'has'} 'Submit and close "
+                f"automatically' unchecked.\n\n"
+                "The form will be filled for every student in the batch "
+                "but you'll need to click Submit manually in Salesforce "
+                "for each one.\n\n"
+                "Proceed anyway?"
+            )
+        else:
+            msg = (
+                f"{notes_label} {'have' if len(off) > 1 else 'has'} "
+                "'Submit and close automatically' unchecked.\n\n"
+                "The form will be filled but you'll need to click "
+                "Submit manually in Salesforce.\n\n"
+                "Proceed anyway?"
+            )
+        return ask_yes_no_topmost(
+            self.root,
+            f"Note{plural} won't auto-submit",
+            msg, yes_label="Proceed", no_label="Abort",
+        )
+
     def _save_yaml(self) -> None:
         new_doc: dict = {"scenarios": {}}
         seen: set[str] = set()
+        # Diagnostic latch: surface the submit state of every note
+        # being saved so the user can spot a stray-uncheck if it
+        # happens. Cheap to compute; logs once per save.
+        submit_summary: list[str] = []
         for old_name, ed in list(self.scenario_editors.items()):
             new_name = ed.current_name or old_name
             if not new_name:
@@ -5268,10 +5352,25 @@ class App:
                 return
             seen.add(new_name)
             try:
-                new_doc["scenarios"][new_name] = ed.serialize()
+                serialized = ed.serialize()
+                new_doc["scenarios"][new_name] = serialized
             except Exception as e:
                 self._append_log(f"Could not serialize {new_name!r}: {e}")
                 return
+            # Record which notes would land with Submit unchecked so
+            # the activity log surfaces it at save time — a stray
+            # uncheck stays visible instead of hiding until the next
+            # batch fire shows up with FALSE rows in note_log.csv.
+            unchecked = [
+                i + 1 for i, n in enumerate(serialized.get("notes", []))
+                if not n.get("submit", True)
+            ]
+            if unchecked:
+                submit_summary.append(
+                    f"{new_name!r}: Note(s) "
+                    + ", ".join(str(i) for i in unchecked)
+                    + " have Submit unchecked"
+                )
 
         try:
             NOTES_YAML.write_text(
@@ -5293,6 +5392,11 @@ class App:
         self._rebuild_scenario_buttons()
         self._restart_hotkeys()
         self._append_log("Saved notes.yaml; tabs, buttons, and hotkeys refreshed.")
+        # Surface the unchecked-submit summary right after save so a
+        # stray uncheck doesn't hide until the next batch fire produces
+        # FALSE rows. One log line per offending scenario.
+        for line in submit_summary:
+            self._append_log(f"  ⚠  {line}")
 
     # ----- Hotkey listener -----
 
@@ -5437,6 +5541,16 @@ class App:
         in-line `_fire` body so we can sandwich it between _set_busy
         and _set_idle."""
 
+        # Pre-flight: if any note has Submit unchecked, confirm before
+        # we ask the user to do anything else (FERPA: don't surprise
+        # them with notes that need manual submission AFTER they've
+        # answered prompts / picked a student).
+        if not self._confirm_submit_off_or_abort(scenario, batch=False):
+            self._append_log(
+                f"{scenario.name!r}: aborted at submit-unchecked warning."
+            )
+            return
+
         # Step 1: find + pick (if enabled). Combined dialog lets the
         # user retype if the first query was wrong or surfaces too
         # many candidates. Worker handles search; fuzzy fallback kicks
@@ -5510,6 +5624,16 @@ class App:
         any modal Cancel button (which aborts the batch from that
         point on)."""
         from tkinter import messagebox
+
+        # Pre-flight: if any note has Submit unchecked, confirm before
+        # we touch the caseload. Different message than single-fire
+        # since the impact scales with batch size — a stray uncheck
+        # means N students will all need manual Salesforce clicks.
+        if not self._confirm_submit_off_or_abort(scenario, batch=True):
+            self._append_log(
+                f"Batch {scenario.name!r}: aborted at submit-unchecked warning."
+            )
+            return
 
         # Step 1: load the caseload rows. Prefer the CSV cache (~50ms,
         # ~100 fields available); fall back to scroll-load DOM scrape

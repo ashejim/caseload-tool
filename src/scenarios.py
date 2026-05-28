@@ -277,6 +277,13 @@ def run_scenario(
         fill_note(target, note)
         if not template.submit:
             all_submitted = False
+            if on_status:
+                on_status(
+                    f"Note {i + 1} filled but NOT submitted — "
+                    "'Submit when filled' is unchecked in the scenario "
+                    "editor. Click Submit in Salesforce to save the "
+                    "note, or check the box and re-fire."
+                )
     if scenario.close_tab_after and all_submitted:
         close_workspace_tab(target)
     return all_submitted
