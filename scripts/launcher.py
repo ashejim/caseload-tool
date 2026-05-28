@@ -1346,35 +1346,64 @@ class BrowserWorker:
                 f"already on Create New): {e}"
             )
 
-        # ---- Step 3: find and focus the name input via JS, then type. ----
-        # Lightning Web Components use shadow DOM that Playwright's
-        # standard `.locator('input')` doesn't pierce. Use JS that
-        # walks shadow roots explicitly to find the empty visible
-        # input, focus it, then use keyboard.type for the value.
-        self.on_status("Setup [3/8]: finding name input via shadow-piercing JS…")
+        # ---- Step 3: find and focus the name input via JS, scoped
+        # to the modal so we don't pick up the page's search bar. ----
+        # Lightning Web Components use shadow DOM Playwright doesn't
+        # pierce. We use JS that walks shadow roots to find INPUT
+        # / TEXTAREA elements, then filter by "is inside a modal
+        # ancestor" so a stray empty input elsewhere on the page
+        # (like the Caseload Search All Rows... bar) can't win.
+        self.on_status("Setup [3/8]: finding name input in modal via JS…")
         target.wait_for_timeout(1500)
         try:
             result = target.evaluate(r"""
                 () => {
-                    const findInputs = (node, depth = 0) => {
+                    // Walk shadow DOM recursively to collect all
+                    // INPUT/TEXTAREA descendants of `root`.
+                    const findInputs = (root, depth = 0) => {
                         if (depth > 30) return [];
-                        const inputs = [];
-                        if (node.tagName === 'INPUT' ||
-                            node.tagName === 'TEXTAREA') {
-                            inputs.push(node);
+                        const out = [];
+                        if (root.tagName === 'INPUT' ||
+                            root.tagName === 'TEXTAREA') {
+                            out.push(root);
                         }
-                        if (node.shadowRoot) {
-                            for (const c of node.shadowRoot.children) {
-                                inputs.push(...findInputs(c, depth + 1));
+                        if (root.shadowRoot) {
+                            for (const c of root.shadowRoot.children) {
+                                out.push(...findInputs(c, depth + 1));
                             }
                         }
-                        for (const c of (node.children || [])) {
-                            inputs.push(...findInputs(c, depth + 1));
+                        for (const c of (root.children || [])) {
+                            out.push(...findInputs(c, depth + 1));
                         }
-                        return inputs;
+                        return out;
                     };
+
+                    // Walk up the DOM tree (crossing shadow boundaries
+                    // via getRootNode().host) to determine if `el` is
+                    // inside a modal/dialog ancestor.
+                    const isInModal = (el) => {
+                        let n = el;
+                        for (let i = 0; i < 50 && n; i++) {
+                            if (n.nodeType === 1 && n.matches) {
+                                if (n.matches(
+                                    'section[role="dialog"], ' +
+                                    'div[role="dialog"], ' +
+                                    '.slds-modal, .modal-container'
+                                )) return true;
+                            }
+                            if (n.parentElement) {
+                                n = n.parentElement;
+                            } else {
+                                const root = n.getRootNode();
+                                n = root && root.host ? root.host : null;
+                            }
+                        }
+                        return false;
+                    };
+
                     const all = findInputs(document.body);
-                    const visible = all.filter(inp => {
+                    const inModal = all.filter(isInModal);
+                    const visible = inModal.filter(inp => {
                         const r = inp.getBoundingClientRect();
                         if (r.width === 0 || r.height === 0) return false;
                         const t = (inp.type || '').toLowerCase();
@@ -1393,15 +1422,19 @@ class BrowserWorker:
                             name: empty.name || '',
                             placeholder: empty.placeholder || '',
                             aria: empty.getAttribute('aria-label') || '',
-                            visible_total: visible.length,
+                            in_modal: inModal.length,
+                            visible: visible.length,
                         };
                     }
                     return {
                         found: false,
-                        visible_total: visible.length,
+                        all_total: all.length,
+                        in_modal: inModal.length,
+                        visible: visible.length,
                         sample: visible.slice(0, 5).map(i => ({
                             name: i.name || '',
                             placeholder: i.placeholder || '',
+                            aria: i.getAttribute('aria-label') || '',
                             value: (i.value || '').substring(0, 20),
                         })),
                     };
@@ -1413,13 +1446,15 @@ class BrowserWorker:
         self.on_status(f"  → JS scan result: {result}")
         if not result.get("found"):
             return _fail("name-input", (
-                f"no empty input found via shadow-piercing JS. "
-                f"Scan saw {result.get('visible_total', 0)} visible "
-                f"inputs total. Inspect popup in DevTools and check "
-                f"what's there."
+                f"no empty input found inside a modal. JS saw "
+                f"{result.get('all_total', 0)} total inputs, "
+                f"{result.get('in_modal', 0)} inside any modal, "
+                f"{result.get('visible', 0)} visible. The popup "
+                f"may use an unusual structure — check the DOM in "
+                f"Edge DevTools."
             ))
 
-        # Input is focused. Clear any leftover state, then type.
+        # Input is focused. Clear leftover state, then type.
         target.wait_for_timeout(300)
         try:
             target.keyboard.press("Control+a")
