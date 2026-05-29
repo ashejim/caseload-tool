@@ -34,6 +34,10 @@ caseload.csv
 # Browser-preview temp written by the HTML editor's Preview button.
 _preview.html
 
+# Per-user settings (advanced mode, first-run flag, etc.) — local
+# to each install; don't commit.
+settings.json
+
 # User-specific email templates — only the canonical sample ships
 # with the repo. Real students' emails contain identifiable
 # correspondence; keep them out of source control (FERPA).
