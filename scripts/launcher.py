@@ -1461,6 +1461,60 @@ SECONDARY_BTN_KWARGS = dict(
 )
 
 
+# Preset palette for scenario group colors. Muted enough to read
+# comfortably on both light and dark backgrounds; tuned so the
+# text-color helper (YIQ luminance) gives a sane white/black
+# foreground without manual override.
+GROUP_COLOR_PALETTE: list[tuple[str, str]] = [
+    ("Slate", "#5a6f8a"),
+    ("Blue", "#3a7ad9"),
+    ("Teal", "#239a8e"),
+    ("Green", "#3f9d3f"),
+    ("Olive", "#7a9038"),
+    ("Amber", "#c08a25"),
+    ("Orange", "#d27033"),
+    ("Red", "#c14e4e"),
+    ("Pink", "#c25c92"),
+    ("Purple", "#8d56b8"),
+    ("Brown", "#7a5a3c"),
+    ("Gray", "#7a7a7a"),
+]
+
+
+def _text_color_for_bg(hex_color: str) -> str:
+    """Return '#000000' or '#ffffff' — whichever contrasts better
+    against `hex_color`. Uses the YIQ luminance formula which
+    weights green most heavily (matches human perception of
+    brightness)."""
+    h = (hex_color or "").lstrip("#")
+    if len(h) == 3:
+        h = "".join(c + c for c in h)
+    if len(h) != 6:
+        return "#000000"
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        return "#000000"
+    yiq = (r * 299 + g * 587 + b * 114) / 1000
+    return "#000000" if yiq >= 128 else "#ffffff"
+
+
+def _hover_color_for(hex_color: str) -> str:
+    """Slightly darker version of `hex_color` for hover state.
+    Returns the input unchanged if it can't be parsed."""
+    h = (hex_color or "").lstrip("#")
+    if len(h) == 3:
+        h = "".join(c + c for c in h)
+    if len(h) != 6:
+        return hex_color
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        return hex_color
+    f = 0.82
+    return f"#{int(r * f):02x}{int(g * f):02x}{int(b * f):02x}"
+
+
 _DIALOG_GEOMETRY: dict[str, str] = {}
 _DIALOG_DEFAULTS: dict[str, str] = {
     "find_and_pick": "480x440",
@@ -5129,18 +5183,136 @@ class App:
         ).pack(side="right")
 
     def _rebuild_scenario_buttons(self) -> None:
+        """Render the scenario button list. Layout depends on whether
+        the user has defined any groups:
+
+        - No groups: flat 2-column grid (legacy behavior).
+        - With groups: Ungrouped section at top (only if non-empty),
+          followed by each group as a collapsible color-coded
+          section. Plus "+ Add group" button at the bottom."""
         for w in self.button_frame.winfo_children():
             w.destroy()
         self.scenario_buttons.clear()
-        for i, (name, sc) in enumerate(self.scenarios.items()):
-            label = f"{name}" + (f"  ({sc.hotkey})" if sc.hotkey else "")
-            btn = ctk.CTkButton(
-                self.button_frame, text=label, command=lambda s=sc: self._fire(s),
+        self.button_frame.grid_columnconfigure(0, weight=1)
+        self.button_frame.grid_columnconfigure(1, weight=1)
+
+        # Track collapse state per group across rebuilds.
+        if not hasattr(self, "_group_collapsed"):
+            self._group_collapsed: dict[str, bool] = {}
+
+        def _scenario_btn(parent, name: str, sc: ScenarioConfig,
+                          color: Optional[str] = None) -> ctk.CTkButton:
+            label = name + (f"  ({sc.hotkey})" if sc.hotkey else "")
+            kwargs: dict = dict(
+                text=label, command=lambda s=sc: self._fire(s),
                 width=160, height=36,
             )
-            btn.grid(row=i // 2, column=i % 2, padx=6, pady=6, sticky="ew")
-            self.button_frame.grid_columnconfigure(i % 2, weight=1)
+            if color:
+                kwargs["fg_color"] = color
+                kwargs["text_color"] = _text_color_for_bg(color)
+                kwargs["hover_color"] = _hover_color_for(color)
+            btn = ctk.CTkButton(parent, **kwargs)
             self.scenario_buttons[name] = btn
+            return btn
+
+        # No groups → flat grid (original behavior preserved).
+        if not self.groups:
+            for i, (name, sc) in enumerate(self.scenarios.items()):
+                btn = _scenario_btn(self.button_frame, name, sc)
+                btn.grid(row=i // 2, column=i % 2, padx=6, pady=6, sticky="ew")
+            return
+
+        # With groups → sectioned layout.
+        row = 0
+        grouped_names: set[str] = set()
+        for g in self.groups:
+            grouped_names.update(s for s in g.scenarios if s in self.scenarios)
+        ungrouped = [n for n in self.scenarios if n not in grouped_names]
+
+        if ungrouped:
+            ctk.CTkLabel(
+                self.button_frame, text="Ungrouped",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=("gray40", "gray70"),
+                anchor="w",
+            ).grid(row=row, column=0, columnspan=2,
+                   sticky="ew", padx=6, pady=(4, 2))
+            row += 1
+            for i, name in enumerate(ungrouped):
+                btn = _scenario_btn(self.button_frame, name, self.scenarios[name])
+                btn.grid(row=row + i // 2, column=i % 2,
+                         padx=6, pady=4, sticky="ew")
+            row += (len(ungrouped) + 1) // 2
+
+        for group in self.groups:
+            collapsed = self._group_collapsed.get(group.name, False)
+            # Header: collapse-toggle button (colored to match group)
+            # + ⚙ settings button.
+            header = ctk.CTkFrame(self.button_frame, fg_color="transparent")
+            header.grid(row=row, column=0, columnspan=2,
+                        sticky="ew", padx=4, pady=(8, 0))
+            header.grid_columnconfigure(0, weight=1)
+            arrow = "▶" if collapsed else "▼"
+            ctk.CTkButton(
+                header, text=f"{arrow}  {group.name}",
+                anchor="w", height=28,
+                fg_color=group.color,
+                text_color=_text_color_for_bg(group.color),
+                hover_color=_hover_color_for(group.color),
+                font=ctk.CTkFont(size=12, weight="bold"),
+                command=lambda gn=group.name: self._toggle_group(gn),
+            ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+            ctk.CTkButton(
+                header, text="⚙", width=32, height=28,
+                command=lambda g=group: self._edit_group(g),
+                **SECONDARY_BTN_KWARGS,
+            ).grid(row=0, column=1, padx=(0, 0))
+            row += 1
+            if collapsed:
+                continue
+            valid = [s for s in group.scenarios if s in self.scenarios]
+            for i, name in enumerate(valid):
+                btn = _scenario_btn(
+                    self.button_frame, name, self.scenarios[name],
+                    color=group.color,
+                )
+                btn.grid(row=row + i // 2, column=i % 2,
+                         padx=6, pady=4, sticky="ew")
+            if valid:
+                row += (len(valid) + 1) // 2
+
+        # "+ Add group" trailing button.
+        ctk.CTkButton(
+            self.button_frame, text="+ Add group",
+            command=self._add_group, height=28,
+            **SECONDARY_BTN_KWARGS,
+        ).grid(row=row, column=0, columnspan=2,
+               sticky="ew", padx=6, pady=(10, 4))
+
+    def _toggle_group(self, group_name: str) -> None:
+        """Flip a group's collapsed flag and re-render the button
+        list. Collapse state is per-session (not persisted)."""
+        if not hasattr(self, "_group_collapsed"):
+            self._group_collapsed = {}
+        self._group_collapsed[group_name] = (
+            not self._group_collapsed.get(group_name, False)
+        )
+        self._rebuild_scenario_buttons()
+
+    def _add_group(self) -> None:
+        """Open the new-group dialog. Implementation lands in
+        Phase 2 commit 3 — for now, logs a placeholder so the
+        button is wired but doesn't crash."""
+        self._append_log(
+            "TODO Phase 2 commit 3: + Add group dialog"
+        )
+
+    def _edit_group(self, group: Group) -> None:
+        """Open the group-management dialog for `group`. Same
+        placeholder behavior as _add_group until commit 3."""
+        self._append_log(
+            f"TODO Phase 2 commit 3: edit group {group.name!r}"
+        )
 
     # ----- Editor (right) pane -----
 
