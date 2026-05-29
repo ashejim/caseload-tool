@@ -48,8 +48,8 @@ from src.config import (
 from src.version import __version__
 from src.note_form import NoteData
 from src.scenarios import (
-    NOTES_YAML, BatchConfig, EmailConfig, ScenarioConfig,
-    load_scenarios, run_scenario,
+    NOTES_YAML, BatchConfig, EmailConfig, Group, ScenarioConfig,
+    load_groups, load_scenarios, run_scenario,
 )
 from src.student_lookup import (
     click_caseload_row,
@@ -4924,6 +4924,9 @@ class App:
         ctk.set_default_color_theme("blue")
 
         self.scenarios = load_scenarios()
+        # User-defined scenario groupings — see Group dataclass.
+        # Empty list means every scenario renders as ungrouped.
+        self.groups: list[Group] = load_groups()
         # User preferences (advanced/dev mode toggle + future settings).
         # Loaded once at startup; saved via the Settings dialog when
         # the user toggles. Default state hides advanced features.
@@ -5310,6 +5313,7 @@ class App:
         # (added or deleted scenarios) are undone, not just field edits.
         try:
             self.scenarios = load_scenarios()
+            self.groups = load_groups()
         except Exception as e:
             self._append_log(f"Revert failed: {e}")
             return
@@ -5405,6 +5409,23 @@ class App:
                     + " have Submit unchecked"
                 )
 
+        # Persist groups alongside scenarios. Each group's scenario
+        # list is filtered to names that still exist in the saved
+        # set — protects against dangling references when a
+        # scenario gets renamed or deleted.
+        if self.groups:
+            saved_names = set(new_doc["scenarios"].keys())
+            new_doc["groups"] = [
+                {
+                    "name": g.name,
+                    "color": g.color,
+                    "scenarios": [
+                        s for s in g.scenarios if s in saved_names
+                    ],
+                }
+                for g in self.groups
+            ]
+
         try:
             NOTES_YAML.write_text(
                 yaml.safe_dump(new_doc, sort_keys=False, allow_unicode=True),
@@ -5415,6 +5436,7 @@ class App:
             return
         try:
             self.scenarios = load_scenarios()
+            self.groups = load_groups()
         except Exception as e:
             self._append_log(f"Saved but reload failed: {e}")
             return

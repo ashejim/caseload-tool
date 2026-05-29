@@ -116,6 +116,22 @@ class ScenarioConfig:
     notes: list[NoteData] = field(default_factory=list)
 
 
+@dataclass
+class Group:
+    """User-defined grouping of scenarios in the launcher UI. Groups
+    have a display name + a color (hex string) that scenarios in
+    the group adopt for their button background. Scenarios are
+    referenced by name; ones not in any group render as "ungrouped"
+    at the top of the launcher's scenario list.
+
+    Stored in notes.yaml under a top-level `groups:` block parallel
+    to `scenarios:`. Order matters — groups display top-to-bottom
+    in the order they appear in the list."""
+    name: str
+    color: str = "#7a7a7a"
+    scenarios: list[str] = field(default_factory=list)
+
+
 def _note_from_dict(d: dict) -> NoteData:
     return NoteData(
         interaction_format=d.get("interaction_format", "Single Interaction"),
@@ -157,6 +173,50 @@ def _batch_from_dict(d: Optional[dict]) -> Optional[BatchConfig]:
         filters=list(d.get("filters") or []),
         preview=bool(d.get("preview", True)),
     )
+
+
+def _groups_from_list(items: Optional[list]) -> list[Group]:
+    """Parse the `groups:` block from notes.yaml. Drops entries
+    without a name (the only required field). Color falls back to
+    neutral gray for entries that don't specify one. Scenario
+    references are NOT validated against the scenarios dict at
+    load time — the launcher resolves them lazily so a typoed name
+    or a since-deleted scenario doesn't crash startup."""
+    if not items:
+        return []
+    out: list[Group] = []
+    for d in items:
+        if not isinstance(d, dict):
+            continue
+        name = str(d.get("name", "") or "").strip()
+        if not name:
+            continue
+        out.append(Group(
+            name=name,
+            color=(str(d.get("color", "") or "#7a7a7a").strip()
+                   or "#7a7a7a"),
+            scenarios=[
+                str(s).strip()
+                for s in (d.get("scenarios") or [])
+                if s and str(s).strip()
+            ],
+        ))
+    return out
+
+
+def load_groups(path: Path = NOTES_YAML) -> list[Group]:
+    """Read `groups:` from notes.yaml. Returns an empty list if the
+    file has no groups block (the launcher then shows every
+    scenario as ungrouped). Failure to read / parse returns an
+    empty list rather than raising — groups are a UI feature and
+    shouldn't block startup."""
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+    if not isinstance(raw, dict):
+        return []
+    return _groups_from_list(raw.get("groups"))
 
 
 def _prompts_from_list(items: Optional[list]) -> list[Prompt]:
