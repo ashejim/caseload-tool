@@ -5300,19 +5300,277 @@ class App:
         self._rebuild_scenario_buttons()
 
     def _add_group(self) -> None:
-        """Open the new-group dialog. Implementation lands in
-        Phase 2 commit 3 — for now, logs a placeholder so the
-        button is wired but doesn't crash."""
-        self._append_log(
-            "TODO Phase 2 commit 3: + Add group dialog"
-        )
+        """Open the group dialog with empty fields. On Save, appends
+        the new group to self.groups, persists via _save_yaml, and
+        rebuilds the scenario button list."""
+        self._open_group_dialog(group=None)
 
     def _edit_group(self, group: Group) -> None:
-        """Open the group-management dialog for `group`. Same
-        placeholder behavior as _add_group until commit 3."""
-        self._append_log(
-            f"TODO Phase 2 commit 3: edit group {group.name!r}"
+        """Open the group dialog seeded with `group`'s current
+        values. On Save, mutates the existing group entry in place.
+        Delete unparents the group's scenarios (they revert to
+        ungrouped) and removes the group from self.groups."""
+        self._open_group_dialog(group=group)
+
+    def _open_group_dialog(self, group: Optional[Group]) -> None:
+        """Modal for creating or editing a group. Fields: name,
+        color (palette + custom hex), scenarios (checkbox per
+        scenario, all checked by default for new groups). On Save:
+        - For a new group: appended to self.groups, persists.
+        - For an existing group: mutated in place, persists.
+        Delete (only shown when editing) unparents the group's
+        scenarios and removes the group itself."""
+        is_new = group is None
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("New group" if is_new else f"Edit group — {group.name}")
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.geometry("520x600")
+        dialog.lift()
+        dialog.focus_force()
+
+        ctk.CTkLabel(
+            dialog,
+            text="New group" if is_new else "Edit group",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(16, 8))
+
+        # --- Name field.
+        ctk.CTkLabel(
+            dialog, text="Name", font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(4, 0))
+        name_entry = ctk.CTkEntry(
+            dialog, placeholder_text="e.g. Welcome emails", width=320,
         )
+        name_entry.pack(fill="x", padx=20, pady=(2, 8))
+        if not is_new:
+            name_entry.insert(0, group.name)
+
+        # --- Color picker: palette + custom hex.
+        ctk.CTkLabel(
+            dialog, text="Color", font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(4, 0))
+        color_state = {"value": group.color if not is_new else GROUP_COLOR_PALETTE[0][1]}
+
+        palette_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        palette_frame.pack(fill="x", padx=20, pady=(2, 4))
+        palette_swatches: list[ctk.CTkButton] = []
+
+        def _refresh_swatches() -> None:
+            for sw, (label, hex_c) in zip(palette_swatches, GROUP_COLOR_PALETTE):
+                if hex_c.lower() == color_state["value"].lower():
+                    sw.configure(border_width=3, border_color=("gray10", "gray95"))
+                else:
+                    sw.configure(border_width=1, border_color=("gray60", "gray40"))
+
+        def _pick_color(hex_c: str) -> None:
+            color_state["value"] = hex_c
+            _refresh_swatches()
+            _update_preview()
+
+        for i, (label, hex_c) in enumerate(GROUP_COLOR_PALETTE):
+            sw = ctk.CTkButton(
+                palette_frame, text="", width=36, height=24,
+                fg_color=hex_c, hover_color=_hover_color_for(hex_c),
+                border_width=1, border_color=("gray60", "gray40"),
+                command=lambda c=hex_c: _pick_color(c),
+            )
+            sw.grid(row=i // 6, column=i % 6, padx=2, pady=2, sticky="w")
+            palette_swatches.append(sw)
+
+        # Custom hex entry for power users.
+        custom_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        custom_row.pack(fill="x", padx=20, pady=(2, 8))
+        ctk.CTkLabel(
+            custom_row, text="Custom hex:", anchor="w",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"),
+        ).pack(side="left")
+        custom_entry = ctk.CTkEntry(
+            custom_row, placeholder_text="#rrggbb", width=100,
+        )
+        custom_entry.pack(side="left", padx=(8, 4))
+
+        def _apply_custom() -> None:
+            v = (custom_entry.get() or "").strip()
+            if not v.startswith("#"):
+                v = "#" + v
+            # Quick validity check
+            h = v.lstrip("#")
+            if len(h) == 3:
+                h = "".join(c + c for c in h)
+            if len(h) != 6:
+                custom_entry.configure(border_color=("#cc0000", "#cc6666"))
+                return
+            try:
+                int(h, 16)
+            except ValueError:
+                custom_entry.configure(border_color=("#cc0000", "#cc6666"))
+                return
+            custom_entry.configure(border_color=("gray60", "gray40"))
+            color_state["value"] = "#" + h.lower()
+            _refresh_swatches()
+            _update_preview()
+
+        ctk.CTkButton(
+            custom_row, text="Apply", width=70, height=28,
+            command=_apply_custom, **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(0, 4))
+
+        # Live preview: a fake scenario button using the current color.
+        preview_label = ctk.CTkLabel(
+            dialog, text="Preview", font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"),
+            anchor="w",
+        )
+        preview_label.pack(fill="x", padx=20, pady=(8, 2))
+        preview_btn = ctk.CTkButton(
+            dialog, text="example scenario  (F3)",
+            width=200, height=36, state="disabled",
+        )
+        preview_btn.pack(anchor="w", padx=20, pady=(0, 8))
+
+        def _update_preview() -> None:
+            c = color_state["value"]
+            try:
+                preview_btn.configure(
+                    fg_color=c,
+                    text_color=_text_color_for_bg(c),
+                    text_color_disabled=_text_color_for_bg(c),
+                )
+            except Exception:
+                pass
+
+        _refresh_swatches()
+        _update_preview()
+
+        # --- Scenarios checkbox list.
+        ctk.CTkLabel(
+            dialog, text="Scenarios in this group",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(8, 0))
+        # Show which group each scenario is currently in (if any).
+        current_membership: dict[str, str] = {}
+        for g in self.groups:
+            if not is_new and g is group:
+                continue
+            for s in g.scenarios:
+                current_membership[s] = g.name
+        scenario_vars: dict[str, ctk.BooleanVar] = {}
+        sc_frame = ctk.CTkScrollableFrame(dialog, fg_color=("gray95", "gray18"))
+        sc_frame.pack(fill="both", expand=True, padx=20, pady=(2, 8))
+        initial_members = set(group.scenarios) if not is_new else set()
+        for name in self.scenarios:
+            v = ctk.BooleanVar(value=(name in initial_members))
+            scenario_vars[name] = v
+            row = ctk.CTkFrame(sc_frame, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            ctk.CTkCheckBox(
+                row, text=name, variable=v,
+            ).pack(side="left")
+            other_group = current_membership.get(name)
+            if other_group:
+                ctk.CTkLabel(
+                    row, text=f"  (currently in {other_group!r})",
+                    font=ctk.CTkFont(size=10, slant="italic"),
+                    text_color=("gray40", "gray65"),
+                ).pack(side="left", padx=(6, 0))
+
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "If a scenario is in another group, checking it here "
+                "moves it to this one (a scenario can only be in one "
+                "group at a time)."
+            ),
+            font=ctk.CTkFont(size=10, slant="italic"),
+            text_color=("gray45", "gray60"),
+            wraplength=460, justify="left", anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 8))
+
+        # --- Buttons row.
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 16), side="bottom")
+
+        def _do_save() -> None:
+            new_name = (name_entry.get() or "").strip()
+            if not new_name:
+                self._append_log("Group save aborted: name is required.")
+                return
+            # Reject duplicate names (except when editing the same one).
+            for g in self.groups:
+                if g is group:
+                    continue
+                if g.name.lower() == new_name.lower():
+                    self._append_log(
+                        f"Group save aborted: name {new_name!r} already exists."
+                    )
+                    return
+            picked = [n for n, v in scenario_vars.items() if v.get()]
+            # Unparent any newly-checked scenario from its current group.
+            for g in self.groups:
+                if not is_new and g is group:
+                    continue
+                g.scenarios = [s for s in g.scenarios if s not in picked]
+            if is_new:
+                self.groups.append(Group(
+                    name=new_name,
+                    color=color_state["value"],
+                    scenarios=picked,
+                ))
+            else:
+                group.name = new_name
+                group.color = color_state["value"]
+                group.scenarios = picked
+            self._save_yaml()
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        def _do_delete() -> None:
+            if is_new or group is None:
+                return
+            # Unparenting is automatic — we just remove the group itself,
+            # any scenarios it referenced just become ungrouped.
+            try:
+                self.groups.remove(group)
+            except ValueError:
+                pass
+            self._save_yaml()
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        def _do_cancel() -> None:
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        ctk.CTkButton(
+            btn_row, text="Save", width=100, command=_do_save,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            btn_row, text="Cancel", width=100, command=_do_cancel,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=4)
+        if not is_new:
+            ctk.CTkButton(
+                btn_row, text="Delete group", width=120,
+                command=_do_delete,
+                fg_color=("#cc4444", "#aa3333"),
+                hover_color=("#aa3333", "#882222"),
+            ).pack(side="right", padx=4)
+
+        dialog.bind("<Escape>", lambda _e: _do_cancel())
+        dialog.protocol("WM_DELETE_WINDOW", _do_cancel)
 
     # ----- Editor (right) pane -----
 
