@@ -114,6 +114,13 @@ class ScenarioConfig:
     batch: Optional[BatchConfig] = None
     prompts: list[Prompt] = field(default_factory=list)
     notes: list[NoteData] = field(default_factory=list)
+    # When True, this scenario appears in the caseload panel's
+    # "Fire scenario" menus (row right-click + selection action bar).
+    # Batch scenarios can't be panel actions — the panel's batch-style
+    # workflow is "filter the view → select rows → apply a single action",
+    # so the editor disables this for batch scenarios. If NO scenario sets
+    # it, the panel falls back to listing every non-batch scenario.
+    panel_action: bool = False
 
 
 @dataclass
@@ -260,6 +267,7 @@ def load_scenarios(path: Path = NOTES_YAML) -> dict[str, ScenarioConfig]:
             batch=_batch_from_dict(cfg.get("batch")),
             prompts=_prompts_from_list(cfg.get("prompts")),
             notes=notes,
+            panel_action=bool(cfg.get("panel_action", False)),
         )
     return out
 

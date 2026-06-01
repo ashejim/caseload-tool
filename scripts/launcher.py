@@ -4705,6 +4705,31 @@ class ScenarioEditor:
         )
         self.find_first_checkbox.grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
 
+        # Caseload-panel action toggle — surfaces this scenario in the
+        # caseload panel's "Fire scenario" menus. Disabled for batch
+        # scenarios (the panel does batch-style work via filter + select +
+        # single action), with a hint shown while batch mode is on.
+        row += 1
+        self.panel_action_var = ctk.BooleanVar(value=False)
+        self.panel_action_checkbox = ctk.CTkCheckBox(
+            self.frame,
+            text="Show as a caseload-panel action",
+            variable=self.panel_action_var,
+        )
+        self.panel_action_checkbox.grid(
+            row=row, column=0, sticky="w", padx=8, pady=(0, 2))
+        row += 1
+        self.panel_action_hint = ctk.CTkLabel(
+            self.frame,
+            text="Batch scenarios run from the main window — in the panel, "
+                 "filter the view and apply a single action instead.",
+            font=ctk.CTkFont(size=10), text_color=("gray45", "gray60"),
+            wraplength=420, justify="left", anchor="w",
+        )
+        self.panel_action_hint.grid(
+            row=row, column=0, sticky="w", padx=(28, 8), pady=(0, 8))
+        self.panel_action_hint.grid_remove()  # shown only in batch mode
+
         # Send-email toggle + email section (sub-frame visible only
         # when toggle is on). Toggle commands grid_remove/.grid so
         # the row collapses to nothing when emails aren't used.
@@ -4828,12 +4853,19 @@ class ScenarioEditor:
             # Force-off find_first so a hidden checkbox can't still
             # save to YAML via serialize().
             self.find_first_var.set(False)
+            # Batch scenarios can't be panel actions — disable + clear the
+            # toggle and explain why.
+            self.panel_action_var.set(False)
+            self.panel_action_checkbox.configure(state="disabled")
+            self.panel_action_hint.grid()
         else:
             self._batch_section.grid_remove()
             self.find_first_checkbox.grid(
                 row=self._find_first_row, column=0,
                 sticky="w", padx=8, pady=(0, 8),
             )
+            self.panel_action_checkbox.configure(state="normal")
+            self.panel_action_hint.grid_remove()
 
     # ----- Scenario variables section -----
 
@@ -5330,6 +5362,8 @@ class ScenarioEditor:
         self.hotkey_entry.delete(0, "end")
         self.hotkey_entry.insert(0, scenario.hotkey)
         self.find_first_var.set(scenario.find_first)
+        # Panel-action toggle (forced off below for batch scenarios).
+        self.panel_action_var.set(scenario.panel_action)
         # Batch config — populate filter rows + visibility.
         self._batch_preview = scenario.batch.preview if scenario.batch else True
         # Rebuild prompt rows fresh from the scenario.
@@ -5391,6 +5425,11 @@ class ScenarioEditor:
             "find_first": self.find_first_var.get(),
             "notes": [ne.serialize() for ne in self.note_editors],
         }
+        # Panel action only makes sense for non-batch scenarios; the
+        # toggle is force-disabled in batch mode, so this is already False
+        # there. Only written when True to keep the YAML uncluttered.
+        if self.panel_action_var.get() and not self.batch_mode_var.get():
+            out["panel_action"] = True
         if self.send_email_var.get():
             tpl = self.email_body_combo.get().strip()
             if "(none" in tpl:  # placeholder for empty templates folder
@@ -5939,12 +5978,23 @@ class CaseloadPanel:
         else:
             self.action_bar.grid_remove()
 
+    def _panel_action_scenarios(self) -> list:
+        """Scenarios offered in the panel's Fire menus: those flagged
+        'Show as a caseload-panel action' (non-batch only). Falls back to
+        every non-batch scenario when none are flagged yet, so the menu is
+        never empty for users who haven't curated."""
+        nonbatch = [s for s in self.app.scenarios.values()
+                    if s.batch is None]
+        flagged = [s for s in nonbatch
+                   if getattr(s, "panel_action", False)]
+        return flagged or nonbatch
+
     def _on_fire_selected_clicked(self) -> None:
-        """Post a menu of non-batch scenarios; firing one runs it across
-        the checked students as a mini-batch (reuses the batch driver)."""
+        """Post a menu of the curated panel-action scenarios; firing one
+        runs it across the checked students as a mini-batch."""
         if not self._checked_rows():
             return
-        nonbatch = [s for s in self.app.scenarios.values() if s.batch is None]
+        nonbatch = self._panel_action_scenarios()
         if not nonbatch:
             self.app._append_log("No non-batch scenarios to fire.")
             return
@@ -6442,8 +6492,7 @@ class CaseloadPanel:
             label="Open in new tab",
             command=lambda: self.app._find_student_by_query(
                 query, new_tab=True))
-        nonbatch = [s for s in self.app.scenarios.values()
-                    if s.batch is None]
+        nonbatch = self._panel_action_scenarios()
         if nonbatch:
             menu.add_separator()
             fire_menu = tk.Menu(menu, tearoff=0)
