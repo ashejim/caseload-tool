@@ -83,6 +83,10 @@ class EmailConfig:
     signature_file: str = ""
     inline_images: list[str] = field(default_factory=list)
     cc_pm: bool = False
+    # When True, the user is asked to pick which template (and confirm the
+    # subject) at fire time, instead of always using `body_html_file`.
+    # Lets one "send email" scenario cover many templates.
+    pick_template: bool = False
     # Font of the SENT message. Empty family or size=0 means "use
     # Outlook's compose default" (no CSS injection). When both are
     # set, the rendered HTML body is wrapped in an inline-styled div
@@ -168,6 +172,7 @@ def _email_from_dict(d: Optional[dict]) -> Optional[EmailConfig]:
         signature_file=d.get("signature_file", ""),
         inline_images=list(d.get("inline_images") or []),
         cc_pm=bool(d.get("cc_pm", False)),
+        pick_template=bool(d.get("pick_template", False)),
         font_family=str(d.get("font_family", "") or ""),
         font_size=font_size,
     )

@@ -3500,9 +3500,21 @@ def prompt_batch_email_review(
     scenario_name: str,
     rendered: list[dict],
     filter_summary: str = "",
-) -> Optional[list[int]]:
-    """Modal reviewer for batch emails. Returns the list of indices
-    (into `rendered`) the user wants to send to, or None on cancel.
+    *,
+    templates: Optional[list[str]] = None,
+    current_template: str = "",
+    on_template_change: Optional[Callable[[str], list[dict]]] = None,
+) -> tuple:
+    """Modal reviewer for batch emails. Returns
+    `(selected_indices_or_None, chosen_template)` — the indices (into
+    `rendered`) the user wants to send to (None on cancel), and the
+    template they had selected (the unchanged default unless a
+    `templates` dropdown was shown).
+
+    When `templates` is given (the scenario opted into 'choose template
+    when fired'), a Template dropdown appears above the preview; changing
+    it calls `on_template_change(template_filename)` which must return a
+    freshly-rendered `rendered` list, and the preview refreshes live.
 
     Each entry in `rendered` is a dict with keys:
         name              — student display name
@@ -3566,6 +3578,39 @@ def prompt_batch_email_review(
         text_color=("gray35", "gray70"), anchor="w",
     )
     selection_label.pack(fill="x", padx=10, pady=(0, 8))
+
+    # Optional template picker (scenario opted into "choose template when
+    # fired"). Changing it re-renders every preview via the callback.
+    chosen_template_box = {"value": current_template}
+    if templates:
+        tpl_row = ctk.CTkFrame(banner, fg_color="transparent")
+        tpl_row.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(
+            tpl_row, text="Template:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(side="left")
+        tpl_combo = ctk.CTkComboBox(
+            tpl_row, values=templates, width=300, state="readonly",
+        )
+        tpl_combo.set(current_template if current_template in templates
+                      else templates[0])
+        tpl_combo.pack(side="left", padx=(6, 0))
+        chosen_template_box["value"] = tpl_combo.get()
+
+        def _on_tpl_change(choice: str) -> None:
+            chosen_template_box["value"] = choice
+            if on_template_change is None:
+                return
+            try:
+                new = on_template_change(choice)
+            except Exception:
+                new = None
+            if new:
+                for i in range(min(len(rendered), len(new))):
+                    rendered[i] = new[i]
+                _show(state["current"])
+
+        tpl_combo.configure(command=_on_tpl_change)
 
     # ---- Main split: student list (left) + preview (right). ----
     body = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -3893,7 +3938,7 @@ def prompt_batch_email_review(
         _show(0)
 
     parent.wait_window(dialog)
-    return result_box["value"]
+    return result_box["value"], chosen_template_box["value"]
 
 
 def prompt_batch_review(
@@ -5071,7 +5116,16 @@ class ScenarioEditor:
         ctk.CTkCheckBox(
             frame, text="CC Program Mentor",
             variable=self.email_cc_pm_var,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 8))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 4))
+
+        # Pick the template (and confirm the subject) at fire time. Lets
+        # one scenario serve many templates — the Body template above is
+        # used as the default pre-selection in the fire-time picker.
+        self.email_pick_template_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            frame, text="Choose email template when fired",
+            variable=self.email_pick_template_var,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8))
 
     @staticmethod
     def _available_template_files() -> list[str]:
@@ -5401,6 +5455,7 @@ class ScenarioEditor:
             self.email_images_entry.delete(0, "end")
             self.email_images_entry.insert(0, ", ".join(scenario.email.inline_images))
             self.email_cc_pm_var.set(scenario.email.cc_pm)
+            self.email_pick_template_var.set(scenario.email.pick_template)
             ff = (scenario.email.font_family or "").strip()
             self.email_font_family_combo.set(ff if ff else EMAIL_FONT_DEFAULT_LABEL)
             fs = scenario.email.font_size or 0
@@ -5412,6 +5467,7 @@ class ScenarioEditor:
             self.email_signature_combo.set("")
             self.email_images_entry.delete(0, "end")
             self.email_cc_pm_var.set(False)
+            self.email_pick_template_var.set(False)
             self.email_font_family_combo.set(EMAIL_FONT_DEFAULT_LABEL)
             self.email_font_size_combo.set("")
         self._on_send_email_toggled()
@@ -5446,6 +5502,8 @@ class ScenarioEditor:
                 "inline_images": inline_images,
                 "cc_pm": self.email_cc_pm_var.get(),
             }
+            if self.email_pick_template_var.get():
+                out["email"]["pick_template"] = True
             # Only write font fields when the user has set them away
             # from the "Outlook default" sentinel — keeps the YAML
             # uncluttered for scenarios that don't override the font.
@@ -6479,10 +6537,11 @@ class CaseloadPanel:
 
     def _show_row_menu(self, iid, x_root, y_root) -> None:
         """Build + post the per-row action menu: Open / Open in new tab /
-        Fire scenario ▸ (built fresh so it reflects the current scenario
-        list; batch scenarios excluded)."""
+        Fire scenario ▸ (this row) / Fire on N selected ▸ (the checked
+        rows, when any). Curated to the panel-action scenarios."""
         query, label = self._query_label_for_iid(iid)
-        if not query:
+        row = self._row_by_iid.get(iid)
+        if not query or not row:
             return
         menu = tk.Menu(self.tree, tearoff=0)
         menu.add_command(
@@ -6495,13 +6554,25 @@ class CaseloadPanel:
         nonbatch = self._panel_action_scenarios()
         if nonbatch:
             menu.add_separator()
+            # Fire on THIS row (single-student mini-batch → same previewer).
             fire_menu = tk.Menu(menu, tearoff=0)
             for sc in nonbatch:
                 fire_menu.add_command(
                     label=sc.name,
-                    command=lambda s=sc: self.app._fire_on_student(
-                        s, query, label))
+                    command=lambda s=sc, r=row: self.app._fire_on_selected(
+                        s, [r]))
             menu.add_cascade(label="Fire scenario", menu=fire_menu)
+            # Fire on the whole checked selection, when there is one.
+            checked = self._checked_rows()
+            if checked:
+                sel_menu = tk.Menu(menu, tearoff=0)
+                for sc in nonbatch:
+                    sel_menu.add_command(
+                        label=sc.name,
+                        command=lambda s=sc: self.app._fire_on_selected(
+                            s, self._checked_rows()))
+                menu.add_cascade(
+                    label=f"Fire on {len(checked)} selected", menu=sel_menu)
         try:
             menu.tk_popup(x_root, y_root)
         finally:
@@ -8242,44 +8313,6 @@ class App:
         finally:
             self._set_idle()
 
-    def _fire_on_student(self, scenario: ScenarioConfig,
-                         query: str, label: str) -> None:
-        """Fire a (non-batch) scenario on a specific student chosen from
-        the caseload panel: confirm, navigate to them, then run the
-        normal per-student flow with the find/pick prompt skipped."""
-        if self._is_busy:
-            self._append_log(
-                f"Busy — wait for the current task to finish before "
-                f"firing {scenario.name!r}."
-            )
-            return
-        if not self.worker.ready_event.is_set():
-            self._append_log("Browser not ready yet — wait and try again.")
-            return
-        if scenario.batch is not None:
-            # The row menu only lists non-batch scenarios, but guard anyway.
-            self._append_log(
-                f"{scenario.name!r} is a batch scenario; fire it from the "
-                "main window, not a single row."
-            )
-            return
-        who = label or query
-        if not ask_yes_no_topmost(
-            self.root, "Fire scenario?",
-            f"Fire {scenario.name!r} on {who}?",
-            yes_label="Fire", no_label="Cancel",
-        ):
-            self._append_log(f"{scenario.name!r} on {who}: cancelled.")
-            return
-        override = self.course_var.get().strip()
-        self._append_log(f"--- Firing {scenario.name!r} on {who} ---")
-        self._set_busy(f"Running {scenario.name} on {who}…")
-        try:
-            self._fire_per_student(
-                scenario, override, prenav_query=query, prenav_label=label)
-        finally:
-            self._set_idle()
-
     def _collect_prompt_vars(
         self, scenario: ScenarioConfig,
     ) -> Optional[dict[str, str]]:
@@ -8298,6 +8331,7 @@ class App:
                 return None
             prompt_vars[p.var] = value
         return prompt_vars
+
 
     def _fire_per_student(self, scenario: ScenarioConfig, override: str,
                           *, prenav_query: str = "",
@@ -8377,11 +8411,10 @@ class App:
         if any(n.append_clipboard for n in scenario.notes):
             clipboard = self._read_clipboard_content()
 
-        # Step 5: email (if scenario has one). Opens an Outlook draft for
-        # FERPA review; user reviews + sends from Outlook, then confirms
-        # before the note fires. Prompt vars merge into the student
-        # context so {{summary}}-style placeholders in the email body
-        # / subject / to-field resolve correctly.
+        # Step 5: email (if scenario has one). Reviewed in the same in-app
+        # previewer as batch/selection (incl. the fire-time template
+        # dropdown when opted in), then auto-sent. Rendered from the
+        # scraped student context since there's no CSV row here.
         if scenario.email is not None:
             student_ctx = self._get_student_context_blocking(name_hint=chosen_name)
             if student_ctx is None:
@@ -8389,9 +8422,24 @@ class App:
                     "Couldn't read student context for email; scenario not fired."
                 )
                 return
-            student_ctx = {**student_ctx, **prompt_vars}
-            if not self._send_scenario_email(scenario.email, student_ctx):
-                self._append_log("Email step aborted; note not filed.")
+            from src import outlook_email
+            user_info = outlook_email.get_user_info()
+            who = (chosen_name or student_ctx.get("full_name", "")
+                   or "this student")
+
+            def _render(scn: ScenarioConfig) -> list[dict]:
+                return [self._build_email_preview_data(
+                    scn, {}, prompt_vars, user_info, ctx_override=student_ctx)]
+
+            scenario, selected = self._run_email_review(scenario, _render, who)
+            if not selected:
+                self._append_log("Email review cancelled; note not filed.")
+                return
+            ctx_send = {**student_ctx, **prompt_vars}
+            if not self._send_scenario_email(
+                scenario.email, ctx_send, auto_send=True,
+            ):
+                self._append_log("Email send failed; note not filed.")
                 return
 
         self.worker.submit_scenario(
@@ -8524,36 +8572,16 @@ class App:
         # review otherwise.
         has_email = scenario.email is not None
         if has_email:
-            from src import outlook_email
-            user_info = outlook_email.get_user_info()
-            self._append_log(
-                f"Rendering {len(matched)} email previews for review…"
-            )
-            rendered = [
-                self._build_email_preview_data(
-                    scenario, row, prompt_vars, user_info,
-                )
-                for row in matched
-            ]
             filter_summary = ", ".join(
                 f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
                 for f in scenario.batch.filters
                 if f.get("column")
             )
-            selected = prompt_batch_email_review(
-                self.root, scenario.name, rendered, filter_summary,
+            scenario, confirmed = self._review_emails(
+                scenario, matched, prompt_vars, filter_summary,
             )
-            if selected is None:
-                self._append_log("Batch cancelled at email review.")
-                return
-            if not selected:
-                self._append_log("Batch: no students selected; nothing to do.")
-                return
-            confirmed = [matched[i] for i in selected]
-            self._append_log(
-                f"Email review confirmed: sending to {len(confirmed)} of "
-                f"{len(matched)} students."
-            )
+            if confirmed is None:
+                return  # cancelled / nothing selected (already logged)
         elif scenario.batch.preview:
             confirmed = prompt_batch_review(
                 self.root, scenario.name, matched, display_columns,
@@ -8773,35 +8801,23 @@ class App:
             return  # user cancelled a prompt
 
         # Review/confirm. With an email step, reuse the per-student FERPA
-        # review modal (same as batch); otherwise a single count confirm.
+        # review modal (same as batch), including the fire-time template
+        # dropdown; otherwise a single count/name confirm.
         if has_email:
-            from src import outlook_email
-            user_info = outlook_email.get_user_info()
-            self._append_log(
-                f"Rendering {len(rows)} email previews for review…"
+            n0 = len(rows)
+            summary = (
+                f"{n0} hand-picked from the caseload panel" if n0 != 1
+                else self._row_name_and_query(rows[0])[0]
             )
-            rendered = [
-                self._build_email_preview_data(
-                    scenario, row, prompt_vars, user_info,
-                )
-                for row in rows
-            ]
-            selected = prompt_batch_email_review(
-                self.root, scenario.name, rendered,
-                f"{len(rows)} hand-picked from the caseload panel",
+            scenario, confirmed = self._review_emails(
+                scenario, rows, prompt_vars, summary,
             )
-            if selected is None:
-                self._append_log("Selection fire cancelled at email review.")
-                return
-            if not selected:
-                self._append_log(
-                    "Selection fire: no students selected; nothing to do."
-                )
-                return
-            confirmed = [rows[i] for i in selected]
+            if confirmed is None:
+                return  # cancelled / nothing selected (already logged)
         else:
             n = len(rows)
-            who = f"{n} selected student" + ("s" if n != 1 else "")
+            who = (self._row_name_and_query(rows[0])[0] if n == 1
+                   else f"{n} selected students")
             if not ask_yes_no_topmost(
                 self.root, "Fire scenario?",
                 f"Fire {scenario.name!r} on {who}?",
@@ -8946,12 +8962,82 @@ class App:
         self.root.wait_variable(done_var)
         return holder["success"], holder["info"]
 
+    @staticmethod
+    def _email_template_files() -> list[str]:
+        """Sorted .html template filenames in the templates dir."""
+        try:
+            return sorted(p.name for p in TEMPLATES_DIR.glob("*.html"))
+        except Exception:
+            return []
+
+    def _run_email_review(self, scenario: ScenarioConfig, render, summary: str):
+        """Core FERPA email-preview review. `render(scenario)` returns the
+        list of preview dicts (re-invoked when the fire-time template
+        dropdown changes). Returns (scenario, selected_indices):
+        selected_indices is None on cancel / empty selection; `scenario`
+        carries any template the user chose in the dropdown."""
+        from dataclasses import replace as _replace
+        rendered = render(scenario)
+        pick = bool(scenario.email and scenario.email.pick_template)
+        templates = self._email_template_files() if pick else None
+        cur_tpl = scenario.email.body_html_file if pick else ""
+
+        def _on_tpl(tpl: str) -> list[dict]:
+            return render(_replace(
+                scenario, email=_replace(scenario.email, body_html_file=tpl)))
+
+        selected, chosen_tpl = prompt_batch_email_review(
+            self.root, scenario.name, rendered, summary,
+            templates=templates, current_template=cur_tpl,
+            on_template_change=(_on_tpl if pick else None),
+        )
+        if not selected:
+            return scenario, None
+        if pick and chosen_tpl and chosen_tpl != scenario.email.body_html_file:
+            scenario = _replace(
+                scenario,
+                email=_replace(scenario.email, body_html_file=chosen_tpl))
+            self._append_log(f"Using email template {chosen_tpl!r}.")
+        return scenario, selected
+
+    def _review_emails(
+        self, scenario: ScenarioConfig, rows: list[dict],
+        prompt_vars: dict, summary: str,
+    ) -> tuple:
+        """Show the email previewer for a list of CSV rows (batch /
+        selection). Returns (scenario, confirmed_rows); confirmed_rows is
+        None when the user cancelled or selected nobody."""
+        from src import outlook_email
+        user_info = outlook_email.get_user_info()
+        self._append_log(
+            f"Rendering {len(rows)} email preview(s) for review…")
+
+        def render(scn: ScenarioConfig) -> list[dict]:
+            return [
+                self._build_email_preview_data(scn, row, prompt_vars, user_info)
+                for row in rows
+            ]
+
+        scenario, selected = self._run_email_review(scenario, render, summary)
+        if selected is None:
+            self._append_log(
+                f"{scenario.name!r}: email review cancelled / nobody selected.")
+            return scenario, None
+        confirmed = [rows[i] for i in selected]
+        self._append_log(
+            f"Email review confirmed: {len(confirmed)} of {len(rows)} "
+            "student(s)."
+        )
+        return scenario, confirmed
+
     def _build_email_preview_data(
         self,
         scenario: ScenarioConfig,
         row: dict,
         prompt_vars: dict,
         user_info: dict,
+        *,
+        ctx_override: Optional[dict] = None,
     ) -> dict:
         """Render one student's email for the batch review modal.
         Returns the dict shape `prompt_batch_email_review` consumes.
@@ -8967,10 +9053,12 @@ class App:
         `user_info` is the cached Outlook CurrentUser dict passed in
         by the caller — avoids re-dispatching COM per student."""
         email_cfg = scenario.email
-        # Base context from the CSV row, augmented with Outlook user
-        # identity (so {{user_name}} / {{user_email}} resolve) and
-        # the batch-wide prompts (so {{summary}} et al. resolve).
-        ctx = self._ctx_from_csv_row(row)
+        # Base context from the CSV row (batch/selection) OR a prebuilt
+        # scraped context (single main-window fire, which has no CSV row),
+        # augmented with Outlook user identity (so {{user_name}} /
+        # {{user_email}} resolve) and the run-wide prompts.
+        ctx = (dict(ctx_override) if ctx_override is not None
+               else self._ctx_from_csv_row(row))
         ctx["user_name"] = user_info.get("name", "")
         ctx["user_email"] = user_info.get("email", "")
         ctx = {**ctx, **prompt_vars}
