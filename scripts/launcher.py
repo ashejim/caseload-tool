@@ -228,11 +228,26 @@ class BrowserWorker:
             custom_bodies or {}, prompt_vars or {}, on_done,
         ))
 
-    def submit_find_student(self, query: str, new_tab: bool = False) -> None:
+    def submit_find_student(self, query: str, new_tab: bool = False,
+                            raise_after: Optional[bool] = None) -> None:
         """Navigate to a student record. When `new_tab` is True the
-        student opens in a fresh browser tab (leaving existing tabs
-        open); otherwise the current/most-recent tab is reused."""
-        self.q.put(("FIND", query, new_tab))
+        student opens in a fresh console subtab (leaving existing tabs
+        open); otherwise the current tab is reused. `raise_after`
+        controls whether the browser is pulled to the foreground when
+        done — defaults to (not new_tab); pass False to navigate in the
+        background (e.g. while the user is mid-dialog firing a scenario)."""
+        self.q.put(("FIND", query, new_tab, raise_after))
+
+    def submit_find_and_settle(
+        self, query: str, on_done: Callable[[bool], None],
+    ) -> None:
+        """Navigate to a student via the FAST find path (Shift+X switch
+        on the live Caseload list, no reload), then poll until the note
+        panel is actually loaded. Used by fire-from-row so the note/email
+        steps run against a ready record without the slower
+        list-matches+click path. `on_done(success)` fires from the
+        worker thread."""
+        self.q.put(("FIND_AND_SETTLE", query, on_done))
 
     def submit_list_matches(
         self, query: str, on_results: Callable[[list[str]], None],
@@ -412,10 +427,36 @@ class BrowserWorker:
                     on_done(success)
         elif cmd[0] == "FIND":
             # Back-compat: older callers queued ("FIND", query) with no
-            # new_tab flag.
+            # new_tab / raise_after flags.
             query = cmd[1]
             new_tab = cmd[2] if len(cmd) > 2 else False
-            self._handle_find(ctx, query, new_tab)
+            raise_after = cmd[3] if len(cmd) > 3 else None
+            self._handle_find(ctx, query, new_tab, raise_after)
+        elif cmd[0] == "FIND_AND_SETTLE":
+            _, query, on_done = cmd
+            ok = False
+            try:
+                # Fast navigation (Shift+X switch, no reload), kept in the
+                # background so it doesn't pop over the fire dialogs.
+                self._handle_find(ctx, query, new_tab=False, raise_after=False)
+                # Poll until the note panel is actually loaded — exits as
+                # soon as get_active_student_name (the same readiness
+                # check _handle_run uses) resolves, up to ~5s.
+                target = self._active_page(ctx)
+                if target is not None:
+                    for _ in range(25):
+                        try:
+                            if get_active_student_name(target):
+                                ok = True
+                                break
+                        except Exception:
+                            pass
+                        try:
+                            target.wait_for_timeout(200)
+                        except Exception:
+                            break
+            finally:
+                on_done(ok)
         elif cmd[0] == "LIST_MATCHES":
             _, query, on_results = cmd
             names: list[str] = []
@@ -565,7 +606,8 @@ class BrowserWorker:
             self.on_status(f"Caseload list table didn't load in time: {e}")
             return False
 
-    def _handle_find(self, ctx, query: str, new_tab: bool = False) -> None:
+    def _handle_find(self, ctx, query: str, new_tab: bool = False,
+                     raise_after: Optional[bool] = None) -> None:
         # `new_tab` is a Salesforce CONSOLE subtab, NOT a browser tab.
         # Clicking a student from the Caseload list already opens it as a
         # new console subtab; the only difference between reuse and
@@ -618,8 +660,11 @@ class BrowserWorker:
             reloaded = True
 
         # First pass: search the (now active) Caseload list. New-tab
-        # opens stay in the background (no raise) by convention.
-        raise_after = not new_tab
+        # opens stay in the background (no raise) by convention; an
+        # explicit raise_after (e.g. background nav for a row-fire)
+        # overrides that default.
+        if raise_after is None:
+            raise_after = not new_tab
         try:
             if self._try_match_or_navigate(target, query, raise_after):
                 return
@@ -1280,8 +1325,16 @@ class BrowserWorker:
         try:
             import ctypes
             user32 = ctypes.windll.user32
-            SW_RESTORE = 9
-            user32.ShowWindow(hwnd, SW_RESTORE)
+            # Only un-minimize when actually minimized. SW_RESTORE on a
+            # snapped (Win+Arrow half-max) or maximized window reverts it
+            # to its pre-snap "normal" rectangle — which Windows never
+            # updated to the snap location, so the window jumps to a
+            # stale, possibly off-screen spot. A snapped window reports
+            # as normal (not iconic), so skipping restore leaves the
+            # half-max layout untouched.
+            if user32.IsIconic(hwnd):
+                SW_RESTORE = 9
+                user32.ShowWindow(hwnd, SW_RESTORE)
             user32.BringWindowToTop(hwnd)
             user32.SetForegroundWindow(hwnd)
         except Exception:
@@ -5295,6 +5348,8 @@ class CaseloadPanel:
         )
         self.search_entry.grid(row=0, column=2, sticky="ew", padx=4)
         self.search_var.trace_add("write", lambda *_: self._on_search())
+        # Down from the search box drops focus into the rows.
+        self.search_entry.bind("<Down>", self._focus_first_row)
         self.freshness_lbl = ctk.CTkLabel(
             bar, text="", font=ctk.CTkFont(size=11),
             text_color=("gray40", "gray65"),
@@ -5328,13 +5383,23 @@ class CaseloadPanel:
         # Zebra striping for readability.
         self.tree.tag_configure("even", background=self._even_bg)
         self.tree.tag_configure("odd", background=self._odd_bg)
-        # Double-click a row → open that student in Salesforce (reuse
-        # the current tab). Right-click OR middle-click → open in a new
-        # browser tab, leaving existing tabs open (middle-click is the
-        # conventional "open in new tab" gesture).
+        # Double-click → open/switch to that student (reuse current tab).
+        # Middle-click → quick "open in new console subtab" (background).
+        # Right-click → action menu (Open / Open in new tab / Fire ▸).
         self.tree.bind("<Double-1>", self._on_row_open)
-        self.tree.bind("<Button-3>", self._on_row_open_new_tab)
         self.tree.bind("<Button-2>", self._on_row_open_new_tab)
+        self.tree.bind("<Button-3>", self._on_row_context_menu)
+        # Keyboard equivalent of right-click: Shift+F10 (Windows standard)
+        # and the dedicated Menu/Application key. Up/Down row navigation
+        # is native to ttk.Treeview once it has focus.
+        self.tree.bind("<Shift-F10>", self._on_row_menu_key)
+        for seq in ("<App>", "<Menu>", "<Key-Menu>"):
+            try:
+                self.tree.bind(seq, self._on_row_menu_key)
+            except Exception:
+                pass
+        # Enter on a focused row opens it (switch tab), matching dbl-click.
+        self.tree.bind("<Return>", self._on_row_open_key)
         self._row_by_iid: dict[str, dict] = {}
         self._table_wrap = table_wrap
         self.empty_lbl = ctk.CTkLabel(
@@ -5451,26 +5516,124 @@ class CaseloadPanel:
         self._open_row(event, new_tab=False)
 
     def _on_row_open_new_tab(self, event=None) -> None:
-        """Right-click → open the student in a new browser tab, leaving
-        any already-open student tabs as they are."""
+        """Middle-click → open the student in a new console subtab,
+        leaving any already-open student tabs as they are."""
         self._open_row(event, new_tab=True)
 
+    def _query_label_for_iid(self, iid):
+        """(query, label) for a row iid. `query` is the unambiguous
+        Student ID (falling back to Name); `label` is the display name.
+        Returns (None, None) if there's no usable row."""
+        row = self._row_by_iid.get(iid) if iid else None
+        if not row:
+            return None, None
+        name = str(row.get("Name", "")).strip()
+        query = str(row.get("StudentID", "")).strip() or name
+        if not query:
+            return None, None
+        return query, (name or query)
+
+    def _row_query_label(self, event):
+        """Resolve a MOUSE event's row to (query, label), selecting it."""
+        iid = self.tree.identify_row(event.y) if event is not None else \
+            self.tree.focus()
+        if not iid:
+            return None, None
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        return self._query_label_for_iid(iid)
+
     def _open_row(self, event, new_tab: bool) -> None:
+        query, _label = self._row_query_label(event)
+        if query:
+            self.app._find_student_by_query(query, new_tab=new_tab)
+
+    def _focus_first_row(self, event=None):
+        """Move keyboard focus from the search box into the rows,
+        selecting the focused/first row so Up/Down navigation starts
+        somewhere sensible."""
+        kids = self.tree.get_children()
+        if not kids:
+            return "break"
+        self.tree.focus_set()
+        cur = self.tree.focus()
+        target = cur if cur else kids[0]
+        self.tree.selection_set(target)
+        self.tree.focus(target)
+        self.tree.see(target)
+        return "break"
+
+    def _on_row_open_key(self, event=None):
+        """Enter on the focused row → open/switch (keyboard equivalent of
+        a double-click). Uses the focused item, not the pointer."""
+        iid = self.tree.focus()
+        query, _label = self._query_label_for_iid(iid)
+        if query:
+            self.tree.selection_set(iid)
+            self.app._find_student_by_query(query)
+        return "break"
+
+    def _on_row_context_menu(self, event=None) -> None:
+        """Right-click a row → action menu (posted at the cursor)."""
         iid = self.tree.identify_row(event.y) if event is not None else \
             self.tree.focus()
         if not iid:
             return
-        # Right-click doesn't move the selection on its own; do it so the
-        # acted-on row is visually obvious.
         self.tree.selection_set(iid)
         self.tree.focus(iid)
-        row = self._row_by_iid.get(iid)
-        if not row:
+        self._show_row_menu(iid, event.x_root, event.y_root)
+
+    def _on_row_menu_key(self, event=None):
+        """Shift+F10 / Menu key → action menu for the focused row,
+        posted just below that row."""
+        iid = self.tree.focus()
+        if not iid:
+            kids = self.tree.get_children()
+            if not kids:
+                return "break"
+            iid = kids[0]
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+        bbox = self.tree.bbox(iid)
+        if bbox:
+            x = self.tree.winfo_rootx() + bbox[0] + 24
+            y = self.tree.winfo_rooty() + bbox[1] + bbox[3]
+        else:
+            x = self.tree.winfo_rootx() + 30
+            y = self.tree.winfo_rooty() + 30
+        self._show_row_menu(iid, x, y)
+        return "break"
+
+    def _show_row_menu(self, iid, x_root, y_root) -> None:
+        """Build + post the per-row action menu: Open / Open in new tab /
+        Fire scenario ▸ (built fresh so it reflects the current scenario
+        list; batch scenarios excluded)."""
+        query, label = self._query_label_for_iid(iid)
+        if not query:
             return
-        query = (str(row.get("StudentID", "")).strip()
-                 or str(row.get("Name", "")).strip())
-        if query:
-            self.app._find_student_by_query(query, new_tab=new_tab)
+        menu = tk.Menu(self.tree, tearoff=0)
+        menu.add_command(
+            label="Open (switch tab)",
+            command=lambda: self.app._find_student_by_query(query))
+        menu.add_command(
+            label="Open in new tab",
+            command=lambda: self.app._find_student_by_query(
+                query, new_tab=True))
+        nonbatch = [s for s in self.app.scenarios.values()
+                    if s.batch is None]
+        if nonbatch:
+            menu.add_separator()
+            fire_menu = tk.Menu(menu, tearoff=0)
+            for sc in nonbatch:
+                fire_menu.add_command(
+                    label=sc.name,
+                    command=lambda s=sc: self.app._fire_on_student(
+                        s, query, label))
+            menu.add_cascade(label="Fire scenario", menu=fire_menu)
+        try:
+            menu.tk_popup(x_root, y_root)
+        finally:
+            menu.grab_release()
 
     def update_freshness(self, count: Optional[int] = None,
                          total: Optional[int] = None) -> None:
@@ -7134,21 +7297,27 @@ class App:
     def _find_student(self) -> None:
         self._find_student_by_query(self.search_var.get())
 
-    def _find_student_by_query(self, query: str, new_tab: bool = False) -> None:
+    def _find_student_by_query(self, query: str, new_tab: bool = False,
+                               raise_after: Optional[bool] = None,
+                               quiet: bool = False) -> None:
         """Navigate the worker browser to a student record by query
         (name / Student ID / email). Shared by the main Find box and
         the caseload panel's row-click. When `new_tab` is True the
-        student opens in a fresh browser tab (right-click), otherwise
-        the current tab is reused (double-click)."""
+        student opens in a fresh console subtab (right/middle-click),
+        otherwise the current tab is reused (double-click). `raise_after`
+        forwards to the worker (pass False for a background nav, e.g.
+        while firing a scenario); `quiet` suppresses the log line."""
         query = (query or "").strip()
         if not query:
             return
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
             return
-        where = " (new tab)" if new_tab else ""
-        self._append_log(f"--- Searching {query!r}{where} ---")
-        self.worker.submit_find_student(query, new_tab=new_tab)
+        if not quiet:
+            where = " (new tab)" if new_tab else ""
+            self._append_log(f"--- Searching {query!r}{where} ---")
+        self.worker.submit_find_student(
+            query, new_tab=new_tab, raise_after=raise_after)
 
     def _fire(self, scenario: ScenarioConfig) -> None:
         if self._is_busy:
@@ -7179,6 +7348,44 @@ class App:
         finally:
             self._set_idle()
 
+    def _fire_on_student(self, scenario: ScenarioConfig,
+                         query: str, label: str) -> None:
+        """Fire a (non-batch) scenario on a specific student chosen from
+        the caseload panel: confirm, navigate to them, then run the
+        normal per-student flow with the find/pick prompt skipped."""
+        if self._is_busy:
+            self._append_log(
+                f"Busy — wait for the current task to finish before "
+                f"firing {scenario.name!r}."
+            )
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        if scenario.batch is not None:
+            # The row menu only lists non-batch scenarios, but guard anyway.
+            self._append_log(
+                f"{scenario.name!r} is a batch scenario; fire it from the "
+                "main window, not a single row."
+            )
+            return
+        who = label or query
+        if not ask_yes_no_topmost(
+            self.root, "Fire scenario?",
+            f"Fire {scenario.name!r} on {who}?",
+            yes_label="Fire", no_label="Cancel",
+        ):
+            self._append_log(f"{scenario.name!r} on {who}: cancelled.")
+            return
+        override = self.course_var.get().strip()
+        self._append_log(f"--- Firing {scenario.name!r} on {who} ---")
+        self._set_busy(f"Running {scenario.name} on {who}…")
+        try:
+            self._fire_per_student(
+                scenario, override, prenav_query=query, prenav_label=label)
+        finally:
+            self._set_idle()
+
     def _collect_prompt_vars(
         self, scenario: ScenarioConfig,
     ) -> Optional[dict[str, str]]:
@@ -7198,10 +7405,16 @@ class App:
             prompt_vars[p.var] = value
         return prompt_vars
 
-    def _fire_per_student(self, scenario: ScenarioConfig, override: str) -> None:
+    def _fire_per_student(self, scenario: ScenarioConfig, override: str,
+                          *, prenav_query: str = "",
+                          prenav_label: str = "") -> None:
         """Per-student (non-batch) scenario fire — wraps the original
         in-line `_fire` body so we can sandwich it between _set_busy
-        and _set_idle."""
+        and _set_idle.
+
+        When `prenav_query` is set (fired from a caseload row), the
+        student is already chosen: we navigate to them in the background
+        and skip the find/pick prompt, then file against that record."""
 
         # Pre-flight: if any note has Submit unchecked, confirm before
         # we ask the user to do anything else (FERPA: don't surprise
@@ -7218,7 +7431,21 @@ class App:
         # many candidates. Worker handles search; fuzzy fallback kicks
         # in if there are no exact matches.
         chosen_name = ""
-        if scenario.find_first:
+        if prenav_query:
+            # Student already chosen (caseload row). Use the FAST
+            # navigation (same Shift+X switch as a double-click), then
+            # wait only until the note panel is actually loaded — no
+            # Caseload reload, no fixed 2s settle. (A bare find returns
+            # before the panel renders, which made the note RUN bail with
+            # "no visible note panel".)
+            if not self._navigate_for_fire_blocking(prenav_query):
+                self._append_log(
+                    f"Could not open {prenav_label or prenav_query!r}; "
+                    "scenario not fired."
+                )
+                return
+            chosen_name = prenav_label
+        elif scenario.find_first:
             chosen = prompt_find_and_pick(self.root, self._list_matches_blocking)
             if not chosen:
                 self._append_log("Find cancelled; scenario not fired.")
@@ -7582,6 +7809,28 @@ class App:
         self.worker.submit_list_matches(query, on_results)
         self.root.wait_variable(done_var)
         return holder["names"]
+
+    def _navigate_for_fire_blocking(self, query: str) -> bool:
+        """Fast-navigate to a student (Shift+X switch, no reload) and
+        block until the note panel is loaded. Used by fire-from-row so
+        the note files against a ready record without the slower
+        list-matches+click path. Returns True once the panel is ready."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"ok": False}
+
+        def on_done(ok: bool) -> None:
+            def set_main() -> None:
+                holder["ok"] = ok
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["ok"] = ok
+                done_var.set(True)
+
+        self.worker.submit_find_and_settle(query, on_done)
+        self.root.wait_variable(done_var)
+        return holder["ok"]
 
     def _click_match_blocking(self, name: str) -> bool:
         """Click the chosen match on the worker and block until the
