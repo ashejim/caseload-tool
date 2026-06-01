@@ -545,7 +545,16 @@ class BrowserWorker:
                 # Suppressed for new-tab opens (background, by convention).
                 if raise_after:
                     self._bring_browser_forward(target)
-            return True
+                return True
+            # Found the row but the click didn't route (Lightning
+            # active-view race). Report False so _handle_find falls
+            # through to re-activate the list and retry, rather than
+            # stopping on a false success.
+            self.on_status(
+                f"  [search] found {name!r} but clicking it didn't open the "
+                "record; re-activating the list to retry."
+            )
+            return False
         # Multiple matches at the same priority — ask user to pick.
         names = [m[2] for m in top]
         self.on_status(
@@ -571,7 +580,11 @@ class BrowserWorker:
             return False
         # Poll briefly for the URL to fall back to the Caseload app page.
         try:
-            for _ in range(20):  # ~3s ceiling before we give up and reload
+            # ~1.5s ceiling before we give up and reload. A successful
+            # Shift+X re-activates the list well under a second; waiting
+            # longer just delays the reload fallback when there was no
+            # closeable record (e.g. focus wasn't on the console).
+            for _ in range(10):
                 if "Caseload_App_Page" in (target.url or ""):
                     return True
                 target.wait_for_timeout(150)
@@ -604,6 +617,21 @@ class BrowserWorker:
             return True
         except Exception as e:
             self.on_status(f"Caseload list table didn't load in time: {e}")
+            return False
+
+    def _caseload_table_present(self, target) -> bool:
+        """Cheap, no-wait check: is the Caseload list table already in the
+        DOM right now? Lets _handle_find skip a wasteful full reload when
+        the list is plainly present and the student just isn't in the
+        ~10 visible rows (the row filter, not a reload, finds those)."""
+        try:
+            return (
+                target.locator("table")
+                .filter(has=target.locator('th:has-text("Course Code")'))
+                .filter(has=target.locator('th:has-text("Name")'))
+                .count() > 0
+            )
+        except Exception:
             return False
 
     def _handle_find(self, ctx, query: str, new_tab: bool = False,
@@ -672,11 +700,13 @@ class BrowserWorker:
             self.on_status(f"Search failed: {e}")
             return
 
-        # Miss. If we were already on Caseload and haven't reloaded, the
-        # student just isn't in the rendered row window — reloading won't
-        # help, so fall through to the row filter. Otherwise reload once
-        # and retry before filtering.
-        if not reloaded and CASELOAD_URL:
+        # Miss. If the list table is already in the DOM, the student just
+        # isn't in the ~10 rendered rows — reloading won't help (and costs
+        # a full goto + render wait), so fall straight through to the row
+        # filter, which searches ALL rows server-side. Only reload when the
+        # list genuinely isn't present (e.g. URL says Caseload but the
+        # table hasn't rendered yet).
+        if not reloaded and CASELOAD_URL and not self._caseload_table_present(target):
             self.on_status(
                 "Caseload list not in DOM — navigating there to retry...")
             if self._ensure_caseload_list(target):
@@ -1114,7 +1144,17 @@ class BrowserWorker:
 
     @staticmethod
     def _active_page(ctx):
-        """Return the most-recent responsive page in `ctx`, or None.
+        """Return the best responsive page in `ctx`, or None.
+
+        Prefers the real Salesforce page — the Caseload list first, then
+        any Lightning page — over transient tabs. WGU's CSV "Download"
+        spawns a short-lived export tab that downloads then closes itself;
+        right after the startup auto-refresh that tab is the MOST RECENT
+        page, so a naive newest-first pick would grab it. It can even pass
+        the responsiveness probe at selection time and then die the moment
+        the caller runs a real query ("Target page... has been closed"),
+        which is exactly what made the first post-startup search fail.
+
         Defensive against:
          - stale closed pages (e.g. download-capture tabs Playwright
            hasn't yet cleaned out of ctx.pages),
@@ -1125,16 +1165,24 @@ class BrowserWorker:
            runs. We do a cheap `locator("html").count()` probe to
            filter these — same kind of operation that subsequent
            callers will run anyway."""
+        caseload = lightning = fallback = None
         for page in reversed(ctx.pages):
             try:
                 if page.is_closed():
                     continue
-                _ = page.url
+                url = page.url or ""
                 _ = page.locator("html").count()  # responsive probe
-                return page
             except Exception:
                 continue
-        return None
+            if fallback is None:
+                fallback = page  # most-recent responsive page (last resort)
+            if "Caseload_App_Page" in url and caseload is None:
+                caseload = page
+            elif "lightning.force.com" in url and lightning is None:
+                lightning = page
+        # Caseload list > any Lightning page (e.g. an open record) >
+        # whatever responsive page we have (covers about:blank-only states).
+        return caseload or lightning or fallback
 
     def _descendant_pids(self) -> set:
         """PIDs of every process descended from this Python process,
@@ -1275,6 +1323,75 @@ class BrowserWorker:
         # Cache hwnd + owning pid for the fast path and the focus guard.
         self._browser_hwnd, self._browser_pid = chosen
         self._raise_hwnd(chosen[0])
+
+    def _locate_browser_hwnd(self):
+        """Return the launcher's browser top-level HWND (cached, else
+        enumerated), WITHOUT raising/focusing it. None if not found.
+        Windows only."""
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return None
+        user32 = ctypes.windll.user32
+        cached = getattr(self, "_browser_hwnd", None)
+        if cached and user32.IsWindow(cached):
+            return cached
+        try:
+            ours = self._descendant_pids()
+        except Exception:
+            ours = set()
+        cands: list = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                cls = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, cls, 256)
+                if cls.value != "Chrome_WidgetWin_1":
+                    return True
+                if user32.GetWindowTextLengthW(hwnd) <= 0:
+                    return True
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                cands.append((hwnd, pid.value))
+            except Exception:
+                pass
+            return True
+
+        try:
+            user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        except Exception:
+            return None
+        mine = [c for c in cands if c[1] in ours]
+        chosen = mine[0] if mine else (cands[0] if len(cands) == 1 else None)
+        if chosen is None:
+            return None
+        self._browser_hwnd, self._browser_pid = chosen
+        return chosen[0]
+
+    def set_browser_enabled(self, enabled: bool) -> None:
+        """Enable/disable OS input to the launcher's browser window so the
+        user can't click/scroll/type into it mid-automation — doing so
+        changes the active console record and breaks a running fire
+        ('No visible note panel'). Playwright drives the page over CDP,
+        not OS input, so automation keeps working while the window is
+        disabled. Safe to call from any thread; Windows-only no-op
+        otherwise."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            hwnd = self._locate_browser_hwnd()
+            if hwnd:
+                ctypes.windll.user32.EnableWindow(hwnd, bool(enabled))
+        except Exception:
+            pass
 
     def _user_is_on_us(self) -> bool:
         """True if the current OS foreground window belongs to the
@@ -1488,6 +1605,19 @@ class BrowserWorker:
             download.save_as(str(save_path))
         except Exception as e:
             return False, f"download save failed: {e}"
+
+        # WGU's Download action occasionally drifts the page off the
+        # Caseload list URL. If it did, re-activate the live list now —
+        # this runs during the (backgrounded) startup auto-refresh, so the
+        # user's FIRST student search starts from the fast path
+        # (on_caseload True) instead of paying a wasted Shift+X poll + full
+        # reload. No-op when the export already ended on Caseload, so it
+        # costs nothing in the common case.
+        try:
+            if "Caseload_App_Page" not in (target.url or ""):
+                self._ensure_caseload_list(target)
+        except Exception:
+            pass
         return True, f"saved to {Path(save_path).name}"
 
     def _read_all_caseload_rows(
@@ -5319,9 +5449,21 @@ class CaseloadPanel:
         self._sort_col: Optional[str] = None
         self._sort_reverse = False
         self._query = ""
+        # Multi-select: checked row keys (Student ID, falling back to
+        # Name). Kept on the panel so the selection survives sort/search/
+        # filter re-renders AND pop-out/re-dock (the dock rebuilds the
+        # panel, but app holds the set — see _mount_caseload_panel).
+        self._checked_ids: set[str] = app._caseload_checked_ids
+        # Active column filters (serialized FilterRow dicts) applied on top
+        # of the search box. Empty = show everything. Ephemeral — reset on
+        # rebuild (pop-out / re-dock).
+        self._active_filters: list[dict] = []
+        self._filters_open = False
         self.frame = ctk.CTkFrame(parent, fg_color="transparent")
         self.frame.grid_columnconfigure(0, weight=1)
-        self.frame.grid_rowconfigure(1, weight=1)
+        # Rows: 0 bar · 1 filters (collapsible) · 2 table (stretch) ·
+        # 3 selection action bar.
+        self.frame.grid_rowconfigure(2, weight=1)
         self._build()
         self.populate()
 
@@ -5350,26 +5492,60 @@ class CaseloadPanel:
         self.search_var.trace_add("write", lambda *_: self._on_search())
         # Down from the search box drops focus into the rows.
         self.search_entry.bind("<Down>", self._focus_first_row)
+        # Filters toggle — shows/hides the collapsible column-filter
+        # section (same builder the batch scenarios use).
+        self.filters_toggle_btn = ctk.CTkButton(
+            bar, text="▸ Filters", width=80, command=self._toggle_filters,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self.filters_toggle_btn.grid(row=0, column=3, padx=(0, 4))
         self.freshness_lbl = ctk.CTkLabel(
             bar, text="", font=ctk.CTkFont(size=11),
             text_color=("gray40", "gray65"),
         )
-        self.freshness_lbl.grid(row=0, column=3, padx=8)
+        self.freshness_lbl.grid(row=0, column=4, padx=8)
         # Pop the panel into its own window (2nd monitor) / re-dock it.
         self.popout_btn = ctk.CTkButton(
             bar, text=("⧉ Dock" if self.popped else "⧉ Pop out"),
             width=80, command=self.app._toggle_caseload_popout,
             **SECONDARY_BTN_KWARGS,
         )
-        self.popout_btn.grid(row=0, column=4, padx=(0, 4))
+        self.popout_btn.grid(row=0, column=5, padx=(0, 4))
+
+        # Collapsible filters section (row 1) — hidden until toggled.
+        self.filters_wrap = ctk.CTkFrame(self.frame)
+        self.filters_wrap.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 4))
+        self.filters_wrap.grid_columnconfigure(0, weight=1)
+        self.filters_container = ctk.CTkFrame(
+            self.filters_wrap, fg_color="transparent")
+        self.filters_container.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
+        self.filters_container.grid_columnconfigure(0, weight=1)
+        self.filter_rows: list[FilterRow] = []
+        filt_actions = ctk.CTkFrame(self.filters_wrap, fg_color="transparent")
+        filt_actions.grid(row=1, column=0, sticky="w", padx=2, pady=(0, 4))
+        ctk.CTkButton(
+            filt_actions, text="+ Add", width=70,
+            command=self._add_filter_row, **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            filt_actions, text="Apply", width=70, command=self._apply_filters,
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            filt_actions, text="Clear", width=70, command=self._clear_filters,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left")
+        self.filters_wrap.grid_remove()  # collapsed by default
 
         table_wrap = ctk.CTkFrame(self.frame)
-        table_wrap.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        table_wrap.grid(row=2, column=0, sticky="nsew", padx=4, pady=(0, 4))
         table_wrap.grid_columnconfigure(0, weight=1)
         table_wrap.grid_rowconfigure(0, weight=1)
         self._style_tree()
+        self._make_check_images()
+        # "tree headings" keeps the implicit #0 column visible — we use it
+        # for the per-row checkbox image (CTk-style blue filled box).
         self.tree = ttk.Treeview(
-            table_wrap, show="headings", selectmode="browse",
+            table_wrap, show="tree headings", selectmode="browse",
             style="Caseload.Treeview",
         )
         self.tree.grid(row=0, column=0, sticky="nsew")
@@ -5400,6 +5576,12 @@ class CaseloadPanel:
                 pass
         # Enter on a focused row opens it (switch tab), matching dbl-click.
         self.tree.bind("<Return>", self._on_row_open_key)
+        # Left-click in the leading checkbox column toggles that row's
+        # selection (handled before the default browse-select so the
+        # highlight doesn't jump). Space toggles the focused row.
+        self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<space>", self._toggle_focused_row)
+        self.tree.bind("<Key-space>", self._toggle_focused_row)
         self._row_by_iid: dict[str, dict] = {}
         self._table_wrap = table_wrap
         self.empty_lbl = ctk.CTkLabel(
@@ -5408,6 +5590,28 @@ class CaseloadPanel:
             font=ctk.CTkFont(size=12), justify="center",
             text_color=("gray45", "gray60"),
         )
+
+        # Selection action bar (row 2) — hidden until ≥1 row is checked.
+        # "N selected" + Clear + Fire-scenario-on-the-selection menu.
+        self.action_bar = ctk.CTkFrame(self.frame, fg_color="transparent")
+        self.action_bar.grid(row=3, column=0, sticky="ew", padx=4, pady=(0, 4))
+        self.action_bar.grid_columnconfigure(0, weight=1)
+        self.sel_count_lbl = ctk.CTkLabel(
+            self.action_bar, text="", font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        )
+        self.sel_count_lbl.grid(row=0, column=0, sticky="w", padx=(4, 8))
+        self.clear_sel_btn = ctk.CTkButton(
+            self.action_bar, text="Clear", width=60,
+            command=self._clear_selection, **SECONDARY_BTN_KWARGS,
+        )
+        self.clear_sel_btn.grid(row=0, column=1, padx=(0, 4))
+        self.fire_sel_btn = ctk.CTkButton(
+            self.action_bar, text="Fire scenario ▸", width=120,
+            command=self._on_fire_selected_clicked,
+        )
+        self.fire_sel_btn.grid(row=0, column=2, padx=(0, 4))
+        self.action_bar.grid_remove()  # shown on first selection
 
     def _style_tree(self) -> None:
         """Style the ttk.Treeview to approximate the CTk theme. Uses the
@@ -5436,6 +5640,43 @@ class CaseloadPanel:
             relief="flat", font=("", 10, "bold"),
         )
         style.map("Caseload.Treeview.Heading", background=[("active", sel)])
+
+    def _make_check_images(self) -> None:
+        """Build checked/unchecked checkbox images that match the CTk
+        scenario-editor style — a filled blue rounded box with a white
+        tick when checked, an outlined box when not. Kept on the instance
+        so Tk retains the reference (else they'd be GC'd and render
+        blank). Colours follow the current light/dark appearance."""
+        from PIL import Image, ImageDraw, ImageTk
+        dark = ctk.get_appearance_mode() == "Dark"
+        blue = "#1f6aa5" if dark else "#3a7ebf"
+        border = "#6b6e70" if dark else "#979da2"
+        size, scale = 16, 4  # supersample then downscale for smooth edges
+        S = size * scale
+        pad, rad, bw = 1 * scale, 4 * scale, 2 * scale
+
+        un = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        ImageDraw.Draw(un).rounded_rectangle(
+            [pad, pad, S - pad, S - pad], radius=rad,
+            outline=border, width=bw,
+        )
+
+        ch = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(ch)
+        d.rounded_rectangle(
+            [pad, pad, S - pad, S - pad], radius=rad, fill=blue, outline=blue,
+        )
+        d.line(
+            [(S * 0.27, S * 0.52), (S * 0.44, S * 0.69), (S * 0.74, S * 0.32)],
+            fill="white", width=bw, joint="curve",
+        )
+        self._img_unchecked = ImageTk.PhotoImage(
+            un.resize((size, size), Image.LANCZOS))
+        self._img_checked = ImageTk.PhotoImage(
+            ch.resize((size, size), Image.LANCZOS))
+
+    def _chk_img(self, checked: bool):
+        return self._img_checked if checked else self._img_unchecked
 
     # ----- data + interaction -----
 
@@ -5467,6 +5708,200 @@ class CaseloadPanel:
         except Exception:
             pass
 
+    # ----- multi-select (checkboxes) -----
+
+    @staticmethod
+    def _row_key(r: dict) -> str:
+        """Stable identity for a caseload row: the unambiguous Student ID
+        (CSV header 'StudentID', spaced 'Student ID' as a fallback), then
+        the name. Used to track checked rows across re-renders."""
+        if not r:
+            return ""
+        return (str(r.get("StudentID", "") or r.get("Student ID", "")).strip()
+                or str(r.get("Name", "")).strip())
+
+    def _checked_rows(self) -> list[dict]:
+        """The checked rows, resolved fresh from the live caseload (so a
+        refresh that drops a student simply drops it from the selection)."""
+        rows = self.app._caseload_rows or []
+        return [r for r in rows if self._row_key(r) in self._checked_ids]
+
+    def _on_tree_click(self, event):
+        """Left-click handler: toggle selection when the click lands in the
+        checkbox (#0 tree) column; otherwise let the default browse-select
+        run."""
+        if self.tree.identify_region(event.x, event.y) != "tree":
+            return  # data cell / heading / separator → default behaviour
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self._toggle_row(iid)
+        return "break"  # don't move the highlight on a checkbox click
+
+    def _toggle_focused_row(self, event=None):
+        """Space toggles the checkbox of the keyboard-focused row."""
+        iid = self.tree.focus()
+        if iid:
+            self._toggle_row(iid)
+        return "break"
+
+    def _toggle_row(self, iid) -> None:
+        row = self._row_by_iid.get(iid)
+        key = self._row_key(row) if row else ""
+        if not key:
+            return
+        checked = key not in self._checked_ids
+        if checked:
+            self._checked_ids.add(key)
+        else:
+            self._checked_ids.discard(key)
+        self.tree.item(iid, image=self._chk_img(checked))
+        self._after_selection_change()
+
+    def _toggle_select_all(self) -> None:
+        """Checkbox-column heading: select all currently-visible rows, or
+        clear them if they're already all selected. Operates on the
+        filtered/searched view, which is the point of pairing select-all
+        with filters."""
+        visible = self.tree.get_children()
+        keys = [k for k in (self._row_key(self._row_by_iid.get(i, {}))
+                            for i in visible) if k]
+        if not keys:
+            return
+        clear = all(k in self._checked_ids for k in keys)
+        for iid in visible:
+            k = self._row_key(self._row_by_iid.get(iid, {}))
+            if not k:
+                continue
+            if clear:
+                self._checked_ids.discard(k)
+            else:
+                self._checked_ids.add(k)
+            self.tree.item(iid, image=self._chk_img(not clear))
+        self._after_selection_change()
+
+    def _clear_selection(self) -> None:
+        self._checked_ids.clear()
+        for iid in self.tree.get_children():
+            self.tree.item(iid, image=self._chk_img(False))
+        self._after_selection_change()
+
+    def _after_selection_change(self) -> None:
+        """Sync the select-all glyph, the count label, and the action
+        bar's visibility to the current selection."""
+        # Select-all heading image reflects the visible rows.
+        visible = self.tree.get_children()
+        vkeys = [k for k in (self._row_key(self._row_by_iid.get(i, {}))
+                             for i in visible) if k]
+        all_vis = bool(vkeys) and all(k in self._checked_ids for k in vkeys)
+        try:
+            self.tree.heading("#0", image=self._chk_img(all_vis))
+        except Exception:
+            pass
+        n = len(self._checked_rows())
+        if n > 0:
+            self.sel_count_lbl.configure(text=f"{n} selected")
+            self.action_bar.grid()
+        else:
+            self.action_bar.grid_remove()
+
+    def _on_fire_selected_clicked(self) -> None:
+        """Post a menu of non-batch scenarios; firing one runs it across
+        the checked students as a mini-batch (reuses the batch driver)."""
+        if not self._checked_rows():
+            return
+        nonbatch = [s for s in self.app.scenarios.values() if s.batch is None]
+        if not nonbatch:
+            self.app._append_log("No non-batch scenarios to fire.")
+            return
+        menu = tk.Menu(self.fire_sel_btn, tearoff=0)
+        for sc in nonbatch:
+            menu.add_command(
+                label=sc.name,
+                command=lambda s=sc: self.app._fire_on_selected(
+                    s, self._checked_rows()))
+        try:
+            x = self.fire_sel_btn.winfo_rootx()
+            y = self.fire_sel_btn.winfo_rooty() + self.fire_sel_btn.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    # ----- column filters (collapsible; reuses the batch FilterRow) -----
+
+    def _panel_columns(self) -> list[str]:
+        """Display-name columns for the filter dropdowns, from the loaded
+        caseload (CSV header → display name, same as the batch editor)."""
+        rows = self.app._caseload_rows or []
+        if not rows:
+            return []
+        return [caseload_csv.display_for_column(h) for h in rows[0].keys()]
+
+    def _toggle_filters(self) -> None:
+        if self._filters_open:
+            self.filters_wrap.grid_remove()
+            self._filters_open = False
+            self.filters_toggle_btn.configure(text="▸ Filters")
+        else:
+            self.filters_wrap.grid()
+            self._filters_open = True
+            self.filters_toggle_btn.configure(text="▾ Filters")
+            if not self.filter_rows:
+                self._add_filter_row()
+
+    def _add_filter_row(self, prefilled: Optional[dict] = None) -> "FilterRow":
+        row = FilterRow(
+            self.filters_container, self._panel_columns(),
+            on_delete=self._delete_filter_row,
+        )
+        row.frame.pack(fill="x", padx=4, pady=2)
+        if prefilled:
+            row.load(prefilled)
+        self.filter_rows.append(row)
+        return row
+
+    def _delete_filter_row(self, row: "FilterRow") -> None:
+        try:
+            self.filter_rows.remove(row)
+        except ValueError:
+            return
+        try:
+            row.frame.destroy()
+        except Exception:
+            pass
+
+    def _apply_filters(self) -> None:
+        """Read the filter rows → active filter set → re-render. Rows with
+        no column chosen are ignored."""
+        self._active_filters = [
+            f for f in (r.serialize() for r in self.filter_rows)
+            if f.get("column", "").strip()
+        ]
+        self.populate()
+
+    def _clear_filters(self) -> None:
+        for row in list(self.filter_rows):
+            self._delete_filter_row(row)
+        self._active_filters = []
+        self.populate()
+
+    def _apply_active_filters(self, rows: list[dict]) -> list[dict]:
+        """Apply the active column filters via the shared filter engine.
+        Display-name columns are resolved to CSV headers; identity entries
+        pass through. Returns all rows when nothing is active or on error
+        (fail-open — the search box + visible list still work)."""
+        if not self._active_filters or not rows:
+            return list(rows)
+        headers = list(rows[0].keys())
+        filters = [
+            {**f, "column": caseload_csv.resolve_column(
+                f.get("column", ""), headers)}
+            for f in self._active_filters
+        ]
+        try:
+            return caseload_filter.apply_filters(filters, rows)
+        except Exception:
+            return list(rows)
+
     def populate(self) -> None:
         rows = self.app._caseload_rows or []
         if not rows:
@@ -5480,6 +5915,11 @@ class CaseloadPanel:
         headers = list(rows[0].keys())
         if tuple(self.tree["columns"]) != tuple(headers):
             self.tree["columns"] = headers
+            # #0 (the tree column) holds the checkbox image; its heading is
+            # a select-all/none toggle over the currently-visible rows.
+            self.tree.column("#0", width=36, minwidth=36, stretch=False,
+                             anchor="center")
+            self.tree.heading("#0", command=self._toggle_select_all)
             for h in headers:
                 self.tree.heading(
                     h, command=lambda c=h: self._sort_by(c))
@@ -5491,28 +5931,38 @@ class CaseloadPanel:
             if h == self._sort_col:
                 disp += "  " + ("▼" if self._sort_reverse else "▲")
             self.tree.heading(h, text=disp)
-        # Filter by the search query (substring across all columns).
+        # Column filters first (the batch filter engine), then the search
+        # box (substring across all columns) on top of that.
+        base = self._apply_active_filters(rows)
         q = self._query.strip().lower()
-        view = ([r for r in rows
+        view = ([r for r in base
                  if any(q in str(v).lower() for v in r.values())]
-                if q else list(rows))
+                if q else list(base))
         if self._sort_col:
             view.sort(key=lambda r: self._sortkey(r.get(self._sort_col, "")),
                       reverse=self._sort_reverse)
         self.tree.delete(*self.tree.get_children())
         self._row_by_iid = {}
         for i, r in enumerate(view):
+            checked = self._row_key(r) in self._checked_ids
             iid = self.tree.insert(
-                "", "end", values=[r.get(h, "") for h in headers],
+                "", "end", image=self._chk_img(checked),
+                values=[r.get(h, "") for h in headers],
                 tags=("even" if i % 2 == 0 else "odd",),
             )
             self._row_by_iid[iid] = r
+        self._after_selection_change()
         self.update_freshness(count=len(view), total=len(rows))
 
     def _on_row_open(self, event=None) -> None:
         """Open the double-clicked student in Salesforce, reusing the
         current browser tab. Prefers the unambiguous Student ID,
         falling back to Name."""
+        # A double-click in the checkbox (#0) column is a (double) toggle,
+        # not an open — don't navigate.
+        if event is not None and \
+                self.tree.identify_region(event.x, event.y) == "tree":
+            return "break"
         self._open_row(event, new_tab=False)
 
     def _on_row_open_new_tab(self, event=None) -> None:
@@ -5678,6 +6128,13 @@ class App:
         # DOM-scroll scrape — slower but always works.
         self._caseload_rows: Optional[list[dict]] = None
         self._caseload_csv_mtime = None
+        # Checked row keys for the caseload panel's multi-select. Held on
+        # the app (not the panel) so the selection survives the panel
+        # rebuild that pop-out / re-dock performs.
+        self._caseload_checked_ids: set[str] = set()
+        # Topmost scrim shown over the browser during a run (see
+        # _show_browser_lock); None when not locked.
+        self._lock_overlay = None
         # Updated by _reload_caseload_cache; True iff the cached CSV
         # carries a student-email column the launcher recognizes.
         # Drives the Settings status line + pre-batch warning when
@@ -7310,6 +7767,17 @@ class App:
         query = (query or "").strip()
         if not query:
             return
+        # Block user-initiated navigation while a fire/batch/selection run
+        # is in progress — a row double-click here would enqueue a FIND
+        # that interleaves with the run's own navigation and yanks the
+        # browser to the wrong record ("No visible note panel"). The run's
+        # own navigation uses the blocking find paths, not this method, so
+        # this guard doesn't affect it.
+        if self._is_busy:
+            self._append_log(
+                "Busy — finish the current task before opening a student."
+            )
+            return
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
             return
@@ -7673,9 +8141,36 @@ class App:
         else:
             confirmed = matched
 
+        # Steps 6 + 7 (custom-body prompts, clipboard, the per-student
+        # loop) are shared with the caseload-panel mini-batch — see
+        # _execute_scenario_over_rows.
+        self._execute_scenario_over_rows(
+            scenario, override, confirmed, prompt_vars,
+            has_email=has_email, source="batch",
+        )
+
+    @staticmethod
+    def _row_name_and_query(row: dict) -> tuple[str, str]:
+        """(display name, find query) for a caseload row. The query prefers
+        the unambiguous Student ID — CSV header 'StudentID', with the
+        spaced 'Student ID' alias as a fallback — then the name."""
+        name = str(row.get("Name", "")).strip()
+        sid = str(row.get("StudentID", "") or row.get("Student ID", "")).strip()
+        return name, (sid or name)
+
+    def _execute_scenario_over_rows(
+        self, scenario: ScenarioConfig, override: str,
+        confirmed: list[dict], prompt_vars: dict, *,
+        has_email: bool, source: str = "batch",
+    ) -> None:
+        """Shared execution core for firing a scenario across many
+        students — the full caseload batch AND the panel's hand-picked
+        mini-batch. Gathers per-note custom bodies + clipboard, then loops
+        fast-find → auto-send email (if configured) → file note. The
+        activity log is the progress display. `source` is the noun used in
+        log lines ('batch' / 'selection')."""
         # Step 6: per-note custom-body prompts and clipboard read.
-        # Same deferral as before — gathered AFTER confirmation so
-        # cancelled batches don't waste the user's typing.
+        # Gathered AFTER confirmation so cancelled runs don't waste typing.
         custom_bodies: dict[int, str] = {}
         for i, n in enumerate(scenario.notes):
             if not n.enter_additional_text:
@@ -7683,111 +8178,227 @@ class App:
             label = f"Note {i + 1} (applies to all {len(confirmed)} students)"
             edited = prompt_additional_text(self.root, label, n.body)
             if edited is None:
-                self._append_log(f"{label}: cancelled; batch not started.")
+                self._append_log(f"{label}: cancelled; {source} not started.")
                 return
             custom_bodies[i] = edited
 
-        # Clipboard is read once at the start of the batch — Tk + PIL
-        # aren't safe to call from the worker thread.
+        # Clipboard is read once up front — Tk + PIL aren't safe to call
+        # from the worker thread.
         clipboard = ""
         if any(n.append_clipboard for n in scenario.notes):
             clipboard = self._read_clipboard_content()
 
         total = len(confirmed)
 
+        # Lock the browser for the (non-interactive) loop so a stray user
+        # click can't change the active record mid-run — the exact failure
+        # mode that produced "No visible note panel" skips. All modals
+        # (prompts / review) ran above, so the scrim can't hide anything
+        # the user needs to act on. Unlocked in the finally below.
+        try:
+            self.worker.set_browser_enabled(False)
+        except Exception:
+            pass
+        self._show_browser_lock()
+
         # Step 7: loop. For each student: fast-find → auto-send
-        # email (if configured) → file note. Everyone is treated
-        # the same now that template review happened upfront.
+        # email (if configured) → file note.
         processed = 0
         skipped: list[tuple[str, str]] = []
-        for idx, row in enumerate(confirmed, start=1):
-            student_name = row.get("Name", "")
-            student_id = row.get("Student ID", "")
-            self._append_log(
-                f"--- batch {idx}/{total}: {student_name!r} ---"
-            )
-
-            # 7a. Fast-find: row filter on Student ID, then click.
-            # The worker also scrapes mailto: emails off the row
-            # BEFORE clicking + the contact card AFTER, so we can
-            # fill in addresses the CSV view didn't include.
-            query = student_id or student_name
-            click_ok, row_emails = self._click_match_by_filter_blocking(
-                query, expected_name=student_name,
-            )
-            if not click_ok:
+        try:
+            for idx, row in enumerate(confirmed, start=1):
+                student_name, query = self._row_name_and_query(row)
                 self._append_log(
-                    f"Skipping {student_name!r}: fast-find failed."
+                    f"--- {source} {idx}/{total}: {student_name!r} ---"
                 )
-                skipped.append((student_name, "find/click failed"))
-                continue
 
-            # 7b. Auto-send email (if configured). Failure skips the
-            # note for this student but doesn't halt the batch.
-            # Prompt vars merge into student_ctx so {{summary}}-
-            # style placeholders in the email body / subject / to
-            # resolve against the batch-wide prompt input.
-            if has_email:
-                # Build context from the CSV row, then fill any gaps
-                # from the row-level mailto + contact-card scrape we
-                # did during fast-find. The two sources together
-                # mean a user whose Caseload view doesn't include
-                # email columns still gets working batch emails —
-                # mailto carries the PM, the contact card surfaces
-                # the student, the CSV provides everything else.
-                ctx_info = self._ctx_from_csv_row(row)
-                if not ctx_info["student_email"] and row_emails.get("student_email"):
-                    ctx_info["student_email"] = row_emails["student_email"]
-                if not ctx_info["pm_email"] and row_emails.get("pm_email"):
-                    ctx_info["pm_email"] = row_emails["pm_email"]
-                # One-time diagnostic only if BOTH sources came back
-                # empty — that points at a Salesforce config issue
-                # the user has to fix in their list view.
-                if (not ctx_info["student_email"]
-                        and not self._email_diag_logged):
-                    self._email_diag_logged = True
-                    present = _email_columns_present(row)
-                    if present:
-                        self._append_log(
-                            "CSV email columns found but not recognized: "
-                            + ", ".join(repr(c) for c in present) + ". "
-                            "Either rename your Caseload-view columns to "
-                            "'Student Email' / 'Mentor Email', or tell the "
-                            "launcher dev to add these names to the alias "
-                            "list."
-                        )
-                    else:
-                        self._append_log(
-                            "Neither the CSV nor the row's Email-Student "
-                            "link surfaced a student email. The PM "
-                            "scrape may still have succeeded — check the "
-                            "next attempt's log line."
-                        )
-                ctx_info = {**ctx_info, **prompt_vars}
-                if not self._send_scenario_email(
-                    scenario.email, ctx_info, auto_send=True,
-                ):
-                    skipped.append((student_name, "auto-send failed"))
+                # 7a. Fast-find: row filter on Student ID, then click.
+                # The worker also scrapes mailto: emails off the row
+                # BEFORE clicking + the contact card AFTER, so we can
+                # fill in addresses the CSV view didn't include.
+                click_ok, row_emails = self._click_match_by_filter_blocking(
+                    query, expected_name=student_name,
+                )
+                if not click_ok:
+                    self._append_log(
+                        f"Skipping {student_name!r}: fast-find failed."
+                    )
+                    skipped.append((student_name, "find/click failed"))
                     continue
 
-            # 7c. Notes — block until the worker finishes this RUN.
-            # Worker returns True iff the run completed without
-            # errors; only count those as truly processed.
-            if self._submit_scenario_blocking(
-                scenario, override, clipboard, custom_bodies,
-                prompt_vars=prompt_vars,
-            ):
-                processed += 1
-            else:
-                skipped.append((student_name, "note fill failed"))
+                # 7b. Auto-send email (if configured). Failure skips the
+                # note for this student but doesn't halt the run.
+                # Prompt vars merge into student_ctx so {{summary}}-
+                # style placeholders in the email body / subject / to
+                # resolve against the run-wide prompt input.
+                if has_email:
+                    # Build context from the CSV row, then fill any gaps
+                    # from the row-level mailto + contact-card scrape we
+                    # did during fast-find. The two sources together
+                    # mean a user whose Caseload view doesn't include
+                    # email columns still gets working emails —
+                    # mailto carries the PM, the contact card surfaces
+                    # the student, the CSV provides everything else.
+                    ctx_info = self._ctx_from_csv_row(row)
+                    if not ctx_info["student_email"] and row_emails.get("student_email"):
+                        ctx_info["student_email"] = row_emails["student_email"]
+                    if not ctx_info["pm_email"] and row_emails.get("pm_email"):
+                        ctx_info["pm_email"] = row_emails["pm_email"]
+                    # One-time diagnostic only if BOTH sources came back
+                    # empty — that points at a Salesforce config issue
+                    # the user has to fix in their list view.
+                    if (not ctx_info["student_email"]
+                            and not self._email_diag_logged):
+                        self._email_diag_logged = True
+                        present = _email_columns_present(row)
+                        if present:
+                            self._append_log(
+                                "CSV email columns found but not recognized: "
+                                + ", ".join(repr(c) for c in present) + ". "
+                                "Either rename your Caseload-view columns to "
+                                "'Student Email' / 'Mentor Email', or tell the "
+                                "launcher dev to add these names to the alias "
+                                "list."
+                            )
+                        else:
+                            self._append_log(
+                                "Neither the CSV nor the row's Email-Student "
+                                "link surfaced a student email. The PM "
+                                "scrape may still have succeeded — check the "
+                                "next attempt's log line."
+                            )
+                    ctx_info = {**ctx_info, **prompt_vars}
+                    if not self._send_scenario_email(
+                        scenario.email, ctx_info, auto_send=True,
+                    ):
+                        skipped.append((student_name, "auto-send failed"))
+                        continue
+
+                # 7c. Notes — block until the worker finishes this RUN.
+                # Worker returns True iff the run completed without
+                # errors; only count those as truly processed.
+                if self._submit_scenario_blocking(
+                    scenario, override, clipboard, custom_bodies,
+                    prompt_vars=prompt_vars,
+                ):
+                    processed += 1
+                else:
+                    skipped.append((student_name, "note fill failed"))
+        finally:
+            # Always unlock the browser when the loop ends (done, error,
+            # or a mid-loop exception).
+            self._hide_browser_lock()
+            try:
+                self.worker.set_browser_enabled(True)
+            except Exception:
+                pass
 
         self._append_log(
-            f"Batch {scenario.name!r} complete: "
+            f"{source.capitalize()} {scenario.name!r} complete: "
             f"{processed}/{total} processed, {len(skipped)} skipped."
         )
         if skipped:
             for name, reason in skipped:
                 self._append_log(f"  skipped: {name!r} ({reason})")
+
+    def _fire_on_selected(
+        self, scenario: ScenarioConfig, rows: list[dict],
+    ) -> None:
+        """Fire a (non-batch) scenario across a hand-picked set of caseload
+        rows (the panel's checkbox selection) — a mini-batch. Reuses the
+        batch execution core, including the FERPA per-student email-review
+        modal when the scenario has an email step."""
+        if self._is_busy:
+            self._append_log(
+                f"Busy — wait for the current task to finish before "
+                f"firing {scenario.name!r}."
+            )
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        if scenario.batch is not None:
+            self._append_log(
+                f"{scenario.name!r} is a batch scenario; fire it from the "
+                "main window, not the panel selection."
+            )
+            return
+        rows = [r for r in (rows or []) if r]
+        if not rows:
+            self._append_log("No students selected.")
+            return
+
+        # Pre-flight submit-unchecked warning (batch wording — the impact
+        # scales with the selection size).
+        if not self._confirm_submit_off_or_abort(scenario, batch=True):
+            self._append_log(
+                f"{scenario.name!r} on selection: aborted at "
+                "submit-unchecked warning."
+            )
+            return
+
+        override = self.course_var.get().strip()
+        has_email = scenario.email is not None
+
+        # Prompts first — the email review modal renders each student's
+        # email with these substitutions in place.
+        prompt_vars = self._collect_prompt_vars(scenario)
+        if prompt_vars is None:
+            return  # user cancelled a prompt
+
+        # Review/confirm. With an email step, reuse the per-student FERPA
+        # review modal (same as batch); otherwise a single count confirm.
+        if has_email:
+            from src import outlook_email
+            user_info = outlook_email.get_user_info()
+            self._append_log(
+                f"Rendering {len(rows)} email previews for review…"
+            )
+            rendered = [
+                self._build_email_preview_data(
+                    scenario, row, prompt_vars, user_info,
+                )
+                for row in rows
+            ]
+            selected = prompt_batch_email_review(
+                self.root, scenario.name, rendered,
+                f"{len(rows)} hand-picked from the caseload panel",
+            )
+            if selected is None:
+                self._append_log("Selection fire cancelled at email review.")
+                return
+            if not selected:
+                self._append_log(
+                    "Selection fire: no students selected; nothing to do."
+                )
+                return
+            confirmed = [rows[i] for i in selected]
+        else:
+            n = len(rows)
+            who = f"{n} selected student" + ("s" if n != 1 else "")
+            if not ask_yes_no_topmost(
+                self.root, "Fire scenario?",
+                f"Fire {scenario.name!r} on {who}?",
+                yes_label="Fire", no_label="Cancel",
+            ):
+                self._append_log(f"{scenario.name!r} on selection: cancelled.")
+                return
+            confirmed = rows
+
+        self._append_log(
+            f"--- Firing {scenario.name!r} on {len(confirmed)} selected "
+            f"student(s) ---"
+        )
+        self._set_busy(
+            f"Running {scenario.name} on {len(confirmed)} students…"
+        )
+        try:
+            self._execute_scenario_over_rows(
+                scenario, override, confirmed, prompt_vars,
+                has_email=has_email, source="selection",
+            )
+        finally:
+            self._set_idle()
 
     def _list_matches_blocking(self, query: str) -> list[str]:
         """Run a LIST_MATCHES on the worker and block until results.
@@ -9029,6 +9640,124 @@ class App:
     # spinner in any monospaced font and renders cleanly in CTkLabel.
     _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
+    def _show_browser_lock(self) -> None:
+        """Cover the launcher's browser window with a topmost, semi-opaque
+        scrim that swallows clicks/keys, so the user can't change the
+        active record while automation drives it. Tracks the window's rect
+        so it stays aligned if the browser is raised/moved mid-run.
+        Windows-only; best-effort no-op otherwise."""
+        if sys.platform != "win32":
+            return
+        if getattr(self, "_lock_overlay", None) is not None:
+            return
+        rect = self._browser_window_rect()
+        if rect is None:
+            return  # can't locate / window minimized → skip (nothing to cover)
+        x, y, w, h = rect
+        try:
+            ov = tk.Toplevel(self.root)
+            ov.overrideredirect(True)
+            ov.attributes("-topmost", True)
+            try:
+                ov.attributes("-alpha", 0.6)
+            except Exception:
+                pass
+            ov.geometry(f"{w}x{h}+{x}+{y}")
+            ov.configure(bg="#0d1117", cursor="watch")
+            tk.Label(
+                ov,
+                text="🔒  Automation running\n\n"
+                     "Please don't click in Salesforce until this finishes.",
+                bg="#0d1117", fg="#ffffff",
+                font=("Segoe UI", 16, "bold"), justify="center",
+            ).place(relx=0.5, rely=0.5, anchor="center")
+            # Swallow any interaction that reaches the scrim.
+            for seq in ("<Button-1>", "<Button-2>", "<Button-3>",
+                        "<Key>", "<MouseWheel>"):
+                ov.bind(seq, lambda e: "break")
+            ov.lift()
+            self._lock_overlay = ov
+            self._track_lock_overlay()
+        except Exception:
+            self._lock_overlay = None
+
+    def _hide_browser_lock(self) -> None:
+        ov = getattr(self, "_lock_overlay", None)
+        self._lock_overlay = None
+        if ov is not None:
+            try:
+                ov.destroy()
+            except Exception:
+                pass
+
+    def _browser_window_rect(self):
+        """(x, y, w, h) of the launcher's browser window in screen coords,
+        or None if it can't be located / is minimized / off-screen."""
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            hwnd = self.worker._locate_browser_hwnd()
+            if not hwnd or user32.IsIconic(hwnd):
+                return None
+            r = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                return None
+            w, h = r.right - r.left, r.bottom - r.top
+            if w <= 0 or h <= 0 or r.left <= -30000 or r.top <= -30000:
+                return None
+            return (r.left, r.top, w, h)
+        except Exception:
+            return None
+
+    def _foreground_is_ours(self) -> bool:
+        """True if the OS foreground window belongs to the launcher or to
+        our browser. Used to show the lock scrim ONLY while the user is
+        actually looking at Salesforce — otherwise a topmost scrim would
+        float over whatever other app they switched to. True off Windows."""
+        if sys.platform != "win32":
+            return True
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            fg = user32.GetForegroundWindow()
+            if not fg:
+                return False
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+            allowed = {os.getpid()}
+            bp = getattr(self.worker, "_browser_pid", None)
+            if bp:
+                allowed.add(bp)
+            return pid.value in allowed
+        except Exception:
+            return True
+
+    def _track_lock_overlay(self) -> None:
+        """Keep the scrim aligned over the browser while it's shown, but
+        only WHILE our app is in the foreground — hide it the moment the
+        user switches to another app so it never floats over their other
+        windows. Re-shows when they return to Salesforce."""
+        ov = getattr(self, "_lock_overlay", None)
+        if ov is None:
+            return
+        try:
+            rect = self._browser_window_rect()
+            if self._foreground_is_ours() and rect is not None:
+                x, y, w, h = rect
+                ov.geometry(f"{w}x{h}+{x}+{y}")
+                ov.deiconify()
+                ov.attributes("-topmost", True)
+                ov.lift()
+            else:
+                ov.withdraw()
+        except Exception:
+            pass
+        self.root.after(150, self._track_lock_overlay)
+
     def _set_busy(self, message: str) -> None:
         """Enter a busy state: disable action buttons, show a spinner
         + status label, and start the animation. Idempotent — calling
@@ -9053,6 +9782,13 @@ class App:
         spinner label and its background tag."""
         self._is_busy = False
         self._busy_message = ""
+        # Safety: never leave the browser scrim/disable up if a run exited
+        # without its own cleanup.
+        self._hide_browser_lock()
+        try:
+            self.worker.set_browser_enabled(True)
+        except Exception:
+            pass
         try:
             self.busy_label.configure(text="", fg_color="transparent")
         except Exception:

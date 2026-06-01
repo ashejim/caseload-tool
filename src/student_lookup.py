@@ -423,7 +423,12 @@ def click_caseload_row(row, name: str, name_idx: int, on_status=None) -> bool:
          viewport", fall back to a JS `el.click()` — that synthesizes
          the click without requiring the mouse coordinate to land in
          the visible area. Lightning's onClick handlers fire on
-         synthetic clicks just like on real ones."""
+         synthetic clicks just like on real ones.
+
+    Returns True only once the URL has actually left the Caseload list
+    (the record opened) — a dispatched click that doesn't route counts as
+    a failure and is retried, then reported honestly so the caller can
+    re-activate the list and try again."""
     def diag(msg: str) -> None:
         if on_status:
             on_status(msg)
@@ -440,6 +445,55 @@ def click_caseload_row(row, name: str, name_idx: int, on_status=None) -> bool:
     except Exception:
         pass
 
+    # Step 2: verified click. A click that dispatches without raising is
+    # NOT proof the record opened — Lightning only routes record
+    # navigation from the ACTIVE view, and the first user-driven action
+    # after the list (re)renders is occasionally swallowed (same quirk
+    # family as the about:blank popup hang). So we confirm the URL
+    # actually leaves the Caseload list before reporting success, and
+    # re-click if it didn't. Previously we returned True the instant the
+    # JS click didn't raise, which logged "Navigated to X" while the page
+    # sat on the list — the user had to search a second time.
+    page = row.page
+    try:
+        before_url = page.url or ""
+    except Exception:
+        before_url = ""
+
+    def _navigated() -> bool:
+        """True once the URL has left the Caseload list (a record opened)."""
+        try:
+            cur = page.url or ""
+        except Exception:
+            return False
+        return cur != before_url and "Caseload_App_Page" not in cur
+
+    def _click_once(loc) -> bool:
+        """Dispatch a click; JS click first (fires onClick even when the
+        cell is off-viewport or covered by an open record panel), then a
+        forced Playwright click for components that demand a trusted
+        pointer event. Returns False only if BOTH ways raise."""
+        try:
+            loc.first.evaluate("el => el.click()")
+            return True
+        except Exception:
+            try:
+                loc.first.click(force=True)
+                return True
+            except Exception as e:
+                diag(f"  [search] click attempt failed: {e}")
+                return False
+
+    def _poll_navigated(timeout_ms: int = 3000) -> bool:
+        for _ in range(max(1, timeout_ms // 150)):
+            if _navigated():
+                return True
+            try:
+                page.wait_for_timeout(150)
+            except Exception:
+                break
+        return _navigated()
+
     for sub_locator in (
         name_cell.locator("a").filter(has_text=name),
         name_cell.locator("span").filter(has_text=name),
@@ -448,26 +502,18 @@ def click_caseload_row(row, name: str, name_idx: int, on_status=None) -> bool:
         try:
             if sub_locator.count() == 0:
                 continue
-            # Step 2a: JS click first. It dispatches the click straight
-            # to the element, so it fires Lightning's onClick handler
-            # regardless of (a) the cell being scrolled off-viewport, or
-            # (b) the row being visually COVERED by an already-open
-            # student record panel. A coordinate-based Playwright click
-            # — even force=True — lands on whatever overlays the row, so
-            # opening a second student while one was already open would
-            # silently click the open record and navigate nowhere (it
-            # still reported success because force clicks never raise).
-            try:
-                sub_locator.first.evaluate("el => el.click()")
-                return True
-            except Exception:
-                # Step 2b: fall back to a real Playwright click for any
-                # component that insists on a trusted pointer event.
-                sub_locator.first.click(force=True)
-                return True
-        except Exception as e:
-            diag(f"  [search] click attempt failed: {e}")
+        except Exception:
             continue
+        # Up to two verified attempts on this target before moving on.
+        for attempt in range(2):
+            if not _click_once(sub_locator):
+                break  # this locator can't be clicked; try the next one
+            if _poll_navigated():
+                return True
+            diag(
+                f"  [search] clicked {name!r} but the record didn't open "
+                f"(attempt {attempt + 1}); retrying…"
+            )
     return False
 
 
