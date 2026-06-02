@@ -280,6 +280,11 @@ class BrowserWorker:
         `on_done(info_dict_or_None)` is called from the worker."""
         self.q.put(("GET_STUDENT_CONTEXT", on_done, name_hint))
 
+    def submit_dump_dom(self, on_done: Callable[[str], None]) -> None:
+        """DEV: return the active page's full HTML (for inspecting the
+        Salesforce notes DOM). Temporary."""
+        self.q.put(("DUMP_DOM", on_done))
+
     def submit_read_caseload_columns(
         self, on_done: Callable[[list[dict]], None],
     ) -> None:
@@ -487,6 +492,15 @@ class BrowserWorker:
                 info = self._read_student_context(ctx, name_hint)
             finally:
                 on_done(info)
+        elif cmd[0] == "DUMP_DOM":  # DEV: inspect notes DOM
+            _, on_done = cmd
+            html_out = ""
+            try:
+                tgt = self._active_page(ctx)
+                if tgt is not None:
+                    html_out = tgt.content()
+            finally:
+                on_done(html_out)
         elif cmd[0] == "READ_CASELOAD_COLUMNS":
             _, on_done = cmd
             cols: list[dict] = []
@@ -1996,6 +2010,101 @@ _DIALOG_DEFAULTS: dict[str, str] = {
 EMAIL_FONT_DEFAULT_LABEL = "(Outlook default)"
 
 
+# ---- Adjustable text sizes (per "channel") -------------------------------
+# Named font channels so each reading/editing surface can carry its own
+# user-adjustable text size: 'activity' (log), 'viewer' (caseload table),
+# 'email' (FERPA reviewer), 'editor' (note bodies + template editor).
+# CTkTextbox surfaces register via register_font_box(); non-CTk surfaces
+# (the ttk caseload Treeview) register an apply callback via
+# register_font_apply(). Ctrl +/- and Ctrl+MouseWheel on a registered
+# widget adjust that channel live. The App wires _FONT_PERSIST to save.
+UI_FONT_CHANNELS = ("activity", "viewer", "email", "editor")
+UI_FONT_DEFAULTS = {"activity": 13, "viewer": 11, "email": 12, "editor": 12}
+UI_FONT_MIN, UI_FONT_MAX = 8, 40
+_font_sizes: dict = dict(UI_FONT_DEFAULTS)
+_font_boxes: dict = {c: [] for c in UI_FONT_CHANNELS}
+_font_applies: dict = {c: [] for c in UI_FONT_CHANNELS}
+_FONT_PERSIST: list = [None]  # holder for persist callback(channel, size)
+
+
+def font_size(channel: str) -> int:
+    return _font_sizes.get(channel, 13)
+
+
+def set_font_size(channel: str, n: int, persist: bool = True) -> None:
+    """Set a channel's text size (clamped) and apply to all its widgets."""
+    n = max(UI_FONT_MIN, min(UI_FONT_MAX, int(n)))
+    _font_sizes[channel] = n
+    for b in list(_font_boxes.get(channel, [])):
+        try:
+            b.configure(font=ctk.CTkFont(size=n))
+        except Exception:
+            try:
+                _font_boxes[channel].remove(b)
+            except ValueError:
+                pass
+    for cb in list(_font_applies.get(channel, [])):
+        try:
+            cb(n)
+        except Exception:
+            pass
+    if persist and _FONT_PERSIST[0]:
+        try:
+            _FONT_PERSIST[0](channel, n)
+        except Exception:
+            pass
+
+
+def bind_font_hotkeys(channel: str, widget) -> None:
+    """Bind Ctrl +/- and Ctrl+MouseWheel on `widget` to adjust `channel`."""
+    def bump(d):
+        set_font_size(channel, _font_sizes[channel] + d)
+        return "break"
+    widget.bind("<Control-MouseWheel>",
+                lambda e: bump(1 if e.delta > 0 else -1))
+    widget.bind("<Control-plus>", lambda e: bump(1))
+    widget.bind("<Control-equal>", lambda e: bump(1))  # Ctrl+= (no shift)
+    widget.bind("<Control-minus>", lambda e: bump(-1))
+
+
+def register_font_box(channel: str, box, hotkeys: bool = True) -> None:
+    """Register a CTkTextbox to a font channel: apply the current size and
+    (optionally) bind the zoom hotkeys."""
+    _font_boxes.setdefault(channel, []).append(box)
+    try:
+        box.configure(font=ctk.CTkFont(size=_font_sizes[channel]))
+    except Exception:
+        pass
+    if hotkeys:
+        bind_font_hotkeys(channel, box)
+
+
+def register_font_apply(channel: str, cb) -> None:
+    """Register an apply callback cb(size) for a non-CTkTextbox surface
+    (e.g. the caseload Treeview style). Called now + on every change."""
+    _font_applies.setdefault(channel, []).append(cb)
+    try:
+        cb(_font_sizes[channel])
+    except Exception:
+        pass
+
+
+_viewer_font_registered = [False]
+
+
+def apply_caseload_tree_font(size: int) -> None:
+    """Apply a text size to the caseload Treeview's global ttk style: row
+    font, row height (so taller text fits), and heading font."""
+    try:
+        style = ttk.Style()
+        style.configure("Caseload.Treeview", font=("", size),
+                        rowheight=max(18, int(size * 2.05)))
+        style.configure("Caseload.Treeview.Heading",
+                        font=("", size, "bold"))
+    except Exception:
+        pass
+
+
 # Variables exposed in the in-app HTML editor's "Insert variable"
 # toolbar. Display label → variable name (so users see the friendly
 # name but the inserted `{{var}}` matches what the renderer accepts).
@@ -3018,7 +3127,7 @@ def prompt_html_template_editor(
     current = {
         "path": Path(path),
         "font_family": "Segoe UI",
-        "font_size": 11,
+        "font_size": font_size("editor"),  # seed from the 'editor' channel
     }
 
     # ---- Toolbar — insert-variable rows + font/size selectors. ----
@@ -3130,11 +3239,19 @@ def prompt_html_template_editor(
     ).pack(side="left", padx=(0, 4))
 
     def apply_font() -> None:
+        n = current["font_size"]
         try:
             text_box.configure(font=ctk.CTkFont(
-                family=current["font_family"],
-                size=current["font_size"],
-            ))
+                family=current["font_family"], size=n))
+        except Exception:
+            pass
+        try:
+            rich.set_base_size(n)  # resize the rich view + its tag fonts
+        except Exception:
+            pass
+        # Drive the shared 'editor' channel (note bodies + persistence).
+        try:
+            set_font_size("editor", n)
         except Exception:
             pass
 
@@ -3146,10 +3263,10 @@ def prompt_html_template_editor(
         apply_font()
 
     size_combo = ctk.CTkComboBox(
-        size_row, values=["8", "9", "10", "11", "12", "14", "16", "18", "22"],
+        size_row, values=["8", "10", "11", "12", "13", "14", "16", "18", "22"],
         width=70, command=on_size_change,
     )
-    size_combo.set("11")
+    size_combo.set(str(current["font_size"]))
     size_combo.pack(side="left")
     ctk.CTkLabel(
         size_row,
@@ -4338,6 +4455,7 @@ def prompt_batch_email_review(
     body_text.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 8))
     preview_frame.grid_rowconfigure(3, weight=1)
     _configure_email_preview_tags(body_text._textbox)
+    register_font_box("email", body_text)  # adjustable + Ctrl +/- zoom
     # Disable typing — preview is read-only.
     body_text.configure(state="disabled")
 
@@ -5111,6 +5229,7 @@ class NoteEditor:
         row += 1
         self.body_text = ctk.CTkTextbox(content, height=80, wrap="word")
         self.body_text.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 4))
+        register_font_box("editor", self.body_text)  # adjustable text size
         self.body_text.bind("<FocusIn>", lambda _e: self._build_var_buttons())
         self._build_var_buttons()
 
@@ -6359,6 +6478,8 @@ class CaseloadPanel:
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<space>", self._toggle_focused_row)
         self.tree.bind("<Key-space>", self._toggle_focused_row)
+        # Ctrl +/- and Ctrl+wheel resize the caseload table text.
+        bind_font_hotkeys("viewer", self.tree)
         # Drag a column heading sideways to reorder columns.
         self.tree.bind("<B1-Motion>", self._on_head_drag, add="+")
         self.tree.bind("<ButtonRelease-1>", self._on_head_release, add="+")
@@ -6453,16 +6574,21 @@ class CaseloadPanel:
             pass
         style.configure(
             "Caseload.Treeview", background=bg, foreground=fg,
-            fieldbackground=bg, bordercolor=bg, borderwidth=0, rowheight=24,
+            fieldbackground=bg, bordercolor=bg, borderwidth=0,
         )
         style.map("Caseload.Treeview",
                   background=[("selected", sel)],
                   foreground=[("selected", "#ffffff")])
         style.configure(
             "Caseload.Treeview.Heading", background=hbg, foreground=fg,
-            relief="flat", font=("", 10, "bold"),
+            relief="flat",
         )
         style.map("Caseload.Treeview.Heading", background=[("active", sel)])
+        # Font + row height come from the 'viewer' channel (adjustable).
+        apply_caseload_tree_font(font_size("viewer"))
+        if not _viewer_font_registered[0]:
+            register_font_apply("viewer", apply_caseload_tree_font)
+            _viewer_font_registered[0] = True
 
     def _make_check_images(self) -> None:
         """Build checked/unchecked checkbox images that match the CTk
@@ -6500,6 +6626,16 @@ class CaseloadPanel:
 
     def _chk_img(self, checked: bool):
         return self._img_checked if checked else self._img_unchecked
+
+    def set_base_size(self, n: int) -> None:
+        """Change the base text size and rebuild the tag fonts so bold /
+        heading / etc. scale with it."""
+        self._base_size = max(8, min(40, int(n)))
+        try:
+            self.text.configure(font=("Segoe UI", self._base_size))
+            self._configure_tags()
+        except Exception:
+            pass
 
     # ----- data + interaction -----
 
@@ -7284,6 +7420,21 @@ class App:
         # Loaded once at startup; saved via the Settings dialog when
         # the user toggles. Default state hides advanced features.
         self.settings: Settings = load_settings()
+        # Overall UI scale (CustomTkinter widget scaling) — apply before
+        # widgets are built.
+        try:
+            scale = float(getattr(self.settings, "ui_scale", 1.0) or 1.0)
+            ctk.set_widget_scaling(max(0.8, min(1.6, scale)))
+        except Exception:
+            pass
+        # Seed each per-area text size BEFORE widgets are built so every
+        # box registers at the right size; wire persistence so live Ctrl
+        # +/- changes are remembered.
+        for _ch in UI_FONT_CHANNELS:
+            _saved = int(getattr(self.settings, f"font_{_ch}", 0) or 0)
+            if _saved:
+                set_font_size(_ch, _saved, persist=False)
+        _FONT_PERSIST[0] = self._persist_font_size
 
         # In-memory caseload cache populated from CASELOAD_CSV_PATH.
         # Set by _reload_caseload_cache() (called on startup and via
@@ -7369,6 +7520,7 @@ class App:
         self._start_hotkeys()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Control-Alt-d>", self._dev_dump_dom)  # DEV: notes DOM
 
         # Apply the saved advanced/basic mode preference once the UI
         # has finished its first layout pass. Deferred via after(0)
@@ -7528,6 +7680,12 @@ class App:
         self.log = ctk.CTkTextbox(activity_tab, wrap="word")
         self.log.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.log.configure(state="disabled")
+        # Red highlight for failure lines (see _append_log).
+        try:
+            self.log._textbox.tag_configure("logerror", foreground="#e0524f")
+        except Exception:
+            pass
+        register_font_box("activity", self.log)  # Ctrl +/-, Ctrl+wheel
         pane.grid_rowconfigure(6, weight=1)
 
         # Bottom row. Quit is packed first (side=right) so it always
@@ -9148,6 +9306,8 @@ class App:
             )
             return
 
+        self._warn_if_caseload_stale("this batch")
+
         # Step 1: load the caseload rows. Prefer the CSV cache (~50ms,
         # ~100 fields available); fall back to scroll-load DOM scrape
         # if no CSV is present (slow but always works).
@@ -9460,6 +9620,8 @@ class App:
                 "submit-unchecked warning."
             )
             return
+
+        self._warn_if_caseload_stale("this fire")
 
         override = self.course_var.get().strip()
         has_email = scenario.email is not None
@@ -10283,9 +10445,25 @@ class App:
         dialog.transient(self.root)
         dialog.attributes("-topmost", True)
         dialog.grab_set()
-        dialog.geometry("560x560")
+        dialog.geometry("560x520")
+        dialog.minsize(520, 360)
         dialog.lift()
         dialog.focus_force()
+
+        def _refit() -> None:
+            """Resize the dialog to fit its current content (after the
+            foldable Display section toggles or the UI scale changes), so
+            controls never end up clipped below the bottom edge. Uses raw
+            wm_geometry + the content's requested size so it stays correct
+            at any UI scale (CTk's geometry() would re-apply the scale)."""
+            try:
+                dialog.update_idletasks()
+                w = max(dialog.winfo_reqwidth(), 480)
+                h = min(max(dialog.winfo_reqheight(), 360),
+                        int(dialog.winfo_screenheight() * 0.9))
+                dialog.wm_geometry(f"{w}x{h}")
+            except Exception:
+                pass
 
         advanced_var = ctk.BooleanVar(value=self.settings.advanced_mode)
         ctk.CTkLabel(
@@ -10365,6 +10543,141 @@ class App:
             width=260,
         ).pack(anchor="w", padx=32, pady=(0, 12))
 
+        # ---- Display (foldable) ----
+        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
+            fill="x", padx=20, pady=(2, 8))
+        disp_open = {"v": False}
+        disp_body = ctk.CTkFrame(dialog, fg_color="transparent")
+
+        def _disp_label() -> str:
+            return ("▾ Display (text size & scaling)" if disp_open["v"]
+                    else "▸ Display (text size & scaling)")
+
+        def _toggle_disp() -> None:
+            if disp_open["v"]:
+                disp_body.pack_forget()
+                disp_open["v"] = False
+            else:
+                disp_body.pack(fill="x", before=alerts_sep)
+                disp_open["v"] = True
+            disp_header.configure(text=_disp_label())
+            _refit()
+
+        disp_header = ctk.CTkButton(
+            dialog, text=_disp_label(), anchor="w", height=28,
+            fg_color="transparent", hover=False,
+            text_color=("gray10", "gray90"),
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=_toggle_disp,
+        )
+        disp_header.pack(fill="x", padx=16, pady=(0, 2))
+
+        # Overall UI scale (whole-app zoom).
+        scale_row = ctk.CTkFrame(disp_body, fg_color="transparent")
+        scale_row.pack(fill="x", padx=12, pady=(6, 4))
+        ctk.CTkLabel(scale_row, text="Overall UI scale", width=130,
+                     anchor="w").pack(side="left")
+        cur_scale = int(round(float(
+            getattr(self.settings, "ui_scale", 1.0) or 1.0) * 100))
+        scale_var = ctk.StringVar(value=f"{cur_scale}%")
+        ctk.CTkComboBox(
+            scale_row, width=80, variable=scale_var, state="readonly",
+            values=["80%", "90%", "100%", "110%", "125%", "140%", "160%"],
+            command=lambda v: (ctk.set_widget_scaling(int(v.rstrip('%')) / 100),
+                               dialog.after(60, _refit)),
+        ).pack(side="left", padx=(6, 6))
+        ctk.CTkLabel(
+            scale_row, text="(whole app — buttons + text)",
+            font=ctk.CTkFont(size=10), text_color=("gray45", "gray65"),
+        ).pack(side="left")
+
+        _SIZE_VALUES = [str(s) for s in (8, 10, 11, 12, 13, 14, 16, 18, 20, 24)]
+
+        def _font_row(label: str, channel: str) -> None:
+            r = ctk.CTkFrame(disp_body, fg_color="transparent")
+            r.pack(fill="x", padx=12, pady=3)
+            ctk.CTkLabel(r, text=label, width=130, anchor="w").pack(side="left")
+            combo = ctk.CTkComboBox(
+                r, width=70, values=_SIZE_VALUES,
+                command=lambda v, c=channel: set_font_size(c, int(v)),
+            )
+            combo.set(str(font_size(channel)))
+            combo.pack(side="left", padx=(6, 6))
+
+            def _reset(c=channel, cb=combo) -> None:
+                set_font_size(c, UI_FONT_DEFAULTS[c])
+                cb.set(str(UI_FONT_DEFAULTS[c]))
+
+            ctk.CTkButton(
+                r, text="Default", width=70, command=_reset,
+                **SECONDARY_BTN_KWARGS,
+            ).pack(side="left")
+
+        ctk.CTkLabel(
+            disp_body, text="Text size by area:",
+            font=ctk.CTkFont(size=11, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=12, pady=(8, 0))
+        _font_row("Activity log", "activity")
+        _font_row("Caseload viewer", "viewer")
+        _font_row("Email reviewer", "email")
+        _font_row("Editors", "editor")
+        ctk.CTkLabel(
+            disp_body,
+            text="Tip: Ctrl +/− and Ctrl+scroll also resize text inside "
+                 "these areas.",
+            font=ctk.CTkFont(size=10), text_color=("gray45", "gray65"),
+            anchor="w", justify="left", wraplength=480,
+        ).pack(fill="x", padx=12, pady=(2, 8))
+
+        # ---- Alerts ----
+        alerts_sep = ctk.CTkFrame(dialog, height=1,
+                                  fg_color=("gray70", "gray35"))
+        alerts_sep.pack(fill="x", padx=20, pady=(6, 8))
+        ctk.CTkLabel(
+            dialog, text="Alerts",
+            font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 4))
+
+        stale_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        stale_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkLabel(stale_row, text="Warn if caseload older than:").pack(
+            side="left")
+        _STALE_PRESETS = {
+            "Off": 0, "15 min": 15, "30 min": 30, "1 h": 60,
+            "6 h": 360, "12 h": 720, "24 h": 1440,
+        }
+        _MIN_TO_LABEL = {v: k for k, v in _STALE_PRESETS.items()}
+        cur_min = int(getattr(self.settings, "caseload_stale_minutes", 0) or 0)
+        init_label = _MIN_TO_LABEL.get(cur_min, "Custom")
+        stale_var = ctk.StringVar(value=init_label)
+        custom_entry = ctk.CTkEntry(stale_row, width=56,
+                                    placeholder_text="num")
+        unit_var = ctk.StringVar(value="min")
+        unit_combo = ctk.CTkComboBox(
+            stale_row, width=78, variable=unit_var, state="readonly",
+            values=["min", "hours"])
+
+        def _on_stale_preset(v: str) -> None:
+            if v == "Custom":
+                custom_entry.pack(side="left", padx=(8, 2))
+                unit_combo.pack(side="left")
+            else:
+                custom_entry.pack_forget()
+                unit_combo.pack_forget()
+
+        ctk.CTkComboBox(
+            stale_row, width=90, variable=stale_var, state="readonly",
+            values=list(_STALE_PRESETS.keys()) + ["Custom"],
+            command=_on_stale_preset,
+        ).pack(side="left", padx=(8, 0))
+        if init_label == "Custom" and cur_min > 0:
+            if cur_min % 60 == 0:
+                custom_entry.insert(0, str(cur_min // 60))
+                unit_var.set("hours")
+            else:
+                custom_entry.insert(0, str(cur_min))
+            _on_stale_preset("Custom")
+
         btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=(0, 18), side="bottom")
 
@@ -10372,6 +10685,24 @@ class App:
             new_mode = advanced_var.get()
             changed = (new_mode != self.settings.advanced_mode)
             self.settings.advanced_mode = new_mode
+            # Overall UI scale.
+            try:
+                self.settings.ui_scale = int(
+                    scale_var.get().rstrip("%")) / 100
+            except Exception:
+                pass
+            # Caseload staleness threshold (preset or Custom → minutes).
+            sv = stale_var.get().strip()
+            if sv in _STALE_PRESETS:
+                self.settings.caseload_stale_minutes = _STALE_PRESETS[sv]
+            else:  # Custom
+                try:
+                    num = int(float(custom_entry.get().strip()))
+                    self.settings.caseload_stale_minutes = (
+                        num * 60 if unit_var.get() == "hours" else num)
+                except Exception:
+                    pass  # leave the existing value
+            # Per-area font sizes already persist live via set_font_size.
             save_settings(self.settings)
             if changed:
                 self._apply_advanced_mode()
@@ -10395,6 +10726,7 @@ class App:
         ).pack(side="left", padx=4)
         dialog.bind("<Escape>", lambda _e: _do_cancel())
         dialog.protocol("WM_DELETE_WINDOW", _do_cancel)
+        dialog.after(0, _refit)  # size to the built content
 
     def _setup_caseload_tool_view_with_help(self, parent_dialog=None) -> None:
         """Open the manual walkthrough for creating the Caseload Tool
@@ -11132,17 +11464,85 @@ class App:
         self.status_var.set(msg)
         self._append_log(msg)
 
-    def _append_log(self, msg: str) -> None:
+    # Failure-ish phrasing that should stand out in red. Deliberately
+    # excludes plain user "cancelled" (that's a choice, not a failure).
+    _LOG_ERROR_RE = re.compile(
+        r"\b(fail(?:ed|ure|s)?|error|couldn'?t|could not|abort(?:ed)?|"
+        r"crash(?:ed)?|not fired|no visible note panel|not delivered|"
+        r"no match|skipp(?:ed|ing)|didn'?t open|timed? out|not found)\b",
+        re.IGNORECASE,
+    )
+
+    def _append_log(self, msg: str, error: Optional[bool] = None) -> None:
         # Defensive: if called before _build_main_pane has created
         # the widget (e.g. very early startup), fall back to stderr
         # so we don't crash the app with AttributeError.
         if not hasattr(self, "log") or self.log is None:
             print(msg, file=sys.stderr)
             return
+        if error is None:
+            error = bool(self._LOG_ERROR_RE.search(msg))
         self.log.configure(state="normal")
+        start = self.log.index("end-1c")
         self.log.insert("end", msg + "\n")
+        if error:
+            try:
+                self.log._textbox.tag_add("logerror", start, "end-1c")
+            except Exception:
+                pass
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    def _dev_dump_dom(self, event=None):
+        """DEV (Ctrl+Alt+D): write the active browser page's HTML to
+        dom_dump.html for notes-DOM inspection. Temporary."""
+        done = tk.BooleanVar(value=False)
+        holder = {"html": ""}
+
+        def on_done(html):
+            def setm():
+                holder["html"] = html or ""
+                done.set(True)
+            try:
+                self.root.after(0, setm)
+            except Exception:
+                holder["html"] = html or ""
+                done.set(True)
+
+        self._append_log("[dev] dumping active page DOM…")
+        self.worker.submit_dump_dom(on_done)
+        self.root.wait_variable(done)
+        try:
+            out = Path("dom_dump.html").resolve()
+            out.write_text(holder["html"], encoding="utf-8")
+            self._append_log(
+                f"[dev] dumped {len(holder['html'])} chars to {out}")
+        except Exception as e:
+            self._append_log(f"[dev] DOM dump failed: {e}")
+
+    def _persist_font_size(self, channel: str, n: int) -> None:
+        if channel in UI_FONT_CHANNELS:
+            setattr(self.settings, f"font_{channel}", int(n))
+            save_settings(self.settings)
+
+    def _warn_if_caseload_stale(self, context: str = "") -> None:
+        """Red activity-log warning when the cached caseload CSV is older
+        than the user's alert threshold (Settings → caseload_stale_minutes;
+        0 = off). Advisory only — doesn't block the action."""
+        mins = int(getattr(self.settings, "caseload_stale_minutes", 0) or 0)
+        if mins <= 0:
+            return
+        mt = caseload_csv.csv_mtime(CASELOAD_CSV_PATH)
+        if mt is None:
+            return
+        if (datetime.now() - mt).total_seconds() / 60 >= mins:
+            where = f" before {context}" if context else ""
+            age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
+            self._append_log(
+                f"⚠ Caseload data is {age} old (over your alert "
+                f"threshold){where} — click ↻ Caseload to refresh.",
+                error=True,
+            )
 
     def _toggle_log(self) -> None:
         """Collapse/expand the activity-log box to reclaim vertical

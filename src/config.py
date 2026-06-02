@@ -151,6 +151,17 @@ class Settings:
     # Columns the user has never seen (new CSV exports) default to visible
     # and append after the saved order.
     caseload_columns: str = ""
+    # Warn (red activity-log line) before a batch/selection fire when the
+    # cached caseload CSV is older than this many MINUTES. 0 = never warn.
+    caseload_stale_minutes: int = 720  # 12 h
+    # Overall UI scale (CustomTkinter widget scaling); 1.0 = 100%.
+    ui_scale: float = 1.0
+    # Per-area text sizes (pt). 0 = use the built-in default for that area.
+    # Adjustable live (Ctrl +/-, Ctrl+wheel) and via the Settings dialog.
+    font_activity: int = 0
+    font_viewer: int = 0
+    font_email: int = 0
+    font_editor: int = 0
 
 
 def load_settings() -> Settings:
