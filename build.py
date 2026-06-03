@@ -12,7 +12,7 @@ Produces:
     CaseloadNotes-vX.Y.Z.zip            <- ready-for-Releases archive
                                            in the project root
 
-Per-user data (notes.yaml, templates/, caseload.csv, browser_data/,
+Per-user data (scenarios.yaml, templates/, caseload.csv, browser_data/,
 screenshots/) lives in %APPDATA%\\caseload-notes\\ so the install
 folder stays clean and read-only.
 """
@@ -54,7 +54,7 @@ Quick start
 
 User config + data
 ------------------
-Your edited scenarios (notes.yaml), email templates, signatures,
+Your edited scenarios (scenarios.yaml), email templates, signatures,
 cached caseload export, and the browser profile all live under:
 
     %APPDATA%\\caseload-notes\\

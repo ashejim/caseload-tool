@@ -1,4 +1,4 @@
-"""Load scenario definitions from notes.yaml and run them against an
+"""Load scenario definitions from scenarios.yaml and run them against an
 open note panel. Each scenario is one or more NoteData entries filed in
 sequence, optionally followed by closing the Salesforce workspace tab.
 """
@@ -10,7 +10,7 @@ from playwright.sync_api import Page
 
 from typing import Callable, Optional
 
-from src.config import NOTES_YAML
+from src.config import SCENARIOS_YAML, NOTES_YAML
 from src.note_form import NoteData, close_workspace_tab, fill_note
 
 # Note-body limits when clipboard is appended (total, including body).
@@ -135,7 +135,7 @@ class Group:
     referenced by name; ones not in any group render as "ungrouped"
     at the top of the launcher's scenario list.
 
-    Stored in notes.yaml under a top-level `groups:` block parallel
+    Stored in scenarios.yaml under a top-level `groups:` block parallel
     to `scenarios:`. Order matters — groups display top-to-bottom
     in the order they appear in the list."""
     name: str
@@ -216,8 +216,8 @@ def _groups_from_list(items: Optional[list]) -> list[Group]:
     return out
 
 
-def load_groups(path: Path = NOTES_YAML) -> list[Group]:
-    """Read `groups:` from notes.yaml. Returns an empty list if the
+def load_groups(path: Path = SCENARIOS_YAML) -> list[Group]:
+    """Read `groups:` from scenarios.yaml. Returns an empty list if the
     file has no groups block (the launcher then shows every
     scenario as ungrouped). Failure to read / parse returns an
     empty list rather than raising — groups are a UI feature and
@@ -250,8 +250,8 @@ def _prompts_from_list(items: Optional[list]) -> list[Prompt]:
     return out
 
 
-def load_scenarios(path: Path = NOTES_YAML) -> dict[str, ScenarioConfig]:
-    """Load all scenarios from notes.yaml, keyed by name."""
+def load_scenarios(path: Path = SCENARIOS_YAML) -> dict[str, ScenarioConfig]:
+    """Load all scenarios from scenarios.yaml, keyed by name."""
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     sections = raw.get("scenarios", {})
     if not isinstance(sections, dict):

@@ -31,6 +31,13 @@ note_log.csv
 # Cached caseload export — student PII, FERPA, never commit.
 caseload.csv
 
+# The user's live scenarios (their personal batches/scenarios/emails).
+# Only the bundled sample, default_scenarios.yaml, is tracked. The legacy
+# notes.yaml name + its backups are ignored too.
+scenarios.yaml
+notes.yaml
+notes.yaml.bak*
+
 # Browser-preview temp written by the HTML editor's Preview button.
 _preview.html
 

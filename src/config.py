@@ -62,7 +62,11 @@ load_dotenv(USER_CONFIG_DIR / ".env")
 if not _is_frozen():
     load_dotenv(PROJECT_ROOT / ".env")
 
-NOTES_YAML = USER_CONFIG_DIR / "notes.yaml"
+# The user's scenario/group definitions. Renamed from the legacy
+# "notes.yaml" (the file only ever held scenarios + groups, never notes).
+SCENARIOS_YAML = USER_CONFIG_DIR / "scenarios.yaml"
+# Back-compat alias so older imports keep working.
+NOTES_YAML = SCENARIOS_YAML
 BROWSER_DATA_DIR = USER_CONFIG_DIR / "browser_data"
 SCREENSHOTS_DIR = USER_CONFIG_DIR / "screenshots"
 NOTE_LOG_CSV = USER_CONFIG_DIR / "note_log.csv"
@@ -79,14 +83,33 @@ DEFAULT_CASELOAD_URL = "https://srm.lightning.force.com/lightning/n/Caseload_App
 CASELOAD_URL = os.getenv("CASELOAD_URL", DEFAULT_CASELOAD_URL).strip()
 
 
-def _seed_user_notes_yaml() -> None:
-    """First-run convenience: copy the bundled default notes.yaml into
-    the user's config dir if they don't have one yet."""
-    if NOTES_YAML.exists():
+def _seed_user_scenarios_yaml() -> None:
+    """First-run setup for the user's scenario file, in priority order:
+    1. If scenarios.yaml already exists, leave it alone.
+    2. Migrate a legacy notes.yaml (the file was renamed) by moving it,
+       so an upgrading user keeps all their scenarios.
+    3. Otherwise seed the bundled default_scenarios.yaml sample so a
+       first-time user has example batches/scenarios/emails to edit.
+    """
+    if SCENARIOS_YAML.exists():
         return
-    bundled_default = (_bundle / "notes.yaml") if _bundle is not None else (PROJECT_ROOT / "notes.yaml")
+    legacy = USER_CONFIG_DIR / "notes.yaml"
+    if legacy.exists():
+        try:
+            legacy.rename(SCENARIOS_YAML)
+            return
+        except Exception:
+            try:
+                SCENARIOS_YAML.write_bytes(legacy.read_bytes())
+                return
+            except Exception:
+                pass
+    bundled_default = (
+        (_bundle / "default_scenarios.yaml") if _bundle is not None
+        else (PROJECT_ROOT / "default_scenarios.yaml")
+    )
     if bundled_default.exists():
-        NOTES_YAML.write_bytes(bundled_default.read_bytes())
+        SCENARIOS_YAML.write_bytes(bundled_default.read_bytes())
 
 
 def _seed_user_templates() -> None:
@@ -103,13 +126,13 @@ def _seed_user_templates() -> None:
             (TEMPLATES_DIR / f.name).write_bytes(f.read_bytes())
 
 
-_seed_user_notes_yaml()
+_seed_user_scenarios_yaml()
 _seed_user_templates()
 
 
 # ===== Settings (user-toggleable preferences) =====
 #
-# A small JSON file alongside notes.yaml in USER_CONFIG_DIR. Currently
+# A small JSON file alongside scenarios.yaml in USER_CONFIG_DIR. Currently
 # only carries the advanced-mode toggle, but designed to grow — future
 # preferences (auto-refresh intervals, default themes, etc.) get added
 # as fields on the Settings dataclass without needing migration code.

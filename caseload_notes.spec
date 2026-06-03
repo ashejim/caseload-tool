@@ -19,7 +19,7 @@ a = Analysis(
     pathex=["."],
     binaries=[],
     datas=[
-        ("notes.yaml", "."),  # bundled default — seeded into user dir on first run
+        ("default_scenarios.yaml", "."),  # bundled sample — seeded into user dir on first run
         *ctk_datas,
     ],
     hiddenimports=[

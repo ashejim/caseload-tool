@@ -3,10 +3,10 @@
 Two panes side by side:
 - Left:  status, course-code field, scenario buttons, activity log
 - Right: collapsible editor with one tab per scenario, fields laid out
-         like the Caseload note form. Edits write back to notes.yaml,
+         like the Caseload note form. Edits write back to scenarios.yaml,
          scenarios reload, hotkeys re-register.
 
-Global hotkeys (defined in notes.yaml) trigger scenarios anywhere on
+Global hotkeys (defined in scenarios.yaml) trigger scenarios anywhere on
 the system. Bare F-keys are claimed system-wide so the browser doesn't
 also react to them.
 
@@ -50,7 +50,7 @@ from src.config import (
 from src.version import __version__
 from src.note_form import NoteData
 from src.scenarios import (
-    NOTES_YAML, BatchConfig, EmailConfig, Group, ScenarioConfig,
+    SCENARIOS_YAML, BatchConfig, EmailConfig, Group, ScenarioConfig,
     load_groups, load_scenarios, run_scenario,
 )
 from src.student_lookup import (
@@ -4302,6 +4302,7 @@ def prompt_additional_text(parent, label: str, prefilled: str) -> Optional[str]:
 def ask_yes_no_topmost(
     parent, title: str, message: str,
     yes_label: str = "Yes", no_label: str = "No",
+    at: Optional[tuple] = None,
 ) -> bool:
     """Topmost Yes/No modal. Use AFTER Outlook (or any other window)
     has stolen focus — tkinter's stock messagebox.askyesno doesn't
@@ -4348,6 +4349,20 @@ def ask_yes_no_topmost(
     dialog.bind("<Return>", lambda _e: _close(True))
     dialog.bind("<Escape>", lambda _e: _close(False))
     dialog.protocol("WM_DELETE_WINDOW", lambda: _close(False))
+
+    # Optionally pop the dialog right where the action was invoked (e.g.
+    # over the caseload row-menu the user just clicked), clamped on-screen.
+    if at is not None:
+        try:
+            dialog.update_idletasks()
+            w = dialog.winfo_reqwidth()
+            h = dialog.winfo_reqheight()
+            sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
+            x = max(0, min(int(at[0]) - 20, sw - w - 8))
+            y = max(0, min(int(at[1]) - 10, sh - h - 8))
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
 
     # Outlook may steal focus right after compose_email returns;
     # claw it back aggressively. The two .after() retries handle the
@@ -5726,7 +5741,7 @@ class NoteEditor:
             "append_clipboard": self.append_clipboard_var.get(),
             "enter_additional_text": self.enter_additional_text_var.get(),
         }
-        # Only emit the override key when non-empty so notes.yaml
+        # Only emit the override key when non-empty so scenarios.yaml
         # stays clean for the (common) auto-detect case.
         cc_override = self.course_code_override_entry.get().strip()
         if cc_override:
@@ -8287,7 +8302,7 @@ class CaseloadPanel:
                 fire_menu.add_command(
                     label=sc.name,
                     command=lambda s=sc, r=row: self.app._fire_on_selected(
-                        s, [r]))
+                        s, [r], near=(x_root, y_root)))
             menu.add_cascade(label="Fire scenario", menu=fire_menu)
             # Fire on the whole checked selection, when there is one.
             checked = self._checked_rows()
@@ -8297,7 +8312,7 @@ class CaseloadPanel:
                     sel_menu.add_command(
                         label=sc.name,
                         command=lambda s=sc: self.app._fire_on_selected(
-                            s, self._checked_rows()))
+                            s, self._checked_rows(), near=(x_root, y_root)))
                 menu.add_cascade(
                     label=f"Fire on {len(checked)} selected", menu=sel_menu)
         try:
@@ -9752,7 +9767,7 @@ class App:
 
     def _delete_scenario(self) -> None:
         """Drop the currently-selected scenario from the in-memory dict
-        and rebuild tabs/buttons. The deletion is *draft* — notes.yaml
+        and rebuild tabs/buttons. The deletion is *draft* — scenarios.yaml
         isn't touched until the user clicks 'Save changes'. 'Revert'
         brings the scenario back."""
         name = getattr(self, "_current_scenario", None)
@@ -9894,7 +9909,7 @@ class App:
             ]
 
         try:
-            NOTES_YAML.write_text(
+            SCENARIOS_YAML.write_text(
                 yaml.safe_dump(new_doc, sort_keys=False, allow_unicode=True),
                 encoding="utf-8",
             )
@@ -9913,7 +9928,8 @@ class App:
         self._rebuild_editor_tabs()
         self._rebuild_scenario_buttons()
         self._restart_hotkeys()
-        self._append_log("Saved notes.yaml; tabs, buttons, and hotkeys refreshed.")
+        self._append_log(
+            "Saved scenarios.yaml; tabs, buttons, and hotkeys refreshed.")
         # Surface the unchecked-submit summary right after save so a
         # stray uncheck doesn't hide until the next batch fire produces
         # FALSE rows. One log line per offending scenario.
@@ -10511,6 +10527,7 @@ class App:
 
     def _fire_on_selected(
         self, scenario: ScenarioConfig, rows: list[dict],
+        near: Optional[tuple] = None,
     ) -> None:
         """Fire a (non-batch) scenario across a hand-picked set of caseload
         rows (the panel's checkbox selection) — a mini-batch. Reuses the
@@ -10577,7 +10594,7 @@ class App:
             if not ask_yes_no_topmost(
                 self.root, "Fire scenario?",
                 f"Fire {scenario.name!r} on {who}?",
-                yes_label="Fire", no_label="Cancel",
+                yes_label="Fire", no_label="Cancel", at=near,
             ):
                 self._append_log(f"{scenario.name!r} on selection: cancelled.")
                 return

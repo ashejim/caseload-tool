@@ -1,0 +1,130 @@
+# ============================================================
+# Sample scenarios — edit these to match how you work!
+# ============================================================
+#
+# This file is just examples to get you started. The easiest way to edit
+# it is inside the app (the right-hand editor panel), but you can also
+# edit this file directly. Your changes are saved to "scenarios.yaml" in
+# your config folder — this sample file is never overwritten.
+#
+# Three kinds of scenarios are shown below:
+#   1. A single note  (logs one interaction note on the open student)
+#   2. A note + email (logs a note AND sends an email)
+#   3. A batch        (runs a note+email across many students by filter)
+#
+# Field cheat-sheet:
+#   hotkey            global shortcut, e.g. "Ctrl+Shift+W" (blank = none)
+#   find_first        true = look the student up before filing the note
+#   close_tab_after   true = close the Salesforce tab when done
+#   panel_action      true = show this in the caseload panel's right-click menu
+#   interaction_type  "Email to Student" / "Email from Student" /
+#                     "Live Call" / "Admin Note"
+#   submit            true = click Submit; false = leave the note for review
+#   email.cc_pm       true = CC the student's Program Mentor
+#   batch.filters     which students to include (column / op / value)
+#
+# ------------------------------------------------------------
+
+scenarios:
+
+  # 1) SINGLE NOTE — logs one "Email to Student" note on the open student.
+  Welcome note:
+    hotkey: ''
+    close_tab_after: true
+    find_first: false
+    panel_action: true
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: Welcome email sent.
+      academic_activities: []
+      submit: true
+      append_clipboard: false
+      enter_additional_text: false
+
+  # A phone-call note. find_first looks the student up first; submit is
+  # false so you can review/add detail before filing.
+  Call logged:
+    hotkey: ''
+    close_tab_after: true
+    find_first: true
+    panel_action: true
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Live Call
+      body: Spoke with student. Followed up on course progress.
+      academic_activities:
+      - Course/Program Information Discussed
+      submit: false
+      append_clipboard: false
+      enter_additional_text: false
+
+  # 2) NOTE + EMAIL — logs a note and sends a follow-up email. The email
+  # body comes from a template file in your "templates" folder. {{first_name}}
+  # is filled in per student. Leave "to" blank to use the student's email.
+  Follow-up email:
+    hotkey: ''
+    close_tab_after: true
+    find_first: false
+    panel_action: true
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: Follow-up email sent.
+      academic_activities: []
+      submit: true
+      append_clipboard: false
+      enter_additional_text: false
+    email:
+      subject: Following up, {{first_name}}
+      body_html_file: sample_followup.html
+      to: ''
+      signature_file: ''
+      inline_images: []
+      cc_pm: false
+      pick_template: false
+
+  # 3) BATCH — sends the welcome email to every student on a course who
+  # doesn't yet have a CI assigned. Change "C123" to your course code.
+  # preview: true shows you the recipient list before anything sends.
+  Welcome batch (by course):
+    hotkey: ''
+    close_tab_after: true
+    find_first: false
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: Welcome email sent.
+      academic_activities: []
+      submit: true
+      append_clipboard: false
+      enter_additional_text: false
+    email:
+      subject: Getting started in your course
+      body_html_file: sample_followup.html
+      to: ''
+      signature_file: ''
+      inline_images: []
+      cc_pm: true
+    batch:
+      filters:
+      - column: Course Code
+        op: is
+        value: C123
+      - column: Last Assigned CI Contact
+        op: is empty
+        value: ''
+      preview: true
+
+# Groups organize the scenario buttons into labeled, colored sections.
+groups:
+- name: Single actions
+  color: '#239a8e'
+  scenarios:
+  - Welcome note
+  - Call logged
+  - Follow-up email
+- name: Batches
+  color: '#3f9d3f'
+  scenarios:
+  - Welcome batch (by course)
