@@ -48,3 +48,8 @@ templates/*
 # Salesforce session cookies + aura.token (active credentials)
 # AND student PII inside the request bodies. Never commit.
 capture-*.json
+
+# Dev DOM dumps + scratch dir used while reverse-engineering the
+# Salesforce notes DOM. Contain student PII; never commit.
+dom_dump.html
+temp/

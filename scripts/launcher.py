@@ -280,10 +280,12 @@ class BrowserWorker:
         `on_done(info_dict_or_None)` is called from the worker."""
         self.q.put(("GET_STUDENT_CONTEXT", on_done, name_hint))
 
-    def submit_dump_dom(self, on_done: Callable[[str], None]) -> None:
-        """DEV: return the active page's full HTML (for inspecting the
-        Salesforce notes DOM). Temporary."""
-        self.q.put(("DUMP_DOM", on_done))
+    def submit_fetch_notes(
+        self, query: str, on_done: Callable[[dict], None],
+    ) -> None:
+        """Open the student's record, wait for their notes to load, and
+        scrape them. on_done({notes, count, timings})."""
+        self.q.put(("FETCH_NOTES", query, on_done))
 
     def submit_read_caseload_columns(
         self, on_done: Callable[[list[dict]], None],
@@ -492,15 +494,13 @@ class BrowserWorker:
                 info = self._read_student_context(ctx, name_hint)
             finally:
                 on_done(info)
-        elif cmd[0] == "DUMP_DOM":  # DEV: inspect notes DOM
-            _, on_done = cmd
-            html_out = ""
+        elif cmd[0] == "FETCH_NOTES":
+            _, query, on_done = cmd
+            res = {}
             try:
-                tgt = self._active_page(ctx)
-                if tgt is not None:
-                    html_out = tgt.content()
+                res = self._fetch_student_notes(ctx, query)
             finally:
-                on_done(html_out)
+                on_done(res)
         elif cmd[0] == "READ_CASELOAD_COLUMNS":
             _, on_done = cmd
             cols: list[dict] = []
@@ -1516,6 +1516,128 @@ class BrowserWorker:
         self.on_status(f"Caseload table didn't load after retries: {last_error}")
         return None, None
 
+    def _fetch_student_notes(
+        self, ctx, query: str, max_notes: int = 60,
+    ) -> dict:
+        """Open the student's record and scrape their note history.
+
+        The notes live in a ShortText datatable that lazy-loads AFTER the
+        record opens, so we poll the *visible* ShortText cells until they
+        appear (the global caseload Notes-History table is in the DOM too
+        but stays hidden when a record subtab is foreground, so `:visible`
+        isolates this student's notes). Returns
+        {notes:[{type,subject,course,date,author,text}], count, timings}.
+        """
+        import time as _t
+        timings: dict = {}
+        t0 = _t.time()
+        # 1. Navigate to the student's record (foregrounds the subtab so
+        #    the hidden global table drops out of :visible).
+        try:
+            self._handle_find(ctx, query, new_tab=False, raise_after=False)
+        except Exception as e:
+            return {"error": f"navigation failed: {e}", "timings": timings}
+        timings["nav_ms"] = int((_t.time() - t0) * 1000)
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page", "timings": timings}
+
+        try:
+            timings["url"] = (target.url or "")[:90]
+        except Exception:
+            timings["url"] = ""
+        # 2. The record opens on the "Essential Actions" tab; the per-student
+        #    note table lives in the *Notes History* scoped tab, which
+        #    Lightning doesn't render until it's activated. Click it.
+        t_tab = _t.time()
+        timings["tab"] = "not found"
+        for _ in range(20):  # wait up to ~5s for the tab to exist
+            try:
+                tab = target.locator(
+                    'a[data-tab-value="NotesHistoryTab"]').first
+                if tab.count() > 0:
+                    tab.click(timeout=2000)
+                    timings["tab"] = "clicked"
+                    break
+            except Exception as e:
+                timings["tab"] = f"click error: {e}"
+            try:
+                target.wait_for_timeout(250)
+            except Exception:
+                break
+        timings["tab_ms"] = int((_t.time() - t_tab) * 1000)
+
+        sel = 'td[data-col-key-value*="ShortText__c"]:visible'
+        sel_all = 'td[data-col-key-value*="ShortText__c"]'
+        # 3. Poll until the per-student notes table populates inside the tab.
+        t1 = _t.time()
+        count = 0
+        for _ in range(40):  # ~10s ceiling (250ms * 40)
+            try:
+                count = target.locator(sel).count()
+            except Exception:
+                count = 0
+            if count > 0:
+                break
+            try:
+                target.wait_for_timeout(250)
+            except Exception:
+                break
+        timings["notes_load_ms"] = int((_t.time() - t1) * 1000)
+        try:
+            timings["all_cells"] = target.locator(sel_all).count()
+        except Exception:
+            timings["all_cells"] = -1
+
+        # 3. Scrape every visible note row in ONE page.evaluate() round-trip
+        #    (vs. ~1600 per-cell locator calls — cuts scrape from ~5s to
+        #    ~50ms). Column keys from the live DOM: Type__c / CourseCode__c /
+        #    Name(=Subject) / ShortText__c / Author__c / WGUCreationDateTime__c.
+        #    Full body lives in each cell's data-cell-value attr.
+        t2 = _t.time()
+        notes: list[dict] = []
+        js = """
+        (maxNotes) => {
+          const norm = (s) => (s || "").replace(/\\s+/g, " ").trim();
+          const cells = document.querySelectorAll(
+            'td[data-col-key-value*="ShortText__c"]');
+          const out = [];
+          for (const cell of cells) {
+            if (out.length >= maxNotes) break;
+            // Only the active tab's table is laid out; hidden console/tab
+            // tables have no client rects — skip them.
+            if (cell.offsetParent === null &&
+                cell.getClientRects().length === 0) continue;
+            const row = cell.closest('tr');
+            if (!row) continue;
+            const pick = (key, prefix) => {
+              const sel = prefix
+                ? 'td[data-col-key-value^="' + key + '"]'
+                : 'td[data-col-key-value*="' + key + '"]';
+              const td = row.querySelector(sel);
+              if (!td) return "";
+              return norm(td.getAttribute("data-cell-value") || td.textContent);
+            };
+            out.push({
+              type: pick("Type__c", false),
+              course: pick("CourseCode__c", false),
+              subject: pick("Name-", true),
+              text: pick("ShortText__c", false),
+              author: pick("Author__c", false),
+              date: pick("WGUCreationDateTime__c", false),
+            });
+          }
+          return out;
+        }
+        """
+        try:
+            notes = target.evaluate(js, max_notes) or []
+        except Exception as e:
+            timings["scrape_error"] = str(e)
+        timings["scrape_ms"] = int((_t.time() - t2) * 1000)
+        timings["total_ms"] = int((_t.time() - t0) * 1000)
+        return {"notes": notes, "count": count, "timings": timings}
+
     @staticmethod
     def _clean_caseload_headers(table) -> list[str]:
         """Strip the 'sorting options' / 'column actions' UI noise off
@@ -2103,6 +2225,173 @@ def apply_caseload_tree_font(size: int) -> None:
                         font=("", size, "bold"))
     except Exception:
         pass
+
+
+# ===== Quick-view derived-value helpers =====
+#
+# The caseload panel's quick-view box shows info that's instantly
+# available from the cached CSV row (no Salesforce navigation), plus a
+# few values we derive for free: a term-end countdown, the student's
+# current local time, and Task pass/fail/not-submitted badges.
+
+# WGU caseload exports a bare timezone abbreviation (EST/CST/...). Map
+# to IANA zones so we can show the correct *current* local time with DST
+# handled (e.g. EST in June is really EDT).
+_TZ_ABBR_TO_IANA = {
+    "EST": "America/New_York", "EDT": "America/New_York",
+    "CST": "America/Chicago", "CDT": "America/Chicago",
+    "MST": "America/Denver", "MDT": "America/Denver",
+    "PST": "America/Los_Angeles", "PDT": "America/Los_Angeles",
+    "AKST": "America/Anchorage", "AKDT": "America/Anchorage",
+    "HST": "Pacific/Honolulu",       # Hawaii — no DST
+    "ChS": "Pacific/Guam", "ChST": "Pacific/Guam",  # Chamorro — no DST
+}
+
+
+def student_local_time(tz_abbr: str) -> str:
+    """Current local time for a student given their CSV timezone
+    abbreviation, e.g. 'EST' -> '2:14 PM'. Empty string if unknown."""
+    tz_abbr = (tz_abbr or "").strip()
+    iana = _TZ_ABBR_TO_IANA.get(tz_abbr)
+    if not iana:
+        return ""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(iana))
+        return now.strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        return ""
+
+
+def days_until(date_str: str) -> Optional[int]:
+    """Whole days from today until an ISO 'YYYY-MM-DD' date (negative if
+    past). None if unparseable."""
+    s = (date_str or "").strip()[:10]
+    if not s:
+        return None
+    try:
+        d = datetime.strptime(s, "%Y-%m-%d").date()
+        return (d - datetime.now().date()).days
+    except Exception:
+        return None
+
+
+def parse_task_status(val: str) -> tuple[str, str]:
+    """Interpret a caseload Task cell. Values look like '2026-06-02 (1)':
+    a submission date plus a trailing pass flag — (1) passed/competent,
+    (0) submitted-not-passed. Empty = not submitted.
+
+    Returns (state, date) where state is 'none' | 'passed' | 'returned'.
+    """
+    s = (val or "").strip()
+    if not s:
+        return "none", ""
+    m = re.match(r"(\d{4}-\d{2}-\d{2}).*?\((\d+)\)", s)
+    if not m:
+        # Has *something* but not the expected shape — treat as submitted.
+        return "passed", s[:10]
+    date, flag = m.group(1), m.group(2)
+    return ("passed" if flag != "0" else "returned"), date
+
+
+def last_logged_action(student_id: str) -> str:
+    """Most recent action THIS app logged for a student (from
+    note_log.csv), as 'Jun 01 · welcome'. Empty if none / unreadable.
+    Matched on student_id (falls back to nothing — ids are unique)."""
+    sid = (student_id or "").strip()
+    if not sid:
+        return ""
+    try:
+        best = None
+        with Path(NOTE_LOG_CSV).open(encoding="utf-8", newline="") as f:
+            for r in csv.DictReader(f):
+                if (r.get("student_id") or "").strip() != sid:
+                    continue
+                ts = (r.get("timestamp") or "").strip()
+                if best is None or ts > best[0]:
+                    best = (ts, r.get("scenario") or "")
+        if not best:
+            return ""
+        ts, scenario = best
+        try:
+            when = datetime.strptime(ts[:10], "%Y-%m-%d").strftime("%b %d")
+        except Exception:
+            when = ts[:10]
+        return f"{when} · {scenario}" if scenario else when
+    except Exception:
+        return ""
+
+
+def note_html_to_text(s: str) -> str:
+    """Flatten a note body (Salesforce stores some as HTML in the
+    data-cell-value attr) to readable plain text."""
+    s = s or ""
+    s = re.sub(r"<\s*br\s*/?\s*>", "\n", s, flags=re.IGNORECASE)
+    s = re.sub(r"</\s*(p|div|li)\s*>", "\n", s, flags=re.IGNORECASE)
+    s = re.sub(r"<[^>]+>", "", s)          # strip remaining tags
+    s = html.unescape(s)                    # &nbsp; &amp; etc.
+    s = s.replace("\xa0", " ")
+    # Collapse runs of blank lines / trailing space.
+    lines = [ln.strip() for ln in s.splitlines()]
+    out, blank = [], False
+    for ln in lines:
+        if not ln:
+            if not blank and out:
+                out.append("")
+            blank = True
+        else:
+            out.append(ln)
+            blank = False
+    return "\n".join(out).strip()
+
+
+def fmt_note_date(iso: str) -> str:
+    """'2026-06-02T17:11:20.000Z' -> '6/02 5:11 PM'. Passes through
+    anything it can't parse."""
+    s = (iso or "").strip()
+    if not s:
+        return ""
+    try:
+        d = datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+        return d.strftime("%m/%d %I:%M %p").lstrip("0")
+    except Exception:
+        return s[:16].replace("T", " ")
+
+
+def _attach_tooltip(widget, text: str) -> None:
+    """Lightweight hover tooltip for a widget (no dependency on any UI
+    framework — a borderless Toplevel shown on enter, hidden on leave)."""
+    state = {"tip": None}
+
+    def show(_e=None):
+        if state["tip"] is not None or not text:
+            return
+        try:
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            tip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(
+                tip, text=text, justify="left",
+                background="#2b2b2b", foreground="#f0f0f0",
+                relief="solid", borderwidth=1, padx=6, pady=3,
+                font=("", 9),
+            ).pack()
+            state["tip"] = tip
+        except Exception:
+            state["tip"] = None
+
+    def hide(_e=None):
+        if state["tip"] is not None:
+            try:
+                state["tip"].destroy()
+            except Exception:
+                pass
+            state["tip"] = None
+
+    widget.bind("<Enter>", show, add="+")
+    widget.bind("<Leave>", hide, add="+")
 
 
 # Variables exposed in the in-app HTML editor's "Insert variable"
@@ -6355,6 +6644,9 @@ class CaseloadPanel:
         self.frame.grid_rowconfigure(2, weight=1)
         self._build()
         self.populate()
+        # Give the table the larger share of the vertical split once the
+        # panel has a real height.
+        self.frame.after(150, self._init_sash)
 
     # ----- construction -----
 
@@ -6432,8 +6724,17 @@ class CaseloadPanel:
         ).pack(side="left")
         self.filters_wrap.grid_remove()  # collapsed by default
 
-        table_wrap = ctk.CTkFrame(self.frame)
-        table_wrap.grid(row=2, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        # Vertical split: the table on top, the student detail pane
+        # (quick view + note viewer) below, with a draggable sash. Lives
+        # inside self.frame so it rebuilds with the panel on pop-out/dock.
+        self.vpane = tk.PanedWindow(
+            self.frame, orient="vertical", bd=0,
+            sashwidth=5, sashrelief="flat",
+            bg=("#3a3a3a" if ctk.get_appearance_mode() == "Dark"
+                else "#c8c8c8"),
+        )
+        self.vpane.grid(row=2, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        table_wrap = ctk.CTkFrame(self.vpane)
         table_wrap.grid_columnconfigure(0, weight=1)
         table_wrap.grid_rowconfigure(0, weight=1)
         self._style_tree()
@@ -6491,6 +6792,11 @@ class CaseloadPanel:
             font=ctk.CTkFont(size=12), justify="center",
             text_color=("gray45", "gray60"),
         )
+        # Highlighting a row (mouse or keyboard) fills the quick view.
+        self.tree.bind("<<TreeviewSelect>>", self._on_row_highlight, add="+")
+        self.vpane.add(table_wrap, minsize=120, stretch="always")
+        self._build_detail_pane()
+        self.vpane.add(self.detail_frame, minsize=120, stretch="always")
 
         # Selection action bar (row 2) — hidden until ≥1 row is checked.
         # "N selected" + Clear + Fire-scenario-on-the-selection menu.
@@ -6556,6 +6862,373 @@ class CaseloadPanel:
         if narrow != self._narrow:
             self._narrow = narrow
             self._apply_bar_mode()
+
+    def _init_sash(self) -> None:
+        """Place the table/detail sash so the list keeps ~62% of the height."""
+        try:
+            h = self.vpane.winfo_height()
+            if h > 120:
+                self.vpane.sash_place(0, 1, int(h * 0.62))
+        except Exception:
+            pass
+
+    # ----- student detail pane (quick view + note viewer) -----
+
+    # Quick-view fields, in display order. Each: (label, csv_key, kind).
+    # kind drives the derived rendering. A future Settings UI can override
+    # this list; for now it's the agreed default set.
+    QUICK_VIEW_FIELDS = [
+        ("Mentor", "MentorName", "text"),
+        ("Term end", "TermEndDate", "date_countdown"),
+        ("Timezone", "Timezone", "timezone"),
+        ("Email", "StudentEmail", "email"),
+        ("Last action", None, "last_action"),
+        ("Followup", "CourseFollowupNote", "longtext"),
+    ]
+
+    def _build_detail_pane(self) -> None:
+        """Bottom pane of the panel: an instant quick-view box for the
+        highlighted student, then (on Enter) the on-demand note viewer."""
+        self.detail_frame = ctk.CTkFrame(self.vpane)
+        self.detail_frame.grid_columnconfigure(0, weight=1)
+        self.detail_frame.grid_rowconfigure(2, weight=1)
+        self._detail_collapsed = False
+
+        # Header: student name + collapse toggle.
+        hdr = ctk.CTkFrame(self.detail_frame, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        hdr.grid_columnconfigure(1, weight=1)
+        self.detail_collapse_btn = ctk.CTkButton(
+            hdr, text="▾", width=24, command=self._toggle_detail_collapsed,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self.detail_collapse_btn.grid(row=0, column=0, padx=(0, 6))
+        self.qv_name = ctk.CTkLabel(
+            hdr, text="Select a student", anchor="w",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.qv_name.grid(row=0, column=1, sticky="ew")
+
+        # Quick-view body (instant CSV info + task badges).
+        self.qv_body = ctk.CTkFrame(self.detail_frame, fg_color="transparent")
+        self.qv_body.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
+        self.qv_body.grid_columnconfigure(1, weight=1)
+
+        # Notes section: header + scrollable list. Collapsed-ish until the
+        # user presses Enter / clicks Review notes.
+        notes_hdr = ctk.CTkFrame(self.detail_frame, fg_color="transparent")
+        notes_hdr.grid(row=2, column=0, sticky="nsew", padx=6, pady=(2, 6))
+        notes_hdr.grid_columnconfigure(0, weight=1)
+        notes_hdr.grid_rowconfigure(1, weight=1)
+        self.notes_section = notes_hdr
+        toprow = ctk.CTkFrame(notes_hdr, fg_color="transparent")
+        toprow.grid(row=0, column=0, sticky="ew")
+        toprow.grid_columnconfigure(0, weight=1)
+        self.notes_title = ctk.CTkLabel(
+            toprow, text="Notes", anchor="w",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.notes_title.grid(row=0, column=0, sticky="w")
+        self.review_btn = ctk.CTkButton(
+            toprow, text="Review notes  ⏎", width=120,
+            command=self._review_focused, **SECONDARY_BTN_KWARGS,
+        )
+        self.review_btn.grid(row=0, column=1, sticky="e")
+        self.notes_scroll = ctk.CTkScrollableFrame(
+            notes_hdr, fg_color=("gray94", "gray16"),
+        )
+        self.notes_scroll.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+        self.notes_scroll.grid_columnconfigure(0, weight=1)
+        self._notes_hint()
+
+    def _toggle_detail_collapsed(self) -> None:
+        self._detail_collapsed = not self._detail_collapsed
+        try:
+            if self._detail_collapsed:
+                # Remember the sash so expanding restores the same split.
+                try:
+                    self._saved_sash = self.vpane.sash_coord(0)[1]
+                except Exception:
+                    self._saved_sash = None
+                self.qv_body.grid_remove()
+                self.notes_section.grid_remove()
+                # Collapse the pane down to just its header bar.
+                self.vpane.sash_place(
+                    0, 1, max(0, self.vpane.winfo_height() - 44))
+                self.detail_collapse_btn.configure(text="▸")
+            else:
+                self.qv_body.grid()
+                self.notes_section.grid()
+                h = self.vpane.winfo_height()
+                pos = getattr(self, "_saved_sash", None)
+                if not pos or pos < 80 or pos > h - 60:
+                    pos = int(h * 0.62)
+                self.vpane.sash_place(0, 1, pos)
+                self.detail_collapse_btn.configure(text="▾")
+        except Exception:
+            pass
+
+    def _ensure_detail_height(self) -> None:
+        """Grow the detail pane (move the sash up) so the whole quick view
+        for the selected student is visible, while keeping the list usable.
+        Grow-only — never fights a manual enlargement or a collapse."""
+        if getattr(self, "_detail_collapsed", False):
+            return
+        try:
+            self.detail_frame.update_idletasks()
+            # header + quick view + a minimum notes area.
+            need = self.qv_body.winfo_reqheight() + 44 + 110
+            h = self.vpane.winfo_height()
+            if h <= 1:
+                return
+            max_detail = max(140, h - 150)   # always leave room for the list
+            detail = min(need, max_detail)
+            cur_detail = h - self.vpane.sash_coord(0)[1]
+            if cur_detail < detail - 4:
+                self.vpane.sash_place(0, 1, max(0, h - detail))
+        except Exception:
+            pass
+
+    def _focused_row(self) -> Optional[dict]:
+        iid = self.tree.focus()
+        if not iid:
+            sel = self.tree.selection()
+            iid = sel[0] if sel else ""
+        return self._row_by_iid.get(iid) if iid else None
+
+    def _on_row_highlight(self, event=None) -> None:
+        row = self._focused_row()
+        if row is not None:
+            self.show_quick_view(row)
+
+    def _cell(self, row: dict, key: str) -> str:
+        return str(row.get(key, "") or "").strip()
+
+    def show_quick_view(self, row: dict) -> None:
+        """Fill the quick-view box from a cached CSV row — instant, no
+        Salesforce. Rebuilds the body each highlight (simple + correct)."""
+        for w in self.qv_body.winfo_children():
+            w.destroy()
+        name = self._cell(row, "Name")
+        pref = self._cell(row, "stuprename")
+        title = name or pref or "(unknown)"
+        if pref and pref.lower() not in name.lower():
+            title = f"{title}  ·  {pref}"
+        self.qv_name.configure(text=title)
+
+        r = 0
+        for label, key, kind in self.QUICK_VIEW_FIELDS:
+            r = self._qv_field(r, row, label, key, kind)
+        # Task badges row (T1/T2/T3) — always shown.
+        self._qv_task_badges(r, row)
+        # New student → reset the notes area to the hint.
+        self._notes_hint()
+        # Make sure the whole quick view is visible by default.
+        self._ensure_detail_height()
+
+    def _qv_field(self, r, row, label, key, kind) -> int:
+        val = self._cell(row, key) if key else ""
+        color = None
+        widget = None
+        if kind == "date_countdown":
+            d = days_until(val)
+            if val and d is not None:
+                suffix = (f"{d}d" if d >= 0 else f"{-d}d ago")
+                val = f"{val}  ({suffix})"
+                color = ("#b00020", "#ff7b72") if d <= 14 else \
+                        ("#9a6700", "#ffd166") if d <= 30 else None
+            if not self._cell(row, key):
+                return r
+        elif kind == "timezone":
+            if not val:
+                return r
+            lt = student_local_time(val)
+            if lt:
+                val = f"{val}  ·  {lt} local"
+        elif kind == "last_action":
+            val = last_logged_action(self._cell(row, "StudentID"))
+            if not val:
+                return r
+        elif kind == "email":
+            if not val:
+                return r
+        elif kind == "longtext":
+            if not val:
+                return r
+        else:  # plain text
+            if not val:
+                return r
+
+        lbl = ctk.CTkLabel(
+            self.qv_body, text=f"{label}:", anchor="nw",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"), width=70,
+        )
+        lbl.grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+        valframe = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        valframe.grid(row=r, column=1, sticky="ew", pady=1)
+        valframe.grid_columnconfigure(0, weight=1)
+        wrap = 360 if not self._narrow else 200
+        vlbl = ctk.CTkLabel(
+            valframe, text=val, anchor="w", justify="left",
+            wraplength=wrap, font=ctk.CTkFont(size=12),
+        )
+        if color:
+            vlbl.configure(text_color=color)
+        vlbl.grid(row=0, column=0, sticky="ew")
+        if kind == "email" and val:
+            ctk.CTkButton(
+                valframe, text="Copy", width=46,
+                command=lambda v=val: self._copy_text(v),
+                **SECONDARY_BTN_KWARGS,
+            ).grid(row=0, column=1, padx=(6, 0))
+        return r + 1
+
+    def _qv_task_badges(self, r, row) -> None:
+        bar = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        bar.grid(row=r, column=0, columnspan=2, sticky="w", pady=(4, 1))
+        ctk.CTkLabel(
+            bar, text="Tasks:", font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"),
+        ).pack(side="left", padx=(0, 6))
+        styles = {
+            "passed":   ("✓", ("#1e7a34", "#2ea043"), "#ffffff"),
+            "returned": ("!", ("#9a6700", "#bb8009"), "#ffffff"),
+            "none":     ("–", ("gray80", "gray35"), ("gray30", "gray75")),
+        }
+        for i in (1, 2, 3):
+            state, date = parse_task_status(self._cell(row, f"Task{i}"))
+            mark, bg, fg = styles[state]
+            tip = {"passed": "passed", "returned": "returned",
+                   "none": "not submitted"}[state]
+            txt = f"T{i} {mark}"
+            badge = ctk.CTkLabel(
+                bar, text=txt, fg_color=bg, text_color=fg,
+                corner_radius=6, font=ctk.CTkFont(size=11, weight="bold"),
+                width=42, height=20,
+            )
+            badge.pack(side="left", padx=2)
+            note = f"Task {i}: {tip}" + (f" ({date})" if date else "")
+            _attach_tooltip(badge, note)
+
+    def _copy_text(self, text: str) -> None:
+        try:
+            self.frame.clipboard_clear()
+            self.frame.clipboard_append(text)
+            self.app._append_log(f"Copied: {text}")
+        except Exception:
+            pass
+
+    # ----- note viewer -----
+
+    def _notes_hint(self) -> None:
+        for w in self.notes_scroll.winfo_children():
+            w.destroy()
+        self.notes_title.configure(text="Notes")
+        ctk.CTkLabel(
+            self.notes_scroll,
+            text="Press Enter (or Review notes) to load this\n"
+                 "student's notes from Salesforce.",
+            justify="left", text_color=("gray45", "gray60"),
+            font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=6)
+
+    def _review_focused(self) -> None:
+        iid = self.tree.focus()
+        query, label = self._query_label_for_iid(iid)
+        if query:
+            self.review_notes(query, label)
+
+    def review_notes(self, query: str, label: str) -> None:
+        """Open the student (navigation) and load their notes into the
+        viewer. Guarded against running mid-batch."""
+        if getattr(self.app, "_is_busy", False):
+            self.show_notes_message("Busy — finish the current run first.")
+            return
+        self.show_notes_loading(label)
+        self.app._review_notes(query, label, self)
+
+    def show_notes_loading(self, label: str) -> None:
+        for w in self.notes_scroll.winfo_children():
+            w.destroy()
+        self.notes_title.configure(text="Notes")
+        ctk.CTkLabel(
+            self.notes_scroll, text=f"Loading notes for {label}…  (~2–3s)",
+            text_color=("gray40", "gray65"), font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=6)
+
+    def show_notes_message(self, msg: str) -> None:
+        for w in self.notes_scroll.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(
+            self.notes_scroll, text=msg, font=ctk.CTkFont(size=12),
+            text_color=("#b00020", "#ff7b72"), justify="left", wraplength=360,
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=6)
+
+    def show_notes_error(self, label: str, msg: str) -> None:
+        self.show_notes_message(f"Couldn't load notes for {label}: {msg}")
+
+    def show_notes(self, label: str, notes: list) -> None:
+        for w in self.notes_scroll.winfo_children():
+            w.destroy()
+        self.notes_title.configure(text=f"Notes for {label} ({len(notes)})")
+        if not notes:
+            ctk.CTkLabel(
+                self.notes_scroll, text="No notes found for this student.",
+                text_color=("gray45", "gray60"), font=ctk.CTkFont(size=12),
+            ).grid(row=0, column=0, sticky="w", padx=6, pady=6)
+            return
+        for i, nt in enumerate(notes):
+            self._render_note_row(i, nt)
+
+    def _render_note_row(self, i: int, nt: dict) -> None:
+        date = fmt_note_date(nt.get("date", ""))
+        ntype = (nt.get("type") or "").strip()
+        subject = (nt.get("subject") or "").strip()
+        body = note_html_to_text(nt.get("text") or "")
+        # One-line summary; full text revealed on click.
+        head_bits = [b for b in (date, ntype, subject) if b]
+        head = "  ·  ".join(head_bits) if head_bits else "(note)"
+
+        card = ctk.CTkFrame(self.notes_scroll, fg_color=("gray90", "gray22"))
+        card.grid(row=i, column=0, sticky="ew", padx=2, pady=2)
+        card.grid_columnconfigure(0, weight=1)
+        state = {"open": False}
+
+        preview = body.replace("\n", " ")
+        preview = (preview[:80] + "…") if len(preview) > 80 else preview
+
+        btn = ctk.CTkButton(
+            card, text=f"▸ {head}", anchor="w", height=24,
+            fg_color="transparent", text_color=("gray10", "gray90"),
+            hover_color=("gray80", "gray30"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        btn.grid(row=0, column=0, sticky="ew", padx=2, pady=(2, 0))
+        prev_lbl = ctk.CTkLabel(
+            card, text=preview, anchor="w", justify="left",
+            text_color=("gray40", "gray65"), font=ctk.CTkFont(size=11),
+            wraplength=420,
+        )
+        prev_lbl.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
+        full_lbl = ctk.CTkLabel(
+            card, text=body, anchor="w", justify="left",
+            font=ctk.CTkFont(size=12), wraplength=420,
+        )
+
+        def toggle():
+            state["open"] = not state["open"]
+            if state["open"]:
+                prev_lbl.grid_remove()
+                full_lbl.grid(row=1, column=0, sticky="ew", padx=10,
+                              pady=(0, 6))
+                btn.configure(text=f"▾ {head}")
+            else:
+                full_lbl.grid_remove()
+                prev_lbl.grid(row=1, column=0, sticky="ew", padx=10,
+                              pady=(0, 4))
+                btn.configure(text=f"▸ {head}")
+        btn.configure(command=toggle)
 
     def _style_tree(self) -> None:
         """Style the ttk.Treeview to approximate the CTk theme. Uses the
@@ -7301,13 +7974,14 @@ class CaseloadPanel:
         return "break"
 
     def _on_row_open_key(self, event=None):
-        """Enter on the focused row → open/switch (keyboard equivalent of
-        a double-click). Uses the focused item, not the pointer."""
+        """Enter on the focused row → open the student AND load their notes
+        into the viewer (the open IS the navigation the fetch needs).
+        Double-click stays open-only for a quick switch without notes."""
         iid = self.tree.focus()
-        query, _label = self._query_label_for_iid(iid)
+        query, label = self._query_label_for_iid(iid)
         if query:
             self.tree.selection_set(iid)
-            self.app._find_student_by_query(query)
+            self.review_notes(query, label)
         return "break"
 
     def _on_row_context_menu(self, event=None) -> None:
@@ -7357,6 +8031,9 @@ class CaseloadPanel:
             label="Open in new tab",
             command=lambda: self.app._find_student_by_query(
                 query, new_tab=True))
+        menu.add_command(
+            label="Review notes",
+            command=lambda q=query, l=label: self.review_notes(q, l))
         nonbatch = self._panel_action_scenarios()
         if nonbatch:
             menu.add_separator()
@@ -7520,7 +8197,6 @@ class App:
         self._start_hotkeys()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.bind("<Control-Alt-d>", self._dev_dump_dom)  # DEV: notes DOM
 
         # Apply the saved advanced/basic mode preference once the UI
         # has finished its first layout pass. Deferred via after(0)
@@ -11458,7 +12134,13 @@ class App:
     # ----- Status / log -----
 
     def _post_status(self, msg: str) -> None:
-        self.root.after(0, lambda: self._update_status_and_log(msg))
+        # Called from the worker thread. root.after can raise "main thread
+        # is not in main loop" if Tk isn't in its event loop yet (startup
+        # race) or is tearing down — swallow it so the worker never dies.
+        try:
+            self.root.after(0, lambda: self._update_status_and_log(msg))
+        except Exception:
+            print(msg, file=sys.stderr)
 
     def _update_status_and_log(self, msg: str) -> None:
         self.status_var.set(msg)
@@ -11493,32 +12175,26 @@ class App:
         self.log.see("end")
         self.log.configure(state="disabled")
 
-    def _dev_dump_dom(self, event=None):
-        """DEV (Ctrl+Alt+D): write the active browser page's HTML to
-        dom_dump.html for notes-DOM inspection. Temporary."""
-        done = tk.BooleanVar(value=False)
-        holder = {"html": ""}
-
-        def on_done(html):
-            def setm():
-                holder["html"] = html or ""
-                done.set(True)
+    def _review_notes(self, query: str, label: str, panel) -> None:
+        """Fetch a student's notes on the worker thread and render them into
+        the caseload panel's note viewer. Non-blocking — the callback
+        marshals back to the UI thread. The fetch navigates to the record
+        (that's the 'open student' part of the flow)."""
+        def on_done(res):
+            def render():
+                try:
+                    if res and not res.get("error"):
+                        panel.show_notes(label, res.get("notes") or [])
+                    else:
+                        panel.show_notes_error(
+                            label, (res or {}).get("error") or "no notes")
+                except Exception:
+                    pass
             try:
-                self.root.after(0, setm)
+                self.root.after(0, render)
             except Exception:
-                holder["html"] = html or ""
-                done.set(True)
-
-        self._append_log("[dev] dumping active page DOM…")
-        self.worker.submit_dump_dom(on_done)
-        self.root.wait_variable(done)
-        try:
-            out = Path("dom_dump.html").resolve()
-            out.write_text(holder["html"], encoding="utf-8")
-            self._append_log(
-                f"[dev] dumped {len(holder['html'])} chars to {out}")
-        except Exception as e:
-            self._append_log(f"[dev] DOM dump failed: {e}")
+                pass
+        self.worker.submit_fetch_notes(query, on_done)
 
     def _persist_font_size(self, channel: str, n: int) -> None:
         if channel in UI_FONT_CHANNELS:
