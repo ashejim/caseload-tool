@@ -162,6 +162,11 @@ class Settings:
     font_viewer: int = 0
     font_email: int = 0
     font_editor: int = 0
+    font_notes: int = 0
+    # Caseload quick-view fields: JSON list of field keys (see
+    # CaseloadPanel.QUICK_VIEW_CATALOG) in display order. Empty = the
+    # built-in default set.
+    quickview_fields: str = ""
 
 
 def load_settings() -> Settings:
