@@ -114,6 +114,14 @@ def main() -> None:
             print(f"Cleaning {target}")
             shutil.rmtree(target)
 
+    # Drop any stray Preview temp from the sample template folder so it
+    # never ships in the bundle (the Preview button writes _preview.html
+    # into whatever the active templates folder is).
+    stray = project_root / "default_email_templates" / "_preview.html"
+    if stray.exists():
+        stray.unlink()
+        print(f"Removed stray {stray.relative_to(project_root)}")
+
     print(f"Building CaseloadNotes v{__version__}...")
     subprocess.run(
         [sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
