@@ -298,6 +298,10 @@ class BrowserWorker:
         or {error}."""
         self.q.put(("FETCH_TASK_STATUS", query, on_done))
 
+    def submit_probe_ea(self, on_done: Callable[[dict], None]) -> None:
+        """TEMP dev probe: capture the live Essential Actions tab DOM."""
+        self.q.put(("PROBE_EA", on_done))
+
     def submit_read_caseload_columns(
         self, on_done: Callable[[list[dict]], None],
     ) -> None:
@@ -517,6 +521,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._fetch_task_status(ctx, query)
+            finally:
+                on_done(res)
+        elif cmd[0] == "PROBE_EA":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._probe_ea(ctx)
             finally:
                 on_done(res)
         elif cmd[0] == "READ_CASELOAD_COLUMNS":
@@ -1927,6 +1938,138 @@ class BrowserWorker:
         if err:
             return {"error": err}
         return {"statuses": statuses}
+
+    def _probe_ea(self, ctx) -> dict:
+        """TEMP dev probe: deep-walk the active page (incl. shadow DOM) to
+        capture the Essential Actions component, its rows, and any OPEN
+        dropdown menu's items. Returns {menuItems, eaTags, html, counts}."""
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        js = r'''
+        () => {
+          const KEEP=['class','data-label','title','role','aria-label',
+            'data-row-key-value','data-target-selection-name','data-tab-value',
+            'name','value','data-aura-class','href','aria-haspopup','aria-expanded',
+            'placeholder','for','type','checked','data-value','data-field'];
+          const cls=el=>String((el.className&&el.className.baseVal!==undefined)
+            ?el.className.baseVal:(el.className||''));
+          function ser(el,d){
+            if(!el||d>30) return '';
+            const tag=(el.tagName||'').toLowerCase();
+            if(['script','style','svg','path','iframe','img'].includes(tag)) return '';
+            let s='<'+tag;
+            const at=el.attributes;
+            if(at) for(let ai=0;ai<at.length;ai++){ const a=at[ai];
+              if(a&&KEEP.includes(a.name))
+                s+=' '+a.name+'="'+String(a.value||'').slice(0,80).replace(/"/g,'')+'"';
+            }
+            s+='>';
+            const serNode=(n)=>{
+              if(n.nodeType===3){const tx=n.textContent.trim();
+                return tx?tx.slice(0,200):'';}
+              if(n.nodeType!==1) return '';
+              return ser(n,d+1);
+            };
+            if(el.shadowRoot) s+='\n#shadow{\n'+
+              [...el.shadowRoot.childNodes].map(serNode).join('')+'}\n';
+            for(const c of el.childNodes) s+=serNode(c);
+            return s+'</'+tag+'>\n';
+          }
+          function deepAll(pred){
+            const r=[];
+            (function w(root){
+              for(const el of root.querySelectorAll('*')){
+                try{if(pred(el))r.push(el);}catch(e){}
+                if(el.shadowRoot) w(el.shadowRoot);
+              }
+            })(document);
+            return r;
+          }
+          const menuItems=[...new Set(deepAll(el=>{
+            const role=el.getAttribute&&el.getAttribute('role');
+            const c=cls(el);
+            return role==='menuitem'||el.tagName==='LIGHTNING-MENU-ITEM'||
+              /menuItem|slds-dropdown__item|uiMenuItem|slds-listbox__option/i.test(c);
+          }).map(el=>(el.textContent||'').trim().slice(0,90)).filter(Boolean))];
+          const eaEls=deepAll(el=>{
+            const t=(el.tagName||'').toLowerCase();
+            return t.includes('essential')||/EssentialAction/i.test(cls(el));
+          });
+          const eaTags=[...new Set(eaEls.map(el=>
+            el.tagName.toLowerCase()+' .'+cls(el).split(/\s+/).slice(0,3).join('.')
+          ))].slice(0,50);
+          let html='';
+          const outer=eaEls.find(el=>!eaEls.some(o=>o!==el&&o.contains(el)));
+          if(outer) html+='=== EA COMPONENT (deep) ===\n'+ser(outer,0);
+          const menus=deepAll(el=>{
+            const role=el.getAttribute&&el.getAttribute('role');
+            const c=cls(el);
+            return role==='menu'||
+              /slds-dropdown(?!_)|uiMenuList|dropdown__list|slds-listbox/i.test(c);
+          });
+          const open=menus.filter(m=>{
+            try{return m.offsetParent!==null||m.getClientRects().length>0;}
+            catch(e){return false;}
+          });
+          for(const m of open.slice(0,3)) html+='\n=== OPEN MENU (deep) ===\n'+ser(m,0);
+          // Any open modal/dialog (the note form behind "Add Note to EA").
+          const dialogs=deepAll(el=>{
+            const role=el.getAttribute&&el.getAttribute('role'); const c=cls(el);
+            return role==='dialog'||/slds-modal__container|slds-modal__content/i.test(c);
+          });
+          const odlg=dialogs.filter(m=>{
+            try{return m.offsetParent!==null||m.getClientRects().length>0;}
+            catch(e){return false;}
+          });
+          for(const dd of odlg.slice(0,2)) html+='\n=== OPEN DIALOG (deep) ===\n'+ser(dd,0);
+          // Find the note form by its FIELDS wherever they render (the
+          // "Add Note to EA" form may not be a role=dialog). Climb a few
+          // levels from each visible editable/combobox and dump that
+          // container so we capture labels + the body/course/activity fields.
+          function vis(el){try{return el.offsetParent!==null||el.getClientRects().length>0;}catch(e){return false;}}
+          function climb(el,n){let p=el;for(let i=0;i<n&&p&&p.parentElement;i++)p=p.parentElement;return p;}
+          const FLD=['TEXTAREA','LIGHTNING-TEXTAREA','LIGHTNING-INPUT',
+            'LIGHTNING-COMBOBOX','LIGHTNING-GROUPED-COMBOBOX',
+            'LIGHTNING-INPUT-RICH-TEXT','LIGHTNING-DUAL-LISTBOX',
+            'LIGHTNING-CHECKBOX-GROUP'];
+          const fields=deepAll(el=>{ if(!vis(el))return false;
+            const role=el.getAttribute&&el.getAttribute('role');
+            return FLD.includes(el.tagName)||role==='combobox'||
+              (el.getAttribute&&el.getAttribute('contenteditable')==='true'); });
+          const seenC=new Set(); let nForm=0;
+          for(const f of fields.slice(0,60)){ const c=climb(f,6);
+            if(!c||seenC.has(c))continue; seenC.add(c);
+            html+='\n=== FORM CONTAINER ===\n'+ser(c,0); nForm++;
+            if(nForm>=8)break; }
+          // List/grid pages (the EA DASHBOARD): capture data grids +
+          // standard list-view managers wherever they render.
+          const grids=deepAll(el=>el.tagName==='LIGHTNING-DATATABLE'||
+            (el.getAttribute&&el.getAttribute('role')==='grid')||
+            /forceListViewManager|listViewContainer|cEssentialAction/i.test(cls(el)));
+          const topGrids=grids.filter(g=>!grids.some(o=>o!==g&&o.contains(g)));
+          let nGrid=0;
+          for(const g of topGrids.slice(0,4)){
+            html+='\n=== GRID / LIST ===\n'+ser(g,0); nGrid++; }
+          return {menuItems:menuItems.slice(0,80), eaTags,
+            html:html.slice(0,700000),
+            counts:{ea:eaEls.length, menus:menus.length, open:open.length,
+              dialogs:odlg.length, fields:fields.length, forms:nForm,
+              grids:nGrid}};
+        }
+        '''
+        # NO auto-click now: we're capturing a form the user has already
+        # opened (clicking anything could disturb it). Just snapshot the
+        # current page — the FORM CONTAINER capture finds the note form by
+        # its fields wherever it renders.
+        try:
+            data = target.evaluate(js)
+            if isinstance(data, dict):
+                data["opened"] = "(captured current page; no auto-open)"
+                return data
+            return {"error": "no data"}
+        except Exception as e:
+            return {"error": str(e)}
 
     def _handle_run(
         self, ctx, scenario: ScenarioConfig, override: str,
@@ -9033,6 +9176,16 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self.capture_btn.pack(side="left", padx=(8, 0))
+        # TEMP dev probe (remove after EA exploration): captures the live
+        # Essential Actions tab (component + rows + open dropdown) to a file
+        # so we can find the real selectors. Open the EA tab + a row's
+        # dropdown, then click this.
+        self._btn_probe_ea = ctk.CTkButton(
+            toggle_frame, text="🧪 Probe EA",
+            width=110, command=self._dev_probe_ea,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_probe_ea.pack(side="left", padx=(8, 0))
         # (Busy/refresh indicator now lives in the top bar — see topbar.)
         # Collapse the rightmost toolbar buttons to emoji-only when the
         # bar gets too narrow (they're the first to clip).
@@ -9823,8 +9976,14 @@ class App:
         self.editor_tabs.pack(fill="both", expand=True)
 
         self.editor_content = ctk.CTkFrame(paned, fg_color=default_bg)
-        self.editor_content.grid_columnconfigure(0, weight=1)
+        # Cap the form width for readability: column 0 holds the editor
+        # (capped to ~a comfortable line length), column 1 is a flexible
+        # spacer that absorbs the extra width when the window is wide /
+        # maximized, so fields don't stretch across the whole screen.
+        self.editor_content.grid_columnconfigure(0, weight=0)
+        self.editor_content.grid_columnconfigure(1, weight=1)
         self.editor_content.grid_rowconfigure(0, weight=1)
+        self.editor_content.bind("<Configure>", self._cap_editor_width)
 
         paned.add(tabs_holder, minsize=200, width=250, stretch="never")
         paned.add(self.editor_content, minsize=320, stretch="always")
@@ -9839,8 +9998,13 @@ class App:
         # wide; collapses to compact icons as it narrows so the Save
         # button is never pushed off-screen. Revert is always the undo
         # glyph. See _relayout_save_row for the width thresholds.
-        save_frame = ctk.CTkFrame(pane, fg_color="transparent")
-        save_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 4))
+        # Save bar lives at the BOTTOM of the editor CONTENT (the right /
+        # form pane) so Save sits at the bottom-right corner of the form and
+        # stays put as a sticky footer while the form scrolls. It's in the
+        # same capped column 0 as the form, so it aligns to the form's width
+        # rather than floating out in the wide spacer.
+        save_frame = ctk.CTkFrame(self.editor_content, fg_color="transparent")
+        save_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 4))
         self._save_row_frame = save_frame
         self._save_row_mode = None
         # Done — leave the focused editor mode and return to the main view.
@@ -9877,6 +10041,31 @@ class App:
         )
         self._btn_revert.pack(side="right", padx=4, pady=2)
         save_frame.bind("<Configure>", self._relayout_save_row)
+
+    def _cap_editor_width(self, event=None) -> None:
+        """Cap the editor form's width to ~a comfortable line length so the
+        fields don't stretch across a maximized window. The cap scales with
+        the editor font size (so it's roughly a fixed character count) and
+        the extra width goes to the column-1 spacer."""
+        try:
+            w = (event.width if event is not None
+                 else self.editor_content.winfo_width())
+        except Exception:
+            return
+        if not w or w <= 1:
+            return
+        font_px = int(getattr(self.settings, "font_editor", 0) or 14)
+        scale = float(getattr(self.settings, "ui_scale", 1.0) or 1.0)
+        # ~110 characters wide; ~0.62 px per pt is a typical UI-font ratio.
+        max_px = max(640, min(int(font_px * scale * 0.62 * 110), 1500))
+        target = min(w, max_px)
+        if getattr(self, "_editor_col0_w", None) == target:
+            return  # avoid relayout thrash
+        self._editor_col0_w = target
+        try:
+            self.editor_content.grid_columnconfigure(0, minsize=target)
+        except Exception:
+            pass
 
     def _relayout_save_row(self, event=None) -> None:
         """Swap the save-row buttons between full labels and compact
@@ -13887,6 +14076,56 @@ class App:
                 pass
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    def _dev_probe_ea(self) -> None:
+        """TEMP dev probe: dump the live Essential Actions tab DOM so we can
+        find the real selectors (component, rows, the 'Add Note & Close EA'
+        dropdown). Open the EA tab + a row's dropdown first, then click."""
+        try:
+            if not self.worker.ready_event.is_set():
+                self._append_log("Browser not ready yet.")
+                return
+        except Exception:
+            return
+        self._append_log(
+            "Probing Essential Actions… make sure the EA tab is open and a "
+            "row's dropdown is expanded.")
+
+        def on_done(res):
+            def show():
+                if not res or res.get("error"):
+                    self._append_log(
+                        f"EA probe failed: {(res or {}).get('error')}",
+                        error=True)
+                    return
+                c = res.get("counts") or {}
+                self._append_log(
+                    f"EA probe: {res.get('opened','')} · ea_els={c.get('ea')} "
+                    f"open_menus={c.get('open')} dialogs={c.get('dialogs')} "
+                    f"fields={c.get('fields')} form_containers={c.get('forms')} "
+                    f"grids={c.get('grids')}")
+                items = res.get("menuItems") or []
+                self._append_log(
+                    "Menu/dropdown items: "
+                    + (" | ".join(items) if items
+                       else "(none — was a row dropdown actually open?)"))
+                for t in (res.get("eaTags") or [])[:15]:
+                    self._append_log("  EA el: " + t)
+                html = res.get("html") or ""
+                try:
+                    p = CASELOAD_CSV_PATH.parent / "temp" / "ea_probe.html"
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(html, encoding="utf-8")
+                    self._append_log(
+                        f"EA deep HTML → {p}  ({len(html)} chars)")
+                except Exception as e:
+                    self._append_log(
+                        f"couldn't write EA probe file: {e}", error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                pass
+        self.worker.submit_probe_ea(on_done)
 
     def _fetch_task_status_for(self, student_id: str, on_apply) -> None:
         """On-demand: fetch a student's real per-task pass/fail from the
