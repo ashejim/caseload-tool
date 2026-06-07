@@ -219,17 +219,29 @@ class BrowserWorker:
         custom_bodies: Optional[dict[int, str]] = None,
         prompt_vars: Optional[dict[str, str]] = None,
         on_done: Optional[Callable[[bool], None]] = None,
+        ea: Optional[tuple] = None,
     ) -> None:
         """Queue a scenario for the worker to fill notes against the
         active student. `prompt_vars` carries the user-typed values
         for any `prompts:` block in the scenario; they're substituted
         into note bodies (and email body / subject / to, handled on
         the main thread before queueing). `on_done(success)` is
-        called from the worker thread when the run finishes."""
+        called from the worker thread when the run finishes.
+
+        `ea` = (reason, course, close) to file the note via the student's
+        Essential Action ("Add Note to EA" / "Add Note & Close EA")
+        instead of the embedded note panel; None for the normal path."""
         self.q.put((
             "RUN", scenario, course_code_override, clipboard,
-            custom_bodies or {}, prompt_vars or {}, on_done,
+            custom_bodies or {}, prompt_vars or {}, on_done, ea,
         ))
+
+    def submit_read_essential_actions(
+        self, on_done: Callable[[dict], None],
+    ) -> None:
+        """Read the active student's open Essential Actions.
+        on_done({eas:[{reason,course,event_progress,intervention}]})."""
+        self.q.put(("READ_EA", on_done))
 
     def submit_find_student(self, query: str, new_tab: bool = False,
                             raise_after: Optional[bool] = None) -> None:
@@ -437,17 +449,26 @@ class BrowserWorker:
         a partial failure doesn't leave the main thread waiting on a
         wait_variable forever."""
         if cmd[0] == "RUN":
-            _, scenario, override, clipboard, custom_bodies, prompt_vars, on_done = cmd
+            (_, scenario, override, clipboard, custom_bodies,
+             prompt_vars, on_done) = cmd[:7]
+            ea = cmd[7] if len(cmd) > 7 else None
             success = False
             try:
                 success = self._handle_run(
                     ctx, scenario, override, clipboard,
                     custom_bodies=custom_bodies,
-                    prompt_vars=prompt_vars,
+                    prompt_vars=prompt_vars, ea=ea,
                 )
             finally:
                 if on_done is not None:
                     on_done(success)
+        elif cmd[0] == "READ_EA":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._read_essential_actions(ctx)
+            finally:
+                on_done(res)
         elif cmd[0] == "FIND":
             # Back-compat: older callers queued ("FIND", query) with no
             # new_tab / raise_after flags.
@@ -2071,11 +2092,24 @@ class BrowserWorker:
         except Exception as e:
             return {"error": str(e)}
 
+    def _read_essential_actions(self, ctx) -> dict:
+        """Read the active student's open Essential Actions for the
+        fire-time attach dialog."""
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        from src.student_lookup import read_essential_actions
+        try:
+            return {"eas": read_essential_actions(target)}
+        except Exception as e:
+            return {"error": str(e)}
+
     def _handle_run(
         self, ctx, scenario: ScenarioConfig, override: str,
         clipboard: str = "",
         custom_bodies: Optional[dict[int, str]] = None,
         prompt_vars: Optional[dict[str, str]] = None,
+        ea: Optional[tuple] = None,
     ) -> bool:
         """Return True iff the note ran without errors (regardless of
         whether all sub-notes were auto-submitted). The batch driver
@@ -2127,6 +2161,26 @@ class BrowserWorker:
                 return False
             course_code = detected
             self.on_status(f"Auto-detected course code: {course_code}")
+        # Essential-Action path: open the note form via the EA's row action
+        # ("Add Note to EA" / "& Close EA") so the note is tied to the EA.
+        # run_scenario then fills that form just like the embedded panel.
+        if ea:
+            from src.student_lookup import open_ea_note_form
+            ea_reason, ea_course, ea_close = ea
+            self.on_status(
+                f"Opening Essential Action note form: {ea_reason!r}"
+                f"{' (& close)' if ea_close else ''}…")
+            try:
+                opened = open_ea_note_form(target, ea_reason, ea_course, ea_close)
+            except Exception as e:
+                opened = False
+                self.on_status(f"EA note form error: {e}")
+            if not opened:
+                self.on_status(
+                    f"Couldn't open the Essential Action note form for "
+                    f"{ea_reason!r}. Note not filed.")
+                return False
+            target.wait_for_timeout(800)
         self.on_status(f"Running {scenario.name!r}...")
         try:
             all_submitted = run_scenario(
@@ -6238,6 +6292,18 @@ class ScenarioEditor:
             row=row, column=0, sticky="w", padx=(28, 8), pady=(0, 8))
         self.panel_action_hint.grid_remove()  # shown only in batch mode
 
+        # Essential-Action awareness: when on, firing this (single) action
+        # checks the student's open Essential Actions at fire time and
+        # offers to attach one to the note (+ optional close). Opt-in
+        # because it adds a couple seconds (open the EA tab + read).
+        row += 1
+        self.attach_ea_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            self.frame,
+            text="Offer to attach an Essential Action at fire time",
+            variable=self.attach_ea_var,
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
+
         # Send-email toggle + email section (sub-frame visible only
         # when toggle is on). Toggle commands grid_remove/.grid so
         # the row collapses to nothing when emails aren't used.
@@ -6906,6 +6972,8 @@ class ScenarioEditor:
         self.find_first_var.set(scenario.find_first)
         # Panel-action toggle (forced off below for batch scenarios).
         self.panel_action_var.set(scenario.panel_action)
+        self.attach_ea_var.set(
+            getattr(scenario, "attach_essential_action", False))
         # Batch config — populate filter rows + visibility.
         self._batch_preview = scenario.batch.preview if scenario.batch else True
         # Rebuild prompt rows fresh from the scenario.
@@ -6974,6 +7042,8 @@ class ScenarioEditor:
         # there. Only written when True to keep the YAML uncluttered.
         if self.panel_action_var.get() and not self.batch_mode_var.get():
             out["panel_action"] = True
+        if self.attach_ea_var.get():
+            out["attach_essential_action"] = True
         if self.send_email_var.get():
             tpl = self.email_body_combo.get().strip()
             if "(none" in tpl:  # placeholder for empty templates folder
@@ -11622,10 +11692,32 @@ class App:
                 self._append_log("Email send failed; note not filed.")
                 return
 
+        # Essential-Action attach (opt-in). If the student has open EAs,
+        # offer to tie one to this note (+ optional close); otherwise file
+        # normally. Reading EAs switches the record to the EA tab, so on
+        # "skip" we re-open the record to restore the note panel.
+        ea_arg = None
+        if getattr(scenario, "attach_essential_action", False):
+            self._append_log("Checking this student's Essential Actions…")
+            eas = self._read_eas_blocking()
+            if eas:
+                mode, ea_arg = self._choose_ea_attachment(eas)
+                if mode == "cancel":
+                    self._append_log(
+                        "Fire cancelled at the Essential Action step.")
+                    return
+                if mode != "attach":
+                    ea_arg = None
+                    nav_query = prenav_query or chosen_name
+                    if nav_query:
+                        self._navigate_for_fire_blocking(nav_query)
+            else:
+                self._append_log("No open Essential Actions for this student.")
+
         self.worker.submit_scenario(
             scenario, override, clipboard,
             custom_bodies=custom_bodies,
-            prompt_vars=prompt_vars,
+            prompt_vars=prompt_vars, ea=ea_arg,
         )
 
     def _fire_batch(self, scenario: ScenarioConfig, override: str) -> None:
@@ -12058,6 +12150,114 @@ class App:
         self.worker.submit_list_matches(query, on_results)
         self.root.wait_variable(done_var)
         return holder["names"]
+
+    def _read_eas_blocking(self) -> list[dict]:
+        """Read the active student's open Essential Actions, blocking the
+        fire flow (nested mainloop) until the worker returns."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"eas": []}
+
+        def on_done(res) -> None:
+            def set_main() -> None:
+                holder["eas"] = (res or {}).get("eas") or []
+                if (res or {}).get("error"):
+                    self._append_log(
+                        f"Essential Actions read failed: {res['error']}",
+                        error=True)
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["eas"] = (res or {}).get("eas") or []
+                done_var.set(True)
+
+        self.worker.submit_read_essential_actions(on_done)
+        self.root.wait_variable(done_var)
+        return holder["eas"]
+
+    def _choose_ea_attachment(self, eas: list) -> tuple:
+        """Fire-time dialog: show the student's open EAs and let the user
+        attach ONE to this note (+ optional close), or file normally.
+        Returns (mode, ea) where mode is 'attach' | 'skip' | 'cancel' and
+        ea = (reason, course, close) when attaching."""
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Essential Actions")
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.lift()
+        dialog.focus_force()
+        result = {"mode": "cancel", "ea": None}
+        ctk.CTkLabel(
+            dialog,
+            text=f"This student has {len(eas)} open Essential Action(s)",
+            font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(18, 2))
+        ctk.CTkLabel(
+            dialog, text="Attach one to this note?",
+            font=ctk.CTkFont(size=12), anchor="w",
+            text_color=("gray35", "gray70"),
+        ).pack(fill="x", padx=20, pady=(0, 8))
+
+        sel = ctk.StringVar(value="skip")
+        box = ctk.CTkFrame(dialog, fg_color=("gray95", "gray18"))
+        box.pack(fill="x", padx=20, pady=(0, 8))
+        ctk.CTkRadioButton(
+            box, text="Don't attach — file a normal note",
+            variable=sel, value="skip",
+        ).pack(anchor="w", padx=10, pady=(8, 2))
+        for i, ea in enumerate(eas):
+            lbl = ea.get("reason", "")
+            if ea.get("course"):
+                lbl += f"   ({ea['course']})"
+            prog = ea.get("event_progress")
+            if prog:
+                lbl += f"   · {prog}"
+            ctk.CTkRadioButton(
+                box, text=lbl, variable=sel, value=str(i),
+            ).pack(anchor="w", padx=10, pady=2)
+        ctk.CTkFrame(box, fg_color="transparent", height=4).pack()
+
+        close_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            dialog, text="Close the Essential Action when the note is saved",
+            variable=close_var, font=ctk.CTkFont(size=12),
+        ).pack(anchor="w", padx=20, pady=(0, 12))
+
+        def _cont() -> None:
+            v = sel.get()
+            if v == "skip":
+                result["mode"] = "skip"
+            else:
+                ea = eas[int(v)]
+                result["mode"] = "attach"
+                result["ea"] = (ea.get("reason", ""), ea.get("course", ""),
+                                bool(close_var.get()))
+            _close()
+
+        def _cancel() -> None:
+            result["mode"] = "cancel"
+            _close()
+
+        def _close() -> None:
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        row = ctk.CTkFrame(dialog, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(0, 16))
+        ctk.CTkButton(row, text="Continue", width=110, command=_cont).pack(
+            side="left", padx=4)
+        ctk.CTkButton(
+            row, text="Cancel", width=110, command=_cancel,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="right", padx=4)
+        dialog.bind("<Escape>", lambda _e: _cancel())
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+        self.root.wait_window(dialog)
+        return (result["mode"], result["ea"])
 
     def _navigate_for_fire_blocking(self, query: str) -> bool:
         """Fast-navigate to a student (Shift+X switch, no reload) and

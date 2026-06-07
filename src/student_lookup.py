@@ -285,6 +285,111 @@ def lookup_task_status(page: Page, query: str) -> dict:
     return out
 
 
+# ----- Essential Actions (EA) -----
+_EA_TAB_SEL = '[data-tab-value="EssentialActionsTab"]'
+_EA_TABLE_SEL = '.cEssentialActionDataTable'
+
+
+def _ea_activate_tab(page: Page) -> None:
+    """Click the record's 'Essential Actions' scoped tab so its datatable
+    renders. No-op if the tab isn't present / already active."""
+    try:
+        tab = page.locator(_EA_TAB_SEL).filter(visible=True).first
+        if tab.count() > 0:
+            tab.click()
+            page.wait_for_timeout(900)
+    except Exception:
+        pass
+
+
+def _ea_cell(row, label: str) -> str:
+    try:
+        c = row.locator(f'td[data-label="{label}"]')
+        if c.count() > 0:
+            return (c.first.inner_text() or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def read_essential_actions(page: Page) -> list[dict]:
+    """Open the active record's Essential Actions tab and read its open
+    EAs. Returns [{reason, course, event_progress, intervention}]. Empty
+    if there are none / no EA tab. Locators pierce the datatable's shadow
+    DOM."""
+    _ea_activate_tab(page)
+    out: list[dict] = []
+    try:
+        comp = page.locator(_EA_TABLE_SEL).first
+        if comp.count() == 0:
+            return out
+        rows = comp.locator("tr")
+        for i in range(rows.count()):
+            row = rows.nth(i)
+            try:
+                rc = row.locator('td[data-label="Reason"]')
+                if rc.count() == 0:
+                    continue  # header / non-data row
+                reason = (rc.first.inner_text() or "").strip()
+            except Exception:
+                continue
+            if not reason:
+                continue
+            out.append({
+                "reason": reason,
+                "course": _ea_cell(row, "Course Code"),
+                "event_progress": _ea_cell(row, "Event Progress"),
+                "intervention": _ea_cell(row, "Intervention"),
+            })
+    except Exception:
+        pass
+    return out
+
+
+def open_ea_note_form(page: Page, reason: str, course: str,
+                      close: bool) -> bool:
+    """Find the EA row matching `reason` (+`course` when given), open its
+    row-action menu, and click 'Add Note & Close EA' (close=True) or
+    'Add Note to EA'. Returns True if the menu item was clicked (the note
+    form should then render for fill_note). Best-effort, raises nothing."""
+    _ea_activate_tab(page)
+    try:
+        comp = page.locator(_EA_TABLE_SEL).first
+        if comp.count() == 0:
+            return False
+        rows = comp.locator("tr")
+        target_row = None
+        for i in range(rows.count()):
+            row = rows.nth(i)
+            rc = row.locator('td[data-label="Reason"]')
+            if rc.count() == 0:
+                continue
+            if (rc.first.inner_text() or "").strip() != reason:
+                continue
+            if course:
+                c = _ea_cell(row, "Course Code")
+                if c and c != course:
+                    continue
+            target_row = row
+            break
+        if target_row is None:
+            return False
+        btn = target_row.locator("lightning-primitive-cell-actions button")
+        if btn.count() == 0:
+            btn = target_row.locator("button[aria-haspopup]")
+        if btn.count() == 0:
+            return False
+        btn.first.click()
+        page.wait_for_timeout(400)
+        label = "Add Note & Close EA" if close else "Add Note to EA"
+        item = page.get_by_role("menuitem", name=label, exact=True)
+        item.wait_for(state="visible", timeout=6000)
+        item.click()
+        return True
+    except Exception:
+        return False
+
+
 def detect_course_code(page: Page, student_name: str) -> Optional[str]:
     """Backward-compatible thin wrapper: returns just the course code,
     or None if not found."""
