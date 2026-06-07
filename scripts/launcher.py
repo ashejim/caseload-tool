@@ -10191,6 +10191,24 @@ class App:
         hides BOTH the fire pane and the caseload viewer so the editor fills
         the window; Done restores them (viewer only if it was open)."""
         if self._editor_visible:
+            # Warn on unsaved edits before leaving the editor.
+            if self._editor_is_dirty():
+                choice = self._ask_unsaved_editor()
+                if choice == "cancel":
+                    return  # stay in the editor
+                if choice == "save":
+                    self._save_yaml()
+                    if self._editor_is_dirty():
+                        # Save didn't take (e.g. duplicate/empty name);
+                        # _save_yaml already logged why — stay so it's fixed.
+                        return
+                elif choice == "discard":
+                    # Reload from disk so the dropped edits don't linger in
+                    # the reused editor widgets.
+                    try:
+                        self._rebuild_editor_tabs(force=True)
+                    except Exception:
+                        pass
             # Leave editor → restore the main pane (+ viewer if it was up).
             try:
                 self.main_paned.forget(self.editor_pane)
@@ -10223,9 +10241,96 @@ class App:
                 pass
             self._editor_visible = True
             self.editor_toggle_btn.configure(text="Hide editor")
+            # Snapshot the clean state so we can detect unsaved edits on close.
+            self._editor_baseline = self._editor_signature()
         # Place the divider synchronously so the panes don't paint at a
         # default split and then snap.
         self._restore_main_sash()
+
+    def _editor_signature(self):
+        """Stable string of the current editor + group state (what Save
+        would persist). Used to detect unsaved edits. None on any error."""
+        import json
+        try:
+            doc = {}
+            for old_name, ed in self.scenario_editors.items():
+                doc[ed.current_name or old_name] = ed.serialize()
+            groups = [
+                {"n": g.name, "c": g.color, "s": list(g.scenarios)}
+                for g in self.groups
+            ]
+            return json.dumps({"s": doc, "g": groups},
+                              sort_keys=True, default=str)
+        except Exception:
+            return None
+
+    def _editor_is_dirty(self) -> bool:
+        """True if the editor has changes not yet saved to scenarios.yaml.
+        False when no baseline was captured or the signature can't be
+        computed (never block on uncertainty)."""
+        base = getattr(self, "_editor_baseline", None)
+        if base is None:
+            return False
+        sig = self._editor_signature()
+        if sig is None:
+            return False
+        return sig != base
+
+    def _ask_unsaved_editor(self) -> str:
+        """Modal: Save / Discard / Cancel for unsaved editor changes.
+        Returns 'save' | 'discard' | 'cancel'."""
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Unsaved changes")
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.geometry("460x190")
+        dialog.resizable(False, False)
+        dialog.lift()
+        dialog.focus_force()
+        result = {"v": "cancel"}
+        ctk.CTkLabel(
+            dialog, text="You have unsaved action changes",
+            font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(18, 4))
+        ctk.CTkLabel(
+            dialog,
+            text="Closing the editor without saving means these edits "
+                 "won't be applied (fires, hotkeys, and buttons use the "
+                 "saved version). Save them before closing?",
+            font=ctk.CTkFont(size=12), anchor="w",
+            wraplength=420, justify="left",
+        ).pack(fill="x", padx=20, pady=(0, 12))
+
+        def choose(v: str) -> None:
+            result["v"] = v
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+
+        row = ctk.CTkFrame(dialog, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(0, 16), side="bottom")
+        ctk.CTkButton(
+            row, text="Save", width=110, command=lambda: choose("save"),
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            row, text="Discard", width=110, command=lambda: choose("discard"),
+            fg_color=("#cc4444", "#aa3333"),
+            hover_color=("#aa3333", "#882222"),
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            row, text="Cancel", width=110, command=lambda: choose("cancel"),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="right", padx=4)
+        dialog.bind("<Escape>", lambda _e: choose("cancel"))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+        self.root.wait_window(dialog)
+        return result["v"]
 
     # ----- Window geometry + divider persistence -----
 
@@ -10971,6 +11076,8 @@ class App:
         self._rebuild_editor_tabs()
         self._rebuild_scenario_buttons()
         self._restart_hotkeys()
+        # Editor now matches disk — reset the unsaved-changes baseline.
+        self._editor_baseline = self._editor_signature()
         self._append_log(
             "Actions saved; tabs, buttons, and hotkeys refreshed.")
         # Surface the unchecked-submit summary right after save so a
