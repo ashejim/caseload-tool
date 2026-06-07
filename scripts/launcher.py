@@ -289,6 +289,15 @@ class BrowserWorker:
         scrape them. on_done({notes, count, timings})."""
         self.q.put(("FETCH_NOTES", query, on_done))
 
+    def submit_fetch_task_status(
+        self, query: str, on_done: Callable[[dict], None],
+    ) -> None:
+        """Row-filter the live Caseload list to `query` (a Student ID) and
+        read the real task pass/fail (the cell color/title the CSV export
+        drops). on_done({statuses: {"1": {state,status,date,attempts}, ...}})
+        or {error}."""
+        self.q.put(("FETCH_TASK_STATUS", query, on_done))
+
     def submit_read_caseload_columns(
         self, on_done: Callable[[list[dict]], None],
     ) -> None:
@@ -501,6 +510,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._fetch_student_notes(ctx, query)
+            finally:
+                on_done(res)
+        elif cmd[0] == "FETCH_TASK_STATUS":
+            _, query, on_done = cmd
+            res = {}
+            try:
+                res = self._fetch_task_status(ctx, query)
             finally:
                 on_done(res)
         elif cmd[0] == "READ_CASELOAD_COLUMNS":
@@ -1842,6 +1858,50 @@ class BrowserWorker:
         self.on_status(f"Caseload loaded: {len(out)} rows.")
         return out
 
+    def _fetch_task_status(self, ctx, query: str) -> dict:
+        """Row-filter the live Caseload list to `query` (a Student ID) and
+        read the per-task pass/fail from the cell color/title — the bit the
+        CSV export drops. Returns {"statuses": {"1": {...}, ...}} or
+        {"error": msg}. Restores the row filter afterward so the live list
+        isn't left narrowed."""
+        from src.student_lookup import lookup_task_status
+        q = (query or "").strip()
+        if not q:
+            return {"error": "no student id"}
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return {"error": "caseload table didn't load"}
+        fi = None
+        try:
+            fi = target.locator(
+                'input[placeholder="Search All Rows..."]'
+            ).filter(visible=True).first
+            if fi.count() > 0:
+                fi.click()
+                fi.fill(q)
+                fi.press("Enter")
+                target.wait_for_timeout(1200)
+        except Exception as e:
+            return {"error": f"row filter failed: {e}"}
+        err = ""
+        statuses: dict = {}
+        try:
+            statuses = lookup_task_status(target, q)
+        except Exception as e:
+            err = str(e)
+        # Always try to clear the filter so the live list is whole again.
+        try:
+            if fi is not None and fi.count() > 0:
+                fi.click()
+                fi.fill("")
+                fi.press("Enter")
+                target.wait_for_timeout(400)
+        except Exception:
+            pass
+        if err:
+            return {"error": err}
+        return {"statuses": statuses}
+
     def _handle_run(
         self, ctx, scenario: ScenarioConfig, override: str,
         clipboard: str = "",
@@ -2298,22 +2358,48 @@ def days_until(date_str: str) -> Optional[int]:
         return None
 
 
-def parse_task_status(val: str) -> tuple[str, str]:
-    """Interpret a caseload Task cell. Values look like '2026-06-02 (1)':
-    a submission date plus a trailing pass flag — (1) passed/competent,
-    (0) submitted-not-passed. Empty = not submitted.
+def parse_task_status(val: str) -> tuple[str, str, int]:
+    """Interpret a caseload Task CSV cell, e.g. '2026-06-03 (1)'.
 
-    Returns (state, date) where state is 'none' | 'passed' | 'returned'.
+    IMPORTANT: the CSV export only carries the most-recent submission
+    DATE and the number in parentheses, and that number is the ATTEMPT
+    COUNT — NOT a pass/fail flag. Pass/fail lives only in the live list
+    view's cell color/title (e.g. class 'cellColorGreen' + a title like
+    '… | Passed | 04/21/2026 | 1 Attempt | System: EMA'), which the CSV
+    export drops. So from the CSV alone we can only say 'submitted' vs
+    'not submitted' — we must NOT infer 'passed'. The real status is
+    fetched on demand (see CaseloadPanel._qv_task_badges).
+
+    Returns (state, date, attempts) where state is 'none' | 'submitted'.
     """
     s = (val or "").strip()
     if not s:
-        return "none", ""
+        return "none", "", 0
     m = re.match(r"(\d{4}-\d{2}-\d{2}).*?\((\d+)\)", s)
     if not m:
-        # Has *something* but not the expected shape — treat as submitted.
-        return "passed", s[:10]
-    date, flag = m.group(1), m.group(2)
-    return ("passed" if flag != "0" else "returned"), date
+        return "submitted", s[:10], 0
+    return "submitted", m.group(1), int(m.group(2))
+
+
+# Task badge appearance per state. (mark, fg_color, text_color). 'passed'
+# /'returned'/'pending' come from the on-demand live-status fetch (the
+# list view's cellColorGreen/Red/Blue); 'submitted' is the CSV-only
+# fallback (date known, pass/fail not yet fetched); 'none' = not
+# submitted. See CaseloadPanel._qv_task_badges.
+TASK_BADGE_STYLES: dict = {
+    "passed":    ("✓", ("#1e7a34", "#2ea043"), "#ffffff"),
+    "returned":  ("✗", ("#b3261e", "#d13b30"), "#ffffff"),
+    "pending":   ("•", ("#1f6feb", "#2f81f7"), "#ffffff"),
+    "submitted": ("•", ("gray70", "gray45"), "#ffffff"),
+    "none":      ("–", ("gray80", "gray35"), ("gray30", "gray75")),
+}
+
+# Map the live list view's task-cell color class → badge state.
+TASK_CELLCOLOR_STATE: dict = {
+    "cellColorGreen": "passed",
+    "cellColorRed": "returned",
+    "cellColorBlue": "pending",
+}
 
 
 def last_logged_action(student_id: str) -> str:
@@ -7411,33 +7497,103 @@ class CaseloadPanel:
             bar, text="Tasks:", font=ctk.CTkFont(size=11, weight="bold"),
             text_color=("gray35", "gray70"),
         ).pack(side="left", padx=(0, 6))
-        styles = {
-            "passed":   ("✓", ("#1e7a34", "#2ea043"), "#ffffff"),
-            "returned": ("!", ("#9a6700", "#bb8009"), "#ffffff"),
-            "none":     ("–", ("gray80", "gray35"), ("gray30", "gray75")),
-        }
+        sid = self._cell(row, "StudentID")
+        # Track which student the badges currently represent, so a
+        # late-arriving status fetch for a previously-selected student
+        # doesn't recolor the wrong badges.
+        self._qv_status_sid = sid
+        badges: dict[str, tuple] = {}
         for i in (1, 2, 3):
-            state, date = parse_task_status(self._cell(row, f"Task{i}"))
-            mark, bg, fg = styles[state]
-            tip = {"passed": "passed", "returned": "returned",
-                   "none": "not submitted"}[state]
-            txt = f"T{i} {mark}"
+            state, date, attempts = parse_task_status(
+                self._cell(row, f"Task{i}"))
             badge = ctk.CTkLabel(
-                bar, text=txt, fg_color=bg, text_color=fg,
-                corner_radius=6, font=ctk.CTkFont(size=11, weight="bold"),
+                bar, text=f"T{i}", corner_radius=6,
+                font=ctk.CTkFont(size=11, weight="bold"),
                 width=42, height=20,
             )
             badge.pack(side="left", padx=2)
-            note = f"Task {i}: {tip}" + (f" ({date})" if date else "")
-            # Submitted tasks (passed/returned) have an EMA Score Report —
-            # make the badge open the most-recent one in a browser tab.
-            if state in ("passed", "returned"):
-                note += "  ·  click to open the EMA Score Report"
-                badge.configure(cursor="hand2")
-                badge.bind(
-                    "<Button-1>",
-                    lambda e, t=i, rw=row: self._open_task_report_for(rw, t))
-            _attach_tooltip(badge, note)
+            # Initial paint from the CSV: submitted vs not. Pass/fail is
+            # NOT in the CSV (see parse_task_status), so a submitted task
+            # shows a neutral dot until the live status fetch returns —
+            # never a (possibly wrong) green check.
+            self._apply_task_badge(badge, i, state, date, attempts, "", row)
+            badges[str(i)] = (badge, date, attempts)
+        # Fetch the real pass/fail (cell color/title) on demand, debounced
+        # + cached. Recolors the badges in place when it returns.
+        self._schedule_task_status_fetch(sid, badges, row)
+
+    def _apply_task_badge(self, badge, i, state, date, attempts,
+                          status_text, row) -> None:
+        """(Re)paint one task badge for `state`, with tooltip + EMA click.
+        Safe to call repeatedly (initial CSV paint, then after the live
+        status fetch)."""
+        try:
+            if not badge.winfo_exists():
+                return
+        except Exception:
+            return
+        mark, bg, fg = TASK_BADGE_STYLES.get(state, TASK_BADGE_STYLES["submitted"])
+        badge.configure(text=f"T{i} {mark}", fg_color=bg, text_color=fg)
+        default_label = {
+            "passed": "passed", "returned": "not passed",
+            "pending": "in progress", "none": "not submitted",
+            "submitted": "submitted (loading pass/fail…)",
+        }.get(state, "submitted")
+        label = status_text or default_label
+        note = f"Task {i}: {label}"
+        if date:
+            note += f"  ({date})"
+        if attempts:
+            note += f"  ·  {attempts} attempt" + ("s" if attempts != 1 else "")
+        if state != "none":
+            note += "\nclick to open the EMA Score Report"
+            badge.configure(cursor="hand2")
+            badge.bind(
+                "<Button-1>",
+                lambda e, t=i, rw=row: self._open_task_report_for(rw, t))
+        _attach_tooltip(badge, note)
+
+    def _schedule_task_status_fetch(self, sid, badges, row) -> None:
+        """Debounced trigger for the on-demand live task-status fetch, so
+        arrowing quickly through students doesn't queue a fetch per row."""
+        if not sid:
+            return
+        h = getattr(self, "_qv_status_after", None)
+        if h:
+            try:
+                self.frame.after_cancel(h)
+            except Exception:
+                pass
+
+        def go():
+            self.app._fetch_task_status_for(
+                sid,
+                lambda st, want=sid: self._apply_fetched_status(
+                    want, st, badges, row),
+            )
+        try:
+            self._qv_status_after = self.frame.after(350, go)
+        except Exception:
+            pass
+
+    def _apply_fetched_status(self, want_sid, statuses, badges, row) -> None:
+        """Recolor the task badges once the live status fetch returns —
+        only if the quick-view still shows the same student."""
+        if getattr(self, "_qv_status_sid", None) != want_sid:
+            return
+        for i in (1, 2, 3):
+            info = (statuses or {}).get(str(i))
+            entry = badges.get(str(i))
+            if not entry:
+                continue
+            badge, date, attempts = entry
+            if not info:
+                continue
+            self._apply_task_badge(
+                badge, i, info.get("state", "submitted"),
+                date or info.get("date") or "",
+                attempts or info.get("attempts") or 0,
+                info.get("status") or "", row)
 
     def _open_task_report_for(self, row: dict, task_num: int) -> None:
         student_id = self._cell(row, "StudentID")
@@ -13384,6 +13540,50 @@ class App:
                 pass
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    def _fetch_task_status_for(self, student_id: str, on_apply) -> None:
+        """On-demand: fetch a student's real per-task pass/fail from the
+        live Caseload list (the CSV can't carry it) and hand the result to
+        `on_apply(statuses)`. Cached per session; non-blocking; skipped
+        while busy or before the browser is ready."""
+        sid = (student_id or "").strip()
+        if not sid:
+            return
+        cache = self.__dict__.setdefault("_task_status_cache", {})
+        if sid in cache:
+            try:
+                on_apply(cache[sid])
+            except Exception:
+                pass
+            return
+        if getattr(self, "_is_busy", False):
+            return  # don't disturb the live browser mid-run
+        try:
+            if not self.worker.ready_event.is_set():
+                return
+        except Exception:
+            return
+
+        def on_done(res):
+            def apply():
+                if res and not res.get("error"):
+                    st = res.get("statuses") or {}
+                    cache[sid] = st
+                    try:
+                        on_apply(st)
+                    except Exception:
+                        pass
+                else:
+                    msg = (res or {}).get("error")
+                    if msg:
+                        self._append_log(
+                            f"Task status fetch failed for {sid}: {msg}",
+                            error=True)
+            try:
+                self.root.after(0, apply)
+            except Exception:
+                pass
+        self.worker.submit_fetch_task_status(sid, on_done)
 
     def _review_notes(self, query: str, label: str, panel) -> None:
         """Fetch a student's notes on the worker thread and render them into

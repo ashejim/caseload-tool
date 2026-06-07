@@ -210,6 +210,81 @@ def lookup_caseload_student(page: Page, student_name: str) -> dict:
     return out
 
 
+def lookup_task_status(page: Page, query: str) -> dict:
+    """Read per-task pass/fail for the row matching `query` (a Student ID)
+    from a Caseload-style table in the DOM.
+
+    The live list encodes status in each task cell's color class
+    (cellColorGreen = passed, cellColorRed = not passed/revisions,
+    cellColorBlue = in-progress/pending) plus a rich title like
+    '… | ROM3 Task 2: IT Proposal | Revisions Needed | 05/07/2026 |
+    2 Attempts | System: EMA'. The CSV export drops both, so this is the
+    only way to get true pass/fail.
+
+    Returns {"1": {state, status, date, attempts}, ...} where state is
+    'passed' | 'returned' | 'pending' | 'submitted'. Empty if not found.
+    """
+    out: dict = {}
+    q = (query or "").strip()
+    color_state = {
+        "cellColorGreen": "passed",
+        "cellColorRed": "returned",
+        "cellColorBlue": "pending",
+    }
+    tables = page.locator("table").filter(
+        has=page.locator("th", has_text="Course Code")
+    )
+    for i in range(tables.count()):
+        table = tables.nth(i)
+        rows = table.locator("tr")
+        if q:
+            rows = rows.filter(has_text=q)
+        for r in range(rows.count()):
+            row = rows.nth(r)
+            try:
+                spans = row.locator("span[class*='cellColor']")
+                data = spans.evaluate_all(
+                    "els => els.map(e => ({"
+                    " cls: e.className || '',"
+                    " title: e.getAttribute('title') || ''}))"
+                )
+            except Exception:
+                data = []
+            for d in data:
+                title = d.get("title", "")
+                m = re.search(r"Task\s*(\d+)\s*:", title)
+                if not m:
+                    continue
+                tnum = m.group(1)
+                parts = [p.strip() for p in title.split("|")]
+                status, date, attempts = "", "", 0
+                for k, p in enumerate(parts):
+                    am = re.match(r"(\d+)\s*Attempt", p)
+                    if am:
+                        attempts = int(am.group(1))
+                        if k - 1 >= 0:
+                            dm = re.search(
+                                r"(\d{1,2}/\d{1,2}/\d{4})", parts[k - 1])
+                            if dm:
+                                date = dm.group(1)
+                        if k - 2 >= 0:
+                            status = parts[k - 2]
+                        break
+                cls = d.get("cls", "")
+                state = "submitted"
+                for key, st in color_state.items():
+                    if key in cls:
+                        state = st
+                        break
+                out[tnum] = {
+                    "state": state, "status": status,
+                    "date": date, "attempts": attempts,
+                }
+            if out:
+                return out
+    return out
+
+
 def detect_course_code(page: Page, student_name: str) -> Optional[str]:
     """Backward-compatible thin wrapper: returns just the course code,
     or None if not found."""

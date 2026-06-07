@@ -16,6 +16,8 @@ of the CSV (clicking Salesforce's Export → Current view), saving to
 the same path with `page.expect_download()`.
 """
 import csv
+import io
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -84,27 +86,81 @@ def display_for_column(csv_header: str) -> str:
     return CSV_TO_DISPLAY.get(csv_header, csv_header)
 
 
+def _row_from(header: list[str], fields: list[str]) -> dict:
+    """Build a row dict from parallel header/field lists, dropping the
+    empty-string key (trailing-comma artifact) and stripping values."""
+    row: dict = {}
+    for k, v in zip(header, fields):
+        if k is None or k == "":
+            continue
+        row[k] = v.strip() if isinstance(v, str) else v
+    return row
+
+
+def _rfc_parse(text: str) -> list[dict]:
+    """Standard RFC-4180 parse (the original behavior). Used as a
+    fallback when the quote-aware fast path can't be trusted."""
+    rows: list[dict] = []
+    reader = csv.DictReader(io.StringIO(text))
+    for raw in reader:
+        row = {
+            k: (v.strip() if isinstance(v, str) else v)
+            for k, v in raw.items()
+            if k is not None and k != ""
+        }
+        if any(row.values()):
+            rows.append(row)
+    return rows
+
+
 def load_caseload_csv(path: Path) -> list[dict]:
-    """Read a Salesforce caseload CSV export. Returns a list of dicts
-    keyed by CSV header name. Trailing-empty-column rows (Salesforce
-    sometimes emits a trailing comma in the header) are tolerated;
-    that empty key is dropped from each row.
+    """Read a Salesforce caseload CSV export → list of dicts keyed by CSV
+    header. The empty-string key (trailing-comma artifact) is dropped.
+
+    WGU's export quotes EVERY data field but does NOT RFC-escape embedded
+    double-quotes (a Cadence auto-text like
+    `... a C769 "welcome email." ...` writes a lone `"` instead of `""`).
+    A standard parser treats that lone `"` as the field's closing quote
+    and the rest of the line spills into extra columns, scrambling that
+    student's whole row (and spawning a phantom row). To be robust we
+    parse the data region by its STRUCTURAL delimiters instead — fields
+    are separated by `","` and records by `"`-newline-`"`, with every
+    field wrapped in quotes — so a stray content quote is just text and
+    can't break alignment. Falls back to the RFC parser if the export
+    isn't in the expected fully-quoted shape; quarantines (skips) any
+    single record that still doesn't line up rather than corrupt the set.
 
     Raises FileNotFoundError if the file doesn't exist."""
-    rows: list[dict] = []
-    with Path(path).open(encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for raw in reader:
-            # Drop the empty-string key (artifact of trailing comma)
-            # and strip whitespace off every value.
-            row = {
-                k: (v.strip() if isinstance(v, str) else v)
-                for k, v in raw.items()
-                if k is not None and k != ""
-            }
+    text = Path(path).read_text(encoding="utf-8-sig")
+    nl = text.find("\n")
+    if nl == -1:
+        return _rfc_parse(text)
+    try:
+        header = next(csv.reader([text[:nl].rstrip("\r")]))
+    except Exception:
+        return _rfc_parse(text)
+    hn = len(header)
+    data = text[nl + 1:].rstrip("\r\n")
+    # Quote-aware fast path only when the data region is fully quoted.
+    if hn and data[:1] == '"' and data[-1:] == '"':
+        core = data[1:-1]
+        records = re.split(r'"\r?\n"', core)
+        out: list[dict] = []
+        quarantined = 0
+        for rs in records:
+            fields = rs.split('","')
+            if len(fields) != hn:
+                # A record whose field count is off (e.g. content holding
+                # a literal '","') — skip it rather than misalign the rest.
+                quarantined += 1
+                continue
+            row = _row_from(header, fields)
             if any(row.values()):
-                rows.append(row)
-    return rows
+                out.append(row)
+        # Trust the fast path only if it recovered the bulk of the rows.
+        if out and quarantined <= max(2, len(records) // 20):
+            return out
+    return _rfc_parse(text)
 
 
 def csv_age_human(path: Path) -> str:
