@@ -9798,17 +9798,25 @@ class App:
         # A thin sash *line* — a visible divider, not a chunky grip.
         default_bg = self.editor_pane.cget("fg_color")
         sash_bg = "#555555" if ctk.get_appearance_mode() == "Dark" else "#a0a0a0"
+        # HORIZONTAL split (master-detail): LEFT = the action picker (mirrors
+        # the main grouped layout but in edit mode — clicking selects an
+        # action to edit, never fires), RIGHT = the selected action's form,
+        # which now gets the full window height (no more cramped top strip).
         paned = tk.PanedWindow(
-            pane, orient="vertical", bd=0,
-            sashwidth=2, sashrelief="flat", bg=sash_bg,
+            pane, orient="horizontal", bd=0,
+            sashwidth=3, sashrelief="flat", bg=sash_bg,
         )
         paned.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.editor_paned = paned
 
-        # Both panes use the default editor background; the only divider
-        # between them is the thin sash line above.
         tabs_holder = ctk.CTkFrame(paned, fg_color=default_bg)
         self._editor_tabs_holder = tabs_holder
+        # Banner so it's unmistakable you're in edit mode, not firing.
+        ctk.CTkLabel(
+            tabs_holder, text="✎ Editing — pick an action",
+            anchor="w", font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("gray35", "gray70"),
+        ).pack(fill="x", padx=6, pady=(6, 2))
         self.editor_tabs = ctk.CTkScrollableFrame(
             tabs_holder, fg_color="transparent",
         )
@@ -9818,8 +9826,8 @@ class App:
         self.editor_content.grid_columnconfigure(0, weight=1)
         self.editor_content.grid_rowconfigure(0, weight=1)
 
-        paned.add(tabs_holder, minsize=40, height=160, stretch="never")
-        paned.add(self.editor_content, minsize=140, stretch="always")
+        paned.add(tabs_holder, minsize=200, width=250, stretch="never")
+        paned.add(self.editor_content, minsize=320, stretch="always")
 
         self.scenario_editors: dict[str, ScenarioEditor] = {}
         self._editor_tab_buttons: dict[str, tuple] = {}
@@ -9997,16 +10005,17 @@ class App:
             self._current_scenario = None
 
     def _build_editor_tab_strips(self) -> None:
-        """(Re)render the stacked tab strips in self.editor_tabs:
-        an optional Ungrouped row, then one collapsible color-outlined
-        row per group, each a wrapping grid of tab-style buttons."""
+        """(Re)render the LEFT-column action picker in self.editor_tabs:
+        an optional Ungrouped section, then one collapsible color-outlined
+        section per group — mirroring the main grouped layout. Each group
+        header carries ＋ (new action in group) and ⚙ (edit group); a
+        trailing "+ Add group". Buttons select an action to EDIT (tab-style
+        look, current one highlighted) — they never fire."""
         for w in self.editor_tabs.winfo_children():
             w.destroy()
         self._editor_tab_buttons = {}
-        TAB_COLS = 3
-        est = {"h": 8}  # running px estimate, drives the sash auto-fit
 
-        def _render_section(key, label, names, color, show_header):
+        def _render_section(key, label, names, color, show_header, group=None):
             collapsed = self._editor_group_collapsed.get(key, False)
             sec = ctk.CTkFrame(
                 self.editor_tabs, fg_color="transparent",
@@ -10014,38 +10023,47 @@ class App:
                 border_color=(color or None), corner_radius=8,
             )
             sec.pack(fill="x", padx=2, pady=(4, 2))
-            est["h"] += 6
             if show_header:
                 arrow = "▶" if collapsed else "▼"
-                # When collapsed, pad below the header so the box's
-                # bottom border is still visible (not hugged tight).
+                hdr = ctk.CTkFrame(sec, fg_color="transparent")
+                hdr.pack(fill="x", padx=4, pady=(2, 4 if collapsed else 0))
+                hdr.grid_columnconfigure(0, weight=1)
                 ctk.CTkButton(
-                    sec, text=f"{arrow}  {label}", anchor="w", height=24,
+                    hdr, text=f"{arrow}  {label}", anchor="w", height=24,
                     fg_color="transparent",
                     text_color=("gray10", "gray90"),
                     hover_color=("gray85", "gray25"),
                     font=ctk.CTkFont(size=12, weight="bold"),
                     command=lambda k=key: self._toggle_editor_group(k),
-                ).pack(fill="x", padx=4, pady=(2, 4 if collapsed else 0))
-                est["h"] += 30
+                ).grid(row=0, column=0, sticky="ew")
+                # Group management lives right in the picker (real groups
+                # only — not the Ungrouped section).
+                if group is not None:
+                    ctk.CTkButton(
+                        hdr, text="+", width=26, height=24,
+                        command=lambda gn=group.name:
+                            self._new_scenario_in_group(gn),
+                        **SECONDARY_BTN_KWARGS,
+                    ).grid(row=0, column=1, padx=(2, 0))
+                    ctk.CTkButton(
+                        hdr, text="⚙", width=26, height=24,
+                        command=lambda g=group: self._edit_group(g),
+                        **SECONDARY_BTN_KWARGS,
+                    ).grid(row=0, column=2, padx=(2, 0))
                 if collapsed:
                     return
             host = ctk.CTkFrame(sec, fg_color="transparent")
             host.pack(fill="x", padx=6, pady=(0, 4))
-            for c in range(TAB_COLS):
-                host.grid_columnconfigure(c, weight=1)
+            host.grid_columnconfigure(0, weight=1)
             for i, name in enumerate(names):
                 btn = ctk.CTkButton(
-                    host, text=name, height=28,
+                    host, text=name, height=28, anchor="w",
                     command=lambda n=name: self._select_editor_scenario(n),
                 )
-                btn.grid(row=i // TAB_COLS, column=i % TAB_COLS,
-                         padx=3, pady=3, sticky="ew")
+                btn.grid(row=i, column=0, padx=3, pady=3, sticky="ew")
                 self._editor_tab_buttons[name] = (btn, color)
-            rows = (len(names) + TAB_COLS - 1) // TAB_COLS
-            est["h"] += rows * 34 + 8
 
-        # No groups → one flat headerless strip (legacy-ish).
+        # No groups → one flat headerless section.
         if not self.groups:
             if self.scenarios:
                 _render_section("__all__", "", list(self.scenarios),
@@ -10061,17 +10079,17 @@ class App:
             for g in self.groups:
                 valid = [s for s in g.scenarios if s in self.scenarios]
                 _render_section(g.name, g.name, valid, g.color,
-                                show_header=True)
+                                show_header=True, group=g)
 
-        # Trailing spacer so the last section's bottom border isn't
-        # clipped at the scroll viewport edge.
+        # "+ Add group" at the bottom (the main toolbar's button is hidden
+        # in full-focus edit mode, so surface group creation here).
+        ctk.CTkButton(
+            self.editor_tabs, text="+ Add group", height=28,
+            command=self._add_group, **SECONDARY_BTN_KWARGS,
+        ).pack(fill="x", padx=6, pady=(8, 2))
+        # Trailing spacer so the last section's border isn't clipped.
         ctk.CTkFrame(self.editor_tabs, fg_color="transparent",
                      height=6).pack(fill="x")
-        est["h"] += 10
-
-        # Grow/shrink the strip pane so an expanded group shows all its
-        # buttons without scrolling (capped so the editor keeps room).
-        self._fit_editor_tabs_height(est["h"])
 
         # Re-apply the selected highlight to the freshly built buttons.
         sel = getattr(self, "_current_scenario", None)
