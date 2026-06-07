@@ -163,6 +163,16 @@ def load_caseload_csv(path: Path) -> list[dict]:
     return _rfc_parse(text)
 
 
+def csv_header(path: Path) -> list[str]:
+    """Return just the header row of a CSV (handles the unquoted-header,
+    quoted-data shape). Empty list on any failure."""
+    try:
+        with Path(path).open(encoding="utf-8-sig", newline="") as f:
+            return next(csv.reader(f), [])
+    except Exception:
+        return []
+
+
 def csv_age_human(path: Path) -> str:
     """Human-readable age string for the file at `path`, used in the
     status bar. 'just now', '12 minutes ago', '3 hours ago', etc."""

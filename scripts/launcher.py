@@ -1768,8 +1768,34 @@ class BrowserWorker:
             return False, f"download did not start: {e}"
 
         try:
-            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-            download.save_as(str(save_path))
+            sp = Path(save_path)
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            tmp = sp.with_name(sp.name + ".new")
+            download.save_as(str(tmp))
+            # Anti-clobber guard: if the new export has FEWER columns than
+            # the existing cache (e.g. the browser view lost columns), keep
+            # the previous file as .bak and warn — silent data loss here is
+            # how a wrong view quietly breaks viewer features.
+            dropped: list[str] = []
+            if sp.exists():
+                try:
+                    old_h = caseload_csv.csv_header(sp)
+                    new_h = caseload_csv.csv_header(tmp)
+                    dropped = [c for c in old_h if c and c not in new_h]
+                except Exception:
+                    dropped = []
+                try:
+                    sp.replace(sp.with_name(sp.name + ".bak"))
+                except Exception:
+                    pass
+            tmp.replace(sp)
+            if dropped:
+                self.on_status(
+                    "  [export] WARNING: new download dropped "
+                    f"{len(dropped)} column(s) vs the previous CSV "
+                    f"({', '.join(dropped[:6])}"
+                    f"{'…' if len(dropped) > 6 else ''}). Previous saved as "
+                    f"{sp.name}.bak — check your Caseload view if unintended.")
         except Exception as e:
             return False, f"download save failed: {e}"
 
@@ -6875,6 +6901,9 @@ class CaseloadPanel:
         # rebuild (pop-out / re-dock).
         self._active_filters: list[dict] = []
         self._filters_open = False
+        # Quick latest-task status filter (header dropdown), keyed off the
+        # CSV's LatestTaskStatus column. "all" = no filtering.
+        self._status_filter = "all"
         # Column drag-reorder state (header click-drag).
         self._coldrag: Optional[dict] = None
         self._suppress_next_sort = False
@@ -6915,31 +6944,41 @@ class CaseloadPanel:
         self.search_var.trace_add("write", lambda *_: self._on_search())
         # Down from the search box drops focus into the rows.
         self.search_entry.bind("<Down>", self._focus_first_row)
+        # Quick status filter (latest task pass/fail, straight from the
+        # CSV's LatestTaskStatus column). Friendly labels → internal keys
+        # via STATUS_FILTER_OPTIONS.
+        self.status_filter_menu = ctk.CTkOptionMenu(
+            bar, width=140,
+            values=[lbl for lbl, _ in self.STATUS_FILTER_OPTIONS],
+            command=self._on_status_filter_change,
+        )
+        self.status_filter_menu.set(self.STATUS_FILTER_OPTIONS[0][0])
+        self.status_filter_menu.grid(row=0, column=3, padx=(0, 4))
         # Filters toggle — shows/hides the collapsible column-filter
         # section (same builder the batch scenarios use).
         self.filters_toggle_btn = ctk.CTkButton(
             bar, text="▸ Filters", width=80, command=self._toggle_filters,
             **SECONDARY_BTN_KWARGS,
         )
-        self.filters_toggle_btn.grid(row=0, column=3, padx=(0, 4))
+        self.filters_toggle_btn.grid(row=0, column=4, padx=(0, 4))
         # Column chooser (show/hide + reorder + persisted widths).
         self.columns_btn = ctk.CTkButton(
             bar, text="☰ Columns", width=90, command=self._open_columns_dialog,
             **SECONDARY_BTN_KWARGS,
         )
-        self.columns_btn.grid(row=0, column=4, padx=(0, 4))
+        self.columns_btn.grid(row=0, column=5, padx=(0, 4))
         self.freshness_lbl = ctk.CTkLabel(
             bar, text="", font=ctk.CTkFont(size=11),
             text_color=("gray40", "gray65"),
         )
-        self.freshness_lbl.grid(row=0, column=5, padx=8)
+        self.freshness_lbl.grid(row=0, column=6, padx=8)
         # Pop the panel into its own window (2nd monitor) / re-dock it.
         self.popout_btn = ctk.CTkButton(
             bar, text=("⧉ Dock" if self.popped else "⧉ Pop out"),
             width=80, command=self.app._toggle_caseload_popout,
             **SECONDARY_BTN_KWARGS,
         )
-        self.popout_btn.grid(row=0, column=6, padx=(0, 4))
+        self.popout_btn.grid(row=0, column=7, padx=(0, 4))
 
         # Collapsible filters section (row 1) — hidden until toggled.
         self.filters_wrap = ctk.CTkFrame(self.frame)
@@ -7114,6 +7153,37 @@ class CaseloadPanel:
             pass
 
     # ----- student detail pane (quick view + note viewer) -----
+
+    # Quick latest-task status filter (header dropdown). (label, key);
+    # the key is matched against the CSV LatestTaskStatus value in
+    # _status_match. Order = dropdown order.
+    STATUS_FILTER_OPTIONS = [
+        ("All statuses", "all"),
+        ("✓ Passed", "passed"),
+        ("✗ Not passed", "not_passed"),
+        ("⏳ Submitted", "pending"),
+        ("– No task yet", "none"),
+    ]
+
+    @staticmethod
+    def _status_match(latest_status: str, key: str) -> bool:
+        """Does a CSV LatestTaskStatus value belong to the filter `key`?
+        Values seen: Passed, Revisions Needed, Task Submitted, Evaluation
+        Started, (empty)."""
+        v = (latest_status or "").strip().lower()
+        if key == "all":
+            return True
+        if key == "none":
+            return v == ""
+        if key == "passed":
+            return "passed" in v
+        if key == "not_passed":
+            return ("revision" in v) or ("not passed" in v) or ("fail" in v)
+        if key == "pending":
+            return any(t in v for t in (
+                "submit", "evaluation", "started", "progress")) \
+                and "passed" not in v
+        return True
 
     # Catalog of selectable quick-view fields: key → (label, csv_key,
     # kind). `kind` drives rendering; csv_key is None for derived/special
@@ -7389,10 +7459,40 @@ class CaseloadPanel:
                 r += 1
             else:
                 r = self._qv_field(r, row, label, csv_key, kind)
+        # Latest course note (straight from the CSV) — a fast preview that
+        # sits just above the on-demand detailed notes. Most of the time
+        # this is all the context needed; load full notes only if more is
+        # wanted.
+        r = self._qv_latest_note(r, row)
         # New student → reset the notes area to the hint.
         self._notes_hint()
         # Make sure the whole quick view is visible by default.
         self._ensure_detail_height()
+
+    def _qv_latest_note(self, r, row) -> int:
+        """Render the latest course note (CSV `LatestCourseNote`) with its
+        date (`MyCourseContact`, = last CI contact) as a compact boxed
+        preview above the detailed-notes section. Skipped if no note."""
+        note = self._cell(row, "LatestCourseNote")
+        if not note:
+            return r
+        date = self._cell(row, "MyCourseContact")
+        box = ctk.CTkFrame(
+            self.qv_body, fg_color=("gray92", "gray22"), corner_radius=6)
+        box.grid(row=r, column=0, columnspan=2, sticky="ew",
+                 padx=4, pady=(6, 2))
+        box.grid_columnconfigure(0, weight=1)
+        head = "Latest course note" + (f"   ·   {date}" if date else "")
+        ctk.CTkLabel(
+            box, text=head, anchor="w",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"),
+        ).grid(row=0, column=0, sticky="ew", padx=8, pady=(4, 0))
+        ctk.CTkLabel(
+            box, text=note, anchor="w", justify="left", wraplength=320,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+        return r + 1
 
     def _qv_field(self, r, row, label, key, kind) -> int:
         val = self._cell(row, key) if key else ""
@@ -8145,6 +8245,26 @@ class CaseloadPanel:
         except Exception:
             pass
 
+    def _on_status_filter_change(self, label: str) -> None:
+        """Header status dropdown changed → set the key and re-render. If
+        the CSV lacks LatestTaskStatus, warn (and reset) so the filter
+        doesn't silently hide everyone."""
+        key = next((k for lbl, k in self.STATUS_FILTER_OPTIONS if lbl == label),
+                   "all")
+        rows = self.app._caseload_rows or []
+        if key != "all" and rows and "LatestTaskStatus" not in rows[0]:
+            self.app._append_log(
+                "Status filter needs the 'Latest Task Status' column — add it "
+                "to your Caseload view and refresh (↻).", error=True)
+            self._status_filter = "all"
+            try:
+                self.status_filter_menu.set(self.STATUS_FILTER_OPTIONS[0][0])
+            except Exception:
+                pass
+            return
+        self._status_filter = key
+        self.populate()
+
     def _apply_filters(self) -> None:
         """Read the filter rows → active filter set → re-render. Rows with
         no column chosen are ignored."""
@@ -8427,6 +8547,15 @@ class CaseloadPanel:
         self.empty_lbl.grid_remove()
         headers = list(rows[0].keys())
         if tuple(self.tree["columns"]) != tuple(headers):
+            # Reset displaycolumns to "#all" BEFORE swapping the column set.
+            # ttk validates the existing displaycolumns against the new
+            # columns, so a stale entry (a column the previous CSV had but
+            # the new one doesn't — e.g. after the user changes their
+            # Salesforce view) makes `columns=` throw "Invalid column index".
+            try:
+                self.tree.configure(displaycolumns="#all")
+            except Exception:
+                pass
             self.tree["columns"] = headers
             # #0 (the tree column) holds the checkbox image; its heading is
             # a select-all/none toggle over the currently-visible rows.
@@ -8446,9 +8575,13 @@ class CaseloadPanel:
             if h == self._sort_col:
                 disp += "  " + ("▼" if self._sort_reverse else "▲")
             self.tree.heading(h, text=disp)
-        # Column filters first (the batch filter engine), then the search
-        # box (substring across all columns) on top of that.
+        # Column filters first (the batch filter engine), then the quick
+        # status filter, then the search box (substring) on top.
         base = self._apply_active_filters(rows)
+        if self._status_filter != "all":
+            base = [r for r in base
+                    if self._status_match(
+                        r.get("LatestTaskStatus", ""), self._status_filter)]
         q = self._query.strip().lower()
         view = ([r for r in base
                  if any(q in str(v).lower() for v in r.values())]
@@ -12474,6 +12607,22 @@ class App:
             dialog, text="Set up Caseload Tool view (instructions)",
             command=lambda: self._setup_caseload_tool_view_with_help(dialog),
             width=260,
+        ).pack(anchor="w", padx=32, pady=(0, 8))
+
+        # Required-columns check: let the user exclude columns they don't
+        # care about so the "missing columns" warning doesn't nag.
+        ctk.CTkLabel(
+            dialog,
+            text="Ignore these columns in the \"missing columns\" check "
+                 "(comma-separated CSV names, e.g. LatestTaskStatus):",
+            wraplength=510, justify="left", anchor="w",
+            text_color=("gray45", "gray60"), font=ctk.CTkFont(size=11),
+        ).pack(fill="x", padx=32, pady=(0, 2))
+        req_ignore_var = ctk.StringVar(
+            value=getattr(self.settings, "required_columns_ignore", "") or "")
+        ctk.CTkEntry(
+            dialog, textvariable=req_ignore_var, width=420,
+            placeholder_text="LatestCourseNote, MyCourseContact",
         ).pack(anchor="w", padx=32, pady=(0, 12))
 
         # ---- Scenarios ----
@@ -12687,6 +12836,11 @@ class App:
             new_mode = advanced_var.get()
             changed = (new_mode != self.settings.advanced_mode)
             self.settings.advanced_mode = new_mode
+            # Required-columns check ignore-list.
+            try:
+                self.settings.required_columns_ignore = req_ignore_var.get().strip()
+            except Exception:
+                pass
             # Overall UI scale.
             try:
                 self.settings.ui_scale = int(
@@ -13405,6 +13559,73 @@ class App:
         self._on_caseload_refresh_clicked()
         return self._get_caseload_columns()
 
+    def _ignored_required_columns(self) -> set:
+        """CSV columns the user has chosen to exclude from the
+        required-columns check (Settings → required_columns_ignore)."""
+        import re as _re
+        raw = (getattr(self.settings, "required_columns_ignore", "") or "").strip()
+        if not raw:
+            return set()
+        return {c.strip() for c in _re.split(r"[,\n]", raw) if c.strip()}
+
+    def _required_caseload_columns(self) -> set:
+        """CSV columns the currently-enabled viewer features depend on.
+        Driven by the quick-view field selection plus the status filter and
+        latest-note features, so the check only flags what's actually used."""
+        req = {"StudentID", "Name", "CourseCode"}
+        p = getattr(self, "caseload_panel", None)
+        if p is not None:
+            try:
+                csv_for = {k: csvk for k, _l, csvk, _kind in p.QUICK_VIEW_CATALOG}
+                for k in p._quickview_field_keys():
+                    c = csv_for.get(k)
+                    if c:
+                        req.add(c)
+                    if k == "tasks":
+                        req.update({"Task1", "Task2", "Task3"})
+            except Exception:
+                pass
+        # Feature columns: latest-note preview + the status filter.
+        req.update({"LatestCourseNote", "MyCourseContact", "LatestTaskStatus"})
+        return req
+
+    def _check_required_caseload_columns(self, rows, *, silent: bool) -> None:
+        """Warn when the loaded CSV is missing columns the viewer needs
+        (so a wrong/narrow Caseload view doesn't silently break features).
+        Logs every reload; offers the setup instructions once per session.
+        Honors the user's Settings ignore-list."""
+        if not rows or not hasattr(self, "log"):
+            return
+        have = set(rows[0].keys())
+        ignore = self._ignored_required_columns()
+        missing = sorted(
+            c for c in self._required_caseload_columns()
+            if c not in have and c not in ignore)
+        if not missing:
+            self._req_cols_warned = False
+            return
+        disp = ", ".join(caseload_csv.display_for_column(c) for c in missing)
+        self._append_log(
+            f"⚠ Caseload CSV is missing {len(missing)} column(s) the viewer "
+            f"uses: {disp}. Add them to your Caseload view and refresh (↻), "
+            "or exclude them in ⚙ Settings.", error=True)
+        # One interactive nudge per session (not on the early silent load).
+        if not silent and not getattr(self, "_req_cols_warned", False):
+            self._req_cols_warned = True
+            try:
+                if ask_yes_no_topmost(
+                    self.root, "Caseload columns missing",
+                    "Your caseload export is missing columns the viewer "
+                    f"uses:\n\n{disp}\n\nAdd them to your Salesforce Caseload "
+                    "list view, then re-download (↻ Caseload). You can also "
+                    "exclude specific columns from this check in Settings.\n\n"
+                    "Show the step-by-step instructions now?",
+                    yes_label="Show instructions", no_label="Later",
+                ):
+                    self._setup_caseload_tool_view_with_help(self.root)
+            except Exception:
+                pass
+
     def _reload_caseload_cache(self, *, silent: bool = False) -> bool:
         """Read CASELOAD_CSV_PATH into self._caseload_rows. Returns
         True on success, False if the file doesn't exist or can't be
@@ -13448,6 +13669,7 @@ class App:
                     "Set up Caseload Tool view in ⚙ Settings to fix."
                 )
         self._refresh_caseload_panel()
+        self._check_required_caseload_columns(rows, silent=silent)
         return True
 
     def _read_clipboard_content(self) -> str:

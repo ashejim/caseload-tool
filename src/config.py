@@ -248,6 +248,10 @@ class Settings:
     # JSON string {courseCode: {"1": {"course_id","task_id"}, ...}}. Seeded
     # by pasting a score-report URL the first time a task badge is clicked.
     ema_report_map: str = ""
+    # Caseload columns to EXCLUDE from the "required columns missing"
+    # check (comma/newline separated CSV header names). Lets a user who
+    # deliberately doesn't use a feature silence its warning.
+    required_columns_ignore: str = ""
 
 
 def load_settings() -> Settings:
