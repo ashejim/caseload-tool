@@ -10288,7 +10288,10 @@ class App:
     def _build_editor_pane(self) -> None:
         pane = ctk.CTkFrame(self.main_paned)
         pane.grid_columnconfigure(0, weight=1)
+        # Row 0 = the master-detail PanedWindow (takes all stretch); row 1 =
+        # the pinned save/Done footer (natural height, never displaced).
         pane.grid_rowconfigure(0, weight=1)
+        pane.grid_rowconfigure(1, weight=0)
         self.editor_pane = pane
         # NOT added to main_paned here — the editor starts hidden and is
         # added by _toggle_editor when the user opens it (focused mode).
@@ -10349,12 +10352,14 @@ class App:
         # wide; collapses to compact icons as it narrows so the Save
         # button is never pushed off-screen. Revert is always the undo
         # glyph. See _relayout_save_row for the width thresholds.
-        # Save bar lives at the BOTTOM of the editor CONTENT (the right /
-        # form pane) so Save sits at the bottom-right corner of the form and
-        # stays put as a sticky footer while the form scrolls. It's in the
-        # same capped column 0 as the form, so it aligns to the form's width
-        # rather than floating out in the wide spacer.
-        save_frame = ctk.CTkFrame(self.editor_content, fg_color="transparent")
+        # The save bar is a WINDOW-LEVEL FOOTER pinned to the bottom of the
+        # editor pane (row 1, weight 0), OUTSIDE the master-detail PanedWindow
+        # (row 0). Keeping it out of the paned area is what guarantees Done/
+        # Save stay reachable: when it lived inside editor_content (a paned
+        # sub-pane) a tall scrollable form could push the whole pane's bottom
+        # — and the bar with it — off the window. Spans the full editor width
+        # under both the action picker and the form.
+        save_frame = ctk.CTkFrame(pane, fg_color="transparent")
         save_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 4))
         self._save_row_frame = save_frame
         self._save_row_mode = None
