@@ -20,6 +20,7 @@ import queue
 import re
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
@@ -375,6 +376,21 @@ class BrowserWorker:
         """TEMP dev probe: capture the live Essential Actions tab DOM."""
         self.q.put(("PROBE_EA", on_done))
 
+    def submit_probe_task_scrape(
+        self, on_done: Callable[[dict], None],
+    ) -> None:
+        """TEMP dev timing probe: measure how long the deferred '2a' bulk
+        task-status scrape would cost (scroll-load + one bulk read)."""
+        self.q.put(("PROBE_TASK_SCRAPE", on_done))
+
+    def submit_scrape_all_task_status(
+        self, on_done: Callable[[dict], None],
+    ) -> None:
+        """Bulk '2a' scrape: scroll-load the whole Caseload list and read
+        every task cell's live pass/fail, keyed by Student ID.
+        on_done({by_sid: {sid: {tnum: {...}}}, count}) or {error}."""
+        self.q.put(("SCRAPE_ALL_TASK_STATUS", on_done))
+
     def submit_read_caseload_columns(
         self, on_done: Callable[[list[dict]], None],
     ) -> None:
@@ -617,6 +633,20 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._probe_ea(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "PROBE_TASK_SCRAPE":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._probe_task_scrape(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "SCRAPE_ALL_TASK_STATUS":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._scrape_all_task_status(ctx)
             finally:
                 on_done(res)
         elif cmd[0] == "READ_CASELOAD_COLUMNS":
@@ -2033,6 +2063,175 @@ class BrowserWorker:
             return {"error": err}
         return {"statuses": statuses}
 
+    def _scrape_all_task_status(self, ctx) -> dict:
+        """Bulk '2a' scrape: scroll-load the whole live Caseload list, then
+        read every task cell's pass/fail (the colour the CSV export drops),
+        keyed by Student ID. Returns {"by_sid": {sid: {tnum: {...}}},
+        "count": N} or {"error": msg}. Runs in the background after a refresh
+        (App._maybe_bulk_scrape_task_status); the ~5-9s cost is the scroll-
+        load, the read itself is ~instant."""
+        from src.student_lookup import read_loaded_task_status
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return {"error": "caseload table didn't load"}
+        # Clear any active row filter so we scroll the WHOLE caseload.
+        try:
+            fi = target.locator(
+                'input[placeholder="Search All Rows..."]'
+            ).filter(visible=True).first
+            if fi.count() > 0:
+                fi.click(); fi.fill(""); fi.press("Enter")
+                _wait_grid_settled(target, 1500)
+        except Exception:
+            pass
+        # Scroll-load: drive the last <tr> into view until the row count is
+        # stable for two checks (Lightning lazy-loads rows on scroll).
+        last_count, stable = 0, 0
+        MAX_ITERS = 200
+        for _ in range(MAX_ITERS):
+            rows = table.locator("tr")
+            count = rows.count()
+            if count == last_count:
+                stable += 1
+                if stable >= 2:
+                    break
+            else:
+                stable = 0
+            last_count = count
+            try:
+                rows.nth(count - 1).scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            try:
+                target.wait_for_timeout(400)
+            except Exception:
+                pass
+        try:
+            by_sid = read_loaded_task_status(table)
+        except Exception as e:
+            return {"error": f"bulk task read failed: {e}"}
+        return {"by_sid": by_sid, "count": len(by_sid)}
+
+    def _probe_task_scrape(self, ctx) -> dict:
+        """TEMP dev TIMING probe for the deferred '2a' bulk task-status
+        scrape. Measures the two costs a refresh-time scrape would add:
+          (1) scroll-loading the whole live Caseload list (the dominant
+              cost — Lightning lazy-loads rows on scroll), and
+          (2) ONE bulk read of every task cell's color/title across all
+              loaded rows (the marginal read cost).
+        Returns the timing breakdown + a per-state tally so we can decide
+        whether 2a runs on every ↻ or behind an opt-in button. Run with the
+        browser already on the all-columns Caseload list view."""
+        t_start = time.perf_counter()
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return {"error": "caseload table didn't load"}
+        t_nav = time.perf_counter() - t_start
+
+        # Clear any active row filter so we scroll the WHOLE caseload.
+        try:
+            fi = target.locator(
+                'input[placeholder="Search All Rows..."]'
+            ).filter(visible=True).first
+            if fi.count() > 0:
+                fi.click(); fi.fill(""); fi.press("Enter")
+                _wait_grid_settled(target, 1500)
+        except Exception:
+            pass
+
+        # (1) Scroll-load: drive the last <tr> into view until the row
+        # count is stable for two checks (the same loop the CSV-less row
+        # reader uses, so the timing transfers directly to a real 2a).
+        t_scroll0 = time.perf_counter()
+        last_count, stable, iters = 0, 0, 0
+        MAX_ITERS = 200
+        for _ in range(MAX_ITERS):
+            iters += 1
+            rows = table.locator("tr")
+            count = rows.count()
+            if count == last_count:
+                stable += 1
+                if stable >= 2:
+                    break
+            else:
+                stable = 0
+            last_count = count
+            try:
+                rows.nth(count - 1).scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            try:
+                target.wait_for_timeout(400)
+            except Exception:
+                pass
+        t_scroll = time.perf_counter() - t_scroll0
+
+        # (2) Bulk read: ONE round-trip reads every task cell's color class
+        # + title across all loaded rows and tallies state per the same
+        # color map lookup_task_status uses.
+        t_read0 = time.perf_counter()
+        try:
+            stats = table.evaluate(r'''(tbl) => {
+              const color={cellColorGreen:'passed',cellColorRed:'returned',
+                cellColorBlue:'pending'};
+              const rows=tbl.querySelectorAll('tr');
+              const tally={passed:0,returned:0,pending:0,submitted:0};
+              let cells=0, students=0, rowsWithSid=0, rowsHaveStatusNoSid=0;
+              const samples=[];
+              for(const r of rows){
+                // Student ID for the join: a cell whose text is exactly a
+                // 9-10 digit number (robust to column position/offsets).
+                let sid='';
+                for(const td of r.querySelectorAll('td')){
+                  const t=(td.textContent||'').trim();
+                  if(/^\d{9,10}$/.test(t)){ sid=t; break; }
+                }
+                const spans=r.querySelectorAll("span[class*='cellColor']");
+                let rowHas=false; const rowStates={};
+                for(const s of spans){
+                  const title=s.getAttribute('title')||'';
+                  const m=title.match(/Task\s*(\d+)\s*:/);
+                  if(!m) continue;
+                  cells++; rowHas=true;
+                  const cls=s.className||'';
+                  let st='submitted';
+                  for(const k in color){
+                    if(cls.indexOf(k)>=0){st=color[k];break;} }
+                  tally[st]=(tally[st]||0)+1;
+                  rowStates[m[1]]=st;
+                }
+                if(rowHas){
+                  students++;
+                  if(sid){ rowsWithSid++;
+                    if(samples.length<3) samples.push({sid, tasks:rowStates});
+                  } else { rowsHaveStatusNoSid++; }
+                }
+              }
+              return {cells, students, tally, totalRows: rows.length,
+                rowsWithSid, rowsHaveStatusNoSid, samples};
+            }''')
+        except Exception as e:
+            return {"error": f"bulk read failed: {e}",
+                    "t_nav": round(t_nav, 2),
+                    "t_scroll": round(t_scroll, 2)}
+        t_read = time.perf_counter() - t_read0
+        t_total = time.perf_counter() - t_start
+
+        return {
+            "t_nav": round(t_nav, 2),
+            "t_scroll": round(t_scroll, 2),
+            "t_read": round(t_read, 3),
+            "t_total": round(t_total, 2),
+            "iters": iters,
+            "rows": (stats or {}).get("totalRows", 0),
+            "students_with_status": (stats or {}).get("students", 0),
+            "task_cells": (stats or {}).get("cells", 0),
+            "tally": (stats or {}).get("tally", {}),
+            "rows_with_sid": (stats or {}).get("rowsWithSid", 0),
+            "status_no_sid": (stats or {}).get("rowsHaveStatusNoSid", 0),
+            "samples": (stats or {}).get("samples", []),
+        }
+
     def _probe_ea(self, ctx) -> dict:
         """TEMP dev probe: deep-walk the active page (incl. shadow DOM) to
         capture the Essential Actions component, its rows, and any OPEN
@@ -2714,7 +2913,10 @@ def parse_task_status(val: str) -> tuple[str, str, int]:
 TASK_BADGE_STYLES: dict = {
     "passed":    ("✓", ("#1e7a34", "#2ea043"), "#ffffff"),
     "returned":  ("✗", ("#b3261e", "#d13b30"), "#ffffff"),
-    "pending":   ("•", ("#1f6feb", "#2f81f7"), "#ffffff"),
+    # In-process: a WHITE HOURGLASS glyph (U+29D6) — not the ⏳ emoji, which
+    # would render in its own colour and ignore text_color. As a plain text
+    # glyph it honours the white text_color on the blue badge.
+    "pending":   ("⧖", ("#1f6feb", "#2f81f7"), "#ffffff"),
     "submitted": ("•", ("gray70", "gray45"), "#ffffff"),
     "none":      ("–", ("gray80", "gray35"), ("gray30", "gray75")),
 }
@@ -2725,6 +2927,84 @@ TASK_CELLCOLOR_STATE: dict = {
     "cellColorRed": "returned",
     "cellColorBlue": "pending",
 }
+
+# Glyph PREFIX for the main grid's Task columns (a ttk.Treeview, which
+# can't colour an individual cell's text or background — tags are per-row
+# only). So we prefix a colour-bearing emoji block onto the cell text to
+# echo the quick-view badges: ✅ passed · ❌ returned · 🟦 in-process ·
+# ⚪ submitted-but-not-yet-scraped ("not loaded"/stale) · blank = no task.
+# Real coloured text/cells await the deferred tksheet widget swap; the ⚪
+# here is the "not ready" cue (every task cell shows ⚪ until a bulk 2a
+# scrape lands, then flips to a colour). See parse_task_status / 2a.
+TASK_CELL_GLYPHS: dict = {
+    "passed":    "✅",
+    "returned":  "❌",
+    "pending":   "🟦",
+    "submitted": "⚪",
+    "none":      "",
+}
+
+# Friendly labels for a task's live status (the cache state → user word).
+TASK_STATE_LABELS: dict = {
+    "returned":  "Returned",
+    "pending":   "In Process",
+    "passed":    "Passed",
+    "submitted": "Submitted",
+}
+
+# A single "Task N" filter column routes to one of three HIDDEN facet
+# columns depending on the chosen operator, so the user filters one "Task 2"
+# entry by date, submission count, OR status (see _rewrite_task_filter):
+#   date ops    → Task{N}Date   (YYYY-MM-DD, from the CSV cell)
+#   numeric ops → Task{N}Count  (submission count, from the CSV cell)
+#   text ops    → Task{N}Status (Passed/Returned/In Process, from the scrape)
+_TASK_DATE_OPS = {
+    "is before", "is after", "is on", "is within",
+    "before", "after", "on", "within",
+}
+_TASK_NUM_OPS = {
+    "more than", "less than", "at least", "at most",
+    "gt", "lt", "gte", "lte",
+}
+
+
+def _is_task_facet_col(col: str) -> bool:
+    """True for the hidden per-task facet helper columns (Task1Date,
+    Task2Count, Task3Status, …) — kept out of the grid + filter dropdowns;
+    the single visible 'Task N' column stands in for all three."""
+    return bool(re.fullmatch(r"Task\d+(Date|Count|Status)", col or ""))
+
+
+def _rewrite_task_filter(f: dict) -> dict:
+    """Route a filter whose column is a 'TaskN' column to the right hidden
+    facet. Unambiguous ops route by operator: date ops → TaskNDate, numeric
+    ops → TaskNCount, empty/not-empty → TaskNDate ('did they submit'). The
+    ambiguous text ops (is/is not/contains/does not contain) route by the
+    VALUE: an all-integer value (incl. comma-OR lists like '2, 3') means the
+    submission COUNT → TaskNCount, anything else is a status word →
+    TaskNStatus. So 'Task 2 is 2' filters count, 'Task 2 is Returned' filters
+    status. Non-task filters pass through. Eval-time only — the visible
+    'Task N' column is what the user picks + sees in review."""
+    col = f.get("column") or ""
+    m = re.fullmatch(r"Task(\d+)", col)
+    if not m:
+        return f
+    n = m.group(1)
+    op = (f.get("op") or "").strip()
+    if op in _TASK_DATE_OPS:
+        facet = f"Task{n}Date"
+    elif op in _TASK_NUM_OPS:
+        facet = f"Task{n}Count"
+    elif op in ("is empty", "is not empty", "empty", "not_empty"):
+        facet = f"Task{n}Date"
+    else:  # is / is not / contains / does not contain → count if numeric value
+        parts = [p.strip() for p in str(f.get("value") or "").split(",")
+                 if p.strip()]
+        if parts and all(re.fullmatch(r"\d+", p) for p in parts):
+            facet = f"Task{n}Count"
+        else:
+            facet = f"Task{n}Status"
+    return {**f, "column": facet}
 
 
 def last_logged_action(student_id: str) -> str:
@@ -5785,13 +6065,20 @@ class FilterRow:
     below that updates with the chosen op to show expected value
     formats (date shorthand, within-presets, numeric, etc.)."""
 
-    def __init__(self, parent, columns: list[str], on_delete: Callable):
+    def __init__(self, parent, columns: list[str], on_delete: Callable,
+                 value_provider: Optional[Callable[[str], list]] = None):
         self.frame = ctk.CTkFrame(parent, fg_color="transparent")
         self.frame.grid_columnconfigure(2, weight=1)
+        # Optional callback: column display-name → a small list of suggested
+        # values (e.g. Passed/Returned/In Process, timezones, EA reasons).
+        # When it returns values, the value field becomes a dropdown of them
+        # (still free-text editable); [] keeps the field plain text.
+        self._value_provider = value_provider
         self.column_combo = ctk.CTkComboBox(
             self.frame,
             values=columns if columns else ["(refresh columns)"],
             width=220,
+            command=self._on_column_change,
         )
         self.column_combo.grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
         self.op_combo = ctk.CTkComboBox(
@@ -5840,6 +6127,25 @@ class FilterRow:
         )
         # Initialize hint + value-combo suggestions for the default op.
         self._on_op_change("is")
+
+    def _on_column_change(self, _col: str) -> None:
+        """Column changed → re-derive the value-field suggestions for the
+        current op (the suggestion list depends on which column is chosen)."""
+        try:
+            self._on_op_change(self.op_combo.get())
+        except Exception:
+            pass
+
+    def _column_value_suggestions(self) -> list:
+        """Suggested values for the currently-selected column, via the
+        provider. [] when there's no provider or the column has no sensible
+        small value set (→ the field stays free-text)."""
+        if not self._value_provider:
+            return []
+        try:
+            return self._value_provider(self.column_combo.get()) or []
+        except Exception:
+            return []
 
     def _on_op_change(self, op: str) -> None:
         """Sync the value-field suggestions and hint label to `op`.
@@ -5891,11 +6197,19 @@ class FilterRow:
             self.value_combo.configure(state="disabled", values=[""])
             self.hint_label.configure(text="(no value needed for this op)")
         elif op in text_ops:
-            self.value_combo.configure(state="normal", values=[""])
-            self.hint_label.configure(
-                text="Text — type the value, or comma-separate for OR "
-                     "match (e.g. 'Pass, NoPass'). Case-insensitive.",
-            )
+            suggestions = self._column_value_suggestions()
+            self.value_combo.configure(
+                state="normal", values=suggestions or [""])
+            if suggestions:
+                self.hint_label.configure(
+                    text="Pick a value or type your own. Case-insensitive; "
+                         "comma-separate for OR match.",
+                )
+            else:
+                self.hint_label.configure(
+                    text="Text — type the value, or comma-separate for OR "
+                         "match (e.g. 'Pass, NoPass'). Case-insensitive.",
+                )
         else:
             self.value_combo.configure(state="normal", values=[""])
             self.hint_label.configure(text="")
@@ -6365,6 +6679,7 @@ class ScenarioEditor:
         capture_handler=None,
         get_columns: Optional[Callable[[], list[str]]] = None,
         refresh_columns: Optional[Callable[[], list[str]]] = None,
+        get_value_suggestions: Optional[Callable[[str], list]] = None,
         get_groups: Optional[Callable[[], list[str]]] = None,
         get_scenario_group: Optional[Callable[[], str]] = None,
         on_group_change: Optional[Callable[[str, str], None]] = None,
@@ -6380,6 +6695,7 @@ class ScenarioEditor:
         # fresh CSV download (blocking) and returns the updated list.
         self._get_columns = get_columns or (lambda: [])
         self._refresh_columns = refresh_columns or (lambda: [])
+        self._get_value_suggestions = get_value_suggestions
         self.frame = ctk.CTkScrollableFrame(parent)
         self.frame.grid_columnconfigure(0, weight=1)
 
@@ -6624,6 +6940,7 @@ class ScenarioEditor:
         cols = self._get_columns() or []
         row = FilterRow(
             self.filters_container, cols, on_delete=self._delete_filter_row,
+            value_provider=self._get_value_suggestions,
         )
         row.frame.pack(fill="x", padx=4, pady=2)
         if prefilled:
@@ -7318,9 +7635,6 @@ class CaseloadPanel:
         # rebuild (pop-out / re-dock).
         self._active_filters: list[dict] = []
         self._filters_open = False
-        # Quick latest-task status filter (header dropdown), keyed off the
-        # CSV's LatestTaskStatus column. "all" = no filtering.
-        self._status_filter = "all"
         # Column drag-reorder state (header click-drag).
         self._coldrag: Optional[dict] = None
         self._suppress_next_sort = False
@@ -7361,16 +7675,10 @@ class CaseloadPanel:
         self.search_var.trace_add("write", lambda *_: self._on_search())
         # Down from the search box drops focus into the rows.
         self.search_entry.bind("<Down>", self._focus_first_row)
-        # Quick status filter (latest task pass/fail, straight from the
-        # CSV's LatestTaskStatus column). Friendly labels → internal keys
-        # via STATUS_FILTER_OPTIONS.
-        self.status_filter_menu = ctk.CTkOptionMenu(
-            bar, width=140,
-            values=[lbl for lbl, _ in self.STATUS_FILTER_OPTIONS],
-            command=self._on_status_filter_change,
-        )
-        self.status_filter_menu.set(self.STATUS_FILTER_OPTIONS[0][0])
-        self.status_filter_menu.grid(row=0, column=3, padx=(0, 4))
+        # (The old blue latest-task status dropdown lived here — removed.
+        # Task pass/fail is now a normal "Task Status" filter inside the
+        # Filters section below, so it works for the viewer AND batch
+        # actions via the shared filter engine.)
         # Filters toggle — shows/hides the collapsible column-filter
         # section (same builder the batch scenarios use).
         self.filters_toggle_btn = ctk.CTkButton(
@@ -7577,36 +7885,10 @@ class CaseloadPanel:
 
     # ----- student detail pane (quick view + note viewer) -----
 
-    # Quick latest-task status filter (header dropdown). (label, key);
-    # the key is matched against the CSV LatestTaskStatus value in
-    # _status_match. Order = dropdown order.
-    STATUS_FILTER_OPTIONS = [
-        ("All statuses", "all"),
-        ("✓ Passed", "passed"),
-        ("✗ Not passed", "not_passed"),
-        ("⏳ Submitted", "pending"),
-        ("– No task yet", "none"),
-    ]
-
-    @staticmethod
-    def _status_match(latest_status: str, key: str) -> bool:
-        """Does a CSV LatestTaskStatus value belong to the filter `key`?
-        Values seen: Passed, Revisions Needed, Task Submitted, Evaluation
-        Started, (empty)."""
-        v = (latest_status or "").strip().lower()
-        if key == "all":
-            return True
-        if key == "none":
-            return v == ""
-        if key == "passed":
-            return "passed" in v
-        if key == "not_passed":
-            return ("revision" in v) or ("not passed" in v) or ("fail" in v)
-        if key == "pending":
-            return any(t in v for t in (
-                "submit", "evaluation", "started", "progress")) \
-                and "passed" not in v
-        return True
+    # (The old quick latest-task status dropdown + _status_match lived here.
+    # Removed: task pass/fail now filters through the shared filter engine
+    # via the synthetic "Task Status" column — see App._apply_task_status_
+    # to_rows — so it covers the viewer AND batch actions.)
 
     # Catalog of selectable quick-view fields: key → (label, csv_key,
     # kind). `kind` drives rendering; csv_key is None for derived/special
@@ -8695,7 +8977,8 @@ class CaseloadPanel:
         rows = self.app._caseload_rows or []
         if not rows:
             return []
-        return [caseload_csv.display_for_column(h) for h in rows[0].keys()]
+        return [caseload_csv.display_for_column(h) for h in rows[0].keys()
+                if not _is_task_facet_col(h)]
 
     def _toggle_filters(self) -> None:
         if self._filters_open:
@@ -8712,6 +8995,7 @@ class CaseloadPanel:
         row = FilterRow(
             self.filters_container, self._panel_columns(),
             on_delete=self._delete_filter_row,
+            value_provider=self.app._filter_value_suggestions,
         )
         row.frame.pack(fill="x", padx=4, pady=2)
         if prefilled:
@@ -8728,26 +9012,6 @@ class CaseloadPanel:
             row.frame.destroy()
         except Exception:
             pass
-
-    def _on_status_filter_change(self, label: str) -> None:
-        """Header status dropdown changed → set the key and re-render. If
-        the CSV lacks LatestTaskStatus, warn (and reset) so the filter
-        doesn't silently hide everyone."""
-        key = next((k for lbl, k in self.STATUS_FILTER_OPTIONS if lbl == label),
-                   "all")
-        rows = self.app._caseload_rows or []
-        if key != "all" and rows and "LatestTaskStatus" not in rows[0]:
-            self.app._append_log(
-                "Status filter needs the 'Latest Task Status' column — add it "
-                "to your Caseload view and refresh (↻).", error=True)
-            self._status_filter = "all"
-            try:
-                self.status_filter_menu.set(self.STATUS_FILTER_OPTIONS[0][0])
-            except Exception:
-                pass
-            return
-        self._status_filter = key
-        self.populate()
 
     def _apply_filters(self) -> None:
         """Read the filter rows → active filter set → re-render. Rows with
@@ -8773,8 +9037,9 @@ class CaseloadPanel:
             return list(rows)
         headers = list(rows[0].keys())
         filters = [
-            {**f, "column": caseload_csv.resolve_column(
-                f.get("column", ""), headers)}
+            _rewrite_task_filter(
+                {**f, "column": caseload_csv.resolve_column(
+                    f.get("column", ""), headers)})
             for f in self._active_filters
         ]
         try:
@@ -9019,6 +9284,23 @@ class CaseloadPanel:
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(6, 0))
 
+    def _task_cell_value(self, r, header, task_cols):
+        """Display value for one grid cell. For Task columns, prefix a colour
+        glyph from the live pass/fail cache (✅/❌/🟦); a submitted task whose
+        live status hasn't been scraped yet shows ⚪ ("not loaded"). Non-task
+        columns and empty cells pass through unchanged. Only the DISPLAY is
+        decorated — sort/filter/search still run on the raw CSV dict."""
+        raw = r.get(header, "")
+        tnum = task_cols.get(header)
+        if not tnum or not raw:
+            return raw
+        sid = (r.get("StudentID") or "").strip()
+        cache = getattr(self.app, "_task_status_cache", None) or {}
+        info = (cache.get(sid) or {}).get(tnum)
+        state = info.get("state") if info else "submitted"
+        glyph = TASK_CELL_GLYPHS.get(state, "")
+        return f"{glyph} {raw}" if glyph else raw
+
     def populate(self) -> None:
         rows = self.app._caseload_rows or []
         if not rows:
@@ -9029,7 +9311,10 @@ class CaseloadPanel:
             self.update_freshness()
             return
         self.empty_lbl.grid_remove()
-        headers = list(rows[0].keys())
+        # Per-task facet columns (Task1Date/Count/Status, …) are hidden
+        # helpers behind the single visible "Task N" column — keep them out
+        # of the grid (the Task1/2/3 columns already show date+count+glyph).
+        headers = [h for h in rows[0].keys() if not _is_task_facet_col(h)]
         if tuple(self.tree["columns"]) != tuple(headers):
             # Reset displaycolumns to "#all" BEFORE swapping the column set.
             # ttk validates the existing displaycolumns against the new
@@ -9059,13 +9344,10 @@ class CaseloadPanel:
             if h == self._sort_col:
                 disp += "  " + ("▼" if self._sort_reverse else "▲")
             self.tree.heading(h, text=disp)
-        # Column filters first (the batch filter engine), then the quick
-        # status filter, then the search box (substring) on top.
+        # Column filters first (the batch filter engine — now also carries
+        # task pass/fail via the synthetic "Task Status" column), then the
+        # search box (substring) on top.
         base = self._apply_active_filters(rows)
-        if self._status_filter != "all":
-            base = [r for r in base
-                    if self._status_match(
-                        r.get("LatestTaskStatus", ""), self._status_filter)]
         if getattr(self, "_ea_only_var", None) is not None and \
                 self._ea_only_var.get():
             base = [r for r in base if (r.get("EssentialAction") or "").strip()]
@@ -9076,13 +9358,19 @@ class CaseloadPanel:
         if self._sort_col:
             view.sort(key=lambda r: self._sortkey(r.get(self._sort_col, "")),
                       reverse=self._sort_reverse)
+        # Task columns (Task1/Task2/…) get a colour glyph prefix from the
+        # live pass/fail cache: ✅ passed · ❌ returned · 🟦 in-process ·
+        # ⚪ submitted-but-not-yet-scraped. Map header → task number once.
+        task_cols = {h: m.group(1) for h in headers
+                     if (m := re.fullmatch(r"Task(\d+)", h))}
         self.tree.delete(*self.tree.get_children())
         self._row_by_iid = {}
         for i, r in enumerate(view):
             checked = self._row_key(r) in self._checked_ids
             iid = self.tree.insert(
                 "", "end", image=self._chk_img(checked),
-                values=[r.get(h, "") for h in headers],
+                values=[self._task_cell_value(r, h, task_cols)
+                        for h in headers],
                 tags=("even" if i % 2 == 0 else "odd",),
             )
             self._row_by_iid[iid] = r
@@ -9540,6 +9828,15 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self._btn_probe_ea.pack(side="left", padx=(8, 0))
+        # TEMP dev TIMING probe (remove after the 2a decision): measures how
+        # long a refresh-time bulk task-status scrape would cost. Put the
+        # browser on the all-columns Caseload list view, then click.
+        self._btn_probe_2a = ctk.CTkButton(
+            toggle_frame, text="⏱ Probe 2a",
+            width=110, command=self._dev_probe_task_scrape,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_probe_2a.pack(side="left", padx=(8, 0))
         # (Busy/refresh indicator now lives in the top bar — see topbar.)
         # Collapse the rightmost toolbar buttons to emoji-only when the
         # bar gets too narrow (they're the first to clip).
@@ -10471,6 +10768,7 @@ class App:
             capture_handler=self._capture_hotkey,
             get_columns=self._get_caseload_columns,
             refresh_columns=self._refresh_caseload_columns_for_editor,
+            get_value_suggestions=self._filter_value_suggestions,
             get_groups=lambda: [g.name for g in self.groups],
             get_scenario_group=(lambda n=name: self._group_of_scenario(n)),
             on_group_change=self._set_scenario_group,
@@ -12119,7 +12417,11 @@ class App:
             )
             return
 
-        matched = caseload_filter.apply_filters(filters, rows)
+        # Route any "Task N" filter to its date/count/status facet by op (the
+        # original `filters` keep the visible "Task N" column for the safety
+        # check above + the review display below; only evaluation is routed).
+        eval_filters = [_rewrite_task_filter(f) for f in filters]
+        matched = caseload_filter.apply_filters(eval_filters, rows)
         if not matched:
             messagebox.showinfo(
                 "No matches",
@@ -12561,6 +12863,74 @@ class App:
             sid = str(r.get("StudentID", "") or r.get("Student ID", "")).strip()
             ea = by_sid.get(sid)
             r["EssentialAction"] = (ea.get("reason", "") if ea else "")
+
+    # Curated value vocabulary for the task-status filter columns (the
+    # aggregate "Task Status" holds combos, so deriving from data would be
+    # messy — offer the atomic states instead).
+    _TASK_STATUS_VALUES = ["Passed", "Returned", "In Process", "Submitted"]
+
+    def _filter_value_suggestions(self, display_col: str) -> list:
+        """Suggested values for a filter row's value field, given the chosen
+        column (display name). Returns a small list when the column has a
+        sensible fixed vocabulary so the value field can be a dropdown:
+        task-status columns get the curated atomic states; any other column
+        with few distinct values in the loaded caseload (timezone, Essential
+        Action reason, momentum, …) gets those values. Returns [] for
+        high-cardinality / free-text columns (names, dates, notes)."""
+        rows = getattr(self, "_caseload_rows", None) or []
+        if not rows or not display_col:
+            return []
+        header = caseload_csv.resolve_column(display_col, list(rows[0].keys()))
+        # A text op on a "Task N" column compares status, so offer the status
+        # vocabulary (date/numeric ops use their own value UI, not this).
+        if re.fullmatch(r"Task\d+(Status)?", header or ""):
+            return list(self._TASK_STATUS_VALUES)
+        vals: set = set()
+        for r in rows:
+            v = str(r.get(header, "") or "").strip()
+            if v:
+                vals.add(v)
+            if len(vals) > 25:
+                return []  # too many distinct values → keep it free-text
+        return sorted(vals)
+
+    def _apply_task_status_to_rows(self) -> None:
+        """Inject HIDDEN per-task facet columns into each cached caseload row
+        so a single visible 'Task N' column can be filtered by date, by
+        submission count, OR by status (the operator picks which — see
+        _rewrite_task_filter). For each task number N present:
+          Task{N}Date   — YYYY-MM-DD from the CSV Task cell (always there)
+          Task{N}Count  — submission count from the CSV Task cell
+          Task{N}Status — Passed/Returned/In Process from the live scrape
+        Date + count come from the CSV so they filter WITHOUT a scrape; status
+        needs the background pass. Re-run after every cache reload AND after
+        the scrape (mirrors _apply_ea_to_rows). Matched by Student ID."""
+        rows = self._caseload_rows or []
+        if not rows:
+            return
+        cache = getattr(self, "_task_status_cache", None) or {}
+        # Task numbers to build facets for = CSV Task columns that actually
+        # carry data (skip empty Task4-15) ∪ any task seen in the scrape;
+        # default 1-3 so the facets exist before the first export/scrape.
+        keys = list(rows[0].keys())
+        csv_tnums = {m.group(1) for k in keys
+                     for m in [re.fullmatch(r"Task(\d+)", k)] if m
+                     and any((r.get(k) or "").strip() for r in rows)}
+        cache_tnums = {t for tasks in cache.values() for t in tasks}
+        tnums = sorted(csv_tnums | cache_tnums, key=lambda x: int(x)) \
+            or ["1", "2", "3"]
+        for r in rows:
+            sid = str(r.get("StudentID", "") or r.get("Student ID", "")).strip()
+            tasks = cache.get(sid) or {}
+            for n in tnums:
+                # Date + count from the CSV Task cell (e.g. "2026-09-13 (1)").
+                _, date, attempts = parse_task_status(r.get(f"Task{n}", ""))
+                r[f"Task{n}Date"] = date
+                r[f"Task{n}Count"] = str(attempts) if date else ""
+                # Status from the live cache (blank until the scrape lands).
+                info = tasks.get(n)
+                st = info.get("state") if info else None
+                r[f"Task{n}Status"] = TASK_STATE_LABELS.get(st, "") if st else ""
 
     def _choose_ea_attachment(self, eas: list) -> tuple:
         """Fire-time dialog: show the student's open EAs and let the user
@@ -13391,6 +13761,8 @@ class App:
                         error=True)
                 self._apply_ea_scrape((res or {}).get("eas") or [])
                 self._set_idle()
+                # Kick the background live task pass/fail pass (startup).
+                self._maybe_bulk_scrape_task_status("startup")
             try:
                 self.root.after(0, apply)
             except Exception:
@@ -13750,6 +14122,29 @@ class App:
                 custom_entry.insert(0, str(cur_min))
             _on_stale_preset("Custom")
 
+        # Live task pass/fail (the "2a" background scrape). Reads each
+        # student's real per-task pass/fail from the live list (the colour
+        # the CSV drops) and colours the grid Task cells + quick-view badges.
+        # Adds ~5-9s, but runs in the BACKGROUND after a refresh.
+        ts_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        ts_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkLabel(ts_row, text="Live task pass/fail scrape:").pack(
+            side="left")
+        _TS_MODE_LABELS = {
+            "Off": "off",
+            "Once on startup": "restart",
+            "Every refresh": "refresh",
+        }
+        _TS_MODE_TO_LABEL = {v: k for k, v in _TS_MODE_LABELS.items()}
+        cur_ts = (getattr(self.settings, "task_status_scrape_mode",
+                          "restart") or "restart")
+        ts_var = ctk.StringVar(
+            value=_TS_MODE_TO_LABEL.get(cur_ts, "Once on startup"))
+        ctk.CTkComboBox(
+            ts_row, width=150, variable=ts_var, state="readonly",
+            values=list(_TS_MODE_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+
         btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=(0, 18), side="bottom")
 
@@ -13779,6 +14174,9 @@ class App:
                         num * 60 if unit_var.get() == "hours" else num)
                 except Exception:
                     pass  # leave the existing value
+            # Live task pass/fail scrape mode (Off / startup / every refresh).
+            self.settings.task_status_scrape_mode = _TS_MODE_LABELS.get(
+                ts_var.get().strip(), "restart")
             # Per-area font sizes already persist live via set_font_size.
             save_settings(self.settings)
             if changed:
@@ -14269,6 +14667,9 @@ class App:
             self._apply_ea_scrape(self._read_ea_dashboard_blocking())
         finally:
             self._set_idle()
+        # After the (blocking) refresh, kick the background live task
+        # pass/fail pass — only if the setting is "every refresh".
+        self._maybe_bulk_scrape_task_status("refresh")
 
     # ----- Busy-state guard -----
 
@@ -14472,6 +14873,7 @@ class App:
         return [
             caseload_csv.display_for_column(h)
             for h in self._caseload_rows[0].keys()
+            if not _is_task_facet_col(h)
         ]
 
     def _refresh_caseload_columns_for_editor(self) -> list[str]:
@@ -14592,9 +14994,11 @@ class App:
                     "emails will use the slower per-student row scrape. "
                     "Set up Caseload Tool view in ⚙ Settings to fix."
                 )
-        # Re-attach scraped Essential Actions to the freshly-loaded rows
-        # (reload rebuilds rows from the CSV, dropping the synthetic column).
+        # Re-attach scraped Essential Actions + live task pass/fail to the
+        # freshly-loaded rows (reload rebuilds rows from the CSV, dropping
+        # the synthetic columns).
         self._apply_ea_to_rows()
+        self._apply_task_status_to_rows()
         self._refresh_caseload_panel()
         self._check_required_caseload_columns(rows, silent=silent)
         return True
@@ -14699,6 +15103,59 @@ class App:
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def _dev_probe_task_scrape(self) -> None:
+        """TEMP dev TIMING probe for the deferred '2a' bulk task-status
+        scrape. Put the app's browser on the all-columns Caseload list view
+        first, then click. Logs how long a refresh-time bulk scrape costs,
+        broken into nav / scroll-load / bulk-read, so we can decide whether
+        2a runs on every ↻ or behind an opt-in button."""
+        try:
+            if not self.worker.ready_event.is_set():
+                self._append_log("Browser not ready yet.")
+                return
+        except Exception:
+            return
+        self._append_log(
+            "Timing 2a bulk task scrape… (browser must be on the "
+            "all-columns Caseload list view)")
+
+        def on_done(res):
+            def show():
+                if not res or res.get("error"):
+                    self._append_log(
+                        f"2a probe failed: {(res or {}).get('error')}",
+                        error=True)
+                    return
+                t = res
+                self._append_log(
+                    f"2a scrape timing → total {t.get('t_total')}s  "
+                    f"(nav {t.get('t_nav')}s · scroll {t.get('t_scroll')}s "
+                    f"in {t.get('iters')} iters · read {t.get('t_read')}s)")
+                tally = t.get("tally") or {}
+                self._append_log(
+                    f"  rows={t.get('rows')} "
+                    f"students_with_status={t.get('students_with_status')} "
+                    f"task_cells={t.get('task_cells')} · "
+                    f"passed={tally.get('passed', 0)} "
+                    f"returned={tally.get('returned', 0)} "
+                    f"pending={tally.get('pending', 0)} "
+                    f"submitted={tally.get('submitted', 0)}")
+                # SID-join check: how many status rows got a Student ID, plus
+                # a few samples so we can confirm the join before building 2a.
+                self._append_log(
+                    f"  SID join: rows_with_sid={t.get('rows_with_sid')} "
+                    f"status_but_no_sid={t.get('status_no_sid')}")
+                for s in (t.get("samples") or []):
+                    tasks = s.get("tasks") or {}
+                    pretty = " ".join(
+                        f"T{k}={v}" for k, v in sorted(tasks.items()))
+                    self._append_log(f"    sid {s.get('sid')} → {pretty}")
+            try:
+                self.root.after(0, show)
+            except Exception:
+                pass
+        self.worker.submit_probe_task_scrape(on_done)
+
     def _dev_probe_ea(self) -> None:
         """TEMP dev probe: dump the live Essential Actions tab DOM so we can
         find the real selectors (component, rows, the 'Add Note & Close EA'
@@ -14792,6 +15249,78 @@ class App:
             except Exception:
                 pass
         self.worker.submit_fetch_task_status(sid, on_done)
+
+    def _maybe_bulk_scrape_task_status(self, reason: str) -> None:
+        """Background '2a' pass: after a refresh, scroll the live Caseload
+        list once and read every student's real per-task pass/fail (the
+        colour the CSV export drops), populating `_task_status_cache` so the
+        grid Task cells get ✅/❌/🟦 glyphs and quick-view badges colour
+        instantly. Gated by the `task_status_scrape_mode` setting:
+          off     → never;
+          restart → only the startup pass  (reason='startup');
+          refresh → startup AND every manual ↻  (reason='refresh').
+        Non-blocking: queued on the worker, so it never freezes the UI and
+        simply runs after whatever refresh just finished."""
+        mode = (getattr(self.settings, "task_status_scrape_mode", "restart")
+                or "restart")
+        if mode == "off":
+            return
+        if reason == "refresh" and mode != "refresh":
+            return
+        try:
+            if not self.worker.ready_event.is_set():
+                return
+        except Exception:
+            return
+
+        def on_done(res):
+            def apply():
+                if not res or res.get("error"):
+                    m = (res or {}).get("error")
+                    if m:
+                        self._append_log(
+                            f"Live task pass/fail scrape failed: {m}",
+                            error=True)
+                    return
+                by_sid = res.get("by_sid") or {}
+                cache = self.__dict__.setdefault("_task_status_cache", {})
+                cache.update(by_sid)
+                self._task_status_scraped = True
+                # Sanity check: how many scraped Student IDs actually JOIN to
+                # a caseload row (catches a leading-zero / string-vs-int
+                # mismatch), plus a per-state tally to compare against the
+                # ⏱ Probe 2a numbers.
+                rows = getattr(self, "_caseload_rows", None) or []
+                csv_sids = {(r.get("StudentID") or "").strip()
+                            for r in rows}
+                matched = sum(1 for sid in by_sid if sid in csv_sids)
+                tally: dict = {}
+                for st in by_sid.values():
+                    for info in st.values():
+                        s = info.get("state", "?")
+                        tally[s] = tally.get(s, 0) + 1
+                tstr = " ".join(f"{k}={v}" for k, v in sorted(tally.items()))
+                self._append_log(
+                    f"Live task pass/fail: {len(by_sid)} student(s) scraped, "
+                    f"{matched} joined to caseload rows. Tasks: {tstr}")
+                if by_sid and matched < len(by_sid):
+                    self._append_log(
+                        f"  ⚠ {len(by_sid) - matched} scraped student(s) "
+                        "didn't match a caseload StudentID — likely a "
+                        "leading-zero/format mismatch in the join.",
+                        error=True)
+                # Refresh the synthetic 'Task Status' filter column from the
+                # fresh cache, then re-render so grid Task cells pick up the
+                # glyphs and any open quick-view badges recolour.
+                self._apply_task_status_to_rows()
+                self._refresh_caseload_panel()
+            try:
+                self.root.after(0, apply)
+            except Exception:
+                pass
+
+        self._append_log("Reading live task pass/fail in the background…")
+        self.worker.submit_scrape_all_task_status(on_done)
 
     def _review_notes(self, query: str, label: str, panel) -> None:
         """Fetch a student's notes on the worker thread and render them into

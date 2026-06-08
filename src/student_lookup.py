@@ -295,6 +295,95 @@ def lookup_task_status(page: Page, query: str) -> dict:
     return out
 
 
+# Live list view task-cell color class → state. Shared by the per-student
+# lookup_task_status and the bulk read_loaded_task_status.
+_TASK_COLOR_STATE = {
+    "cellColorGreen": "passed",
+    "cellColorRed": "returned",
+    "cellColorBlue": "pending",
+}
+
+
+def _parse_task_cell(cls: str, title: str):
+    """Parse one task cell (its color class + rich title) into
+    (task_number, {state, status, date, attempts}), or None if the title
+    isn't a 'Course Task N: …' cell. Title looks like
+    '… | C769 Task 2: IT Proposal | Revisions Needed | 05/07/2026 |
+    2 Attempts | System: EMA'. Same logic lookup_task_status uses per row."""
+    m = re.search(r"Task\s*(\d+)\s*:", title or "")
+    if not m:
+        return None
+    tnum = m.group(1)
+    parts = [p.strip() for p in (title or "").split("|")]
+    status, date, attempts = "", "", 0
+    for k, p in enumerate(parts):
+        am = re.match(r"(\d+)\s*Attempt", p)
+        if am:
+            attempts = int(am.group(1))
+            if k - 1 >= 0:
+                dm = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", parts[k - 1])
+                if dm:
+                    date = dm.group(1)
+            if k - 2 >= 0:
+                status = parts[k - 2]
+            break
+    state = "submitted"
+    for key, st in _TASK_COLOR_STATE.items():
+        if key in (cls or ""):
+            state = st
+            break
+    return tnum, {"state": state, "status": status,
+                  "date": date, "attempts": attempts}
+
+
+def read_loaded_task_status(table) -> dict:
+    """Bulk per-task pass/fail for the WHOLE caseload, keyed by Student ID.
+
+    Pass an ALREADY scroll-loaded caseload table locator (the caller drives
+    the lazy-load scroll). One page.evaluate reads each row's Student ID (a
+    cell whose text is exactly a 9-10 digit number — robust to column
+    position) plus every task cell's color class + title; the titles are
+    parsed in Python via _parse_task_cell. Returns
+    {sid: {"1": {state,status,date,attempts}, ...}} — the SAME shape
+    lookup_task_status returns per student, so it drops straight into the
+    app's _task_status_cache. Student IDs can have leading zeros, so they
+    stay STRINGS for the CSV join."""
+    rows = table.evaluate(
+        r'''(tbl) => {
+          const out = [];
+          for (const r of tbl.querySelectorAll('tr')) {
+            let sid = '';
+            for (const td of r.querySelectorAll('td')) {
+              const t = (td.textContent || '').trim();
+              if (/^\d{9,10}$/.test(t)) { sid = t; break; }
+            }
+            if (!sid) continue;
+            const cells = [];
+            for (const s of r.querySelectorAll("span[class*='cellColor']")) {
+              cells.push({cls: s.className || '',
+                          title: s.getAttribute('title') || ''});
+            }
+            if (cells.length) out.push({sid, cells});
+          }
+          return out;
+        }'''
+    )
+    result: dict = {}
+    for row in rows or []:
+        sid = row.get("sid")
+        if not sid:
+            continue
+        statuses: dict = {}
+        for c in row.get("cells", []):
+            parsed = _parse_task_cell(c.get("cls", ""), c.get("title", ""))
+            if parsed:
+                tnum, info = parsed
+                statuses[tnum] = info
+        if statuses:
+            result[sid] = statuses
+    return result
+
+
 # ----- Essential Actions (EA) -----
 _EA_TAB_SEL = '[data-tab-value="EssentialActionsTab"]'
 _EA_TABLE_SEL = '.cEssentialActionDataTable'

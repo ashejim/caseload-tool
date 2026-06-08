@@ -259,6 +259,16 @@ class Settings:
     # check (comma/newline separated CSV header names). Lets a user who
     # deliberately doesn't use a feature silence its warning.
     required_columns_ignore: str = ""
+    # Bulk live task pass/fail ("2a"): scroll-load the whole Caseload list
+    # and read each task cell's color (passed/returned/in-process), the bit
+    # the CSV export drops, then color the grid + quick-view badges. Adds
+    # ~5-9s (scroll-load) and runs in the BACKGROUND after a refresh so it
+    # never blocks the UI. Mode:
+    #   "off"     — never bulk-scrape (badges still fetch per-student on
+    #               open; grid task cells stay neutral/⚪)
+    #   "restart" — one background pass after the startup auto-refresh only
+    #   "refresh" — a background pass after startup AND every ↻ refresh
+    task_status_scrape_mode: str = "restart"
 
 
 def load_settings() -> Settings:

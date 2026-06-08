@@ -38,9 +38,9 @@ DISPLAY_TO_CSV: dict[str, str] = {
     "IC End date": "Icenddate",
     "Timezone": "Timezone",
     "Followup Note": "CourseFollowupNote",
-    "Task1": "Task1",
-    "Task2": "Task2",
-    "Task3": "Task3",
+    "Task 1": "Task1",
+    "Task 2": "Task2",
+    "Task 3": "Task3",
     "Course Instructor": "CourseMentor",
     "Course Start Date": "CourseStartDate",
     "Course End Date": "CourseEndDate",
@@ -68,7 +68,14 @@ def resolve_column(name: str, csv_headers: list[str]) -> str:
         return name
     if name in csv_headers:
         return name
-    return DISPLAY_TO_CSV.get(name, name)
+    if name in DISPLAY_TO_CSV:
+        return DISPLAY_TO_CSV[name]
+    # Synthetic per-task status columns ("Task 2 Status" → "Task2Status"),
+    # generated dynamically for whatever task numbers a caseload has.
+    m = re.fullmatch(r"Task (\d+) Status", name)
+    if m:
+        return f"Task{m.group(1)}Status"
+    return name
 
 
 # Reverse direction: CSV header → display name. Used by the editor's
@@ -85,7 +92,13 @@ def display_for_column(csv_header: str) -> str:
     their raw names)."""
     if not csv_header:
         return csv_header
-    return CSV_TO_DISPLAY.get(csv_header, csv_header)
+    if csv_header in CSV_TO_DISPLAY:
+        return CSV_TO_DISPLAY[csv_header]
+    # Synthetic per-task status columns ("Task2Status" → "Task 2 Status").
+    m = re.fullmatch(r"Task(\d+)Status", csv_header)
+    if m:
+        return f"Task {m.group(1)} Status"
+    return csv_header
 
 
 def _row_from(header: list[str], fields: list[str]) -> dict:
