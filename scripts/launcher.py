@@ -1221,6 +1221,8 @@ class BrowserWorker:
         return {
             "full_name": name,
             "first_name": first,
+            # Preferred name from the caseload row, else the first name.
+            "preferred_name": info.get("preferred_name", "") or first,
             "last_name": last,
             "student_email": info.get("student_email", ""),
             "student_id": info.get("student_id", ""),
@@ -2851,6 +2853,7 @@ def _attach_tooltip(widget, text: str) -> None:
 # name but the inserted `{{var}}` matches what the renderer accepts).
 _TEMPLATE_INSERT_VARS_STUDENT = [
     ("First name", "first_name"),
+    ("Preferred name", "preferred_name"),
     ("Last name", "last_name"),
     ("Full name", "full_name"),
     ("Student email", "student_email"),
@@ -12949,6 +12952,10 @@ class App:
         return {
             "full_name": name,
             "first_name": first,
+            # Preferred name, falling back to the first name when blank.
+            "preferred_name": _first(
+                "stuprename", "Student Preferred Name",
+                "PreferredName", "Preferred Name") or first,
             "last_name": last,
             "student_email": _first_present_value(
                 row, _CSV_STUDENT_EMAIL_COLS,

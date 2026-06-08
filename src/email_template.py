@@ -73,6 +73,7 @@ PLACEHOLDER_LABELS = {
     "first_name": "STUDENT FIRST NAME",
     "last_name": "STUDENT LAST NAME",
     "full_name": "STUDENT FULL NAME",
+    "preferred_name": "STUDENT PREFERRED NAME",
     "student_email": "STUDENT EMAIL",
     "student_id": "STUDENT ID",
     "course_code": "COURSE CODE",

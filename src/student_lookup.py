@@ -137,7 +137,8 @@ def lookup_caseload_student(page: Page, student_name: str) -> dict:
     """Look up student context from any Caseload-style table in DOM.
 
     Returns a dict with keys: 'course_code', 'student_id',
-    'student_email', 'pm_name', 'pm_email'. The two emails come from
+    'student_email', 'pm_name', 'pm_email', 'preferred_name'. The two
+    emails come from
     the row's 'Email Student' action link, whose mailto: href has the
     PM as the primary recipient and the student as CC. PM name comes
     from the 'Program Mentor' column. Missing fields come back as
@@ -146,6 +147,7 @@ def lookup_caseload_student(page: Page, student_name: str) -> dict:
     out = {
         "course_code": "", "student_id": "",
         "student_email": "", "pm_name": "", "pm_email": "",
+        "preferred_name": "",
     }
     tables = page.locator("table").filter(
         has=page.locator("th", has_text="Course Code")
@@ -161,6 +163,8 @@ def lookup_caseload_student(page: Page, student_name: str) -> dict:
                 col_idx["student_id"] = j
             if "Program Mentor" in h and "pm_name" not in col_idx:
                 col_idx["pm_name"] = j
+            if "Preferred" in h and "preferred_name" not in col_idx:
+                col_idx["preferred_name"] = j
         rows = table.locator("tr").filter(has_text=student_name)
         for r in range(rows.count()):
             row = rows.nth(r)
@@ -180,6 +184,12 @@ def lookup_caseload_student(page: Page, student_name: str) -> dict:
                 name = cells[col_idx["pm_name"]].strip()
                 if name and not out["pm_name"]:
                     out["pm_name"] = name
+
+            if ("preferred_name" in col_idx
+                    and col_idx["preferred_name"] < len(cells)):
+                pref = cells[col_idx["preferred_name"]].strip()
+                if pref and not out["preferred_name"]:
+                    out["preferred_name"] = pref
 
             # The 'Email Student' link's mailto: has PM as primary, student as CC.
             if not out["pm_email"] or not out["student_email"]:
