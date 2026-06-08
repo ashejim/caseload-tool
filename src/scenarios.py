@@ -155,7 +155,6 @@ def _note_from_dict(d: dict) -> NoteData:
         submit=bool(d.get("submit", True)),
         append_clipboard=bool(d.get("append_clipboard", False)),
         enter_additional_text=bool(d.get("enter_additional_text", False)),
-        attach_essential_action=bool(d.get("attach_essential_action", False)),
     )
 
 

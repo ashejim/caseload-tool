@@ -4637,6 +4637,122 @@ def prompt_additional_text(parent, label: str, prefilled: str) -> Optional[str]:
     return result["value"]
 
 
+def prompt_edit_note(parent, label, body_prefill, course_default,
+                     activities_on, eas):
+    """Unified fire-time note dialog: edit the body, course code, and
+    academic activities, and — when the student has open Essential
+    Actions — attach/close one. Returns
+    {body, course, activities, ea} (ea = (reason, course, close) or None)
+    or None if cancelled."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title(f"Edit note — {label}")
+    _restore_dialog_geometry(dialog, "edit_note")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.lift()
+    dialog.after(50, lambda: (dialog.lift(), dialog.focus_force()))
+    res = {"value": None}
+
+    ctk.CTkLabel(
+        dialog, text="Edit this note before it's filed.  Esc = cancel.",
+        anchor="w", text_color=("gray35", "gray70"),
+    ).pack(fill="x", padx=12, pady=(10, 2))
+
+    crow = ctk.CTkFrame(dialog, fg_color="transparent")
+    crow.pack(fill="x", padx=12, pady=(2, 2))
+    ctk.CTkLabel(crow, text="Course code:", width=90, anchor="w").pack(side="left")
+    course_entry = ctk.CTkEntry(crow, width=160)
+    course_entry.pack(side="left")
+    if course_default:
+        course_entry.insert(0, course_default)
+
+    ctk.CTkLabel(dialog, text="Note body:", anchor="w").pack(
+        fill="x", padx=12, pady=(6, 0))
+    text_box = ctk.CTkTextbox(dialog, wrap="word", height=150)
+    text_box.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+    c = body_prefill or ""
+    if c and c[-1] not in (" ", "\n", "\t"):
+        c += " "
+    text_box.insert("1.0", c)
+    text_box.mark_set("insert", "end-1c")
+
+    ctk.CTkLabel(dialog, text="Academic activities:", anchor="w").pack(
+        fill="x", padx=12, pady=(6, 0))
+    act_frame = ctk.CTkFrame(dialog, fg_color=("gray95", "gray18"))
+    act_frame.pack(fill="x", padx=12, pady=(0, 4))
+    act_vars = {}
+    for lbl in ACADEMIC_ACTIVITY_LABELS:
+        v = ctk.BooleanVar(value=(lbl in (activities_on or [])))
+        act_vars[lbl] = v
+        ctk.CTkCheckBox(
+            act_frame, text=lbl, variable=v, font=ctk.CTkFont(size=11),
+        ).pack(anchor="w", padx=8, pady=1)
+
+    ea_sel = ctk.StringVar(value="skip")
+    ea_close = ctk.BooleanVar(value=False)
+    if eas:
+        ctk.CTkLabel(
+            dialog, text=f"Essential Actions ({len(eas)} open):", anchor="w",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(fill="x", padx=12, pady=(6, 0))
+        eabox = ctk.CTkFrame(dialog, fg_color=("gray95", "gray18"))
+        eabox.pack(fill="x", padx=12, pady=(0, 4))
+        ctk.CTkRadioButton(
+            eabox, text="Don't attach", variable=ea_sel, value="skip",
+        ).pack(anchor="w", padx=8, pady=1)
+        for i, ea in enumerate(eas):
+            t = ea.get("reason", "")
+            if ea.get("course"):
+                t += f"   ({ea['course']})"
+            ctk.CTkRadioButton(
+                eabox, text=t, variable=ea_sel, value=str(i),
+            ).pack(anchor="w", padx=8, pady=1)
+        ctk.CTkCheckBox(
+            dialog, text="Close the Essential Action when the note is saved",
+            variable=ea_close, font=ctk.CTkFont(size=11),
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+
+    def _cont(_e=None):
+        ea_choice = None
+        v = ea_sel.get()
+        if eas and v != "skip":
+            ea = eas[int(v)]
+            ea_choice = (ea.get("reason", ""), ea.get("course", ""),
+                         bool(ea_close.get()))
+        res["value"] = {
+            "body": text_box.get("1.0", "end-1c"),
+            "course": course_entry.get().strip(),
+            "activities": [l for l, vv in act_vars.items() if vv.get()],
+            "ea": ea_choice,
+        }
+        _save_dialog_geometry(dialog, "edit_note")
+        _close()
+
+    def _cancel(_e=None):
+        _save_dialog_geometry(dialog, "edit_note")
+        _close()
+
+    def _close():
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(pady=(2, 10))
+    ctk.CTkButton(btn_row, text="Continue", command=_cont, width=110).pack(
+        side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text="Cancel", command=_cancel, width=90,
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=4)
+    dialog.bind("<Escape>", _cancel)
+    dialog.protocol("WM_DELETE_WINDOW", _cancel)
+    parent.wait_window(dialog)
+    return res["value"]
+
+
 def ask_yes_no_topmost(
     parent, title: str, message: str,
     yes_label: str = "Yes", no_label: str = "No",
@@ -5933,7 +6049,8 @@ class NoteEditor:
         row += 1
         self.enter_additional_text_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
-            content, text="Enter additional text at fire time",
+            content, text="Edit note at fire time "
+                          "(body, course, academic activities, Essential Action)",
             variable=self.enter_additional_text_var,
         ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
 
@@ -5957,17 +6074,6 @@ class NoteEditor:
         # The warning label next to the checkbox makes the off state
         # visible at a glance so a stray click doesn't silently leave
         # notes unsubmitted across an entire batch.
-        # Essential-Action attach — when on, firing the action checks the
-        # student's open Essential Actions and offers to tie THIS note to
-        # one (with an optional close), chosen at fire time.
-        row += 1
-        self.attach_ea_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            content,
-            text="Offer to attach an Essential Action at fire time",
-            variable=self.attach_ea_var,
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 6))
-
         row += 1
         submit_row = ctk.CTkFrame(content, fg_color="transparent")
         submit_row.grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
@@ -6081,8 +6187,6 @@ class NoteEditor:
         self._update_submit_warning()
         self.append_clipboard_var.set(note.append_clipboard)
         self.enter_additional_text_var.set(note.enter_additional_text)
-        self.attach_ea_var.set(
-            getattr(note, "attach_essential_action", False))
         # Course code override (per-note, replaces the old main-window
         # global field). Empty = auto-detect at fire time.
         self.course_code_override_entry.delete(0, "end")
@@ -6138,7 +6242,6 @@ class NoteEditor:
             "submit": self.submit_var.get(),
             "append_clipboard": self.append_clipboard_var.get(),
             "enter_additional_text": self.enter_additional_text_var.get(),
-            "attach_essential_action": self.attach_ea_var.get(),
         }
         # Only emit the override key when non-empty so scenarios.yaml
         # stays clean for the (common) auto-detect case.
@@ -11572,7 +11675,7 @@ class App:
 
     def _fire_per_student(self, scenario: ScenarioConfig, override: str,
                           *, prenav_query: str = "",
-                          prenav_label: str = "") -> None:
+                          prenav_label: str = "", course_hint: str = "") -> None:
         """Per-student (non-batch) scenario fire — wraps the original
         in-line `_fire` body so we can sandwich it between _set_busy
         and _set_idle.
@@ -11636,26 +11739,45 @@ class App:
         if any(n.append_clipboard for n in scenario.notes):
             clipboard = self._read_clipboard_content()
 
-        # Step 4: body edits. The user is committed to a student now, so
-        # the dialogs are filled with the right context in mind. When a
-        # note uses BOTH "enter additional text" and "append clipboard",
-        # prefill the editor with the clipboard paste so it's reviewed/
-        # edited in one place (run_scenario then skips the separate append
-        # for any note that has a custom body, so it isn't duplicated).
+        # Step 4: per-note fire-time edit. A note that opts into "Edit note
+        # at fire time" pops a single dialog to edit the body, course code,
+        # academic activities, and — if the student has open Essential
+        # Actions — attach/close one (read once; offered in the first such
+        # note's dialog). Replaces the old separate body prompt + EA dialog.
         custom_bodies: dict[int, str] = {}
-        for i, n in enumerate(scenario.notes):
-            if not n.enter_additional_text:
-                continue
+        custom_courses: dict[int, str] = {}
+        custom_activities: dict[int, list] = {}
+        ea_arg = None
+        eas_read = False
+        eas: list = []
+        edit_idxs = [i for i, n in enumerate(scenario.notes)
+                     if n.enter_additional_text]
+        for pos, i in enumerate(edit_idxs):
+            n = scenario.notes[i]
             label = f"Note {i + 1}"
             prefill = n.body
             if n.append_clipboard and clipboard:
                 sep = "\n" if prefill and not prefill.endswith("\n") else ""
                 prefill = f"{prefill}{sep}{clipboard}"
-            edited = prompt_additional_text(self.root, label, prefill)
-            if edited is None:
+            if not eas_read:
+                self._append_log("Checking this student's Essential Actions…")
+                eas = self._read_eas_blocking()
+                eas_read = True
+            course_default = (n.course_code_override or course_hint
+                              or override or "")
+            offer_ea = (pos == 0)  # attach at most one EA per fire
+            res = prompt_edit_note(
+                self.root, label, prefill, course_default,
+                list(n.academic_activities), eas if offer_ea else [])
+            if res is None:
                 self._append_log(f"{label} edit cancelled; action not fired.")
                 return
-            custom_bodies[i] = edited
+            custom_bodies[i] = res["body"]
+            if res.get("course"):
+                custom_courses[i] = res["course"]
+            custom_activities[i] = res.get("activities", [])
+            if offer_ea and res.get("ea"):
+                ea_arg = res["ea"]
 
         # Step 5: email (if scenario has one). Reviewed in the same in-app
         # previewer as batch/selection (incl. the fire-time template
@@ -11690,28 +11812,25 @@ class App:
                 self._append_log("Email send failed; note not filed.")
                 return
 
-        # Essential-Action attach (opt-in). If the student has open EAs,
-        # offer to tie one to this note (+ optional close); otherwise file
-        # normally. Reading EAs switches the record to the EA tab, so on
-        # "skip" we re-open the record to restore the note panel.
-        ea_arg = None
-        if any(getattr(n, "attach_essential_action", False)
-               for n in scenario.notes):
-            self._append_log("Checking this student's Essential Actions…")
-            eas = self._read_eas_blocking()
-            if eas:
-                mode, ea_arg = self._choose_ea_attachment(eas)
-                if mode == "cancel":
-                    self._append_log(
-                        "Fire cancelled at the Essential Action step.")
-                    return
-                if mode != "attach":
-                    ea_arg = None
-                    nav_query = prenav_query or chosen_name
-                    if nav_query:
-                        self._navigate_for_fire_blocking(nav_query)
-            else:
-                self._append_log("No open Essential Actions for this student.")
+        # Reading EAs switched the record to the EA tab; if we're NOT
+        # attaching, re-open the record so the normal note panel is back.
+        if eas_read and ea_arg is None:
+            nav_query = prenav_query or chosen_name
+            if nav_query:
+                self._navigate_for_fire_blocking(nav_query)
+
+        # Apply the fire-time course / academic-activity edits onto a copy
+        # of the scenario (run_scenario reads note.course_code_override and
+        # note.academic_activities); body edits go via custom_bodies.
+        if custom_courses or custom_activities:
+            import copy as _copy
+            scenario = _copy.deepcopy(scenario)
+            for i, cc in custom_courses.items():
+                if 0 <= i < len(scenario.notes):
+                    scenario.notes[i].course_code_override = cc
+            for i, acts in custom_activities.items():
+                if 0 <= i < len(scenario.notes):
+                    scenario.notes[i].academic_activities = acts
 
         self.worker.submit_scenario(
             scenario, override, clipboard,
@@ -12065,20 +12184,22 @@ class App:
             self._append_log("No students selected.")
             return
 
-        # EA-aware action on a SINGLE student → route through the
-        # per-student fire path, which surfaces the Essential Actions
-        # attach dialog. (Mini-batch over multiple rows doesn't do the
-        # per-student EA attach.)
+        # Edit-note action on a SINGLE student → route through the
+        # per-student fire path, which surfaces the unified fire-time edit
+        # dialog (body / course / academic activities / Essential Action).
+        # (Mini-batch over multiple rows doesn't do the per-student dialog.)
         if (len(rows) == 1 and any(
-                getattr(n, "attach_essential_action", False)
+                getattr(n, "enter_additional_text", False)
                 for n in scenario.notes)):
             name, query = self._row_name_and_query(rows[0])
             override = self.course_var.get().strip()
+            course_hint = str(rows[0].get("CourseCode", "")
+                              or rows[0].get("Course Code", "")).strip()
             self._set_busy(f"Running {scenario.name}…")
             try:
                 self._fire_per_student(
-                    scenario, override,
-                    prenav_query=query, prenav_label=name)
+                    scenario, override, prenav_query=query,
+                    prenav_label=name, course_hint=course_hint)
             finally:
                 self._set_idle()
             return
