@@ -5957,6 +5957,17 @@ class NoteEditor:
         # The warning label next to the checkbox makes the off state
         # visible at a glance so a stray click doesn't silently leave
         # notes unsubmitted across an entire batch.
+        # Essential-Action attach — when on, firing the action checks the
+        # student's open Essential Actions and offers to tie THIS note to
+        # one (with an optional close), chosen at fire time.
+        row += 1
+        self.attach_ea_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            content,
+            text="Offer to attach an Essential Action at fire time",
+            variable=self.attach_ea_var,
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 6))
+
         row += 1
         submit_row = ctk.CTkFrame(content, fg_color="transparent")
         submit_row.grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
@@ -6070,6 +6081,8 @@ class NoteEditor:
         self._update_submit_warning()
         self.append_clipboard_var.set(note.append_clipboard)
         self.enter_additional_text_var.set(note.enter_additional_text)
+        self.attach_ea_var.set(
+            getattr(note, "attach_essential_action", False))
         # Course code override (per-note, replaces the old main-window
         # global field). Empty = auto-detect at fire time.
         self.course_code_override_entry.delete(0, "end")
@@ -6125,6 +6138,7 @@ class NoteEditor:
             "submit": self.submit_var.get(),
             "append_clipboard": self.append_clipboard_var.get(),
             "enter_additional_text": self.enter_additional_text_var.get(),
+            "attach_essential_action": self.attach_ea_var.get(),
         }
         # Only emit the override key when non-empty so scenarios.yaml
         # stays clean for the (common) auto-detect case.
@@ -6307,18 +6321,6 @@ class ScenarioEditor:
         self._email_section_row = row
         self._build_email_section()
         # Visibility set by load() based on scenario.email != None.
-
-        # Essential-Action attach toggle — lives in the note section since
-        # it governs how this action's note is filed (tied to an EA, with
-        # an optional close, chosen at fire time). Opt-in (the check adds a
-        # couple seconds: open the record's EA tab + read).
-        row += 1
-        self.attach_ea_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            self.frame,
-            text="Offer to attach an Essential Action to the note at fire time",
-            variable=self.attach_ea_var,
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(6, 2))
 
         # Notes live in their own container so add/delete can just
         # pack/destroy children without disturbing the outer grid rows.
@@ -6972,8 +6974,6 @@ class ScenarioEditor:
         self.find_first_var.set(scenario.find_first)
         # Panel-action toggle (forced off below for batch scenarios).
         self.panel_action_var.set(scenario.panel_action)
-        self.attach_ea_var.set(
-            getattr(scenario, "attach_essential_action", False))
         # Batch config — populate filter rows + visibility.
         self._batch_preview = scenario.batch.preview if scenario.batch else True
         # Rebuild prompt rows fresh from the scenario.
@@ -7042,8 +7042,6 @@ class ScenarioEditor:
         # there. Only written when True to keep the YAML uncluttered.
         if self.panel_action_var.get() and not self.batch_mode_var.get():
             out["panel_action"] = True
-        if self.attach_ea_var.get():
-            out["attach_essential_action"] = True
         if self.send_email_var.get():
             tpl = self.email_body_combo.get().strip()
             if "(none" in tpl:  # placeholder for empty templates folder
@@ -11697,7 +11695,8 @@ class App:
         # normally. Reading EAs switches the record to the EA tab, so on
         # "skip" we re-open the record to restore the note panel.
         ea_arg = None
-        if getattr(scenario, "attach_essential_action", False):
+        if any(getattr(n, "attach_essential_action", False)
+               for n in scenario.notes):
             self._append_log("Checking this student's Essential Actions…")
             eas = self._read_eas_blocking()
             if eas:
@@ -12070,7 +12069,9 @@ class App:
         # per-student fire path, which surfaces the Essential Actions
         # attach dialog. (Mini-batch over multiple rows doesn't do the
         # per-student EA attach.)
-        if getattr(scenario, "attach_essential_action", False) and len(rows) == 1:
+        if (len(rows) == 1 and any(
+                getattr(n, "attach_essential_action", False)
+                for n in scenario.notes)):
             name, query = self._row_name_and_query(rows[0])
             override = self.course_var.get().strip()
             self._set_busy(f"Running {scenario.name}…")

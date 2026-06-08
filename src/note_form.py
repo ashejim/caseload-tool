@@ -31,6 +31,7 @@ class NoteData:
     submit: bool = False                   # leave False while we dial in selectors
     append_clipboard: bool = False         # paste clipboard text after body at fire time
     enter_additional_text: bool = False    # prompt user for body edits at fire time
+    attach_essential_action: bool = False  # offer to tie this note to an EA at fire time
 
 
 def _screenshot_failure(page: Page, tag: str) -> Path:

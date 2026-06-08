@@ -125,11 +125,6 @@ class ScenarioConfig:
     # so the editor disables this for batch scenarios. If NO scenario sets
     # it, the panel falls back to listing every non-batch scenario.
     panel_action: bool = False
-    # When True, firing this (single) action checks the student's open
-    # Essential Actions at fire time and offers to attach one to the note
-    # (with an optional close). Opt-in because the check adds a couple
-    # seconds (open the record's Essential Actions tab + read rows).
-    attach_essential_action: bool = False
 
 
 @dataclass
@@ -160,6 +155,7 @@ def _note_from_dict(d: dict) -> NoteData:
         submit=bool(d.get("submit", True)),
         append_clipboard=bool(d.get("append_clipboard", False)),
         enter_additional_text=bool(d.get("enter_additional_text", False)),
+        attach_essential_action=bool(d.get("attach_essential_action", False)),
     )
 
 
@@ -278,8 +274,6 @@ def load_scenarios(path: Path = SCENARIOS_YAML) -> dict[str, ScenarioConfig]:
             prompts=_prompts_from_list(cfg.get("prompts")),
             notes=notes,
             panel_action=bool(cfg.get("panel_action", False)),
-            attach_essential_action=bool(
-                cfg.get("attach_essential_action", False)),
         )
     return out
 
