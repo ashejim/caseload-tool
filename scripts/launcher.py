@@ -172,6 +172,60 @@ def _typo_variants(query: str) -> list[str]:
     return out
 
 
+def _wait_grid_settled(page, max_ms: int = 1500) -> None:
+    """After typing into the caseload row-filter, wait until the grid has
+    settled — no visible loading spinner and the row count stable across two
+    polls — BOUNDED by max_ms. Replaces a blind sleep: returns as soon as
+    the filter has applied (often a few hundred ms), never later than the
+    old fixed wait."""
+    import time as _t
+    deadline = _t.monotonic() + max_ms / 1000.0
+    try:
+        page.wait_for_timeout(120)  # let a spinner appear before polling
+    except Exception:
+        return
+    last, stable = -1, 0
+    while _t.monotonic() < deadline:
+        try:
+            spinner = page.locator(
+                ".slds-spinner_container").filter(visible=True).count()
+        except Exception:
+            spinner = 0
+        try:
+            cnt = page.locator("table tr").count()
+        except Exception:
+            cnt = -1
+        if spinner == 0 and cnt >= 0 and cnt == last:
+            stable += 1
+            if stable >= 2:
+                return
+        else:
+            stable = 0
+        last = cnt
+        try:
+            page.wait_for_timeout(120)
+        except Exception:
+            return
+
+
+def _wait_record_ready(page, max_ms: int = 2000) -> None:
+    """After navigating to a record, return as soon as it's ready (the
+    active student name resolves) — BOUNDED by max_ms. Replaces a blind
+    post-navigation sleep."""
+    import time as _t
+    deadline = _t.monotonic() + max_ms / 1000.0
+    while _t.monotonic() < deadline:
+        try:
+            if get_active_student_name(page):
+                return
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(150)
+        except Exception:
+            return
+
+
 class BrowserWorker:
     SHUTDOWN = object()
 
@@ -517,7 +571,7 @@ class BrowserWorker:
                     tgt = self._active_page(ctx)
                     if tgt is not None:
                         try:
-                            tgt.wait_for_timeout(2000)
+                            _wait_record_ready(tgt, 2000)
                         except Exception:
                             pass
                         self._bring_browser_forward(tgt)
@@ -802,7 +856,7 @@ class BrowserWorker:
             filter_input.fill(query)
             filter_input.press("Enter")
             # Lightning debounces the filter; give it a moment to update.
-            target.wait_for_timeout(1500)
+            _wait_grid_settled(target, 1500)
         except Exception as e:
             self.on_status(f"Filter step failed: {e}")
             return
@@ -886,7 +940,7 @@ class BrowserWorker:
                     filter_input.fill("")
                     filter_input.fill(text)
                     filter_input.press("Enter")
-                    target.wait_for_timeout(1500)
+                    _wait_grid_settled(target, 1500)
                 except Exception as e:
                     self.on_status(f"  [debug] filter {text!r}: {e}")
                     return []
@@ -921,7 +975,7 @@ class BrowserWorker:
                 filter_input.focus()
                 filter_input.fill("")
                 filter_input.press("Enter")
-                target.wait_for_timeout(1500)
+                _wait_grid_settled(target, 1500)
             except Exception as e:
                 self.on_status(f"  [debug] clear filter: {e}")
 
@@ -985,7 +1039,7 @@ class BrowserWorker:
             filter_input.fill("")
             filter_input.fill(query)
             filter_input.press("Enter")
-            target.wait_for_timeout(800)
+            _wait_grid_settled(target, 800)
         except Exception as e:
             self.on_status(f"Fast-find filter failed for {query!r}: {e}")
             return False, row_info
@@ -1100,7 +1154,10 @@ class BrowserWorker:
         post_click_target = self._active_page(ctx)
         if post_click_target is not None:
             try:
-                post_click_target.wait_for_timeout(2000)
+                # Ready as soon as the record resolves; small extra settle
+                # so the contact card (email field) is painted before scrape.
+                _wait_record_ready(post_click_target, 2000)
+                post_click_target.wait_for_timeout(250)
             except Exception:
                 pass
 
@@ -1781,7 +1838,7 @@ class BrowserWorker:
                 filter_input.focus()
                 filter_input.fill("")
                 filter_input.press("Enter")
-                target.wait_for_timeout(800)
+                _wait_grid_settled(target, 800)
         except Exception as e:
             self.on_status(f"  [export] couldn't clear row filter: {e}")
 
@@ -1865,7 +1922,7 @@ class BrowserWorker:
             if fi.count() > 0:
                 fi.click(); fi.fill("")
                 fi.press("Enter")
-                target.wait_for_timeout(1500)
+                _wait_grid_settled(target, 1500)
         except Exception:
             pass
 
@@ -1938,7 +1995,7 @@ class BrowserWorker:
                 fi.click()
                 fi.fill(q)
                 fi.press("Enter")
-                target.wait_for_timeout(1200)
+                _wait_grid_settled(target, 1200)
         except Exception as e:
             return {"error": f"row filter failed: {e}"}
         err = ""
