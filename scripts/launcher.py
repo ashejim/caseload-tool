@@ -499,6 +499,14 @@ class BrowserWorker:
                     pass
                 self.on_status("Browser ready.")
                 self.ready_event.set()
+                # Bring the browser to the front so the user can log in to
+                # Salesforce; the launcher is foreground at startup, so the
+                # raise is honoured. It's minimized again once the startup
+                # caseload load finishes (App._minimize_browser).
+                try:
+                    self._raise_browser_window()
+                except Exception:
+                    pass
                 while True:
                     cmd = self.q.get()
                     if cmd is self.SHUTDOWN:
@@ -1622,6 +1630,22 @@ class BrowserWorker:
                 user32.ShowWindow(hwnd, SW_RESTORE)
             user32.BringWindowToTop(hwnd)
             user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+    def _minimize_browser_window(self) -> None:
+        """Minimize the launcher's browser window — called once the startup
+        caseload load is done so it's out of the user's way. No-op off
+        Windows / if the window can't be located."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = self._locate_browser_hwnd()
+            if hwnd and user32.IsWindow(hwnd):
+                SW_MINIMIZE = 6
+                user32.ShowWindow(hwnd, SW_MINIMIZE)
         except Exception:
             pass
 
@@ -13806,8 +13830,11 @@ class App:
                         error=True)
                 self._apply_ea_scrape((res or {}).get("eas") or [])
                 self._set_idle()
-                # Kick the background live task pass/fail pass (startup).
-                self._maybe_bulk_scrape_task_status("startup")
+                # Kick the background live task pass/fail pass (startup), then
+                # minimize the browser once it's done — after the scrape, since
+                # the scroll needs the window un-minimized to render.
+                self._maybe_bulk_scrape_task_status(
+                    "startup", on_complete=self._minimize_browser)
             try:
                 self.root.after(0, apply)
             except Exception:
@@ -15295,7 +15322,18 @@ class App:
                 pass
         self.worker.submit_fetch_task_status(sid, on_done)
 
-    def _maybe_bulk_scrape_task_status(self, reason: str) -> None:
+    def _minimize_browser(self) -> None:
+        """Minimize the launcher's browser once the startup caseload load is
+        finished (login's done + data's in), so it's out of the way."""
+        try:
+            self.worker._minimize_browser_window()
+            self._append_log("Caseload loaded — minimized the browser.")
+        except Exception:
+            pass
+
+    def _maybe_bulk_scrape_task_status(
+        self, reason: str, on_complete=None,
+    ) -> None:
         """Background '2a' pass: after a refresh, scroll the live Caseload
         list once and read every student's real per-task pass/fail (the
         colour the CSV export drops), populating `_task_status_cache` so the
@@ -15305,17 +15343,31 @@ class App:
           restart → only the startup pass  (reason='startup');
           refresh → startup AND every manual ↻  (reason='refresh').
         Non-blocking: queued on the worker, so it never freezes the UI and
-        simply runs after whatever refresh just finished."""
+        simply runs after whatever refresh just finished. `on_complete` (if
+        given) runs once this is done — including the skipped paths — so the
+        startup caller can minimize the browser only AFTER the scrape (the
+        scroll needs the window un-minimized to render)."""
+        def _finish():
+            if on_complete:
+                try:
+                    on_complete()
+                except Exception:
+                    pass
+
         mode = (getattr(self.settings, "task_status_scrape_mode", "restart")
                 or "restart")
         if mode == "off":
+            _finish()
             return
         if reason == "refresh" and mode != "refresh":
+            _finish()
             return
         try:
             if not self.worker.ready_event.is_set():
+                _finish()
                 return
         except Exception:
+            _finish()
             return
 
         def on_done(res):
@@ -15326,6 +15378,7 @@ class App:
                         self._append_log(
                             f"Live task pass/fail scrape failed: {m}",
                             error=True)
+                    _finish()
                     return
                 by_sid = res.get("by_sid") or {}
                 cache = self.__dict__.setdefault("_task_status_cache", {})
@@ -15359,6 +15412,7 @@ class App:
                 # glyphs and any open quick-view badges recolour.
                 self._apply_task_status_to_rows()
                 self._refresh_caseload_panel()
+                _finish()
             try:
                 self.root.after(0, apply)
             except Exception:
