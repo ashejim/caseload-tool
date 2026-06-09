@@ -391,6 +391,11 @@ class BrowserWorker:
         on_done({by_sid: {sid: {tnum: {...}}}, count}) or {error}."""
         self.q.put(("SCRAPE_ALL_TASK_STATUS", on_done))
 
+    def submit_probe_followup(self, on_done: Callable[[dict], None]) -> None:
+        """TEMP dev probe: capture the caseload Followup Date/Note cells +
+        any open inline editor (for building followup-field writes)."""
+        self.q.put(("PROBE_FOLLOWUP", on_done))
+
     def submit_read_caseload_columns(
         self, on_done: Callable[[list[dict]], None],
     ) -> None:
@@ -655,6 +660,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._scrape_all_task_status(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "PROBE_FOLLOWUP":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._probe_followup(ctx)
             finally:
                 on_done(res)
         elif cmd[0] == "READ_CASELOAD_COLUMNS":
@@ -2386,6 +2398,94 @@ class BrowserWorker:
                 data["opened"] = "(captured current page; no auto-open)"
                 return data
             return {"error": "no data"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _probe_followup(self, ctx) -> dict:
+        """TEMP dev probe for the Followup Date/Note inline-edit DOM. Run on
+        the Caseload LIST view. To capture the EDITOR, click into a Followup
+        Date or Note cell FIRST (open the calendar/input), then click probe.
+        Captures: list headers (followup ones), the followup cells, any
+        visible inline editor (input / datepicker / calendar), and the
+        inline-edit docked Save footer. → temp/followup_probe.html"""
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        js = r'''
+        () => {
+          const KEEP=['class','data-label','title','role','aria-label',
+            'data-row-key-value','name','value','data-aura-class','placeholder',
+            'type','aria-expanded','data-field','aria-colindex','data-column-key'];
+          const cls=el=>String((el.className&&el.className.baseVal!==undefined)
+            ?el.className.baseVal:(el.className||''));
+          function ser(el,d){
+            if(!el||d>25) return '';
+            const tag=(el.tagName||'').toLowerCase();
+            if(['script','style','svg','path','iframe','img'].includes(tag)) return '';
+            let s='<'+tag;
+            const at=el.attributes;
+            if(at) for(let ai=0;ai<at.length;ai++){ const a=at[ai];
+              if(a&&KEEP.includes(a.name))
+                s+=' '+a.name+'="'+String(a.value||'').slice(0,80).replace(/"/g,'')+'"';
+            }
+            s+='>';
+            const serNode=(n)=>{
+              if(n.nodeType===3){const tx=n.textContent.trim();
+                return tx?tx.slice(0,160):'';}
+              if(n.nodeType!==1) return '';
+              return ser(n,d+1);
+            };
+            if(el.shadowRoot) s+='\n#shadow{\n'+
+              [...el.shadowRoot.childNodes].map(serNode).join('')+'}\n';
+            for(const c of el.childNodes) s+=serNode(c);
+            return s+'</'+tag+'>\n';
+          }
+          function deepAll(pred){
+            const r=[];
+            (function w(root){
+              for(const el of root.querySelectorAll('*')){
+                try{if(pred(el))r.push(el);}catch(e){}
+                if(el.shadowRoot) w(el.shadowRoot);
+              }
+            })(document);
+            return r;
+          }
+          const vis=el=>{try{return el.offsetParent!==null||
+            el.getClientRects().length>0;}catch(e){return false;}};
+          const headers=[...new Set(deepAll(el=>el.tagName==='TH')
+            .map(th=>(th.textContent||'').trim()).filter(Boolean))];
+          // Followup cells by data-label.
+          const fcells=deepAll(el=>{const dl=el.getAttribute&&
+            el.getAttribute('data-label');return dl&&/follow.?up/i.test(dl);});
+          // Visible inline editors: inputs, datepicker, calendar, cell editor.
+          const editors=deepAll(el=>{const t=el.tagName,c=cls(el),
+            role=el.getAttribute&&el.getAttribute('role');
+            return t==='INPUT'||t==='TEXTAREA'||t==='LIGHTNING-INPUT'||
+              t==='LIGHTNING-DATEPICKER'||t==='LIGHTNING-PRIMITIVE-CELL-EDITOR'||
+              (role==='grid'&&/datepicker/i.test(c))||
+              /datepicker|slds-datepicker|cellEditor|inline.?edit|slds-table_edit|popupTarget/i.test(c);
+            }).filter(vis);
+          // Inline-edit docked Save/Cancel footer.
+          const footers=deepAll(el=>/docked|inlineEdit|slds-docked-form-footer/i
+            .test(cls(el))||(el.getAttribute&&
+            /Save|Cancel/.test(el.getAttribute('title')||''))).filter(vis);
+          let html='=== HEADERS ('+headers.length+') ===\n'+headers.join(' | ')+'\n';
+          for(const f of fcells.slice(0,4))
+            html+='\n=== FOLLOWUP CELL ['+(f.getAttribute('data-label')||'')+
+              '] ===\n'+ser(f,0);
+          for(const e of editors.slice(0,6))
+            html+='\n=== VISIBLE EDITOR ['+e.tagName.toLowerCase()+'] ===\n'+ser(e,0);
+          for(const ft of footers.slice(0,3))
+            html+='\n=== DOCKED/SAVE ===\n'+ser(ft,0);
+          return {headers:headers.filter(h=>/follow.?up/i.test(h)),
+            all_header_count:headers.length, followup_cells:fcells.length,
+            editors_visible:editors.length, footers:footers.length,
+            html:html.slice(0,500000)};
+        }
+        '''
+        try:
+            data = target.evaluate(js)
+            return data if isinstance(data, dict) else {"error": "no data"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -9959,6 +10059,15 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self._btn_probe_2a.pack(side="left", padx=(8, 0))
+        # TEMP dev probe (remove with the others): capture the caseload
+        # Followup Date/Note inline-edit DOM. On the Caseload list, click into
+        # a Followup cell to open its editor, then click this.
+        self._btn_probe_flup = ctk.CTkButton(
+            toggle_frame, text="🧪 Probe Flup",
+            width=120, command=self._dev_probe_followup,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_probe_flup.pack(side="left", padx=(8, 0))
         # (Busy/refresh indicator now lives in the top bar — see topbar.)
         # Collapse the rightmost toolbar buttons to emoji-only when the
         # bar gets too narrow (they're the first to clip).
@@ -15349,6 +15458,50 @@ class App:
             except Exception:
                 pass
         self.worker.submit_probe_task_scrape(on_done)
+
+    def _dev_probe_followup(self) -> None:
+        """TEMP dev probe: capture the caseload Followup Date/Note inline-edit
+        DOM. On the Caseload LIST view, click into a Followup cell to open its
+        editor (calendar/input) FIRST, then click this. Writes the deep DOM to
+        temp/followup_probe.html for selector discovery."""
+        try:
+            if not self.worker.ready_event.is_set():
+                self._append_log("Browser not ready yet.")
+                return
+        except Exception:
+            return
+        self._append_log(
+            "Probing Followup fields… be on the Caseload list; click into a "
+            "Followup Date/Note cell to open its editor first.")
+
+        def on_done(res):
+            def show():
+                if not res or res.get("error"):
+                    self._append_log(
+                        f"Followup probe failed: {(res or {}).get('error')}",
+                        error=True)
+                    return
+                self._append_log(
+                    f"Followup probe: followup headers={res.get('headers')} "
+                    f"· followup_cells={res.get('followup_cells')} "
+                    f"· editors_visible={res.get('editors_visible')} "
+                    f"· save_footers={res.get('footers')} "
+                    f"(of {res.get('all_header_count')} cols)")
+                html = res.get("html") or ""
+                try:
+                    p = CASELOAD_CSV_PATH.parent / "temp" / "followup_probe.html"
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(html, encoding="utf-8")
+                    self._append_log(
+                        f"Followup deep DOM → {p}  ({len(html)} chars)")
+                except Exception as e:
+                    self._append_log(
+                        f"couldn't write followup probe file: {e}", error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                pass
+        self.worker.submit_probe_followup(on_done)
 
     def _dev_probe_ea(self) -> None:
         """TEMP dev probe: dump the live Essential Actions tab DOM so we can

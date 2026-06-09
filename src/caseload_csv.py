@@ -38,6 +38,7 @@ DISPLAY_TO_CSV: dict[str, str] = {
     "IC End date": "Icenddate",
     "Timezone": "Timezone",
     "Followup Note": "CourseFollowupNote",
+    "Followup Date": "CourseFollowupDate",
     "Task 1": "Task1",
     "Task 2": "Task2",
     "Task 3": "Task3",
