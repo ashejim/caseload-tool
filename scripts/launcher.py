@@ -1719,7 +1719,36 @@ class BrowserWorker:
                 last_error = str(e)
                 continue
         self.on_status(f"Caseload table didn't load after retries: {last_error}")
+        if target is not None and self._looks_like_login(target):
+            self.on_status(
+                "⚠ Salesforce is asking you to sign in. Opening the browser "
+                "— please log in, then retry.")
+            try:
+                self._raise_browser_window()
+            except Exception:
+                pass
         return None, None
+
+    def _looks_like_login(self, target) -> bool:
+        """True if the active page looks like a Salesforce sign-in page — by
+        URL (login host / *.salesforce.com/login) or a visible username +
+        password field pair. Used to surface 'please sign in' in the log
+        (the browser is usually minimized, so a silent failure is confusing)."""
+        try:
+            url = (target.url or "").lower()
+        except Exception:
+            url = ""
+        if any(s in url for s in (
+                "login.salesforce.com", "/login", "/_ui/login", "secur/login")):
+            return True
+        try:
+            u = target.locator('input[name="username"], input#username')
+            p = target.locator('input[type="password"]')
+            if u.count() > 0 and p.count() > 0:
+                return True
+        except Exception:
+            pass
+        return False
 
     def _fetch_student_notes(
         self, ctx, query: str, max_notes: int = 60,
@@ -4911,7 +4940,18 @@ def prompt_calendar_pick(parent, initial_date=None):
     dialog.transient(parent)
     dialog.attributes("-topmost", True)
     dialog.grab_set()
-    dialog.geometry("280x300")
+    # Pop up near the mouse so the cursor barely travels (general practice
+    # for small popups). Offset slightly up-left so the pointer lands just
+    # inside, and clamp to the screen so it never opens off-edge.
+    _w, _h = 280, 300
+    try:
+        _px, _py = parent.winfo_pointerxy()
+        _sw, _sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
+        _x = min(max(_px - 20, 0), max(_sw - _w, 0))
+        _y = min(max(_py - 20, 0), max(_sh - _h, 0))
+        dialog.geometry(f"{_w}x{_h}+{_x}+{_y}")
+    except Exception:
+        dialog.geometry(f"{_w}x{_h}")
     # Topmost-claw-back (same pattern as our other modals so a busy
     # background window can't bury it).
     dialog.lift()
@@ -8614,12 +8654,14 @@ class CaseloadPanel:
             val = entry.get().strip()
 
             def _applied(res) -> None:
-                # On success, reflect the new date in the cached row so
-                # reopening the student shows it (until the next ↻ reloads
-                # the CSV). The grid's column, if shown, picks it up too.
+                # On success, write the new date into the cached row AND
+                # re-render the grid so the Followup Date column shows it
+                # immediately — no need to wait for a ↻ CSV reload. (We know
+                # exactly what Salesforce stored, so we mirror it locally.)
                 if res.get("ok"):
                     try:
                         row["CourseFollowupDate"] = val
+                        self.populate()
                     except Exception:
                         pass
 
