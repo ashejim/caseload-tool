@@ -2980,11 +2980,16 @@ def _rewrite_task_filter(f: dict) -> dict:
     facet. Unambiguous ops route by operator: date ops → TaskNDate, numeric
     ops → TaskNCount, empty/not-empty → TaskNDate ('did they submit'). The
     ambiguous text ops (is/is not/contains/does not contain) route by the
-    VALUE: an all-integer value (incl. comma-OR lists like '2, 3') means the
-    submission COUNT → TaskNCount, anything else is a status word →
-    TaskNStatus. So 'Task 2 is 2' filters count, 'Task 2 is Returned' filters
-    status. Non-task filters pass through. Eval-time only — the visible
-    'Task N' column is what the user picks + sees in review."""
+    VALUE:
+      - all-integer (incl. comma-OR like '2, 3') → submission COUNT,
+      - the special word 'Submitted' → 'has a submission' (passed/returned/
+        in-process all carry a date), so it maps to TaskNDate is-not-empty
+        (is-empty for the negated ops) and works even before the scrape,
+      - anything else → a status word → TaskNStatus.
+    So 'Task 2 is 2' filters count, 'Task 2 is Submitted' = has any
+    submission, 'Task 2 is Returned' filters status. Non-task filters pass
+    through. Eval-time only — the visible 'Task N' column is what the user
+    picks + sees in review."""
     col = f.get("column") or ""
     m = re.fullmatch(r"Task(\d+)", col)
     if not m:
@@ -2997,11 +3002,20 @@ def _rewrite_task_filter(f: dict) -> dict:
         facet = f"Task{n}Count"
     elif op in ("is empty", "is not empty", "empty", "not_empty"):
         facet = f"Task{n}Date"
-    else:  # is / is not / contains / does not contain → count if numeric value
-        parts = [p.strip() for p in str(f.get("value") or "").split(",")
-                 if p.strip()]
+    else:  # is / is not / contains / does not contain
+        val = str(f.get("value") or "").strip()
+        parts = [p.strip() for p in val.split(",") if p.strip()]
         if parts and all(re.fullmatch(r"\d+", p) for p in parts):
             facet = f"Task{n}Count"
+        elif val.lower() == "submitted":
+            # "Submitted" = has been submitted (passed/returned/in-process —
+            # all have a date). Use the date facet's emptiness, not the
+            # colour-derived status (which has no real 'Submitted' value).
+            negated = op in ("is not", "does not contain",
+                             "not_equals", "not_contains")
+            return {**f, "column": f"Task{n}Date",
+                    "op": "is empty" if negated else "is not empty",
+                    "value": ""}
         else:
             facet = f"Task{n}Status"
     return {**f, "column": facet}
