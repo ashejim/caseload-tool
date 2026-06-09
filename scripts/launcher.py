@@ -3120,8 +3120,9 @@ TASK_STATE_LABELS: dict = {
 #   numeric ops → Task{N}Count  (submission count, from the CSV cell)
 #   text ops    → Task{N}Status (Passed/Returned/In Process, from the scrape)
 _TASK_DATE_OPS = {
-    "is before", "is after", "is on", "is within",
-    "before", "after", "on", "within",
+    "is before", "is after", "is on", "is on or before", "is on or after",
+    "is within", "before", "after", "on", "on_or_before", "on_or_after",
+    "within",
 }
 _TASK_NUM_OPS = {
     "more than", "less than", "at least", "at most",
@@ -3134,6 +3135,20 @@ def _is_task_facet_col(col: str) -> bool:
     Task2Count, Task3Status, …) — kept out of the grid + filter dropdowns;
     the single visible 'Task N' column stands in for all three."""
     return bool(re.fullmatch(r"Task\d+(Date|Count|Status)", col or ""))
+
+
+def _resolve_filter_columns(f: dict, headers: list) -> dict:
+    """Resolve a filter's display-name `column` to its CSV header, AND — for
+    a column-comparison value written as `{Display Name}` — resolve the
+    referenced column too, so the engine's per-row `row.get(...)` finds it.
+    Identity entries pass through unchanged."""
+    out = {**f, "column": caseload_csv.resolve_column(
+        f.get("column", ""), headers)}
+    m = re.fullmatch(r"\{(.+)\}", str(out.get("value", "")).strip())
+    if m:
+        out["value"] = "{" + caseload_csv.resolve_column(
+            m.group(1), headers) + "}"
+    return out
 
 
 def _rewrite_task_filter(f: dict) -> dict:
@@ -6266,6 +6281,8 @@ FILTER_OPS = (
     "is before",
     "is after",
     "is on",
+    "is on or before",
+    "is on or after",
     "is within",
     "more than",
     "less than",
@@ -6370,14 +6387,15 @@ class FilterRow:
         except Exception:
             pass
 
-    def _column_value_suggestions(self) -> list:
-        """Suggested values for the currently-selected column, via the
-        provider. [] when there's no provider or the column has no sensible
-        small value set (→ the field stays free-text)."""
+    def _column_value_suggestions(self, op: str) -> list:
+        """Value suggestions for the current column + `op`, via the provider.
+        For date/number ops these are `{Other Column}` comparison refs; for
+        text ops, a small fixed vocabulary. [] when nothing sensible applies
+        (field stays free-text)."""
         if not self._value_provider:
             return []
         try:
-            return self._value_provider(self.column_combo.get()) or []
+            return self._value_provider(self.column_combo.get(), op) or []
         except Exception:
             return []
 
@@ -6385,7 +6403,8 @@ class FilterRow:
         """Sync the value-field suggestions and hint label to `op`.
         Called whenever the op dropdown selection changes (and once
         at init / once during `load` to set the initial state)."""
-        date_ops = ("is before", "is after", "is on")
+        date_ops = ("is before", "is after", "is on",
+                    "is on or before", "is on or after")
         numeric_ops = ("more than", "less than", "at least", "at most")
         text_ops = ("is", "is not", "contains", "does not contain")
 
@@ -6399,14 +6418,17 @@ class FilterRow:
             pass
 
         if op in date_ops:
+            # Relative/absolute date shorthands PLUS any {Other Date Column}
+            # comparison refs the provider offers (column-vs-column).
+            col_refs = self._column_value_suggestions(op)
             self.value_combo.configure(state="normal", values=[
                 "today",
                 "today-7d", "today-14d", "today-30d",
                 "today+7d", "today+14d", "today+30d",
-            ])
+            ] + col_refs)
             self.hint_label.configure(
-                text="e.g. today, today-21d, today+45d, 5/21/2026, "
-                     "2026-05-21 — or click 📅",
+                text="e.g. today, today-21d, 2026-05-21, 📅 — or {Another "
+                     "Date Column} to compare two dates",
             )
             try:
                 self.cal_btn.grid(row=0, column=3, padx=(0, 4), pady=2)
@@ -6421,17 +6443,19 @@ class FilterRow:
                      + ", ".join(caseload_filter.WITHIN_PRESETS) + ".",
             )
         elif op in numeric_ops:
-            self.value_combo.configure(state="normal", values=[""])
+            col_refs = self._column_value_suggestions(op)
+            self.value_combo.configure(
+                state="normal", values=col_refs or [""])
             self.hint_label.configure(
-                text="Number — e.g. 0, 1.5, 12. The column's cell must "
-                     "also parse as a number.",
+                text="Number — e.g. 0, 1.5, 12 — or {Another Number Column} "
+                     "to compare two columns.",
             )
         elif op in ("is empty", "is not empty"):
             self.value_combo.set("")
             self.value_combo.configure(state="disabled", values=[""])
             self.hint_label.configure(text="(no value needed for this op)")
         elif op in text_ops:
-            suggestions = self._column_value_suggestions()
+            suggestions = self._column_value_suggestions(op)
             self.value_combo.configure(
                 state="normal", values=suggestions or [""])
             if suggestions:
@@ -9245,9 +9269,7 @@ class CaseloadPanel:
             return list(rows)
         headers = list(rows[0].keys())
         filters = [
-            _rewrite_task_filter(
-                {**f, "column": caseload_csv.resolve_column(
-                    f.get("column", ""), headers)})
+            _rewrite_task_filter(_resolve_filter_columns(f, headers))
             for f in self._active_filters
         ]
         try:
@@ -12657,9 +12679,7 @@ class App:
         # entries pass through unchanged.
         csv_headers = list(rows[0].keys()) if rows else []
         filters = [
-            {**f, "column": caseload_csv.resolve_column(
-                f.get("column", ""), csv_headers,
-            )}
+            _resolve_filter_columns(f, csv_headers)
             for f in scenario.batch.filters
         ]
 
@@ -13144,20 +13164,38 @@ class App:
     # messy — offer the atomic states instead).
     _TASK_STATUS_VALUES = ["Passed", "Returned", "In Process", "Submitted"]
 
-    def _filter_value_suggestions(self, display_col: str) -> list:
+    def _filter_value_suggestions(self, display_col: str, op: str = "") -> list:
         """Suggested values for a filter row's value field, given the chosen
-        column (display name). Returns a small list when the column has a
-        sensible fixed vocabulary so the value field can be a dropdown:
-        task-status columns get the curated atomic states; any other column
-        with few distinct values in the loaded caseload (timezone, Essential
-        Action reason, momentum, …) gets those values. Returns [] for
-        high-cardinality / free-text columns (names, dates, notes)."""
+        column + operator.
+        - Date/number ops → `{Other Column}` comparison refs of the matching
+          type (so you can compare two columns, e.g. last contact vs a task
+          date). Excludes the column itself + hidden facet helpers.
+        - Text ops → a small fixed vocabulary: task-status columns get the
+          curated states; any other column with few distinct values
+          (timezone, Essential Action, momentum…) gets those. [] otherwise."""
         rows = getattr(self, "_caseload_rows", None) or []
         if not rows or not display_col:
             return []
-        header = caseload_csv.resolve_column(display_col, list(rows[0].keys()))
-        # A text op on a "Task N" column compares status, so offer the status
-        # vocabulary (date/numeric ops use their own value UI, not this).
+        headers = list(rows[0].keys())
+        sop = caseload_filter.normalize_op(op)
+        date_ops = {"before", "after", "on", "on_or_before", "on_or_after",
+                    "within"}
+        num_ops = {"gt", "lt", "gte", "lte"}
+        if sop in date_ops or sop in num_ops:
+            want = "date" if sop in date_ops else "number"
+            sel = caseload_csv.resolve_column(display_col, headers)
+            sample = rows[:40]
+            refs = []
+            for h in headers:
+                if _is_task_facet_col(h) or h == sel:
+                    continue
+                ctype = caseload_filter.sniff_column_type(
+                    [str(r.get(h, "") or "") for r in sample])
+                if ctype == want:
+                    refs.append("{" + caseload_csv.display_for_column(h) + "}")
+            return sorted(refs)
+        # Text ops → small-vocabulary value suggestions.
+        header = caseload_csv.resolve_column(display_col, headers)
         if re.fullmatch(r"Task\d+(Status)?", header or ""):
             return list(self._TASK_STATUS_VALUES)
         vals: set = set()

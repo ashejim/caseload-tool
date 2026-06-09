@@ -44,6 +44,8 @@ _OP_ALIASES = {
     "is before": "before",
     "is after": "after",
     "is on": "on",
+    "is on or before": "on_or_before",
+    "is on or after": "on_or_after",
     "is within": "within",
     "more than": "gt",
     "less than": "lt",
@@ -93,6 +95,16 @@ def _parse_date_cell(value: str) -> Optional[date]:
             return datetime.strptime(v, fmt).date()
         except ValueError:
             pass
+    # Tolerant fallback: a leading date with trailing junk, e.g. a caseload
+    # Task cell like '2026-09-13 (1)' (date + submission count). Lets a
+    # column-reference value like {Task 1} compare as a date.
+    m = re.match(r"(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4}|\d{1,2}/\d{1,2}/\d{2})", v)
+    if m:
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+            try:
+                return datetime.strptime(m.group(1), fmt).date()
+            except ValueError:
+                pass
     return None
 
 
@@ -200,6 +212,18 @@ def evaluate_filter(filt: dict, row: dict, *, today: Optional[date] = None) -> b
     value_str = "" if value is None else str(value)
     value_lower = value_str.strip().lower()
 
+    # Column-to-column comparison: a value written as "{Other Column}" means
+    # "compare this row's `column` against this row's `Other Column`". Resolve
+    # it to that cell's value here so the op below compares the two cells.
+    value_is_ref = False
+    m_ref = re.fullmatch(r"\{(.+)\}", value_str.strip())
+    if m_ref:
+        value_is_ref = True
+        ref_cell = row.get(m_ref.group(1), "")
+        value = "" if ref_cell is None else str(ref_cell)
+        value_str = value
+        value_lower = value_str.strip().lower()
+
     if op == "empty":
         return cell_str.strip() == ""
     if op == "not_empty":
@@ -223,15 +247,22 @@ def evaluate_filter(filt: dict, row: dict, *, today: Optional[date] = None) -> b
         if op == "not_contains":
             return all(t not in cell_lower for t in targets)
 
-    if op in ("before", "after", "on"):
+    if op in ("before", "after", "on", "on_or_before", "on_or_after"):
         cell_date = _parse_date_cell(cell_str)
-        target_date = _parse_date_value(value_str, today=today)
+        # A column-ref value is a CELL (parse as a date cell); a literal value
+        # may use relative shorthand (today-7d), so parse it as a date value.
+        target_date = (_parse_date_cell(value_str) if value_is_ref
+                       else _parse_date_value(value_str, today=today))
         if cell_date is None or target_date is None:
             return False
         if op == "before":
             return cell_date < target_date
         if op == "after":
             return cell_date > target_date
+        if op == "on_or_before":
+            return cell_date <= target_date
+        if op == "on_or_after":
+            return cell_date >= target_date
         return cell_date == target_date
 
     if op == "within":
