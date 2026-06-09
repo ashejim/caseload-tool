@@ -396,6 +396,14 @@ class BrowserWorker:
         any open inline editor (for building followup-field writes)."""
         self.q.put(("PROBE_FOLLOWUP", on_done))
 
+    def submit_set_followup_date(
+        self, query: str, date_str: str, on_done: Callable[[dict], None],
+    ) -> None:
+        """Row-filter the Caseload list to `query` (a Student ID) and set
+        that student's Followup Date cell to `date_str` (MM/DD/YYYY).
+        on_done({ok, value, error})."""
+        self.q.put(("SET_FOLLOWUP_DATE", query, date_str, on_done))
+
     def submit_read_caseload_columns(
         self, on_done: Callable[[list[dict]], None],
     ) -> None:
@@ -667,6 +675,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._probe_followup(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "SET_FOLLOWUP_DATE":
+            _, query, date_str, on_done = cmd
+            res = {}
+            try:
+                res = self._set_followup_date(ctx, query, date_str)
             finally:
                 on_done(res)
         elif cmd[0] == "READ_CASELOAD_COLUMNS":
@@ -2099,6 +2114,40 @@ class BrowserWorker:
         if err:
             return {"error": err}
         return {"statuses": statuses}
+
+    def _set_followup_date(self, ctx, query: str, date_str: str) -> dict:
+        """Row-filter the live Caseload list to `query` (a Student ID), set
+        that row's Followup Date to `date_str`, then restore the filter.
+        Returns {ok, value, error}."""
+        from src.student_lookup import set_followup_date
+        q = (query or "").strip()
+        if not q:
+            return {"ok": False, "error": "no student id"}
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return {"ok": False, "error": "caseload table didn't load"}
+        fi = None
+        try:
+            fi = target.locator(
+                'input[placeholder="Search All Rows..."]'
+            ).filter(visible=True).first
+            if fi.count() > 0:
+                fi.click(); fi.fill(q); fi.press("Enter")
+                _wait_grid_settled(target, 1200)
+        except Exception as e:
+            return {"ok": False, "error": f"row filter failed: {e}"}
+        try:
+            res = set_followup_date(target, date_str)
+        except Exception as e:
+            res = {"ok": False, "value": "", "error": str(e)}
+        # Restore the filter so the live list is whole again.
+        try:
+            if fi is not None and fi.count() > 0:
+                fi.click(); fi.fill(""); fi.press("Enter")
+                target.wait_for_timeout(400)
+        except Exception:
+            pass
+        return res
 
     def _scrape_all_task_status(self, ctx) -> dict:
         """Bulk '2a' scrape: scroll-load the whole live Caseload list, then
@@ -8438,6 +8487,8 @@ class CaseloadPanel:
         # this is all the context needed; load full notes only if more is
         # wanted.
         r = self._qv_latest_note(r, row)
+        # Editable follow-up date (writes back to Salesforce).
+        r = self._qv_followup_editor(r, row)
         # Essential Actions for this student (right-hand panel).
         self._qv_render_ea(row)
         # New student → reset the notes area to the hint.
@@ -8516,6 +8567,67 @@ class CaseloadPanel:
             box, text=note, anchor="w", justify="left", wraplength=320,
             font=ctk.CTkFont(size=12),
         ).grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+        return r + 1
+
+    def _qv_followup_editor(self, r, row) -> int:
+        """Editable Follow-up Date: shows the current value (CSV
+        CourseFollowupDate), lets the user type or pick a date and write it
+        back to Salesforce. The CSV value won't refresh until the next ↻, so
+        success is confirmed in the activity log."""
+        sid = self._cell(row, "StudentID")
+        if not sid:
+            return r
+        cur = self._cell(row, "CourseFollowupDate")
+        frame = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        frame.grid(row=r, column=0, columnspan=2, sticky="ew",
+                   padx=4, pady=(4, 2))
+        frame.grid_columnconfigure(4, weight=1)
+        ctk.CTkLabel(
+            frame, text="Follow-up date", anchor="w",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"),
+        ).grid(row=0, column=0, sticky="w", padx=(4, 6))
+        entry = ctk.CTkEntry(frame, width=104, placeholder_text="MM/DD/YYYY")
+        if cur:
+            entry.insert(0, cur)
+        entry.grid(row=0, column=1, sticky="w")
+
+        def pick() -> None:
+            from datetime import datetime as _dt
+            initial = None
+            cur_val = entry.get().strip()
+            for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
+                try:
+                    initial = _dt.strptime(cur_val, fmt).date()
+                    break
+                except ValueError:
+                    continue
+            d = prompt_calendar_pick(self.frame.winfo_toplevel(), initial)
+            if d:
+                entry.delete(0, "end")
+                entry.insert(0, d.strftime("%m/%d/%Y"))
+
+        ctk.CTkButton(
+            frame, text="📅", width=32, command=pick, **SECONDARY_BTN_KWARGS,
+        ).grid(row=0, column=2, padx=2)
+        def do_set() -> None:
+            val = entry.get().strip()
+
+            def _applied(res) -> None:
+                # On success, reflect the new date in the cached row so
+                # reopening the student shows it (until the next ↻ reloads
+                # the CSV). The grid's column, if shown, picks it up too.
+                if res.get("ok"):
+                    try:
+                        row["CourseFollowupDate"] = val
+                    except Exception:
+                        pass
+
+            self.app._set_followup_date_for(sid, val, on_apply=_applied)
+
+        ctk.CTkButton(
+            frame, text="Set", width=46, command=do_set,
+        ).grid(row=0, column=3, padx=2)
         return r + 1
 
     def _qv_field(self, r, row, label, key, kind) -> int:
@@ -15590,6 +15702,51 @@ class App:
             except Exception:
                 pass
         self.worker.submit_probe_ea(on_done)
+
+    def _set_followup_date_for(self, student_id: str, date_str: str,
+                               on_apply=None) -> None:
+        """WRITE the student's Salesforce Followup Date to `date_str`
+        (MM/DD/YYYY) via the live caseload list. Blocks the UI briefly (it's
+        a real write that drives the browser). on_apply(res) gets
+        {ok, value, error} on the UI thread."""
+        sid = (student_id or "").strip()
+        date_str = (date_str or "").strip()
+        if not sid:
+            return
+        if not date_str:
+            self._append_log("Enter a follow-up date first (MM/DD/YYYY).")
+            return
+        if getattr(self, "_is_busy", False):
+            self._append_log("Busy — try again when the current task finishes.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet.")
+            return
+        self._set_busy(f"Setting follow-up date for {sid}…")
+
+        def on_done(res):
+            def apply():
+                self._set_idle()
+                if not res or res.get("error"):
+                    self._append_log(
+                        f"Set follow-up date failed: {(res or {}).get('error')}",
+                        error=True)
+                else:
+                    self._append_log(
+                        f"Follow-up date set to {res.get('value') or date_str} "
+                        f"for {sid}.")
+                if on_apply:
+                    try:
+                        on_apply(res or {})
+                    except Exception:
+                        pass
+            try:
+                self.root.after(0, apply)
+            except Exception:
+                self._set_idle()
+
+        self._append_log(f"Setting follow-up date {date_str} for {sid}…")
+        self.worker.submit_set_followup_date(sid, date_str, on_done)
 
     def _fetch_task_status_for(self, student_id: str, on_apply) -> None:
         """On-demand: fetch a student's real per-task pass/fail from the

@@ -384,6 +384,82 @@ def read_loaded_task_status(table) -> dict:
     return result
 
 
+def set_followup_date(page: Page, date_str: str) -> dict:
+    """Set the Followup Date cell on the Caseload LIST to `date_str`
+    (MM/DD/YYYY). The CALLER must have row-filtered the list to ONE student
+    first (so td[data-label="Followup Date"] is that student's cell).
+
+    The list is a custom Aura cDataGrid that inline-edits per cell with NO
+    Salesforce Save bar: click the cell's 'Add followup date' button → type
+    the date → commit (Enter + Tab/blur). Re-reads the cell to confirm.
+    Returns {ok: bool, value: str, error: str}. Requires the Followup Date
+    column to be visible in the list view."""
+    cell = page.locator('td[data-label="Followup Date"]').first
+    try:
+        if cell.count() == 0:
+            return {"ok": False, "value": "",
+                    "error": "Followup Date column not visible in the list"}
+    except Exception as e:
+        return {"ok": False, "value": "", "error": str(e)}
+    # Open the inline editor: the 'Add followup date' button, else the cell.
+    opened = False
+    try:
+        add = cell.locator('button[title^="Add followup date"]')
+        if add.count() > 0:
+            add.first.click()
+            opened = True
+    except Exception:
+        pass
+    if not opened:
+        try:
+            cell.click()
+        except Exception:
+            pass
+    # Fill the revealed text input.
+    try:
+        inp = cell.locator('input[type="text"]').first
+        inp.wait_for(state="visible", timeout=3000)
+        inp.click()
+        inp.fill("")
+        inp.fill(date_str)
+    except Exception as e:
+        return {"ok": False, "value": "",
+                "error": f"date input didn't appear: {e}"}
+    # Commit. The custom grid commits inline — try Enter, then blur via Tab.
+    for key in ("Enter", "Tab"):
+        try:
+            inp.press(key)
+        except Exception:
+            pass
+    try:
+        page.wait_for_timeout(900)
+    except Exception:
+        pass
+    # Re-read the cell to confirm what stuck (format may normalize).
+    value = ""
+    try:
+        sp = cell.locator('span.uiOutputDate')
+        if sp.count() > 0:
+            value = (sp.first.inner_text() or "").strip()
+        if not value:
+            # Editor may not have closed yet — read the input's value, NOT
+            # cell.inner_text() (which would grab the calendar icon's
+            # "Date Picker" assistive text).
+            inp2 = cell.locator('input[type="text"]')
+            if inp2.count() > 0:
+                try:
+                    value = (inp2.first.input_value() or "").strip()
+                except Exception:
+                    value = ""
+    except Exception:
+        pass
+    if value.strip().lower() == "date picker":  # assistive-text leak guard
+        value = ""
+    return {"ok": bool(value), "value": value,
+            "error": "" if value else
+            "no value after commit — the commit trigger may differ"}
+
+
 # ----- Essential Actions (EA) -----
 _EA_TAB_SEL = '[data-tab-value="EssentialActionsTab"]'
 _EA_TABLE_SEL = '.cEssentialActionDataTable'
