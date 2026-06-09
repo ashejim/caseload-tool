@@ -9193,11 +9193,20 @@ class CaseloadPanel:
         widths from the persisted prefs."""
         prefs = self._load_col_prefs()
         visible = self._resolve_display_columns(headers, prefs)
+        # Defensive: displaycolumns MUST only name columns the tree actually
+        # defines — one stray name makes ttk reject the WHOLE assignment, so a
+        # single bad entry would silently break show/hide entirely.
         try:
-            self.tree["displaycolumns"] = visible
+            defined = set(self.tree["columns"])
+        except Exception:
+            defined = set(headers)
+        safe = [v for v in visible if v in defined] or \
+            [h for h in headers if h in defined]
+        try:
+            self.tree["displaycolumns"] = safe
         except Exception:
             try:
-                self.tree["displaycolumns"] = list(headers)
+                self.tree.configure(displaycolumns="#all")
             except Exception:
                 pass
         widths = prefs.get("widths", {})
@@ -9258,7 +9267,11 @@ class CaseloadPanel:
         rows = self.app._caseload_rows or []
         if not rows:
             return
-        headers = list(rows[0].keys())
+        # Same column set the grid actually has — EXCLUDE the hidden per-task
+        # facet helpers (Task1Date/…); otherwise Apply would try to put them
+        # in displaycolumns, which the tree doesn't define → ttk error → the
+        # whole show/hide silently no-ops.
+        headers = [h for h in rows[0].keys() if not _is_task_facet_col(h)]
         # Capture any drag-resizes done since load so they aren't lost.
         self.persist_column_state()
         prefs = self._load_col_prefs()
