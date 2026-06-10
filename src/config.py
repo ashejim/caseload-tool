@@ -128,6 +128,11 @@ DEFAULT_EMAIL_TEMPLATES_DIR = (
 # here; round 2 will populate it via Playwright export automation.
 CASELOAD_CSV_PATH = USER_CONFIG_DIR / "caseload.csv"
 
+# Local longitudinal history of the dynamic caseload fields (Momentum,
+# task status, …) snapshotted on every CSV reload. SQLite so it reads
+# straight into pandas; see src/history.py.
+HISTORY_DB = USER_CONFIG_DIR / "history.db"
+
 # Default to WGU's standard Caseload page. Override via .env in the user
 # config dir if your campus / org uses a different Salesforce instance.
 DEFAULT_CASELOAD_URL = "https://srm.lightning.force.com/lightning/n/Caseload_App_Page"

@@ -32,6 +32,10 @@ note_log.csv
 caseload.csv
 # Backups/temp written by the download anti-clobber guard (also PII).
 caseload.csv.*
+# Local caseload history snapshots — student PII, FERPA, never commit
+# (covers history.db and any -journal/-wal/-shm sidecars + CSV exports).
+history.db*
+caseload_history.csv
 # Single-instance lock file (runtime).
 launcher.lock
 

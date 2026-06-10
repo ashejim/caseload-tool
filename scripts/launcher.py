@@ -42,11 +42,11 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import caseload_csv, caseload_filter, email_template
+from src import caseload_csv, caseload_filter, email_template, history
 from src.browser import persistent_context
 from src.config import (
     CASELOAD_CSV_PATH, CASELOAD_URL, DEFAULT_EMAIL_TEMPLATES_DIR,
-    DEFAULT_SCENARIOS_FILE, EMAIL_TEMPLATES_DIR, NOTE_LOG_CSV,
+    DEFAULT_SCENARIOS_FILE, EMAIL_TEMPLATES_DIR, HISTORY_DB, NOTE_LOG_CSV,
     USER_CONFIG_DIR, Settings, load_settings, save_settings,
     set_templates_dir, templates_dir,
 )
@@ -8098,6 +8098,18 @@ class CaseloadPanel:
             **SECONDARY_BTN_KWARGS,
         )
         self.popout_btn.grid(row=0, column=7, padx=(0, 4))
+        # Local history: review students who left the caseload + export the
+        # snapshot DB for pandas/Excel.
+        self.departures_btn = ctk.CTkButton(
+            bar, text="⚑ Departures", width=100,
+            command=self._open_departures_dialog, **SECONDARY_BTN_KWARGS,
+        )
+        self.departures_btn.grid(row=0, column=8, padx=(0, 4))
+        self.export_history_btn = ctk.CTkButton(
+            bar, text="⤓ Export history", width=110,
+            command=self._export_history, **SECONDARY_BTN_KWARGS,
+        )
+        self.export_history_btn.grid(row=0, column=9, padx=(0, 4))
 
         # Collapsible filters section (row 1) — hidden until toggled.
         self.filters_wrap = ctk.CTkFrame(self.frame)
@@ -8540,6 +8552,102 @@ class CaseloadPanel:
         row = self._focused_row()
         if row is not None:
             self.show_quick_view(row)
+
+    def _open_departures_dialog(self) -> None:
+        """Show students who left the caseload since the last history capture
+        (passed = informational; anything else = needs follow-up). Reads the
+        local history DB fresh so it's always current."""
+        try:
+            deps = history.find_departures()
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showwarning("Departures", f"Couldn't read history: {e}")
+            return
+
+        dlg = ctk.CTkToplevel(self.frame)
+        dlg.title("Departed students")
+        dlg.geometry("580x460")
+        try:
+            dlg.transient(self.frame.winfo_toplevel())
+        except Exception:
+            pass
+        dlg.attributes("-topmost", True)
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        dlg.grid_columnconfigure(0, weight=1)
+        dlg.grid_rowconfigure(1, weight=1)
+
+        fu = sum(1 for d in deps if d["classification"] == "followup")
+        ctk.CTkLabel(
+            dlg,
+            text=(f"{len(deps)} departed since last capture — "
+                  f"{fu} need follow-up"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+
+        scroll = ctk.CTkScrollableFrame(dlg)
+        scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        scroll.grid_columnconfigure(1, weight=1)
+
+        if not deps:
+            ctk.CTkLabel(
+                scroll, text="No departures since the last capture.",
+                text_color=("gray40", "gray65"),
+            ).grid(row=0, column=0, columnspan=2, padx=8, pady=20)
+        else:
+            # Follow-ups first, then completed; each block alphabetical-ish by
+            # the order find_departures returned (prior-collection order).
+            ordered = ([d for d in deps if d["classification"] == "followup"]
+                       + [d for d in deps if d["classification"] != "followup"])
+            for i, d in enumerate(ordered):
+                followup = d["classification"] == "followup"
+                tag = ctk.CTkLabel(
+                    scroll,
+                    text=("FOLLOW UP" if followup else "completed"),
+                    width=84, corner_radius=6,
+                    fg_color=("#b3261e" if followup else "#3a3a3a"),
+                    text_color="white",
+                    font=ctk.CTkFont(size=10, weight="bold"),
+                )
+                tag.grid(row=i, column=0, padx=(4, 8), pady=2, sticky="w")
+                last = d.get("last_task_status") or "—"
+                seen = d.get("last_seen_date") or "?"
+                detail = (f"{d.get('name') or d['student_id']}  "
+                          f"[{d['student_id']}]  ·  {d['course_code']}  ·  "
+                          f"last: {last}  ·  seen {seen}")
+                ctk.CTkLabel(
+                    scroll, text=detail, anchor="w", justify="left",
+                ).grid(row=i, column=1, padx=4, pady=2, sticky="w")
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 10))
+        ctk.CTkButton(
+            btns, text="⤓ Export history", width=120,
+            command=self._export_history, **SECONDARY_BTN_KWARGS,
+        ).pack(side="left")
+        ctk.CTkButton(
+            btns, text="Close", width=80, command=dlg.destroy,
+        ).pack(side="right")
+
+    def _export_history(self) -> None:
+        """Dump the snapshot history to a CSV the user picks (for pandas/Excel)."""
+        from tkinter import filedialog, messagebox
+        path = filedialog.asksaveasfilename(
+            title="Export caseload history",
+            defaultextension=".csv",
+            initialfile="caseload_history.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            n = history.export_to_csv(path)
+        except Exception as e:
+            messagebox.showwarning("Export history", f"Export failed: {e}")
+            return
+        self.app._append_log(f"Exported {n} history rows → {path}")
 
     def _cell(self, row: dict, key: str) -> str:
         return str(row.get(key, "") or "").strip()
@@ -10098,6 +10206,9 @@ class App:
         # recognize, here's what IS there" message once per session
         # rather than on every student in a batch.
         self._email_diag_logged = False
+        # Summary from the most recent history snapshot (status + departures);
+        # read by the ⚑ Departures button. None until the first reload runs.
+        self._last_history_summary = None
         self._reload_caseload_cache(silent=True)
 
         # Busy-state guard so the user can't fire a second action
@@ -15575,6 +15686,31 @@ class App:
         self._apply_task_status_to_rows()
         self._refresh_caseload_panel()
         self._check_required_caseload_columns(rows, silent=silent)
+        # Snapshot the dynamic fields into the local history DB (non-fatal:
+        # the panel is already rendered, and a DB failure must not break the
+        # reload). Runs on the silent startup reload too — that's the
+        # once-a-day capture baseline.
+        try:
+            summary = history.record_snapshot(
+                rows, self._caseload_csv_mtime,
+                note="startup" if silent else "manual",
+            )
+            self._last_history_summary = summary
+            if not silent and summary.get("status") in ("captured", "updated"):
+                n = summary.get("row_count", 0)
+                dep = summary.get("departure_count", 0)
+                msg = f"History: {summary['status']} {n} rows."
+                if dep:
+                    fu = sum(1 for d in summary["departures"]
+                             if d["classification"] == "followup")
+                    msg += (f"  {dep} departed since last seen "
+                            f"({fu} need follow-up).")
+                self._append_log(msg)
+            elif not silent and summary.get("warning"):
+                self._append_log(summary["warning"], error=True)
+        except Exception as e:
+            if not silent:
+                self._append_log(f"(history snapshot skipped: {e})")
         return True
 
     def _read_clipboard_content(self) -> str:
