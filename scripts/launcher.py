@@ -3848,16 +3848,80 @@ def prompt_add_image_dialog(
     return result["html"], result["filename"]
 
 
+def _extract_cf_html_fragment(raw: bytes) -> Optional[str]:
+    """Pull the copied HTML fragment out of a Windows 'HTML Format' clipboard
+    payload. The payload is a header (Version/StartHTML/StartFragment/… BYTE
+    offsets) followed by HTML with <!--StartFragment-->…<!--EndFragment-->
+    markers around the actual selection. Prefer the byte offsets (exact), fall
+    back to the comment markers, then the whole thing."""
+    try:
+        header = raw[:256].decode("ascii", "replace")
+        sf = re.search(r"StartFragment:(\d+)", header)
+        ef = re.search(r"EndFragment:(\d+)", header)
+        if sf and ef:
+            frag = raw[int(sf.group(1)):int(ef.group(1))]
+            return frag.decode("utf-8", "replace")
+    except Exception:
+        pass
+    try:
+        text = raw.decode("utf-8", "replace")
+    except Exception:
+        return None
+    s = text.find("<!--StartFragment-->")
+    e = text.find("<!--EndFragment-->")
+    if s != -1 and e != -1:
+        return text[s + len("<!--StartFragment-->"):e]
+    return text or None
+
+
+def _clipboard_html_fragment() -> Optional[str]:
+    """The clipboard's rich-HTML form (with links/formatting), or None when
+    the clipboard has no HTML (so callers fall back to plain-text paste).
+    Windows-only via pywin32's win32clipboard (already a dependency)."""
+    try:
+        import win32clipboard as wc
+    except Exception:
+        return None
+    try:
+        wc.OpenClipboard()
+    except Exception:
+        return None
+    try:
+        cf = wc.RegisterClipboardFormat("HTML Format")
+        if not wc.IsClipboardFormatAvailable(cf):
+            return None
+        raw = wc.GetClipboardData(cf)
+    except Exception:
+        return None
+    finally:
+        try:
+            wc.CloseClipboard()
+        except Exception:
+            pass
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "replace")
+    if not isinstance(raw, (bytes, bytearray)):
+        return None
+    return _extract_cf_html_fragment(bytes(raw))
+
+
 class _EditorHTMLParser(HTMLParser):
     """Parse simple HTML into a RichTextEditor's Tk Text with editable
     tags. Companion to RichTextEditor.to_html — handles paragraphs,
     headings, b/i/u, links, alignment, images, and (for round-tripping
     older templates) bullet/numbered lists rendered as plain lines."""
 
-    def __init__(self, editor: "RichTextEditor"):
+    def __init__(self, editor: "RichTextEditor", anchor: str = "end"):
         super().__init__()
         self.ed = editor
         self.t = editor.text
+        # Where parsed content lands: "end" when building the whole document
+        # (set_html), or "insert" to splice at the cursor (rich paste). `_here`
+        # is the matching "current position" index — "end-1c" sits just before
+        # the Text widget's permanent trailing newline; the insert mark needs
+        # no such offset.
+        self.anchor = anchor
+        self._here = "end-1c" if anchor == "end" else "insert"
         self._inline: list[str] = []        # active bold/italic/underline
         self._link: Optional[str] = None    # active link tag name
         self._block_start: Optional[str] = None
@@ -3872,16 +3936,16 @@ class _EditorHTMLParser(HTMLParser):
 
     def _begin_block(self, block: str, align: str) -> None:
         if self._pending_nl:
-            self.t.insert("end", "\n")
+            self.t.insert(self.anchor, "\n")
         self._pending_nl = False
-        self._block_start = self.t.index("end-1c")
+        self._block_start = self.t.index(self._here)
         self._block = block
         self._align = align
 
     def _end_block(self) -> None:
         if self._block_start is None:
             return
-        end = self.t.index("end-1c")
+        end = self.t.index(self._here)
         if self._block == "h2":
             self.t.tag_add("h2", self._block_start, end)
         elif self._block in ("ul", "ol"):
@@ -3909,12 +3973,15 @@ class _EditorHTMLParser(HTMLParser):
         if self._skip:
             return
         d = dict(attrs)
-        if tag == "p":
+        if tag in ("p", "div"):
+            # div is treated as a paragraph break — web/Outlook content uses
+            # it per line; the pending-newline logic keeps siblings on
+            # separate lines without breaking on benign nesting.
             self._begin_block("p", self._align_of(d))
         elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
             self._begin_block("h2", self._align_of(d))
         elif tag == "br":
-            self.t.insert("end", "\n")
+            self.t.insert(self.anchor, "\n")
         elif tag in ("b", "strong"):
             self._inline.append("bold")
         elif tag in ("i", "em"):
@@ -3928,21 +3995,22 @@ class _EditorHTMLParser(HTMLParser):
             self._ol_n.append(0)
         elif tag == "li":
             if self._pending_nl:
-                self.t.insert("end", "\n")
+                self.t.insert(self.anchor, "\n")
             self._pending_nl = False
-            self._block_start = self.t.index("end-1c")
+            self._block_start = self.t.index(self._here)
             kind = "ol" if (self._list and self._list[-1] == "ol") else "ul"
             self._block, self._align = kind, "left"
-            mstart = self.t.index("end-1c")
+            mstart = self.t.index(self._here)
             if kind == "ol":
                 self._ol_n[-1] += 1
-                self.t.insert("end", "%d. " % self._ol_n[-1])
+                self.t.insert(self.anchor, "%d. " % self._ol_n[-1])
             else:
-                self.t.insert("end", "• ")
-            self.t.tag_add("listmarker", mstart, "end-1c")
+                self.t.insert(self.anchor, "• ")
+            self.t.tag_add("listmarker", mstart, self._here)
         elif tag == "img":
             self.ed._insert_image_token(
-                d.get("src", ""), pending_nl=self._pending_nl)
+                d.get("src", ""), pending_nl=self._pending_nl,
+                anchor=self.anchor)
             self._pending_nl = True
 
     def handle_endtag(self, tag):
@@ -3951,7 +4019,7 @@ class _EditorHTMLParser(HTMLParser):
             return
         if self._skip:
             return
-        if tag in ("p", "h1", "h2", "h3", "h4", "h5", "h6", "li"):
+        if tag in ("p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li"):
             self._end_block()
         elif tag in ("b", "strong"):
             self._pop("bold")
@@ -3974,7 +4042,7 @@ class _EditorHTMLParser(HTMLParser):
 
     def _insert(self, text: str) -> None:
         tags = tuple(self._inline) + ((self._link,) if self._link else ())
-        self.t.insert("end", text, tags)
+        self.t.insert(self.anchor, text, tags)
 
     def handle_data(self, data):
         if self._skip:
@@ -4039,6 +4107,8 @@ class RichTextEditor:
         # Enter continues/exits a list; Space drives Markdown shortcuts.
         self.text.bind("<Return>", self._on_return)
         self.text.bind("<KeyPress-space>", self._on_space)
+        # Rich paste: keep links/bold/etc. when the clipboard carries HTML.
+        self.text.bind("<<Paste>>", self._on_paste)
 
     # ----- setup -----
 
@@ -4301,17 +4371,19 @@ class RichTextEditor:
         self.text.insert("insert", text)
         self.text.focus_set()
 
-    def _insert_image_token(self, src: str, pending_nl: bool = False) -> None:
+    def _insert_image_token(self, src: str, pending_nl: bool = False,
+                            anchor: str = "end") -> None:
+        here = "end-1c" if anchor == "end" else "insert"
         if pending_nl:
-            self.text.insert("end", "\n")
+            self.text.insert(anchor, "\n")
         stem = src[4:] if src.startswith("cid:") else src.rsplit("/", 1)[-1]
         self._img_seq += 1
         tag = f"img#{self._img_seq}"
         self._imgs[tag] = src
-        start = self.text.index("end-1c")
-        self.text.insert("end", f"🖼 {stem}")
-        self.text.tag_add("image", start, "end-1c")
-        self.text.tag_add(tag, start, "end-1c")
+        start = self.text.index(here)
+        self.text.insert(anchor, f"🖼 {stem}")
+        self.text.tag_add("image", start, here)
+        self.text.tag_add(tag, start, here)
 
     def insert_image(self, src: str) -> None:
         """Insert an image placeholder at a fresh line near the cursor."""
@@ -4348,6 +4420,32 @@ class RichTextEditor:
             self.text.delete("1.0", "2.0")
         self._renumber_lists()  # normalize bullet/number markers
         self.text.edit_reset()
+
+    def _on_paste(self, event=None):
+        """Paste rich content (links, bold, etc.) when the clipboard carries
+        HTML, by parsing it in at the cursor. With no HTML on the clipboard,
+        returns None so Tk's default plain-text paste runs unchanged."""
+        frag = _clipboard_html_fragment()
+        if not frag or not frag.strip():
+            return None  # plain text only -> let the default <<Paste>> proceed
+        try:
+            if self.text.tag_ranges("sel"):
+                self.text.delete("sel.first", "sel.last")
+        except Exception:
+            pass
+        parser = _EditorHTMLParser(self, anchor="insert")
+        try:
+            parser.feed(frag)
+            parser.close()
+        except Exception:
+            pass  # best-effort: whatever parsed before the error stays
+        self._renumber_lists()
+        try:
+            self.text.see("insert")
+        except Exception:
+            pass
+        self.text.focus_set()
+        return "break"  # consumed — skip the default plain-text paste
 
     def _inline_key_at(self, idx: str):
         names = self.text.tag_names(idx)
