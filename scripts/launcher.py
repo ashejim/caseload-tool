@@ -13615,7 +13615,13 @@ class App:
                 if scheduled else "sending now")
         self._append_log(
             f"Text: {when} for {who} via {inbox_label or 'current inbox'}…")
-        res = self._send_text_blocking(payload)
+        # Lock the browser while the tool drives Mongoose (the review dialog
+        # already ran, so the scrim hides nothing the user needs).
+        self._lock_browser_for_run()
+        try:
+            res = self._send_text_blocking(payload)
+        finally:
+            self._unlock_browser_after_run()
         if not res or res.get("error"):
             self._append_log(f"Text failed: {(res or {}).get('error')}",
                              error=True)
@@ -13915,34 +13921,73 @@ class App:
             self._append_log("Batch text: 0 selected; nothing to do.")
             return
 
-        # Send/schedule each selected student (one compose each).
-        sent = 0
-        for n, idx in enumerate(selected, 1):
+        # Group students who can share ONE compose: identical rendered body +
+        # inbox + schedule slot. Personalized messages differ per student (so
+        # 1 compose each), but a GENERIC message collapses to a single
+        # multi-recipient compose per (inbox, schedule) — far fewer composes.
+        groups: dict = {}
+        order: list = []
+        skipped = 0
+        for idx in selected:
             e = entries[idx]
             blocking = [i for i in e["issues"]
                         if i == "no mobile" or i.startswith("unknown tz")]
             if blocking:
                 self._append_log(
-                    f"  text {n}/{len(selected)}: skipped {e['name']} "
-                    f"({', '.join(blocking)}).", error=True)
-                continue
-            payload = {
-                "body": e["body"], "recipients": [e["mobile"]],
-                "inbox_label": e["inbox_label"], "schedule": e["schedule"],
-                "schedule_name": e["schedule_name"], "commit": True,
-            }
-            self._append_log(
-                f"  text {n}/{len(selected)}: {e['name']} ({e['when_str']})…")
-            res = self._send_text_blocking(payload)
-            if not res or res.get("error"):
-                self._append_log(
-                    f"  text failed for {e['name']}: {(res or {}).get('error')}",
+                    f"  text: skipped {e['name']} ({', '.join(blocking)}).",
                     error=True)
-            else:
-                sent += 1
+                skipped += 1
+                continue
+            sch = e["schedule"]
+            key = (e["body"], e["inbox_label"],
+                   (sch["date_str"], sch["hour12"], sch["minute"], sch["ampm"])
+                   if sch else None)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(e)
+
+        if not order:
+            self._append_log("Batch text: nothing sendable.")
+            return
+        total_recip = sum(len(groups[k]) for k in order)
+        ngroups = len(order)
+        if ngroups < total_recip:
+            self._append_log(
+                f"Batch text: grouped into {ngroups} compose(s) for "
+                f"{total_recip} recipient(s) (identical messages share a send).")
+
+        # Lock the browser for the whole non-interactive send loop (the review
+        # already happened, so the scrim hides nothing the user needs).
+        self._lock_browser_for_run()
+        sent = 0
+        try:
+            for gi, key in enumerate(order, 1):
+                g = groups[key]
+                e0 = g[0]
+                mobiles = [x["mobile"] for x in g]
+                names = ", ".join(x["name"] for x in g)
+                payload = {
+                    "body": e0["body"], "recipients": mobiles,
+                    "inbox_label": e0["inbox_label"], "schedule": e0["schedule"],
+                    "schedule_name": e0["schedule_name"], "commit": True,
+                }
+                self._append_log(
+                    f"  text {gi}/{ngroups}: {len(mobiles)} recipient(s) "
+                    f"[{names}] ({e0['when_str']})…")
+                res = self._send_text_blocking(payload)
+                if not res or res.get("error"):
+                    self._append_log(
+                        f"  text failed [{names}]: {(res or {}).get('error')}",
+                        error=True)
+                else:
+                    sent += len(mobiles)
+        finally:
+            self._unlock_browser_after_run()
         self._append_log(
-            f"Batch text complete: {sent}/{len(selected)} "
-            f"{'scheduled' if scheduled else 'sent'}.")
+            f"Batch text complete: {sent} recipient(s) in {ngroups} compose(s) "
+            f"{'scheduled' if scheduled else 'sent'}"
+            + (f"; {skipped} skipped." if skipped else "."))
 
     @staticmethod
     def _row_name_and_query(row: dict) -> tuple[str, str]:
@@ -16232,7 +16277,7 @@ class App:
             tk.Label(
                 ov,
                 text="🔒  Automation running\n\n"
-                     "Please don't click in Salesforce until this finishes.",
+                     "Please don't click in the browser until this finishes.",
                 bg="#0d1117", fg="#ffffff",
                 font=("Segoe UI", 16, "bold"), justify="center",
             ).place(relx=0.5, rely=0.5, anchor="center")
@@ -16245,6 +16290,22 @@ class App:
             self._track_lock_overlay()
         except Exception:
             self._lock_overlay = None
+
+    def _lock_browser_for_run(self) -> None:
+        """Disable OS input to the browser window AND show the scrim, so a
+        stray click can't disturb automation (Salesforce or Mongoose)."""
+        try:
+            self.worker.set_browser_enabled(False)
+        except Exception:
+            pass
+        self._show_browser_lock()
+
+    def _unlock_browser_after_run(self) -> None:
+        self._hide_browser_lock()
+        try:
+            self.worker.set_browser_enabled(True)
+        except Exception:
+            pass
 
     def _hide_browser_lock(self) -> None:
         ov = getattr(self, "_lock_overlay", None)
