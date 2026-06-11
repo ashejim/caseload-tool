@@ -522,17 +522,11 @@ class BrowserWorker:
                     self._raise_browser_window()
                 except Exception:
                     pass
-                # Texting (Mongoose) lives on a separate site the app drives in
-                # its OWN context. Open it now, at startup, in a dedicated tab:
-                # a user-opened new tab while Salesforce is the main page hangs
-                # at about:blank, but a Playwright-driven new_page()+goto() here
-                # loads fine, and the texting feature needs a persistent
-                # Mongoose tab anyway. focus=False so it doesn't pull focus from
-                # the Salesforce login. Best-effort — never block startup.
-                try:
-                    self._open_mongoose(ctx, focus=False)
-                except Exception:
-                    pass
+                # NOTE: Mongoose is opened on demand via 🐭 Open Mongoose, NOT
+                # at startup. A new_page()+goto() this early still hangs at
+                # about:blank — the popup hang only clears after the caseload
+                # load runs real Playwright actions later. By the time the user
+                # clicks the button, popups work; opening it then is reliable.
                 while True:
                     cmd = self.q.get()
                     if cmd is self.SHUTDOWN:
