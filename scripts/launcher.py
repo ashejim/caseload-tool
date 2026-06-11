@@ -397,6 +397,14 @@ class BrowserWorker:
         (commit=False — stops at the confirm step for review)."""
         self.q.put(("TEST_TEXT", mobile, body, on_done))
 
+    def submit_send_text(
+        self, payload: dict, on_done: Callable[[dict], None],
+    ) -> None:
+        """Drive the Mongoose compose modal from a fired text action. `payload`:
+        body, recipients (list of mobiles), inbox_label, schedule (slot dict or
+        None), schedule_name, commit."""
+        self.q.put(("SEND_TEXT", payload, on_done))
+
     def submit_set_followup_date(
         self, query: str, date_str: str, on_done: Callable[[dict], None],
     ) -> None:
@@ -689,6 +697,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._test_text(ctx, mobile, body)
+            finally:
+                on_done(res)
+        elif cmd[0] == "SEND_TEXT":
+            _, payload, on_done = cmd
+            res = {}
+            try:
+                res = self._send_text(ctx, payload)
             finally:
                 on_done(res)
         elif cmd[0] == "SET_FOLLOWUP_DATE":
@@ -2329,6 +2344,45 @@ class BrowserWorker:
             except Exception:
                 continue
         return None
+
+    def _send_text(self, ctx, payload: dict) -> dict:
+        """Drive the Mongoose compose modal from a fired text action. `payload`
+        carries the rendered body, recipient mobiles, inbox label, an optional
+        schedule-slot dict, the schedule name, and the commit flag. Returns
+        {ok} or {error}."""
+        page = self._mongoose_page(ctx)
+        if page is None:
+            return {"error": "No Mongoose tab open — open Mongoose first "
+                             "(🐭 Open Mongoose)."}
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        from src import text_message as tm
+        sch = payload.get("schedule")
+        slot = None
+        if sch:
+            slot = tm.ScheduleSlot(
+                team_dt=None,
+                date_str=sch.get("date_str", ""),
+                hour12=int(sch.get("hour12", 10)),
+                minute=int(sch.get("minute", 0)),
+                ampm=sch.get("ampm", "AM"),
+                student_local_str=sch.get("student_local_str", ""),
+            )
+        msg = tm.TextMessage(
+            body=payload.get("body", ""),
+            recipients_mobile=list(payload.get("recipients") or []),
+            inbox_label=payload.get("inbox_label", ""),
+            schedule=slot,
+            schedule_name=payload.get("schedule_name", ""),
+            commit=bool(payload.get("commit", False)),
+        )
+        try:
+            tm.send_text(page, msg, on_status=self.on_status)
+            return {"ok": True}
+        except Exception as e:
+            return {"error": str(e)}
 
     def _test_text(self, ctx, mobile: str, body: str) -> dict:
         """TEMP dev: drive the Mongoose compose modal for one REAL recipient and
@@ -7882,6 +7936,9 @@ class ScenarioEditor:
         self.find_first_var.set(scenario.find_first)
         # Panel-action toggle (forced off below for batch scenarios).
         self.panel_action_var.set(scenario.panel_action)
+        # Text (Mongoose) config has no editor UI yet — stash it so serialize()
+        # round-trips it unchanged instead of dropping it on save.
+        self._loaded_text = scenario.text
         # Batch config — populate filter rows + visibility.
         self._batch_preview = scenario.batch.preview if scenario.batch else True
         # Rebuild prompt rows fresh from the scenario.
@@ -7992,6 +8049,18 @@ class ScenarioEditor:
             prompts_out = [p for p in prompts_out if p.get("var")]
             if prompts_out:
                 out["prompts"] = prompts_out
+        # Text (Mongoose) config — no editor UI yet, so round-trip the loaded
+        # config unchanged rather than dropping it on save.
+        text_cfg = getattr(self, "_loaded_text", None)
+        if text_cfg is not None:
+            out["text"] = {
+                "body": text_cfg.body,
+                "body_file": text_cfg.body_file,
+                "schedule": text_cfg.schedule,
+                "target_hour": text_cfg.target_hour,
+                "inbox_label": text_cfg.inbox_label,
+                "commit": text_cfg.commit,
+            }
         return out
 
 
@@ -12950,11 +13019,153 @@ class App:
                 if 0 <= i < len(scenario.notes):
                     scenario.notes[i].academic_activities = acts
 
-        self.worker.submit_scenario(
-            scenario, override, clipboard,
-            custom_bodies=custom_bodies,
-            prompt_vars=prompt_vars, ea=ea_arg,
-        )
+        # Text (Mongoose) channel — fire before the note submit so a text-only
+        # action doesn't fall through to the note-form path.
+        if scenario.text is not None:
+            self._fire_text(scenario, chosen_name, prompt_vars)
+
+        # Note submit — skip for channel-only (text/email) actions with no notes.
+        if scenario.notes:
+            self.worker.submit_scenario(
+                scenario, override, clipboard,
+                custom_bodies=custom_bodies,
+                prompt_vars=prompt_vars, ea=ea_arg,
+            )
+
+    def _caseload_row_by_id(self, student_id: str) -> Optional[dict]:
+        """The cached caseload CSV row for a Student ID, or None."""
+        sid = (student_id or "").strip()
+        if not sid or not self._caseload_rows:
+            return None
+        for r in self._caseload_rows:
+            if (r.get("StudentID") or "").strip() == sid:
+                return r
+        return None
+
+    def _send_text_blocking(self, payload: dict) -> Optional[dict]:
+        """Queue a SEND_TEXT and block the main thread until the worker returns
+        {ok}/{error}."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"res": None}
+
+        def on_done(res):
+            def set_main():
+                holder["res"] = res
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["res"] = res
+                done_var.set(True)
+
+        self.worker.submit_send_text(payload, on_done)
+        self.root.wait_variable(done_var)
+        return holder["res"]
+
+    # Team timezone for converting a student-local schedule time to the tz
+    # Mongoose's scheduler enters times in. The team is Eastern; TODO: make
+    # this a setting (read Mongoose's .timezone-label) for non-Eastern teams.
+    TEAM_IANA = "America/New_York"
+
+    def _fire_text(self, scenario: ScenarioConfig, chosen_name: str,
+                   prompt_vars: Optional[dict]) -> bool:
+        """Fire a scenario's text (Mongoose) channel for the active student.
+        Resolves Mobile Phone + Timezone from the caseload CSV cache, renders
+        the body, computes a timezone-aware schedule slot, and drives Mongoose
+        (commit=False stops at the confirm/schedule step for review). Returns
+        True on success."""
+        from src import text_message as tm
+        tcfg = scenario.text
+        ctx = self._get_student_context_blocking(name_hint=chosen_name)
+        if not ctx:
+            self._append_log("Text: couldn't read student context; not sent.",
+                             error=True)
+            return False
+        sid = (ctx.get("student_id") or "").strip()
+        row = self._caseload_row_by_id(sid)
+        mobile_raw = (row.get("MobilePhone") if row else "") or ""
+        mobile = tm.normalize_phone(mobile_raw)
+        who = ctx.get("full_name") or sid or "this student"
+        if not mobile:
+            self._append_log(
+                f"Text: no usable Mobile Phone for {who} (got {mobile_raw!r}); "
+                "not sent.", error=True)
+            return False
+        variables = {
+            "first_name": ctx.get("first_name", ""),
+            "last_name": ctx.get("last_name", ""),
+            "full_name": ctx.get("full_name", ""),
+            "preferred_name": ctx.get("preferred_name", ""),
+            "student_email": ctx.get("student_email", ""),
+            "student_id": sid,
+            "course_code": ctx.get("course_code", ""),
+            "pm_name": ctx.get("pm_name", ""),
+            "pm_email": ctx.get("pm_email", ""),
+        }
+        if prompt_vars:
+            variables.update(prompt_vars)
+        body_tmpl = tcfg.body
+        if not body_tmpl and tcfg.body_file:
+            try:
+                from src import config as _cfg, email_template
+                body_tmpl = email_template.load_template(
+                    _cfg.templates_dir() / tcfg.body_file)
+            except Exception as e:
+                self._append_log(
+                    f"Text: couldn't load template {tcfg.body_file!r}: {e}",
+                    error=True)
+                return False
+        body = tm.render_message(body_tmpl, variables)
+        over = tm.over_length(body)
+        if over:
+            self._append_log(
+                f"Text: message is {over} char(s) over the {tm.MAX_SMS_LEN} "
+                "limit; not sent.", error=True)
+            return False
+        sch_payload = None
+        sched_name = ""
+        if tcfg.schedule:
+            tzc = (row.get("Timezone") if row else "") or ""
+            slot = tm.compute_schedule_slot(
+                tzc, self.TEAM_IANA, target_hour=tcfg.target_hour)
+            if slot is None:
+                self._append_log(
+                    f"Text: unknown timezone {tzc!r} for {who}; can't schedule "
+                    "(set a Timezone, or set schedule:false).", error=True)
+                return False
+            sch_payload = {
+                "date_str": slot.date_str, "hour12": slot.hour12,
+                "minute": slot.minute, "ampm": slot.ampm,
+                "student_local_str": slot.student_local_str,
+            }
+            sched_name = (f"{variables['course_code']} "
+                          f"{variables['first_name']}").strip() or "Scheduled text"
+        inbox_label = tcfg.inbox_label or (
+            f"{variables['course_code']} Inbox" if variables["course_code"] else "")
+        payload = {
+            "body": body,
+            "recipients": [mobile],
+            "inbox_label": inbox_label,
+            "schedule": sch_payload,
+            "schedule_name": sched_name,
+            "commit": tcfg.commit,
+        }
+        when = (f"scheduling ({sch_payload['student_local_str']} student-local)"
+                if sch_payload else "composing")
+        self._append_log(
+            f"Text: {when} for {who} via {inbox_label or 'current inbox'}…")
+        res = self._send_text_blocking(payload)
+        if not res or res.get("error"):
+            self._append_log(f"Text failed: {(res or {}).get('error')}",
+                             error=True)
+            return False
+        if tcfg.commit:
+            self._append_log("Text: sent/scheduled in Mongoose.")
+        else:
+            self._append_log(
+                "Text: composed — review the Mongoose modal and click "
+                "Send/Schedule.")
+        return True
 
     def _fire_batch(self, scenario: ScenarioConfig, override: str) -> None:
         """Drive a batch scenario end-to-end: load caseload, filter,

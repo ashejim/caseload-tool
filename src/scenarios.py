@@ -96,6 +96,28 @@ class EmailConfig:
 
 
 @dataclass
+class TextConfig:
+    """Mongoose ("Cadence") text-message step for a scenario.
+
+    The body is a plain-text template with the same `{{vars}}` as email
+    (first_name / preferred_name / course_code / ...). It's sent via the
+    Mongoose compose driver in src/text_message.py.
+
+    - `schedule=True` schedules the text at `target_hour` in the STUDENT's
+      local timezone (converted to the team's tz); `schedule=False` sends now.
+    - `inbox_label` overrides which Mongoose inbox to compose from. Empty =
+      derive "<course> Inbox" from the student's course code.
+    - `commit=False` stops at the confirm/schedule step for the user to review
+      and click Send/Schedule themselves (mirrors a note's submit=False)."""
+    body: str = ""
+    body_file: str = ""        # optional template filename in the templates dir
+    schedule: bool = True
+    target_hour: int = 10      # local hour (student tz) to schedule at
+    inbox_label: str = ""
+    commit: bool = False
+
+
+@dataclass
 class BatchConfig:
     """Batch-mode config for a scenario. When present, find_first is
     ignored — the batch driver picks students by applying `filters`
@@ -115,6 +137,7 @@ class ScenarioConfig:
     close_tab_after: bool
     find_first: bool = False
     email: Optional[EmailConfig] = None
+    text: Optional[TextConfig] = None
     batch: Optional[BatchConfig] = None
     prompts: list[Prompt] = field(default_factory=list)
     notes: list[NoteData] = field(default_factory=list)
@@ -175,6 +198,23 @@ def _email_from_dict(d: Optional[dict]) -> Optional[EmailConfig]:
         pick_template=bool(d.get("pick_template", False)),
         font_family=str(d.get("font_family", "") or ""),
         font_size=font_size,
+    )
+
+
+def _text_from_dict(d: Optional[dict]) -> Optional[TextConfig]:
+    if not d:
+        return None
+    try:
+        target_hour = int(d.get("target_hour", 10) or 10)
+    except (TypeError, ValueError):
+        target_hour = 10
+    return TextConfig(
+        body=str(d.get("body", "") or ""),
+        body_file=str(d.get("body_file", "") or ""),
+        schedule=bool(d.get("schedule", True)),
+        target_hour=target_hour,
+        inbox_label=str(d.get("inbox_label", "") or ""),
+        commit=bool(d.get("commit", False)),
     )
 
 
@@ -261,14 +301,19 @@ def load_scenarios(path: Path = SCENARIOS_YAML) -> dict[str, ScenarioConfig]:
     out: dict[str, ScenarioConfig] = {}
     for name, cfg in sections.items():
         notes = [_note_from_dict(n) for n in cfg.get("notes", [])]
-        if not notes:
-            raise ValueError(f"Scenario {name!r} has no notes defined")
+        text = _text_from_dict(cfg.get("text"))
+        # A scenario needs at least one channel. Notes are the usual one, but a
+        # scenario can be email-only or text-only too.
+        if not notes and cfg.get("email") is None and text is None:
+            raise ValueError(
+                f"Scenario {name!r} has no notes, email, or text defined")
         out[name] = ScenarioConfig(
             name=name,
             hotkey=cfg.get("hotkey", ""),
             close_tab_after=bool(cfg.get("close_tab_after", True)),
             find_first=bool(cfg.get("find_first", False)),
             email=_email_from_dict(cfg.get("email")),
+            text=text,
             batch=_batch_from_dict(cfg.get("batch")),
             prompts=_prompts_from_list(cfg.get("prompts")),
             notes=notes,
