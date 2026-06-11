@@ -5907,6 +5907,134 @@ def _configure_email_preview_tags(text_widget) -> None:
     )
 
 
+def prompt_batch_text_review(
+    parent,
+    scenario_name: str,
+    entries: list[dict],
+    filter_summary: str = "",
+    *,
+    scheduled: bool = True,
+) -> Optional[list[int]]:
+    """Modal reviewer for batch texts — the texting analog of
+    prompt_batch_email_review. Left: a checklist of students (name · course ·
+    send time · any issues). Right: the selected student's actual rendered
+    message. Returns the list of selected indices into `entries`, or None on
+    cancel. Rows with issues (no mobile / unknown tz / over the char limit)
+    start unchecked so they're consciously opted in."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title(f"Review texts — {scenario_name}")
+    dialog.geometry("900x640")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.lift()
+    dialog.after(150, lambda: (dialog.lift(), dialog.focus_force()))
+    result: dict = {"value": None}
+    sel_vars = [ctk.BooleanVar(value=not bool(e.get("issues"))) for e in entries]
+
+    banner = ctk.CTkFrame(dialog, fg_color=("gray92", "gray18"))
+    banner.pack(fill="x", padx=8, pady=(8, 0))
+    ctk.CTkLabel(
+        banner, text=f"Review batch texts: {scenario_name}",
+        font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
+    ).pack(fill="x", padx=10, pady=(8, 0))
+    if filter_summary:
+        ctk.CTkLabel(
+            banner, text=f"Matched by: {filter_summary}",
+            font=ctk.CTkFont(size=11), text_color=("gray40", "gray70"),
+            anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 2))
+    sel_label = ctk.CTkLabel(
+        banner, text="", font=ctk.CTkFont(size=11),
+        text_color=("gray35", "gray70"), anchor="w")
+    sel_label.pack(fill="x", padx=10, pady=(0, 8))
+
+    body = ctk.CTkFrame(dialog, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=8, pady=6)
+    left = ctk.CTkScrollableFrame(body, label_text="Students", width=330)
+    left.pack(side="left", fill="y", padx=(0, 6))
+    right = ctk.CTkFrame(body, fg_color=("gray95", "gray16"))
+    right.pack(side="left", fill="both", expand=True)
+    preview_hdr = ctk.CTkLabel(
+        right, text="", anchor="w", justify="left", font=ctk.CTkFont(size=12))
+    preview_hdr.pack(fill="x", padx=10, pady=(10, 4))
+    preview_box = ctk.CTkTextbox(right, wrap="word")
+    preview_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    preview_box.configure(state="disabled")
+
+    def _update_sel_label():
+        n = sum(1 for v in sel_vars if v.get())
+        sel_label.configure(text=f"{n} of {len(entries)} selected")
+
+    def _show(i: int):
+        e = entries[i]
+        hdr = (f"To:  {e['name']}"
+               + (f"   ·   {e['mobile']}" if e.get("mobile") else "  ·  (no mobile)")
+               + f"\n{'Schedule' if scheduled else 'Send'}:  {e['when_str']}")
+        if e.get("issues"):
+            hdr += f"\n⚠ {', '.join(e['issues'])}"
+        preview_hdr.configure(text=hdr)
+        preview_box.configure(state="normal")
+        preview_box.delete("1.0", "end")
+        preview_box.insert("1.0", e.get("body", ""))
+        preview_box.configure(state="disabled")
+
+    for i, e in enumerate(entries):
+        rowf = ctk.CTkFrame(left, fg_color="transparent")
+        rowf.pack(fill="x", pady=1)
+        ctk.CTkCheckBox(
+            rowf, text="", width=24, variable=sel_vars[i],
+            command=_update_sel_label,
+        ).pack(side="left")
+        sub = f"{e.get('course_code', '')}  ·  {e['when_str']}"
+        if e.get("issues"):
+            sub += f"  ·  ⚠ {', '.join(e['issues'])}"
+        ctk.CTkButton(
+            rowf, text=f"{e['name']}\n{sub}", anchor="w",
+            fg_color="transparent", text_color=("gray10", "gray90"),
+            hover_color=("gray85", "gray25"),
+            command=lambda x=i: _show(x),
+        ).pack(side="left", fill="x", expand=True)
+    _update_sel_label()
+    if entries:
+        _show(0)
+
+    footer = ctk.CTkFrame(dialog, fg_color="transparent")
+    footer.pack(fill="x", padx=8, pady=(0, 8))
+
+    def _toggle_all():
+        target = not all(v.get() for v in sel_vars)
+        for v in sel_vars:
+            v.set(target)
+        _update_sel_label()
+
+    def _close():
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    def _send():
+        result["value"] = [i for i, v in enumerate(sel_vars) if v.get()]
+        _close()
+
+    ctk.CTkButton(
+        footer, text="Select all / none", command=_toggle_all, width=140,
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="left")
+    ctk.CTkButton(
+        footer, text=("Schedule selected" if scheduled else "Send selected"),
+        command=_send, width=150,
+    ).pack(side="right", padx=(6, 0))
+    ctk.CTkButton(
+        footer, text="Cancel", command=_close, width=90, **SECONDARY_BTN_KWARGS,
+    ).pack(side="right")
+    dialog.bind("<Escape>", lambda _e: _close())
+    dialog.protocol("WM_DELETE_WINDOW", _close)
+    parent.wait_window(dialog)
+    return result["value"]
+
+
 def prompt_batch_email_review(
     parent,
     scenario_name: str,
@@ -13504,6 +13632,13 @@ class App:
         point on)."""
         from tkinter import messagebox
 
+        # Text-only batch: no Salesforce notes/navigation — render each
+        # student's text, review them all, then send/schedule each. Its own
+        # driver (the note/email path below doesn't apply).
+        if self._is_text_only(scenario):
+            self._fire_batch_text(scenario)
+            return
+
         # Pre-flight: if any note has Submit unchecked, confirm before
         # we touch the caseload. Different message than single-fire
         # since the impact scales with batch size — a stray uncheck
@@ -13655,6 +13790,159 @@ class App:
             scenario, override, confirmed, prompt_vars,
             has_email=has_email, source="batch", body_overrides=body_overrides,
         )
+
+    def _fire_batch_text(self, scenario: ScenarioConfig) -> None:
+        """Batch texting: filter the caseload, render each student's text with
+        their own variables, review them all (email-style), then send/schedule
+        each via Mongoose — one personalized compose per student, at that
+        student's local time. No Salesforce notes or navigation."""
+        from tkinter import messagebox
+        from src import text_message as tm
+
+        self._warn_if_caseload_stale("this batch")
+        # Load rows (CSV cache preferred; DOM fallback).
+        if self._caseload_rows is not None:
+            rows = self._caseload_rows
+            age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
+            self._append_log(
+                f"Batch {scenario.name!r}: using cached caseload "
+                f"({len(rows)} rows from CSV, {age})")
+        else:
+            self._append_log(
+                f"Batch {scenario.name!r}: no CSV cache; loading caseload from "
+                "DOM (5-30s)…")
+            rows = self._read_all_caseload_rows_blocking()
+            if not rows:
+                self._append_log("Batch aborted: couldn't load caseload rows.")
+                return
+
+        # Filter (same engine + safety check as the note/email batch).
+        csv_headers = list(rows[0].keys()) if rows else []
+        filters = [_resolve_filter_columns(f, csv_headers)
+                   for f in scenario.batch.filters]
+        missing = [f.get("column", "") for f in filters
+                   if f.get("column") and f.get("column") not in csv_headers]
+        if missing:
+            self._append_log(
+                "Batch aborted: filter column(s) not in the Caseload export: "
+                f"{', '.join(repr(c) for c in missing)}.")
+            messagebox.showerror(
+                "Filter column(s) not in Caseload view",
+                "These filter column(s) aren't in your current Caseload "
+                "export:\n\n  • " + "\n  • ".join(missing) +
+                "\n\nAdd them to your list view, click ↻ Caseload, and retry.")
+            return
+        eval_filters = [_rewrite_task_filter(f) for f in filters]
+        matched = caseload_filter.apply_filters(eval_filters, rows)
+        if not matched:
+            messagebox.showinfo(
+                "No matches",
+                f"No students match the filters for {scenario.name!r}.")
+            self._append_log("Batch: no matches; nothing to do.")
+            return
+        self._append_log(f"Filters matched {len(matched)} students.")
+
+        # Prompts first, so each per-student render includes them.
+        prompt_vars = self._collect_prompt_vars(scenario)
+        if prompt_vars is None:
+            return
+
+        tcfg = scenario.text
+        body_tmpl = tcfg.body
+        if not body_tmpl and tcfg.body_file:
+            try:
+                from src import config as _cfg, email_template
+                body_tmpl = email_template.load_template(
+                    _cfg.templates_dir() / tcfg.body_file)
+            except Exception as e:
+                self._append_log(
+                    f"Batch text: couldn't load template {tcfg.body_file!r}: "
+                    f"{e}", error=True)
+                return
+
+        # Build a per-student entry: rendered body + recipient + schedule slot.
+        entries: list[dict] = []
+        for row in matched:
+            variables = self._text_vars_from_row(row)
+            variables.update(prompt_vars or {})
+            body = tm.render_message(body_tmpl, variables)
+            mobile = tm.normalize_phone(row.get("MobilePhone") or "")
+            issues: list[str] = []
+            if not mobile:
+                issues.append("no mobile")
+            when_str, sch_payload, sched_name = "now", None, ""
+            if tcfg.schedule:
+                tzc = row.get("Timezone") or ""
+                slot = tm.compute_schedule_slot(
+                    tzc, self.TEAM_IANA, target_hour=tcfg.target_hour)
+                if slot is None:
+                    issues.append(f"unknown tz {tzc!r}")
+                else:
+                    when_str = f"{slot.student_local_str} (local)"
+                    sch_payload = {
+                        "date_str": slot.date_str, "hour12": slot.hour12,
+                        "minute": slot.minute, "ampm": slot.ampm,
+                        "student_local_str": slot.student_local_str,
+                    }
+                    sched_name = (f"{variables['course_code']} "
+                                  f"{variables['first_name']}").strip() \
+                        or "Scheduled text"
+            if tm.over_length(body):
+                issues.append(f"{tm.over_length(body)} over limit")
+            inbox_label = tcfg.inbox_label or (
+                f"{variables['course_code']} Inbox"
+                if variables["course_code"] else "")
+            entries.append({
+                "name": variables["full_name"] or row.get("Name", ""),
+                "student_id": variables["student_id"],
+                "course_code": variables["course_code"],
+                "mobile": mobile, "when_str": when_str, "body": body,
+                "inbox_label": inbox_label, "schedule": sch_payload,
+                "schedule_name": sched_name, "issues": issues,
+            })
+
+        scheduled = bool(tcfg.schedule)
+        filter_summary = ", ".join(
+            f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
+            for f in scenario.batch.filters if f.get("column"))
+        selected = prompt_batch_text_review(
+            self.root, scenario.name, entries, filter_summary,
+            scheduled=scheduled)
+        if selected is None:
+            self._append_log("Batch text cancelled.")
+            return
+        if not selected:
+            self._append_log("Batch text: 0 selected; nothing to do.")
+            return
+
+        # Send/schedule each selected student (one compose each).
+        sent = 0
+        for n, idx in enumerate(selected, 1):
+            e = entries[idx]
+            blocking = [i for i in e["issues"]
+                        if i == "no mobile" or i.startswith("unknown tz")]
+            if blocking:
+                self._append_log(
+                    f"  text {n}/{len(selected)}: skipped {e['name']} "
+                    f"({', '.join(blocking)}).", error=True)
+                continue
+            payload = {
+                "body": e["body"], "recipients": [e["mobile"]],
+                "inbox_label": e["inbox_label"], "schedule": e["schedule"],
+                "schedule_name": e["schedule_name"], "commit": True,
+            }
+            self._append_log(
+                f"  text {n}/{len(selected)}: {e['name']} ({e['when_str']})…")
+            res = self._send_text_blocking(payload)
+            if not res or res.get("error"):
+                self._append_log(
+                    f"  text failed for {e['name']}: {(res or {}).get('error')}",
+                    error=True)
+            else:
+                sent += 1
+        self._append_log(
+            f"Batch text complete: {sent}/{len(selected)} "
+            f"{'scheduled' if scheduled else 'sent'}.")
 
     @staticmethod
     def _row_name_and_query(row: dict) -> tuple[str, str]:
