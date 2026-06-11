@@ -200,8 +200,9 @@ from playwright.sync_api import TimeoutError as PWTimeout  # noqa: E402
 class TextMessage:
     body: str                                   # final plain text (already rendered)
     recipients_mobile: list[str] = field(default_factory=list)  # raw or normalized
-    inbox_label: str = ""                       # e.g. "C769 Inbox"; "" = whatever's selected
+    inbox_label: str = ""                       # e.g. "C769 Inbox"; "" = pick first/only
     schedule: Optional[ScheduleSlot] = None     # None = Send Now path
+    schedule_name: str = ""                     # Mongoose "Message Name" on the schedule step
     commit: bool = False                        # False = stop at confirm/schedule for review
 
 
@@ -225,15 +226,13 @@ def open_compose(page: Page, *, timeout_ms: int = 15_000) -> None:
 
 
 def select_inbox(page: Page, inbox_label: str, *, timeout_ms: int = 6_000) -> None:
-    """On the "Select Inbox" step, click the inbox whose label matches.
-    No-op if the modal opened straight to the compose step (inbox preselected
-    because we launched from that inbox's URL)."""
-    if not inbox_label:
-        return
+    """On the "Select Inbox" step, click the inbox whose label matches (or the
+    first/only one if no label is given). No-op if the modal opened straight to
+    the compose step (inbox preselected because we launched from its URL)."""
+    item = page.locator(".inbox-select").filter(visible=True)
+    if inbox_label:
+        item = item.filter(has_text=inbox_label)
     try:
-        item = page.locator(".inbox-select").filter(
-            has_text=inbox_label, visible=True
-        )
         item.first.wait_for(state="visible", timeout=timeout_ms)
         item.first.click()
     except PWTimeout:
@@ -331,8 +330,17 @@ def send_text(
             _click_button(page, "Send Now")
         return True
 
-    # Schedule path: open the schedule step, fill date/time.
+    # Schedule path: open the schedule step, name it, fill date/time.
     _click_button(page, "Schedule")
+    if msg.schedule_name:
+        try:
+            name_input = page.locator(
+                "input#schedule-message-name-input"
+            ).filter(visible=True).first
+            name_input.wait_for(state="visible", timeout=8_000)
+            name_input.fill(msg.schedule_name)
+        except PWTimeout:
+            pass  # name may be optional; continue
     fill_schedule(page, msg.schedule)
     say(f"  text: scheduled for {msg.schedule.student_local_str} "
         f"(student-local) — review and click Schedule" if not msg.commit

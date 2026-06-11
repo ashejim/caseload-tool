@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Optional
@@ -2331,9 +2331,12 @@ class BrowserWorker:
         return None
 
     def _test_text(self, ctx, mobile: str, body: str) -> dict:
-        """TEMP dev: drive the Mongoose compose modal for one test recipient
-        with commit=False (stops at the confirm step for review). Lets us verify
-        the compose driver's click-through end-to-end against the live site."""
+        """TEMP dev: drive the Mongoose compose modal for one REAL recipient and
+        SCHEDULE the text for tomorrow ~10:00 AM (commit=True). The recipient
+        must be a contact in the currently-open inbox (inboxes are course-
+        scoped). Verify it appears under Scheduled Messages, then delete it —
+        it won't actually send until tomorrow. Validates the full driver
+        click-through incl. the schedule step."""
         page = self._mongoose_page(ctx)
         if page is None:
             return {"error": "No Mongoose tab open — click 🐭 Open Mongoose first."}
@@ -2342,10 +2345,19 @@ class BrowserWorker:
         except Exception:
             pass
         from src import text_message as tm
+        tomorrow = datetime.now() + timedelta(days=1)
+        slot = tm.ScheduleSlot(
+            team_dt=tomorrow,
+            date_str=tomorrow.strftime("%m/%d/%Y"),
+            hour12=10, minute=0, ampm="AM",
+            student_local_str="tomorrow 10:00 AM (test)",
+        )
         msg = tm.TextMessage(
             body=body or "Test message — please ignore.",
             recipients_mobile=[mobile],
-            commit=False,
+            schedule=slot,
+            schedule_name="TEST – delete me",
+            commit=True,
         )
         try:
             tm.send_text(page, msg, on_status=self.on_status)
@@ -15851,9 +15863,11 @@ class App:
 
     def _dev_test_text(self) -> None:
         """TEMP dev: verify the Mongoose compose driver end-to-end. Prompts for a
-        test mobile number, then drives open -> recipient -> message -> Preview
-        (commit=False: stops at the confirm step so nothing is sent). Open
-        🐭 Open Mongoose and land on an inbox first."""
+        REAL student's mobile (must be a contact in the currently-open inbox —
+        inboxes are course-scoped), then drives open -> recipient -> message ->
+        Preview -> Schedule for TOMORROW 10 AM and commits it. Verify it under
+        Scheduled Messages and delete it (won't send until tomorrow). Open
+        🐭 Open Mongoose and land on the matching course inbox first."""
         try:
             if not self.worker.ready_event.is_set():
                 self._append_log("Browser not ready yet.")
@@ -15861,15 +15875,20 @@ class App:
         except Exception:
             return
         dlg = ctk.CTkInputDialog(
-            title="Test Text",
-            text=("Mobile number to text (a test contact). The driver stops at "
-                  "the confirm step — nothing is sent.\n\n"
-                  "Open 🐭 Open Mongoose and navigate to an inbox first."),
+            title="Test Text (schedules for tomorrow)",
+            text=("Mobile number of a REAL student in the inbox that's open now "
+                  "(inboxes are course-scoped, e.g. C769).\n\n"
+                  "This SCHEDULES a test text for tomorrow ~10:00 AM and commits "
+                  "it — verify it under Scheduled Messages, then DELETE it. It "
+                  "won't send until tomorrow.\n\n"
+                  "Open 🐭 Open Mongoose and land on the matching inbox first."),
         )
         mobile = (dlg.get_input() or "").strip()
         if not mobile:
             return
-        self._append_log(f"Test Text: driving compose for {mobile}…")
+        self._append_log(
+            f"Test Text: scheduling a test text for {mobile} tomorrow 10 AM "
+            "(verify + delete it after)…")
 
         def on_done(res):
             def show():
@@ -15879,8 +15898,8 @@ class App:
                         error=True)
                     return
                 self._append_log(
-                    "Test Text: reached confirm/schedule step — review the "
-                    "Mongoose modal (nothing sent).")
+                    "Test Text: driver finished — check Scheduled Messages in "
+                    "Mongoose for 'TEST – delete me' and delete it.")
             try:
                 self.root.after(0, show)
             except Exception:
