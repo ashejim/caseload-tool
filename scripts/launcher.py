@@ -13029,7 +13029,12 @@ class App:
                     return
                 chosen_name = prenav_label
         elif scenario.find_first:
-            chosen = prompt_find_and_pick(self.root, self._list_matches_blocking)
+            # Text-only actions search the cached CSV (instant, main-thread) so
+            # Find doesn't queue behind a running background scrape; note/email
+            # actions search the live list via the worker.
+            searcher = (self._list_matches_from_csv if text_only
+                        else self._list_matches_blocking)
+            chosen = prompt_find_and_pick(self.root, searcher)
             if not chosen:
                 self._append_log("Find cancelled; action not fired.")
                 return
@@ -13197,6 +13202,33 @@ class App:
             if (r.get("Name") or "").strip().lower() == n:
                 return r
         return None
+
+    def _list_matches_from_csv(self, query: str) -> list[str]:
+        """Search the cached caseload CSV by name (main thread, no worker, no
+        Salesforce). Used for text-action Find so it's instant and doesn't queue
+        behind a running background scrape. Tiers: exact, startswith, contains."""
+        q = (query or "").strip().lower()
+        if not q or not self._caseload_rows:
+            return []
+        exact, starts, contains = [], [], []
+        for r in self._caseload_rows:
+            name = (r.get("Name") or "").strip()
+            if not name:
+                continue
+            low = name.lower()
+            if low == q:
+                exact.append(name)
+            elif low.startswith(q):
+                starts.append(name)
+            elif q in low:
+                contains.append(name)
+        out, seen = [], set()
+        for n in exact + starts + contains:
+            k = n.lower()
+            if k not in seen:
+                seen.add(k)
+                out.append(n)
+        return out[:50]
 
     def _text_vars_from_row(self, row: dict) -> dict:
         """Build template variables (the same set email uses) from a caseload
