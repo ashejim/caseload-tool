@@ -277,12 +277,9 @@ def set_message(page: Page, body: str) -> None:
 def fill_schedule(page: Page, slot: ScheduleSlot) -> None:
     """Fill the Schedule step's Date + Time controls from a ScheduleSlot
     (already expressed in the team's tz)."""
-    date_input = page.locator(
-        'input.dp__input[aria-label="Datepicker input"]'
-    ).filter(visible=True).first
-    date_input.wait_for(state="visible", timeout=10_000)
-    date_input.fill(slot.date_str)
-    # Time: three native <select>s — hours (1-12), minutes (00-59), AM/PM.
+    # Time first, while the date picker's calendar is closed (entering the date
+    # opens an overlay that can cover the time controls).
+    # Three native <select>s — hours (1-12), minutes (00-59), AM/PM.
     page.locator("select.vc-time-select-hours").first.select_option(
         label=str(slot.hour12)
     )
@@ -293,6 +290,21 @@ def fill_schedule(page: Page, slot: ScheduleSlot) -> None:
     page.locator('select:has(option[value="true"])').first.select_option(
         value=("true" if slot.ampm.upper() == "AM" else "false")
     )
+
+    # Date last. @vuepic/vue-datepicker accepts typed MM/DD/YYYY but only
+    # *commits* it on Enter — a bare fill() sets the text without parsing it and
+    # leaves the calendar overlay open (covering the Schedule button -> "not
+    # visible / not stable"). So: focus, clear, type, Enter to commit + close.
+    date_input = page.locator(
+        'input.dp__input[aria-label="Datepicker input"]'
+    ).filter(visible=True).first
+    date_input.wait_for(state="visible", timeout=10_000)
+    date_input.click()
+    date_input.fill("")
+    date_input.press_sequentially(slot.date_str, delay=20)
+    date_input.press("Enter")
+    # Let the overlay close + the form revalidate (enables the Schedule button).
+    page.wait_for_timeout(300)
 
 
 def send_text(
