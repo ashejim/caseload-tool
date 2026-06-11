@@ -5,3 +5,6 @@ pynput>=1.7
 customtkinter>=5.2
 Pillow>=10.0
 pywin32>=305 ; sys_platform == "win32"
+# Windows/standalone Python ships no system tz database; zoneinfo needs this
+# for the timezone-aware texting scheduler (and student-local-time display).
+tzdata>=2024.1
