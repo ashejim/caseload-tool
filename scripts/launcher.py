@@ -7283,6 +7283,20 @@ class ScenarioEditor:
         self._build_email_section()
         # Visibility set by load() based on scenario.email != None.
 
+        # Send-text toggle + text (Mongoose) section, same collapse pattern.
+        row += 1
+        self.send_text_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            self.frame,
+            text="Send text (Mongoose)",
+            variable=self.send_text_var,
+            command=self._on_send_text_toggled,
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
+        row += 1
+        self._text_section_row = row
+        self._build_text_section()
+        # Visibility set by load() based on scenario.text != None.
+
         # Notes live in their own container so add/delete can just
         # pack/destroy children without disturbing the outer grid rows.
         row += 1
@@ -7664,6 +7678,100 @@ class ScenarioEditor:
         else:
             self._email_section.grid_remove()
 
+    # 12-hour labels for the text-schedule "send at" picker, mapped to/from
+    # the 24-hour `target_hour` stored in TextConfig.
+    _HOUR_LABELS = [
+        "6 AM", "7 AM", "8 AM", "9 AM", "10 AM", "11 AM", "12 PM", "1 PM",
+        "2 PM", "3 PM", "4 PM", "5 PM", "6 PM", "7 PM", "8 PM", "9 PM",
+    ]
+
+    @staticmethod
+    def _hour_to_label(h) -> str:
+        try:
+            h = int(h) % 24
+        except (TypeError, ValueError):
+            h = 10
+        ap = "AM" if h < 12 else "PM"
+        h12 = h % 12 or 12
+        return f"{h12} {ap}"
+
+    @staticmethod
+    def _label_to_hour(label: str) -> int:
+        m = re.match(r"\s*(\d{1,2})\s*(AM|PM)", (label or "").strip(), re.I)
+        if not m:
+            return 10
+        h = int(m.group(1)) % 12
+        if m.group(2).upper() == "PM":
+            h += 12
+        return h
+
+    def _build_text_section(self) -> None:
+        """Construct the text (Mongoose) config widgets inside a sub-frame.
+        Always created — visibility toggled by `_on_send_text_toggled`."""
+        frame = ctk.CTkFrame(self.frame)
+        frame.grid_columnconfigure(1, weight=1)
+        self._text_section = frame
+        # Round-tripped fields the UI doesn't expose (e.g. body_file).
+        self._text_body_file = ""
+
+        ctk.CTkLabel(frame, text="Message").grid(
+            row=0, column=0, sticky="nw", padx=8, pady=(6, 0))
+        self.text_body_box = ctk.CTkTextbox(frame, height=90, wrap="word")
+        self.text_body_box.grid(row=0, column=1, sticky="ew", padx=8, pady=(6, 0))
+        ctk.CTkLabel(
+            frame,
+            text="Plain text. Use {{first_name}}, {{preferred_name}}, "
+                 "{{course_code}}… (max 306 chars after variables).",
+            font=ctk.CTkFont(size=10), text_color=("gray45", "gray60"),
+            wraplength=420, justify="left", anchor="w",
+        ).grid(row=1, column=1, sticky="w", padx=8, pady=(0, 4))
+
+        self.text_schedule_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            frame, text="Schedule at the student's local time",
+            variable=self.text_schedule_var,
+            command=self._on_text_schedule_toggled,
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=(2, 0))
+
+        self._text_hour_row = ctk.CTkFrame(frame, fg_color="transparent")
+        self._text_hour_row.grid(row=3, column=1, sticky="w", padx=8, pady=(2, 0))
+        ctk.CTkLabel(self._text_hour_row, text="Send at (local):").pack(side="left")
+        self.text_hour_combo = ctk.CTkComboBox(
+            self._text_hour_row, values=self._HOUR_LABELS, width=90)
+        self.text_hour_combo.pack(side="left", padx=(6, 0))
+        self.text_hour_combo.set("10 AM")
+
+        ctk.CTkLabel(frame, text="Inbox").grid(
+            row=4, column=0, sticky="w", padx=8, pady=(4, 0))
+        self.text_inbox_entry = ctk.CTkEntry(
+            frame, placeholder_text="empty = “{course_code} Inbox”")
+        self.text_inbox_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=(4, 0))
+
+        self.text_commit_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            frame,
+            text="Send/Schedule automatically (else stop for review in Mongoose)",
+            variable=self.text_commit_var,
+        ).grid(row=5, column=1, sticky="w", padx=8, pady=(4, 8))
+
+    def _on_text_schedule_toggled(self) -> None:
+        """Show the 'send at' hour picker only when scheduling is on."""
+        if self.text_schedule_var.get():
+            self._text_hour_row.grid()
+        else:
+            self._text_hour_row.grid_remove()
+
+    def _on_send_text_toggled(self) -> None:
+        """Show or hide the text section based on the checkbox."""
+        if self.send_text_var.get():
+            self._text_section.grid(
+                row=self._text_section_row, column=0,
+                sticky="ew", padx=8, pady=(0, 8),
+            )
+            self._on_text_schedule_toggled()
+        else:
+            self._text_section.grid_remove()
+
     def _current_prompt_var_names(self) -> list[str]:
         """Return the live list of `var` names from the prompts
         section, so the in-app HTML editor can offer them as
@@ -7936,9 +8044,24 @@ class ScenarioEditor:
         self.find_first_var.set(scenario.find_first)
         # Panel-action toggle (forced off below for batch scenarios).
         self.panel_action_var.set(scenario.panel_action)
-        # Text (Mongoose) config has no editor UI yet — stash it so serialize()
-        # round-trips it unchanged instead of dropping it on save.
-        self._loaded_text = scenario.text
+        # Text (Mongoose) section — populate from scenario.text.
+        t = scenario.text
+        self.send_text_var.set(t is not None)
+        self._text_body_file = (t.body_file if t else "") or ""
+        self.text_body_box.delete("1.0", "end")
+        if t is not None:
+            self.text_body_box.insert("1.0", t.body or "")
+            self.text_schedule_var.set(bool(t.schedule))
+            self.text_hour_combo.set(self._hour_to_label(t.target_hour))
+            self.text_inbox_entry.delete(0, "end")
+            self.text_inbox_entry.insert(0, t.inbox_label or "")
+            self.text_commit_var.set(bool(t.commit))
+        else:
+            self.text_schedule_var.set(True)
+            self.text_hour_combo.set("10 AM")
+            self.text_inbox_entry.delete(0, "end")
+            self.text_commit_var.set(False)
+        self._on_send_text_toggled()
         # Batch config — populate filter rows + visibility.
         self._batch_preview = scenario.batch.preview if scenario.batch else True
         # Rebuild prompt rows fresh from the scenario.
@@ -8049,17 +8172,15 @@ class ScenarioEditor:
             prompts_out = [p for p in prompts_out if p.get("var")]
             if prompts_out:
                 out["prompts"] = prompts_out
-        # Text (Mongoose) config — no editor UI yet, so round-trip the loaded
-        # config unchanged rather than dropping it on save.
-        text_cfg = getattr(self, "_loaded_text", None)
-        if text_cfg is not None:
+        # Text (Mongoose) section.
+        if self.send_text_var.get():
             out["text"] = {
-                "body": text_cfg.body,
-                "body_file": text_cfg.body_file,
-                "schedule": text_cfg.schedule,
-                "target_hour": text_cfg.target_hour,
-                "inbox_label": text_cfg.inbox_label,
-                "commit": text_cfg.commit,
+                "body": self.text_body_box.get("1.0", "end-1c"),
+                "body_file": getattr(self, "_text_body_file", "") or "",
+                "schedule": bool(self.text_schedule_var.get()),
+                "target_hour": self._label_to_hour(self.text_hour_combo.get()),
+                "inbox_label": self.text_inbox_entry.get().strip(),
+                "commit": bool(self.text_commit_var.get()),
             }
         return out
 
