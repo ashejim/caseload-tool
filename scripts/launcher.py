@@ -5520,6 +5520,85 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
     return res["value"]
 
 
+def prompt_text_review(
+    parent, *, who: str, mobile: str, inbox_label: str, when_str: str,
+    body: str, char_limit: int, scheduled: bool,
+) -> Optional[str]:
+    """In-app review/edit for a single outgoing text — the texting equivalent of
+    the email previewer. Shows recipient / inbox / scheduled time and lets the
+    user edit the message. Returns the (possibly edited) body to send, or None
+    on cancel. The caller then drives Mongoose to completion (no manual clicks
+    in Mongoose)."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Review text")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.lift()
+    dialog.after(50, lambda: (dialog.lift(), dialog.focus_force()))
+    res = {"value": None}
+
+    header = "To:  " + who + (f"   ·   {mobile}" if mobile else "")
+    if inbox_label:
+        header += f"\nInbox:  {inbox_label}"
+    header += f"\n{'Schedule' if scheduled else 'Send'}:  {when_str}"
+    ctk.CTkLabel(
+        dialog, text=header, justify="left", anchor="w",
+        font=ctk.CTkFont(size=12),
+    ).pack(fill="x", padx=12, pady=(12, 6))
+
+    ctk.CTkLabel(dialog, text="Message:", anchor="w").pack(
+        fill="x", padx=12, pady=(2, 0))
+    box = ctk.CTkTextbox(dialog, wrap="word", height=150, width=460)
+    box.pack(fill="both", expand=True, padx=12, pady=(0, 2))
+    box.insert("1.0", body or "")
+    box.mark_set("insert", "end-1c")
+
+    count = ctk.CTkLabel(
+        dialog, text="", anchor="e", font=ctk.CTkFont(size=11),
+        text_color=("gray40", "gray70"))
+    count.pack(fill="x", padx=12, pady=(0, 4))
+
+    def _update_count(_e=None):
+        n = len(box.get("1.0", "end-1c"))
+        over = n - char_limit
+        count.configure(
+            text=f"{n}/{char_limit}" + (f"  ({over} over — will be trimmed)"
+                                        if over > 0 else ""),
+            text_color=("#d11" if over > 0 else ("gray40", "gray70")),
+        )
+
+    box.bind("<KeyRelease>", _update_count)
+    _update_count()
+
+    def _close():
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    def _send(_e=None):
+        res["value"] = box.get("1.0", "end-1c")
+        _close()
+
+    def _cancel(_e=None):
+        _close()
+
+    btns = ctk.CTkFrame(dialog, fg_color="transparent")
+    btns.pack(pady=(2, 10))
+    ctk.CTkButton(
+        btns, text=("Schedule" if scheduled else "Send"),
+        command=_send, width=120,
+    ).pack(side="left", padx=4)
+    ctk.CTkButton(
+        btns, text="Cancel", command=_cancel, width=90, **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=4)
+    dialog.bind("<Escape>", _cancel)
+    dialog.protocol("WM_DELETE_WINDOW", _cancel)
+    parent.wait_window(dialog)
+    return res["value"]
+
+
 def ask_yes_no_topmost(
     parent, title: str, message: str,
     yes_label: str = "Yes", no_label: str = "No",
@@ -7763,7 +7842,7 @@ class ScenarioEditor:
         self.text_commit_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             frame,
-            text="Send/Schedule automatically (else stop for review in Mongoose)",
+            text="Send automatically (otherwise review/edit in the app first)",
             variable=self.text_commit_var,
         ).grid(row=5, column=1, sticky="w", padx=8, pady=(4, 8))
 
@@ -13371,16 +13450,34 @@ class App:
                           f"{variables['first_name']}").strip() or "Scheduled text"
         inbox_label = tcfg.inbox_label or (
             f"{variables['course_code']} Inbox" if variables["course_code"] else "")
+        # Review/edit in the app (unless the action is set to send automatically),
+        # then let the tool drive Mongoose to completion — the user never has to
+        # touch the Mongoose UI.
+        scheduled = sch_payload is not None
+        if not tcfg.commit:
+            when_str = (f"{sch_payload['student_local_str']} (student-local)"
+                        if scheduled else "now")
+            edited = prompt_text_review(
+                self.root, who=who, mobile=mobile, inbox_label=inbox_label,
+                when_str=when_str, body=body, char_limit=tm.MAX_SMS_LEN,
+                scheduled=scheduled)
+            if edited is None:
+                self._append_log("Text review cancelled; not sent.")
+                return False
+            body = edited
+            if tm.over_length(body):
+                self._append_log(
+                    f"Text: trimmed to the {tm.MAX_SMS_LEN}-char limit.")
         payload = {
             "body": body,
             "recipients": [mobile],
             "inbox_label": inbox_label,
             "schedule": sch_payload,
             "schedule_name": sched_name,
-            "commit": tcfg.commit,
+            "commit": True,  # tool finishes in Mongoose; review already happened
         }
         when = (f"scheduling ({sch_payload['student_local_str']} student-local)"
-                if sch_payload else "composing")
+                if scheduled else "sending now")
         self._append_log(
             f"Text: {when} for {who} via {inbox_label or 'current inbox'}…")
         res = self._send_text_blocking(payload)
@@ -13388,12 +13485,8 @@ class App:
             self._append_log(f"Text failed: {(res or {}).get('error')}",
                              error=True)
             return False
-        if tcfg.commit:
-            self._append_log("Text: sent/scheduled in Mongoose.")
-        else:
-            self._append_log(
-                "Text: composed — review the Mongoose modal and click "
-                "Send/Schedule.")
+        self._append_log(
+            f"Text: {'scheduled' if scheduled else 'sent'} in Mongoose for {who}.")
         return True
 
     def _fire_batch(self, scenario: ScenarioConfig, override: str) -> None:
