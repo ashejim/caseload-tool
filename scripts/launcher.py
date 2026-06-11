@@ -2352,8 +2352,21 @@ class BrowserWorker:
         {ok} or {error}."""
         page = self._mongoose_page(ctx)
         if page is None:
-            return {"error": "No Mongoose tab open — open Mongoose first "
-                             "(🐭 Open Mongoose)."}
+            # Auto-open Mongoose in-context if it isn't open yet. (Reliable
+            # mid-session — by now the caseload load has cleared the
+            # about:blank popup hang.)
+            self.on_status("Opening Mongoose…")
+            res = self._open_mongoose(ctx, focus=True)
+            if res.get("error"):
+                return {"error": f"couldn't open Mongoose: {res['error']}"}
+            page = self._mongoose_page(ctx)
+            if page is None:
+                return {"error": "Mongoose didn't open."}
+            # Let SSO / the SPA settle before composing.
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
         try:
             page.bring_to_front()
         except Exception:
