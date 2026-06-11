@@ -12872,32 +12872,42 @@ class App:
         # user retype if the first query was wrong or surfaces too
         # many candidates. Worker handles search; fuzzy fallback kicks
         # in if there are no exact matches.
+        # Text-only actions resolve the student from the caseload CSV, so they
+        # DON'T need the Salesforce record opened — skip the navigation (faster
+        # and avoids the intermittent "record didn't open" click flake).
+        text_only = self._is_text_only(scenario)
         chosen_name = ""
         if prenav_query:
-            # Student already chosen (caseload row). Use the FAST
-            # navigation (same Shift+X switch as a double-click), then
-            # wait only until the note panel is actually loaded — no
-            # Caseload reload, no fixed 2s settle. (A bare find returns
-            # before the panel renders, which made the note RUN bail with
-            # "no visible note panel".)
-            if not self._navigate_for_fire_blocking(prenav_query):
-                self._append_log(
-                    f"Could not open {prenav_label or prenav_query!r}; "
-                    "scenario not fired."
-                )
-                return
-            chosen_name = prenav_label
+            if text_only:
+                chosen_name = prenav_label or prenav_query
+            else:
+                # Student already chosen (caseload row). Use the FAST
+                # navigation (same Shift+X switch as a double-click), then
+                # wait only until the note panel is actually loaded — no
+                # Caseload reload, no fixed 2s settle. (A bare find returns
+                # before the panel renders, which made the note RUN bail with
+                # "no visible note panel".)
+                if not self._navigate_for_fire_blocking(prenav_query):
+                    self._append_log(
+                        f"Could not open {prenav_label or prenav_query!r}; "
+                        "scenario not fired."
+                    )
+                    return
+                chosen_name = prenav_label
         elif scenario.find_first:
             chosen = prompt_find_and_pick(self.root, self._list_matches_blocking)
             if not chosen:
                 self._append_log("Find cancelled; action not fired.")
                 return
-            if not self._click_match_blocking(chosen):
+            if text_only:
+                chosen_name = chosen
+            elif not self._click_match_blocking(chosen):
                 self._append_log(
                     f"Could not navigate to {chosen!r}; action not fired."
                 )
                 return
-            chosen_name = chosen
+            else:
+                chosen_name = chosen
 
         # Step 2: prompts (scenario-level, feed {{var}} into emails
         # and note bodies). Collect BEFORE per-note custom edits so
@@ -13042,6 +13052,51 @@ class App:
                 return r
         return None
 
+    def _caseload_row_by_name(self, name: str) -> Optional[dict]:
+        """The cached caseload CSV row matching a student Name (case-insensitive),
+        or None. Lets a text action resolve a student without opening their
+        Salesforce record."""
+        n = (name or "").strip().lower()
+        if not n or not self._caseload_rows:
+            return None
+        for r in self._caseload_rows:
+            if (r.get("Name") or "").strip().lower() == n:
+                return r
+        return None
+
+    def _text_vars_from_row(self, row: dict) -> dict:
+        """Build template variables (the same set email uses) from a caseload
+        CSV row — for firing a text without scraping the Salesforce record."""
+        name = (row.get("Name") or "").strip()
+        first, _, last = name.partition(" ")
+        pref = (row.get("stuprename") or "").strip() or first
+        course = (row.get("CourseCode") or "").strip()
+        try:
+            from src.student_lookup import COURSE_CODE_RE
+            m = COURSE_CODE_RE.match(course)
+            if m:
+                course = m.group(1)
+        except Exception:
+            pass
+        return {
+            "first_name": _capitalize_name(first),
+            "last_name": _capitalize_name(last),
+            "full_name": _capitalize_name(name),
+            "preferred_name": _capitalize_name(pref),
+            "student_email": (row.get("StudentEmail") or "").strip(),
+            "student_id": (row.get("StudentID") or "").strip(),
+            "course_code": course,
+            "pm_name": _capitalize_name((row.get("MentorName") or "").strip()),
+            "pm_email": "",
+        }
+
+    def _is_text_only(self, scenario: ScenarioConfig) -> bool:
+        """A scenario whose only channel is text — no Salesforce note and no
+        email. Such actions don't need the student's Salesforce record opened;
+        they resolve everything from the caseload CSV."""
+        return (scenario.text is not None and not scenario.notes
+                and scenario.email is None)
+
     def _send_text_blocking(self, payload: dict) -> Optional[dict]:
         """Queue a SEND_TEXT and block the main thread until the worker returns
         {ok}/{error}."""
@@ -13076,34 +13131,42 @@ class App:
         True on success."""
         from src import text_message as tm
         tcfg = scenario.text
-        ctx = self._get_student_context_blocking(name_hint=chosen_name)
-        if not ctx:
-            self._append_log("Text: couldn't read student context; not sent.",
-                             error=True)
-            return False
-        sid = (ctx.get("student_id") or "").strip()
-        row = self._caseload_row_by_id(sid)
+        # Resolve the student WITHOUT needing the Salesforce record open: prefer
+        # the cached caseload CSV row (by name) — texting only needs the mobile,
+        # timezone, and course, all of which the CSV has. Fall back to scraping
+        # the active page only if the name isn't in the cache.
+        row = self._caseload_row_by_name(chosen_name) if chosen_name else None
+        if row is not None:
+            variables = self._text_vars_from_row(row)
+        else:
+            ctx = self._get_student_context_blocking(name_hint=chosen_name)
+            if not ctx:
+                self._append_log("Text: couldn't read student context; not sent.",
+                                 error=True)
+                return False
+            row = self._caseload_row_by_id(ctx.get("student_id", ""))
+            variables = {
+                "first_name": ctx.get("first_name", ""),
+                "last_name": ctx.get("last_name", ""),
+                "full_name": ctx.get("full_name", ""),
+                "preferred_name": ctx.get("preferred_name", ""),
+                "student_email": ctx.get("student_email", ""),
+                "student_id": (ctx.get("student_id") or "").strip(),
+                "course_code": ctx.get("course_code", ""),
+                "pm_name": ctx.get("pm_name", ""),
+                "pm_email": ctx.get("pm_email", ""),
+            }
+        if prompt_vars:
+            variables.update(prompt_vars)
+        who = (variables.get("full_name") or variables.get("student_id")
+               or "this student")
         mobile_raw = (row.get("MobilePhone") if row else "") or ""
         mobile = tm.normalize_phone(mobile_raw)
-        who = ctx.get("full_name") or sid or "this student"
         if not mobile:
             self._append_log(
                 f"Text: no usable Mobile Phone for {who} (got {mobile_raw!r}); "
                 "not sent.", error=True)
             return False
-        variables = {
-            "first_name": ctx.get("first_name", ""),
-            "last_name": ctx.get("last_name", ""),
-            "full_name": ctx.get("full_name", ""),
-            "preferred_name": ctx.get("preferred_name", ""),
-            "student_email": ctx.get("student_email", ""),
-            "student_id": sid,
-            "course_code": ctx.get("course_code", ""),
-            "pm_name": ctx.get("pm_name", ""),
-            "pm_email": ctx.get("pm_email", ""),
-        }
-        if prompt_vars:
-            variables.update(prompt_vars)
         body_tmpl = tcfg.body
         if not body_tmpl and tcfg.body_file:
             try:
