@@ -381,9 +381,14 @@ class BrowserWorker:
         self.q.put(("SCRAPE_ALL_TASK_STATUS", on_done))
 
     def submit_probe_text(self, on_done: Callable[[dict], None]) -> None:
-        """TEMP dev probe: capture the live Cadence "Send Text" composer DOM
-        (for building the texting send selectors)."""
+        """TEMP dev probe: capture the live Mongoose ("Cadence") texting
+        composer DOM (for building the texting send selectors)."""
         self.q.put(("PROBE_TEXT", on_done))
+
+    def submit_open_mongoose(self, on_done: Callable[[dict], None]) -> None:
+        """Open the Mongoose texting dashboard as a tab in the launcher's OWN
+        browser context (so the probe / texting automation can see it)."""
+        self.q.put(("OPEN_MONGOOSE", on_done))
 
     def submit_set_followup_date(
         self, query: str, date_str: str, on_done: Callable[[dict], None],
@@ -658,6 +663,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._probe_text(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "OPEN_MONGOOSE":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._open_mongoose(ctx)
             finally:
                 on_done(res)
         elif cmd[0] == "SET_FOLLOWUP_DATE":
@@ -2248,6 +2260,36 @@ class BrowserWorker:
         except Exception as e:
             return {"error": f"bulk task read failed: {e}"}
         return {"by_sid": by_sid, "count": len(by_sid)}
+
+    MONGOOSE_DASHBOARD_URL = "https://sms.mongooseresearch.com/legacy-dashboard"
+
+    def _open_mongoose(self, ctx) -> dict:
+        """Open (or focus) the Mongoose texting dashboard in the launcher's OWN
+        persistent context, so the probe / texting automation can see it.
+        Reuses an existing mongoose tab if one is already open; otherwise spawns
+        a fresh page and navigates. Brings the tab to the foreground. Returns
+        {ok, url} or {error}."""
+        # Reuse an existing Mongoose tab if present.
+        for page in ctx.pages:
+            try:
+                if not page.is_closed() and "mongoose" in (page.url or "").lower():
+                    try:
+                        page.bring_to_front()
+                    except Exception:
+                        pass
+                    return {"ok": True, "url": page.url or ""}
+            except Exception:
+                continue
+        try:
+            page = ctx.new_page()
+            page.goto(self.MONGOOSE_DASHBOARD_URL, wait_until="domcontentloaded")
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+            return {"ok": True, "url": page.url or ""}
+        except Exception as e:
+            return {"error": str(e)}
 
     def _probe_text(self, ctx) -> dict:
         """TEMP dev probe: capture the live Mongoose ("Cadence") texting
@@ -10291,6 +10333,15 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self._btn_probe_text.pack(side="left", padx=(8, 0))
+        # TEMP dev helper (remove with the text probe): open Mongoose in the
+        # launcher's OWN browser context so the probe can see it. Click this,
+        # navigate to your inbox + compose view, then click Probe Text.
+        self._btn_open_mongoose = ctk.CTkButton(
+            toggle_frame, text="🐭 Open Mongoose",
+            width=140, command=self._dev_open_mongoose,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_open_mongoose.pack(side="left", padx=(8, 0))
         # (Busy/refresh indicator now lives in the top bar — see topbar.)
         # Collapse the rightmost toolbar buttons to emoji-only when the
         # bar gets too narrow (they're the first to clip).
@@ -15696,6 +15747,36 @@ class App:
                 pass
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    def _dev_open_mongoose(self) -> None:
+        """TEMP dev helper: open the Mongoose dashboard in the launcher's OWN
+        browser context so the probe (and later, the texting automation) can
+        see it. Then navigate to your inbox + compose view and click Probe
+        Text."""
+        try:
+            if not self.worker.ready_event.is_set():
+                self._append_log("Browser not ready yet.")
+                return
+        except Exception:
+            return
+        self._append_log("Opening Mongoose in the launcher's browser…")
+
+        def on_done(res):
+            def show():
+                if not res or res.get("error"):
+                    self._append_log(
+                        f"Open Mongoose failed: {(res or {}).get('error')}",
+                        error=True)
+                    return
+                self._append_log(
+                    f"Mongoose open: {res.get('url') or '(unknown)'}  "
+                    "→ navigate to your inbox + compose view, then click "
+                    "🧪 Probe Text.")
+            try:
+                self.root.after(0, show)
+            except Exception:
+                pass
+        self.worker.submit_open_mongoose(on_done)
 
     def _dev_probe_text(self) -> None:
         """TEMP dev probe: dump the live Mongoose ("Cadence") texting composer
