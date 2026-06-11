@@ -40,6 +40,31 @@ def _screenshot_failure(page: Page, tag: str) -> Path:
     return out
 
 
+def wait_for_submit_enabled(page: Page, timeout_ms: int = 4_000) -> bool:
+    """Poll until the visible Submit button is enabled, up to `timeout_ms`.
+
+    Lightning re-enables Submit *reactively*, a beat AFTER the last required
+    field is set — e.g. ticking an Academic Activity for "Email from Student".
+    Checking `is_enabled()` the instant our fill returns can therefore read a
+    stale "disabled" even though the form is actually valid (an intermittent
+    failure, more likely on a slow/right-click fire). Polling absorbs that lag.
+
+    Returns True if Submit becomes enabled within the window, else False."""
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    btn = selectors.submit_button(page)
+    while time.monotonic() < deadline:
+        try:
+            if btn.is_enabled():
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(150)
+    try:
+        return btn.is_enabled()
+    except Exception:
+        return False
+
+
 def wait_for_submit_complete(page: Page, timeout_ms: int = 15_000) -> None:
     """After clicking Submit, wait until Salesforce has settled the
     submission. Two equally-valid signals: Submit becomes hidden (panel
@@ -167,14 +192,16 @@ def fill_note(page: Page, data: NoteData, *, timeout_ms: int = 10_000) -> None:
                     page.keyboard.insert_text(line)
 
         if data.submit:
-            submit_btn = selectors.submit_button(page)
-            if not submit_btn.is_enabled():
+            # Poll instead of checking once: Lightning re-enables Submit a beat
+            # after the last required field is set, so an immediate read can
+            # spuriously see "disabled" on a valid form (intermittent failure).
+            if not wait_for_submit_enabled(page):
                 raise RuntimeError(
                     "Submit button is disabled — a required field is missing "
                     "(check Interaction Type, Subject/Course Code, body, and "
                     "any Academic Activity gates)."
                 )
-            _safe_click(submit_btn)
+            _safe_click(selectors.submit_button(page))
             wait_for_submit_complete(page)
 
     except PlaywrightTimeoutError as e:
