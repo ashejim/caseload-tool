@@ -13479,6 +13479,13 @@ class App:
         return (scenario.text is not None and not scenario.notes
                 and scenario.email is None)
 
+    @staticmethod
+    def _texting_opted_in(row: dict) -> bool:
+        """True if the caseload row's TextingPreference is 'Opted In'. Students
+        who aren't opted in don't exist as textable contacts in Mongoose, so we
+        skip them up front (faster + no batch stalls on an un-addable number)."""
+        return (row.get("TextingPreference") or "").strip().lower() == "opted in"
+
     def _send_text_blocking(self, payload: dict) -> Optional[dict]:
         """Queue a SEND_TEXT and block the main thread until the worker returns
         {ok}/{error}."""
@@ -13542,6 +13549,10 @@ class App:
             variables.update(prompt_vars)
         who = (variables.get("full_name") or variables.get("student_id")
                or "this student")
+        if row is not None and not self._texting_opted_in(row):
+            self._append_log(
+                f"Text: {who} is not opted in to texting — skipped.", error=True)
+            return False
         mobile_raw = (row.get("MobilePhone") if row else "") or ""
         mobile = tm.normalize_phone(mobile_raw)
         if not mobile:
@@ -13876,7 +13887,13 @@ class App:
         prompt_vars = prompt_vars or {}
         groups: dict = {}
         order: list = []
+        not_opted = 0
         for row in matched:
+            # Skip students not opted in to texting — they aren't textable in
+            # Mongoose anyway, so including them only stalls the batch.
+            if not self._texting_opted_in(row):
+                not_opted += 1
+                continue
             rv = self._text_vars_from_row(row)
             course = rv["course_code"]
             inbox_label = tcfg.inbox_label or (
@@ -13896,6 +13913,15 @@ class App:
                 g["mobiles"].append(mobile)
             else:
                 g["no_mobile"].append(name)
+
+        if not_opted:
+            self._append_log(
+                f"Batch text: skipped {not_opted} student(s) not opted in to "
+                "texting.")
+        if not order:
+            self._append_log(
+                "Batch text: no opted-in students to text after filtering.")
+            return
 
         # One review entry per group: the shared (generic) message + slot.
         scheduled = bool(tcfg.schedule)
