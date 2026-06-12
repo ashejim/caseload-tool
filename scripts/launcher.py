@@ -5910,27 +5910,39 @@ def _configure_email_preview_tags(text_widget) -> None:
 def prompt_batch_text_review(
     parent,
     scenario_name: str,
-    entries: list[dict],
+    groups: list[dict],
+    skipped_names: "Optional[list[str]]" = None,
     filter_summary: str = "",
     *,
     scheduled: bool = True,
-) -> Optional[list[int]]:
-    """Modal reviewer for batch texts — the texting analog of
-    prompt_batch_email_review. Left: a checklist of students (name · course ·
-    send time · any issues). Right: the selected student's actual rendered
-    message. Returns the list of selected indices into `entries`, or None on
-    cancel. Rows with issues (no mobile / unknown tz / over the char limit)
-    start unchecked so they're consciously opted in."""
+) -> "Optional[list[list[str]]]":
+    """Modal reviewer for batch texts. Each timezone group is a foldable section
+    with a per-student checklist (default checked; students without a mobile are
+    shown disabled). A read-only "Skipped - not opted in" section lists students
+    who won't be texted. The right pane shows the group's shared message.
+
+    `groups`: dicts with keys label, course_code, when_str, body, issues,
+    inbox_label, schedule, schedule_name, members (list of {name, mobile}).
+    Returns a list PARALLEL to `groups`, each element the selected recipient
+    mobiles for that group; or None on cancel."""
+    skipped_names = skipped_names or []
     dialog = ctk.CTkToplevel(parent)
-    dialog.title(f"Review texts — {scenario_name}")
-    dialog.geometry("900x640")
+    dialog.title(f"Review texts - {scenario_name}")
+    dialog.geometry("980x680")
     dialog.transient(parent)
     dialog.attributes("-topmost", True)
     dialog.grab_set()
     dialog.lift()
     dialog.after(150, lambda: (dialog.lift(), dialog.focus_force()))
     result: dict = {"value": None}
-    sel_vars = [ctk.BooleanVar(value=not bool(e.get("issues"))) for e in entries]
+
+    # Per-group, per-member selection vars. No-mobile members aren't textable
+    # -> var stays False and the checkbox is disabled.
+    member_vars: list = []
+    for g in groups:
+        member_vars.append(
+            [ctk.BooleanVar(value=bool(m.get("mobile")))
+             for m in g.get("members", [])])
 
     banner = ctk.CTkFrame(dialog, fg_color=("gray92", "gray18"))
     banner.pack(fill="x", padx=8, pady=(8, 0))
@@ -5951,7 +5963,8 @@ def prompt_batch_text_review(
 
     body = ctk.CTkFrame(dialog, fg_color="transparent")
     body.pack(fill="both", expand=True, padx=8, pady=6)
-    left = ctk.CTkScrollableFrame(body, label_text="Students", width=330)
+    left = ctk.CTkScrollableFrame(
+        body, label_text="Students by timezone", width=400)
     left.pack(side="left", fill="y", padx=(0, 6))
     right = ctk.CTkFrame(body, fg_color=("gray95", "gray16"))
     right.pack(side="left", fill="both", expand=True)
@@ -5962,66 +5975,137 @@ def prompt_batch_text_review(
     preview_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
     preview_box.configure(state="disabled")
 
-    def _update_sel_label():
-        n = sum(1 for v in sel_vars if v.get())
-        sel_label.configure(text=f"{n} of {len(entries)} selected")
+    def _count():
+        return sum(1 for gv in member_vars for v in gv if v.get())
 
-    def _show(i: int):
-        e = entries[i]
-        hdr = (f"To:  {e['name']}"
-               + (f"   ·   {e['mobile']}" if e.get("mobile") else "  ·  (no mobile)")
-               + f"\n{'Schedule' if scheduled else 'Send'}:  {e['when_str']}")
-        if e.get("recipients_str"):
-            hdr += f"\nRecipients:  {e['recipients_str']}"
-        if e.get("issues"):
-            hdr += f"\n⚠ {', '.join(e['issues'])}"
+    def _update_sel_label():
+        sel_label.configure(
+            text=f"{_count()} recipient(s) selected across "
+                 f"{len(groups)} timezone group(s)")
+
+    def _show(i):
+        g = groups[i]
+        names = ", ".join(m["name"] for m in g.get("members", []))
+        hdr = (f"{g['label']}\n{'Schedule' if scheduled else 'Send'}:  "
+               f"{g['when_str']}\nRecipients:  {names}")
+        if g.get("issues"):
+            hdr += f"\n⚠ {', '.join(g['issues'])}"
         preview_hdr.configure(text=hdr)
         preview_box.configure(state="normal")
         preview_box.delete("1.0", "end")
-        preview_box.insert("1.0", e.get("body", ""))
+        preview_box.insert("1.0", g.get("body", ""))
         preview_box.configure(state="disabled")
 
-    for i, e in enumerate(entries):
-        rowf = ctk.CTkFrame(left, fg_color="transparent")
-        rowf.pack(fill="x", pady=1)
+    if skipped_names:
+        skip_frame = ctk.CTkFrame(left, fg_color=("gray90", "gray22"))
+        skip_frame.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(
+            skip_frame,
+            text=f"Skipped - not opted in ({len(skipped_names)})",
+            anchor="w", font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray45", "gray65"),
+        ).pack(fill="x", padx=8, pady=(4, 0))
+        ctk.CTkLabel(
+            skip_frame, text=", ".join(skipped_names), anchor="w",
+            justify="left", wraplength=360, font=ctk.CTkFont(size=10),
+            text_color=("gray45", "gray60"),
+        ).pack(fill="x", padx=8, pady=(0, 4))
+
+    def _make_group(i):
+        g = groups[i]
+        gv = member_vars[i]
+        sec = ctk.CTkFrame(left, fg_color=("gray94", "gray20"))
+        sec.pack(fill="x", pady=2)
+        head = ctk.CTkFrame(sec, fg_color="transparent")
+        head.pack(fill="x")
+        master = ctk.BooleanVar(value=any(v.get() for v in gv))
+        members_box = ctk.CTkFrame(sec, fg_color="transparent")
+        fold = {"open": True}
+
+        def _sync_master():
+            master.set(any(v.get() for v in gv))
+            _update_sel_label()
+
+        def _toggle_group():
+            on = master.get()
+            for m, v in zip(g.get("members", []), gv):
+                if m.get("mobile"):
+                    v.set(on)
+            _update_sel_label()
+
         ctk.CTkCheckBox(
-            rowf, text="", width=24, variable=sel_vars[i],
-            command=_update_sel_label,
+            head, text="", width=24, variable=master, command=_toggle_group,
         ).pack(side="left", anchor="n")
-        # A wrapping label (not a button) so long group labels / "⚠ …" notes
-        # don't clip. Clicking it shows the message on the right. Compact sub-
-        # line — the full issue text lives in the right preview header.
-        warn = "⚠  " if e.get("issues") else ""
-        sub = e.get("mobile", "") or e.get("when_str", "")
+        toggle_btn = ctk.CTkButton(
+            head, text="▾", width=24, fg_color="transparent",
+            text_color=("gray10", "gray90"), hover_color=("gray85", "gray25"))
+        toggle_btn.pack(side="left")
+        ntext = sum(1 for m in g.get("members", []) if m.get("mobile"))
+        warn = "⚠  " if g.get("issues") else ""
         lbl = ctk.CTkLabel(
-            rowf, text=f"{warn}{e['name']}\n{sub}", anchor="w", justify="left",
-            wraplength=250, font=ctk.CTkFont(size=11),
-            text_color=(("#a33", "#e88") if e.get("issues")
-                        else ("gray10", "gray90")),
-        )
+            head,
+            text=f"{warn}{g['label']}\n{g['when_str']}  ·  {ntext} textable",
+            anchor="w", justify="left", wraplength=320,
+            font=ctk.CTkFont(size=11),
+            text_color=(("#a33", "#e88") if g.get("issues")
+                        else ("gray10", "gray90")))
         lbl.pack(side="left", fill="x", expand=True)
         lbl.bind("<Button-1>", lambda _ev, x=i: _show(x))
+
+        for m, v in zip(g.get("members", []), gv):
+            has = bool(m.get("mobile"))
+            txt = m["name"] + ("" if has else "   (no mobile)")
+            ctk.CTkCheckBox(
+                members_box, text=txt, variable=v, command=_sync_master,
+                font=ctk.CTkFont(size=11),
+                state=("normal" if has else "disabled"),
+            ).pack(anchor="w", padx=(30, 8), pady=1)
+        members_box.pack(fill="x")
+
+        def _fold():
+            if fold["open"]:
+                members_box.pack_forget()
+                toggle_btn.configure(text="▸")
+                fold["open"] = False
+            else:
+                members_box.pack(fill="x")
+                toggle_btn.configure(text="▾")
+                fold["open"] = True
+        toggle_btn.configure(command=_fold)
+
+    for i in range(len(groups)):
+        _make_group(i)
     _update_sel_label()
-    if entries:
+    if groups:
         _show(0)
 
     footer = ctk.CTkFrame(dialog, fg_color="transparent")
     footer.pack(fill="x", padx=8, pady=(0, 8))
 
     def _toggle_all():
-        target = not all(v.get() for v in sel_vars)
-        for v in sel_vars:
-            v.set(target)
+        target = _count() == 0
+        for g, gv in zip(groups, member_vars):
+            for m, v in zip(g.get("members", []), gv):
+                if m.get("mobile"):
+                    v.set(target)
         _update_sel_label()
 
     def _close():
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
+        try:
+            dialog.grab_release()
+        except Exception:
+            pass
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
 
     def _send():
-        result["value"] = [i for i, v in enumerate(sel_vars) if v.get()]
+        out = []
+        for g, gv in zip(groups, member_vars):
+            out.append([m["mobile"] for m, v in zip(g.get("members", []), gv)
+                        if v.get() and m.get("mobile")])
+        result["value"] = out
         _close()
 
     ctk.CTkButton(
@@ -13883,59 +13967,56 @@ class App:
                     f"{e}", error=True)
                 return
 
-        # Batch texts are NOT personalized — one shared message per group. Group
+        # Batch texts are NOT personalized - one shared message per group. Group
         # the matched students by (inbox, timezone): the inbox is course-scoped
         # and one Mongoose compose sends ONE body at ONE time, so each
         # (course-inbox, timezone) becomes a single multi-recipient scheduled
-        # compose. (Personalized bulk would need Mongoose merge fields — later.)
+        # compose. (Personalized bulk would need Mongoose merge fields - later.)
         prompt_vars = prompt_vars or {}
         groups: dict = {}
         order: list = []
-        not_opted = 0
+        skipped_names: list = []
         for row in matched:
-            # Skip students not opted in to texting — they aren't textable in
-            # Mongoose anyway, so including them only stalls the batch.
-            if not self._texting_opted_in(row):
-                not_opted += 1
-                continue
             rv = self._text_vars_from_row(row)
+            name = rv["full_name"] or row.get("Name", "")
+            # Students not opted in aren't textable in Mongoose - list them as
+            # skipped (shown read-only in the review) and don't try to text them.
+            if not self._texting_opted_in(row):
+                skipped_names.append(name)
+                continue
             course = rv["course_code"]
             inbox_label = tcfg.inbox_label or (
                 f"{course} Inbox" if course else "")
             tz = (row.get("Timezone") or "").strip()
             mobile = tm.normalize_phone(row.get("MobilePhone") or "")
-            name = rv["full_name"] or row.get("Name", "")
             key = (inbox_label, tz)
             g = groups.get(key)
             if g is None:
                 g = {"inbox_label": inbox_label, "tz": tz, "course": course,
-                     "mobiles": [], "names": [], "no_mobile": []}
+                     "members": []}
                 groups[key] = g
                 order.append(key)
-            g["names"].append(name)
-            if mobile:
-                g["mobiles"].append(mobile)
-            else:
-                g["no_mobile"].append(name)
+            g["members"].append({"name": name, "mobile": mobile})
 
-        if not_opted:
+        if skipped_names:
             self._append_log(
-                f"Batch text: skipped {not_opted} student(s) not opted in to "
-                "texting.")
+                f"Batch text: {len(skipped_names)} student(s) not opted in "
+                "(listed in the review; skipped).")
         if not order:
             self._append_log(
                 "Batch text: no opted-in students to text after filtering.")
             return
 
-        # One review entry per group: the shared (generic) message + slot.
+        # One review group per (inbox, timezone): the shared (generic) message
+        # + schedule slot + the member list (for the per-student checklist).
         scheduled = bool(tcfg.schedule)
-        entries: list[dict] = []
+        review_groups: list = []
         for key in order:
             g = groups[key]
             gvars = {"course_code": g["course"]}  # group-level vars only
             gvars.update(prompt_vars)
             body = tm.render_message(body_tmpl, gvars)
-            issues: list[str] = []
+            issues: list = []
             when_str, sch_payload, sched_name = "now", None, ""
             if tcfg.schedule:
                 slot = tm.compute_schedule_slot(
@@ -13950,78 +14031,73 @@ class App:
                         "student_local_str": slot.student_local_str,
                     }
                     sched_name = f"{g['course']} batch".strip() or "Scheduled text"
-            if not g["mobiles"]:
+            n_mobile = sum(1 for m in g["members"] if m["mobile"])
+            n_no_mobile = len(g["members"]) - n_mobile
+            if n_mobile == 0:
                 issues.append("no recipients with a mobile")
-            elif g["no_mobile"]:
-                issues.append(f"{len(g['no_mobile'])} without a mobile")
+            elif n_no_mobile:
+                issues.append(f"{n_no_mobile} without a mobile")
             if tm.over_length(body):
                 issues.append(f"{tm.over_length(body)} over limit")
             if "{{" in body and "}}" in body:
-                # Batch is generic — a leftover {{var}} (e.g. {{first_name}})
-                # won't be personalized; surface it so it's caught in review.
-                issues.append("unresolved {{variable}} — batch isn't personalized")
-            label = f"{g['inbox_label'] or 'inbox?'}  ·  {g['tz'] or 'tz?'}"
-            entries.append({
-                "name": label,
-                "course_code": g["course"],
-                "mobile": f"{len(g['mobiles'])} recipient(s)",
-                "recipients_str": ", ".join(g["names"]),
-                "when_str": when_str, "body": body, "issues": issues,
-                "inbox_label": g["inbox_label"], "schedule": sch_payload,
-                "schedule_name": sched_name, "mobiles": g["mobiles"],
+                issues.append("unresolved {{variable}} - batch isn't personalized")
+            review_groups.append({
+                "label": f"{g['inbox_label'] or 'inbox?'}  ·  {g['tz'] or 'tz?'}",
+                "course_code": g["course"], "when_str": when_str, "body": body,
+                "issues": issues, "inbox_label": g["inbox_label"],
+                "schedule": sch_payload, "schedule_name": sched_name,
+                "members": g["members"],
             })
 
         filter_summary = ", ".join(
             f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
             for f in scenario.batch.filters if f.get("column"))
         selected = prompt_batch_text_review(
-            self.root, scenario.name, entries, filter_summary,
-            scheduled=scheduled)
+            self.root, scenario.name, review_groups, skipped_names,
+            filter_summary, scheduled=scheduled)
         if selected is None:
             self._append_log("Batch text cancelled.")
             return
-        if not selected:
-            self._append_log("Batch text: 0 selected; nothing to do.")
+        if not any(selected):
+            self._append_log("Batch text: 0 recipients selected; nothing to do.")
             return
 
-        # One compose per selected group. Lock the browser for the loop (review
-        # already happened, so the scrim hides nothing the user needs).
+        # One compose per group, to that group's selected mobiles. Lock the
+        # browser for the loop (review already happened).
         self._lock_browser_for_run()
         sent = 0
-        ngroups = len(selected)
+        groups_sent = 0
         try:
-            for n, idx in enumerate(selected, 1):
-                e = entries[idx]
-                if not e["mobiles"]:
-                    self._append_log(
-                        f"  text {n}/{ngroups}: skipped {e['name']} "
-                        "(no recipients with a mobile).", error=True)
+            for i, grp in enumerate(review_groups):
+                mobiles = selected[i] if i < len(selected) else []
+                if not mobiles:
                     continue
-                if any(i.startswith("unknown tz") for i in e["issues"]):
+                if any(s.startswith("unknown tz") for s in grp["issues"]):
                     self._append_log(
-                        f"  text {n}/{ngroups}: skipped {e['name']} "
-                        "(unknown timezone).", error=True)
+                        f"  text: skipped {grp['label']} (unknown timezone).",
+                        error=True)
                     continue
                 payload = {
-                    "body": e["body"], "recipients": e["mobiles"],
-                    "inbox_label": e["inbox_label"], "schedule": e["schedule"],
-                    "schedule_name": e["schedule_name"], "commit": True,
+                    "body": grp["body"], "recipients": mobiles,
+                    "inbox_label": grp["inbox_label"], "schedule": grp["schedule"],
+                    "schedule_name": grp["schedule_name"], "commit": True,
                 }
+                groups_sent += 1
                 self._append_log(
-                    f"  text {n}/{ngroups}: {e['name']} — "
-                    f"{len(e['mobiles'])} recipient(s) ({e['when_str']})…")
+                    f"  text: {grp['label']} - {len(mobiles)} recipient(s) "
+                    f"({grp['when_str']})...")
                 res = self._send_text_blocking(payload)
                 if not res or res.get("error"):
                     self._append_log(
-                        f"  text failed [{e['name']}]: "
+                        f"  text failed [{grp['label']}]: "
                         f"{(res or {}).get('error')}", error=True)
                 else:
-                    sent += len(e["mobiles"])
+                    sent += len(mobiles)
         finally:
             self._unlock_browser_after_run()
         self._append_log(
-            f"Batch text complete: {sent} recipient(s) in "
-            f"{len(selected)} group(s) {'scheduled' if scheduled else 'sent'}.")
+            f"Batch text complete: {sent} recipient(s) in {groups_sent} "
+            f"group(s) {'scheduled' if scheduled else 'sent'}.")
 
     @staticmethod
     def _row_name_and_query(row: dict) -> tuple[str, str]:
