@@ -2429,6 +2429,7 @@ class BrowserWorker:
             inbox_label=payload.get("inbox_label", ""),
             schedule=slot,
             schedule_name=payload.get("schedule_name", ""),
+            course=payload.get("course", ""),
             commit=bool(payload.get("commit", False)),
         )
         try:
@@ -13775,6 +13776,7 @@ class App:
             "inbox_label": inbox_label,
             "schedule": sch_payload,
             "schedule_name": sched_name,
+            "course": variables.get("course_code", ""),
             "commit": True,  # tool finishes in Mongoose; review already happened
         }
         when = (f"scheduling ({sch_payload['student_local_str']} student-local)"
@@ -14138,17 +14140,9 @@ class App:
             filter_summary = ", ".join(
                 f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
                 for f in scenario.batch.filters if f.get("column"))
-        # Up-front department check: Mongoose Compose only offers the current
-        # department's inbox, so flag any group whose course doesn't match it
-        # (so the user is warned in the review, not at send time). Best-effort —
-        # opens Mongoose in the background to read it.
-        dept = self._mongoose_department_blocking()
-        if dept:
-            for grp in review_groups:
-                gc = (grp.get("course_code") or "").strip()
-                if gc and gc.lower() != dept.lower():
-                    grp.setdefault("issues", []).insert(
-                        0, f"Mongoose is on {dept} — switch to {gc} to send")
+        # (No up-front department warning needed: send_text auto-switches
+        # Mongoose to each group's course before composing, and fails loudly if
+        # that department/team doesn't exist.)
         selected = prompt_batch_text_review(
             self.root, scenario.name, review_groups, skipped_names,
             filter_summary, scheduled=scheduled)
@@ -14174,7 +14168,8 @@ class App:
                 payload = {
                     "body": grp["body"], "recipients": mobiles,
                     "inbox_label": grp["inbox_label"], "schedule": grp["schedule"],
-                    "schedule_name": grp["schedule_name"], "commit": True,
+                    "schedule_name": grp["schedule_name"],
+                    "course": grp.get("course_code", ""), "commit": True,
                 }
                 groups_sent += 1
                 self._append_log(

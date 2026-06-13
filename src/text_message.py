@@ -26,6 +26,7 @@ compose per zone, each at the target local hour converted to the team's tz.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Optional
@@ -203,11 +204,67 @@ class TextMessage:
     inbox_label: str = ""                       # e.g. "C769 Inbox"; "" = pick first/only
     schedule: Optional[ScheduleSlot] = None     # None = Send Now path
     schedule_name: str = ""                     # Mongoose "Message Name" on the schedule step
+    course: str = ""                            # auto-switch Mongoose to this dept first
     commit: bool = False                        # False = stop at confirm/schedule for review
 
 
 def _noop(_msg: str) -> None:
     pass
+
+
+def current_department(page: Page) -> str:
+    """The Mongoose department currently selected in the sidebar (e.g. 'C769'),
+    or '' if it can't be read."""
+    try:
+        el = page.locator(".department-name").filter(visible=True).first
+        if el.count() == 0:
+            return ""
+        return (el.inner_text() or "").strip()
+    except Exception:
+        return ""
+
+
+def switch_department(page: Page, course: str, *, timeout_ms: int = 10_000) -> None:
+    """Make Mongoose's selected department match `course` (e.g. 'C769') so the
+    Compose modal offers that course's inbox. No-op if already on it. Raises if
+    the department isn't in the team list. Driven via Playwright, which also
+    wakes a backgrounded/frozen renderer (where a manual click wouldn't)."""
+    course = (course or "").strip()
+    if not course:
+        return
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+    if current_department(page).lower() == course.lower():
+        return
+    # Open the department switcher (the sidebar box showing the current dept).
+    trigger = page.locator(
+        ".department-name.department-dropdown").filter(visible=True).first
+    trigger.wait_for(state="visible", timeout=timeout_ms)
+    trigger.click()
+    # Pick the team whose aria-label starts with the course code
+    # (e.g. "C769, 1 unread message" / "C964, Current team" / "D502").
+    item = page.locator(
+        f'.team-list .v-list-item[aria-label^="{course}"]'
+    ).filter(visible=True).first
+    try:
+        item.wait_for(state="visible", timeout=timeout_ms)
+    except PWTimeout:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Mongoose has no {course!r} department/team to switch to.")
+    item.click()
+    # Wait for the switch to take effect (the sidebar dept updates).
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        if current_department(page).lower() == course.lower():
+            return
+        page.wait_for_timeout(200)
+    # Not confirmed in time — proceed; select_inbox will fail loudly if wrong.
 
 
 def _click_button(page: Page, name: str, *, timeout_ms: int = 10_000) -> None:
@@ -335,6 +392,11 @@ def send_text(
     Returns True if it reached the confirm/schedule step without error (whether
     or not the final click was made). Raises on a hard driver failure."""
     say = on_status or _noop
+    # Make sure Mongoose is on the right department first (Compose only offers
+    # the current department's inbox). Playwright-driven, so it also wakes a
+    # frozen/backgrounded renderer.
+    if msg.course:
+        switch_department(page, msg.course)
     open_compose(page)
     select_inbox(page, msg.inbox_label)
 
