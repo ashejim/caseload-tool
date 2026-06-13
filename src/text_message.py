@@ -258,10 +258,13 @@ def switch_department(page: Page, course: str, *, timeout_ms: int = 10_000) -> N
         raise RuntimeError(
             f"Mongoose has no {course!r} department/team to switch to.")
     item.click()
-    # Wait for the switch to take effect (the sidebar dept updates).
+    # Wait for the switch to take effect (the sidebar dept updates), then let
+    # the new department's inbox page render before we open Compose — opening
+    # mid-transition leaves the modal stuck before the recipient step.
     deadline = time.monotonic() + timeout_ms / 1000.0
     while time.monotonic() < deadline:
         if current_department(page).lower() == course.lower():
+            page.wait_for_timeout(1200)
             return
         page.wait_for_timeout(200)
     # Not confirmed in time — proceed; select_inbox will fail loudly if wrong.
@@ -274,8 +277,38 @@ def _click_button(page: Page, name: str, *, timeout_ms: int = 10_000) -> None:
     ).first.click(timeout=timeout_ms)
 
 
+def close_compose(page: Page, *, timeout_ms: int = 5_000) -> None:
+    """Close the compose modal if one is open. A left-open modal (e.g. from a
+    failed previous group) makes the Compose button `inert` and its overlay
+    intercepts clicks — so we reset to a clean slate before each compose."""
+    overlay = page.locator(".compose-modal-overlay").filter(visible=True)
+    try:
+        if overlay.count() == 0:
+            return
+    except Exception:
+        return
+    try:
+        btn = page.get_by_role(
+            "button", name="Close Compose Modal").filter(visible=True)
+        if btn.count() > 0:
+            btn.first.click(timeout=timeout_ms)
+        else:
+            page.keyboard.press("Escape")
+    except Exception:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+    try:
+        overlay.first.wait_for(state="hidden", timeout=timeout_ms)
+    except Exception:
+        pass
+
+
 def open_compose(page: Page, *, timeout_ms: int = 15_000) -> None:
-    """Click Compose and wait for the compose modal to appear."""
+    """Click Compose and wait for the compose modal to appear. Resets any
+    leftover modal first so the (otherwise inert) Compose button is clickable."""
+    close_compose(page)
     _click_button(page, "Compose", timeout_ms=timeout_ms)
     page.locator(".compose-modal").filter(visible=True).first.wait_for(
         state="visible", timeout=timeout_ms
@@ -325,6 +358,15 @@ def add_recipient(page: Page, mobile: str, *, timeout_ms: int = 10_000) -> bool:
     if box.count() == 0:
         box = page.get_by_label("Search by First, Last, ID, or Mobile")
     box = box.filter(visible=True).first
+    # The recipient box lives on the compose step; if it never shows, the modal
+    # is stuck on an earlier step — fail fast + clearly instead of a 30s click
+    # timeout.
+    try:
+        box.wait_for(state="visible", timeout=12_000)
+    except PWTimeout:
+        raise RuntimeError(
+            "recipient search box didn't appear — the compose modal didn't "
+            "reach the recipient step (inbox not selected / page still loading).")
     box.click()
     box.fill(term)
     # Results render in an overlay listbox of .v-list-item options.
