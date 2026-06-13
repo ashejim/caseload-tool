@@ -2572,14 +2572,16 @@ class BrowserWorker:
             el.tagName.toLowerCase()+' .'+cls(el).split(/\s+/).slice(0,3).join('.')
           ))].slice(0,60);
           let html='';
-          // Visible dialogs / panels / docked composer.
+          // Visible dialogs / panels / docked composer / open menus & dropdowns
+          // (Vuetify v-overlay/v-menu/v-list, role=menu/listbox) — the latter
+          // so the department switcher dropdown gets captured when it's open.
           const dialogs=deepAll(el=>{ if(!vis(el))return false;
             const role=el.getAttribute&&el.getAttribute('role'); const c=cls(el);
-            return role==='dialog'||
-              /slds-modal__container|slds-modal__content|slds-docked|dockable|slds-panel|cadence|sendText|sms/i.test(c);
+            return role==='dialog'||role==='menu'||role==='listbox'||
+              /slds-modal__container|slds-modal__content|slds-docked|dockable|slds-panel|cadence|sendText|sms|v-overlay__content|v-menu|v-list|department|dropdown/i.test(c);
           });
           const topD=dialogs.filter(m=>!dialogs.some(o=>o!==m&&o.contains(m)));
-          for(const dd of topD.slice(0,3)) html+='\n=== DIALOG / PANEL ===\n'+ser(dd,0);
+          for(const dd of topD.slice(0,5)) html+='\n=== DIALOG / PANEL / MENU ===\n'+ser(dd,0);
           // Form fields (the message body, recipient, template, schedule),
           // climbed a few levels to grab their labels + surrounding controls.
           function climb(el,n){let p=el;for(let i=0;i<n&&p&&p.parentElement;i++)p=p.parentElement;return p;}
