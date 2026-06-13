@@ -13884,11 +13884,25 @@ class App:
             if confirmed is None:
                 self._append_log("Batch cancelled.")
                 return
-            if not confirmed:
+            if not confirmed and scenario.text is None:
                 self._append_log("Batch: 0 students confirmed; nothing to do.")
                 return
         else:
             confirmed = matched
+
+        # Text channel (combined action): review + send the texts FIRST
+        # (timezone-grouped + scheduled = fast), then the slower per-student
+        # email+note loop below. Cancelling the text review aborts the action.
+        if scenario.text is not None:
+            tgroups, tskipped = self._build_text_review_groups(
+                scenario, matched, prompt_vars)
+            if tgroups is None:
+                return
+            if tgroups and not self._review_and_send_texts(
+                    scenario, tgroups, tskipped):
+                self._append_log(
+                    "Action cancelled at text review; notes/email not run.")
+                return
 
         # Steps 6 + 7 (custom-body prompts, clipboard, the per-student
         # loop) are shared with the caseload-panel mini-batch — see
@@ -13954,6 +13968,22 @@ class App:
         if prompt_vars is None:
             return
 
+        groups, skipped = self._build_text_review_groups(
+            scenario, matched, prompt_vars)
+        if groups is None:
+            return  # template load failed (already logged)
+        if not groups:
+            self._append_log(
+                "Batch text: no opted-in students to text after filtering.")
+            return
+        self._review_and_send_texts(scenario, groups, skipped)
+
+    def _build_text_review_groups(self, scenario, matched, prompt_vars):
+        """Group matched students by (inbox, timezone) for batch texting and
+        render the shared (generic) message + schedule per group. Returns
+        (review_groups, skipped_names); review_groups is None on a template-load
+        error, [] if no opted-in students. Logs the not-opted-in count."""
+        from src import text_message as tm
         tcfg = scenario.text
         body_tmpl = tcfg.body
         if not body_tmpl and tcfg.body_file:
@@ -13965,13 +13995,7 @@ class App:
                 self._append_log(
                     f"Batch text: couldn't load template {tcfg.body_file!r}: "
                     f"{e}", error=True)
-                return
-
-        # Batch texts are NOT personalized - one shared message per group. Group
-        # the matched students by (inbox, timezone): the inbox is course-scoped
-        # and one Mongoose compose sends ONE body at ONE time, so each
-        # (course-inbox, timezone) becomes a single multi-recipient scheduled
-        # compose. (Personalized bulk would need Mongoose merge fields - later.)
+                return None, []
         prompt_vars = prompt_vars or {}
         groups: dict = {}
         order: list = []
@@ -13979,8 +14003,6 @@ class App:
         for row in matched:
             rv = self._text_vars_from_row(row)
             name = rv["full_name"] or row.get("Name", "")
-            # Students not opted in aren't textable in Mongoose - list them as
-            # skipped (shown read-only in the review) and don't try to text them.
             if not self._texting_opted_in(row):
                 skipped_names.append(name)
                 continue
@@ -13997,19 +14019,10 @@ class App:
                 groups[key] = g
                 order.append(key)
             g["members"].append({"name": name, "mobile": mobile})
-
         if skipped_names:
             self._append_log(
                 f"Batch text: {len(skipped_names)} student(s) not opted in "
                 "(listed in the review; skipped).")
-        if not order:
-            self._append_log(
-                "Batch text: no opted-in students to text after filtering.")
-            return
-
-        # One review group per (inbox, timezone): the shared (generic) message
-        # + schedule slot + the member list (for the per-student checklist).
-        scheduled = bool(tcfg.schedule)
         review_groups: list = []
         for key in order:
             g = groups[key]
@@ -14048,22 +14061,27 @@ class App:
                 "schedule": sch_payload, "schedule_name": sched_name,
                 "members": g["members"],
             })
+        return review_groups, skipped_names
 
-        filter_summary = ", ".join(
-            f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
-            for f in scenario.batch.filters if f.get("column"))
+    def _review_and_send_texts(self, scenario, review_groups, skipped_names):
+        """Show the batch-text reviewer, then send each selected group's text as
+        one multi-recipient scheduled compose. Returns False if the user
+        cancelled the review (so a combined action aborts), True otherwise."""
+        scheduled = bool(scenario.text.schedule)
+        filter_summary = ""
+        if scenario.batch is not None:
+            filter_summary = ", ".join(
+                f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
+                for f in scenario.batch.filters if f.get("column"))
         selected = prompt_batch_text_review(
             self.root, scenario.name, review_groups, skipped_names,
             filter_summary, scheduled=scheduled)
         if selected is None:
             self._append_log("Batch text cancelled.")
-            return
+            return False
         if not any(selected):
-            self._append_log("Batch text: 0 recipients selected; nothing to do.")
-            return
-
-        # One compose per group, to that group's selected mobiles. Lock the
-        # browser for the loop (review already happened).
+            self._append_log("Batch text: 0 recipients selected; skipping texts.")
+            return True
         self._lock_browser_for_run()
         sent = 0
         groups_sent = 0
@@ -14098,6 +14116,7 @@ class App:
         self._append_log(
             f"Batch text complete: {sent} recipient(s) in {groups_sent} "
             f"group(s) {'scheduled' if scheduled else 'sent'}.")
+        return True
 
     @staticmethod
     def _row_name_and_query(row: dict) -> tuple[str, str]:
