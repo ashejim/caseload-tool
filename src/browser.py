@@ -37,7 +37,17 @@ def persistent_context(headless: bool = False) -> Iterator[BrowserContext]:
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
             "--disable-backgrounding-occluded-windows",
-            "--disable-features=CalculateNativeWinOcclusion",
+            # Keep background/minimized tabs from being throttled or frozen.
+            # Edge "sleeping tabs" / efficiency mode freeze a backgrounded tab's
+            # JS (we minimize the browser after the caseload loads), which makes
+            # JS-driven UI like Mongoose's department dropdown unresponsive until
+            # the process is restarted. Disable the Chromium throttles AND Edge's
+            # sleeping-tab/efficiency features. Unknown feature names are ignored
+            # by Chromium, so the best-guess Edge names are harmless if wrong.
+            "--disable-features="
+            "CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,"
+            "msSleepingTabs,msEfficiencyMode,HeavyAdIntervention",
+            "--disable-background-mode",
         ],
         ignore_default_args=["--enable-automation"],
     )
