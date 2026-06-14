@@ -36,6 +36,12 @@ caseload.csv.*
 # (covers history.db and any -journal/-wal/-shm sidecars + CSV exports).
 history.db*
 caseload_history.csv
+# Mongoose contacts/segment exports (Contact ids + names + mobiles) — PII.
+# Auto-detected from the config dir by their contactId column; ignore the
+# likely names so a dev-mode export dropped in the repo root never commits.
+mongoose*.csv
+*segment*.csv
+*contacts*.csv
 # Single-instance lock file (runtime).
 launcher.lock
 
