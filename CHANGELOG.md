@@ -3,6 +3,49 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.10.0 — 2026-06-14
+
+Text messaging. An action can now **send a text** through Mongoose (the SMS
+platform behind "Cadence"), alongside the existing note + email channels —
+composed, reviewed, and sent entirely inside the tool. You never touch the
+Mongoose UI.
+
+### Major features
+- **Send texts (single & batch)** — add a "Send text (Mongoose)" step to any
+  action. The body is a plain-text template with the same `{{variables}}` as
+  email (`first_name`, `preferred_name`, `course_code`, …), rendered tool-side.
+  Single texts are personalized and shown in an in-app review/edit dialog;
+  batches send one shared message per group. The tool drives Mongoose
+  (open → pick inbox → add recipients → message → schedule) to completion.
+- **Always-scheduled, with an acceptable window** — texts are scheduled (never
+  sent immediately, a Mongoose limitation). Each action defines an acceptable
+  **window in the student's local time** (default 10 AM–4 PM); the text goes out
+  **ASAP within it** — at least ~10 min from now, rolling to the window's start
+  the next day if it's already too late today.
+- **Timezone-aware + smart grouping** — sends land at the right local time per
+  timezone; when several timezones resolve to the *same* absolute send time
+  (a wide window fired mid-day), they **merge into one Mongoose compose** for a
+  faster, smoother send. Reviews now show **Today / Tomorrow / a date**.
+- **Contact-ID matching (blank-mobile-proof)** — students are matched to their
+  Salesforce Contact ID from a Mongoose **segment export**, so texting reaches
+  students even when their caseload mobile is blank or differs. The new
+  **⬇ Texting IDs** button auto-exports each caseload department's
+  `all <course> students` segment, joins it to the caseload (by mobile, then
+  name), and persists the map locally (SQLite); a pop-up walks you through
+  creating a segment for any department that has none.
+- **Combined actions** — one action can file a note **and** send an email **and**
+  send a text, reviewed together.
+
+### Improvements
+- Non-opted-in students are skipped up front (faster batches); students with an
+  unknown timezone default to Mountain rather than being dropped.
+- **↻ Browser** one-click restart for hang recovery; firing is blocked while the
+  live task pass/fail scrape is updating (prevents stalls/contention).
+- Auto department switching in Mongoose before composing each group.
+
+### Notes
+- Texting needs the `tzdata` package (bundled in the build) for timezone math.
+
 ## 0.9.0 — 2026-06-10
 
 A large feature release: Essential Actions support, live task pass/fail,

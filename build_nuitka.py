@@ -53,8 +53,11 @@ def main() -> None:
         "--include-package=pynput",
         "--include-package=playwright",
         "--include-package=yaml",
+        # tzdata: IANA tz DB for zoneinfo on Windows (texting schedule math).
+        "--include-package=tzdata",
         "--include-package-data=customtkinter",
         "--include-package-data=playwright",
+        "--include-package-data=tzdata",
         "--include-data-files=notes.yaml=notes.yaml",
         f"--output-dir={DIST_PARENT}",
         f"--output-filename={FINAL_NAME}",

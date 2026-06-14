@@ -14,6 +14,11 @@ block_cipher = None
 # sure those tag along.
 ctk_datas = collect_data_files("customtkinter")
 
+# tzdata provides the IANA timezone database that zoneinfo needs on Windows
+# (no system tz DB) — required by the texting schedule math. Its .zi data
+# files aren't auto-detected, so collect them explicitly.
+tzdata_datas = collect_data_files("tzdata")
+
 a = Analysis(
     ["scripts/launcher.py"],
     pathex=["."],
@@ -22,12 +27,14 @@ a = Analysis(
         ("default_scenarios.yaml", "."),  # bundled sample — seeded into user dir on first run
         ("default_email_templates", "default_email_templates"),  # sample email templates
         *ctk_datas,
+        *tzdata_datas,
     ],
     hiddenimports=[
         "customtkinter",
         "darkdetect",
         "pynput.keyboard._win32",
         "pynput.mouse._win32",
+        "tzdata",
     ],
     hookspath=[],
     runtime_hooks=[],
