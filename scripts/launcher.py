@@ -2713,11 +2713,20 @@ class BrowserWorker:
             for(let i=0;i<8&&row.parentElement&&row.tagName!=='TR';i++)
               row=row.parentElement;
             html+='\n=== ID ROW SAMPLE ===\n'+ser(row,0); }
+          // Generic table sample: the first couple visible tables, header + a
+          // few rows — captures the Segments LIST (name cell + the ⋯ menu
+          // button) so we can drive ⋯ → Export.
+          const tables=deepAll(el=>el.tagName==='TABLE'&&vis(el)).slice(0,2);
+          for(const tb of tables){
+            html+='\n=== TABLE SAMPLE ===\n';
+            const rows=[...tb.querySelectorAll('tr')].slice(0,4);
+            for(const r of rows) html+=ser(r,0)+'\n'; }
           return {buttons, matchTags, id003,
             id003count:(idAttr.length+idText.length),
             html:html.slice(0,700000),
             counts:{hits:hits.length, dialogs:topD.length,
-              fields:fields.length, field_containers:nForm, match_blocks:nHit}};
+              fields:fields.length, field_containers:nForm, match_blocks:nHit,
+              tables:tables.length}};
         }
         '''
         try:
