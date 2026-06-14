@@ -2687,18 +2687,34 @@ class BrowserWorker:
           let nHit=0;
           for(const h of topHits.slice(0,6)){
             html+='\n=== MATCH (text/sms/cadence) ===\n'+ser(h,0); nHit++; }
-          // Salesforce-id scan: do any elements carry a 003... Contact id in an
-          // attribute (data-*, href, etc.)? If so, the Contacts page is
-          // scrapable for the StudentID->ContactId map without an export.
+          // Salesforce-id scan: is a 003... Contact id present anywhere — in an
+          // attribute (data-*/href) OR as visible table text? If so, this view
+          // is scrapable for the StudentID->ContactId map without a CSV export.
           const IDRE=/003[0-9A-Za-z]{12,15}/;
-          const idEls=deepAll(el=>{ if(!el.attributes) return false;
+          const idAttr=deepAll(el=>{ if(!el.attributes) return false;
             for(const a of el.attributes) if(IDRE.test(a.value||'')) return true;
             return false; });
-          const id003=[...new Set(idEls.map(el=>{
-            for(const a of el.attributes){const m=(a.value||'').match(IDRE);
+          // Elements whose OWN text node holds an id (leaf cells), not ancestors.
+          const idText=deepAll(el=>{ if(!el.childNodes) return false;
+            for(const n of el.childNodes)
+              if(n.nodeType===3 && IDRE.test(n.nodeValue||'')) return true;
+            return false; });
+          const id003=[...new Set([
+            ...idAttr.map(el=>{ for(const a of el.attributes){
+              const m=(a.value||'').match(IDRE);
               if(m) return el.tagName.toLowerCase()+'['+a.name+']='+m[0];}
-            return ''; }).filter(Boolean))].slice(0,12);
-          return {buttons, matchTags, id003, id003count:idEls.length,
+              return ''; }),
+            ...idText.map(el=>{ const m=(el.textContent||'').match(IDRE);
+              return m?el.tagName.toLowerCase()+'(text)='+m[0]:''; }),
+          ].filter(Boolean))].slice(0,12);
+          // Dump the row enclosing the first text-id match so we can see how the
+          // segment/contacts table is laid out (which cell is name vs id).
+          if(idText.length){ let row=idText[0];
+            for(let i=0;i<8&&row.parentElement&&row.tagName!=='TR';i++)
+              row=row.parentElement;
+            html+='\n=== ID ROW SAMPLE ===\n'+ser(row,0); }
+          return {buttons, matchTags, id003,
+            id003count:(idAttr.length+idText.length),
             html:html.slice(0,700000),
             counts:{hits:hits.length, dialogs:topD.length,
               fields:fields.length, field_containers:nForm, match_blocks:nHit}};
