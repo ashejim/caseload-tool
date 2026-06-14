@@ -344,6 +344,27 @@ def read_caseload_row_ids(table) -> dict:
     the list doesn't expose it. Pass an already scroll-loaded table locator."""
     rows = table.evaluate(
         r'''(tbl) => {
+          const RE = /(003[0-9A-Za-z]{12,15})/;
+          // Deep walk a subtree INCLUDING shadow roots: find a 003 id in any
+          // attribute, and sample the first few href values seen.
+          function scan(root){
+            let cid = ''; const hrefs = [];
+            const stack = [root];
+            while (stack.length) {
+              const el = stack.pop();
+              if (!el || el.nodeType !== 1) continue;
+              if (el.attributes) {
+                for (const a of el.attributes) {
+                  const v = a.value || '';
+                  if (!cid) { const m = v.match(RE); if (m) cid = m[1]; }
+                  if (a.name === 'href' && hrefs.length < 5) hrefs.push(v.slice(0, 90));
+                }
+              }
+              if (el.shadowRoot) for (const c of el.shadowRoot.children) stack.push(c);
+              for (const c of el.children) stack.push(c);
+            }
+            return {cid, hrefs};
+          }
           const out = [];
           for (const r of tbl.querySelectorAll('tr')) {
             let sid = '';
@@ -352,13 +373,9 @@ def read_caseload_row_ids(table) -> dict:
               if (/^\d{9,10}$/.test(t)) { sid = t; break; }
             }
             if (!sid) continue;
-            const rowkey = (r.getAttribute('data-row-key-value') || '');
-            let cid = '';
-            for (const a of r.querySelectorAll('a[href]')) {
-              const m = (a.getAttribute('href') || '').match(/(003[0-9A-Za-z]{12,15})/);
-              if (m) { cid = m[1]; break; }
-            }
-            out.push({sid, rowkey, cid});
+            const s = scan(r);
+            out.push({sid, rowkey: r.getAttribute('data-row-key-value') || '',
+                      cid: s.cid, hrefs: s.hrefs});
           }
           return out;
         }'''
@@ -368,7 +385,8 @@ def read_caseload_row_ids(table) -> dict:
         sid = row.get("sid")
         if sid:
             result[sid] = {"rowkey": row.get("rowkey", ""),
-                           "contact_id": row.get("cid", "")}
+                           "contact_id": row.get("cid", ""),
+                           "hrefs": row.get("hrefs", [])}
     return result
 
 

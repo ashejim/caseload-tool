@@ -2328,7 +2328,8 @@ class BrowserWorker:
             for sid, v in list(ids.items())[:3]:
                 self.on_status(
                     f"  [sf-id probe] sid {sid} -> rowkey={v.get('rowkey')!r} "
-                    f"contact_id={v.get('contact_id')!r}")
+                    f"contact_id={v.get('contact_id')!r} "
+                    f"hrefs={v.get('hrefs')}")
         except Exception as e:
             self.on_status(f"  [sf-id probe] failed: {e}")
         return {"by_sid": by_sid, "count": len(by_sid)}
