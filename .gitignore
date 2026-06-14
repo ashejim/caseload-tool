@@ -37,11 +37,15 @@ caseload.csv.*
 history.db*
 caseload_history.csv
 # Mongoose contacts/segment exports (Contact ids + names + mobiles) — PII.
-# Auto-detected from the config dir by their contactId column; ignore the
-# likely names so a dev-mode export dropped in the repo root never commits.
+# These can be named anything (e.g. "all C769 students-cfad.csv"), so the
+# narrow patterns below aren't enough on their own.
 mongoose*.csv
 *segment*.csv
 *contacts*.csv
+# CATCH-ALL: the config dir IS the repo root in dev, where every CSV export
+# (caseload + Mongoose segments) lands. Treat ALL root-level CSVs as local PII
+# and never commit them. Use `git add -f` for the rare CSV meant to be tracked.
+/*.csv
 # Single-instance lock file (runtime).
 launcher.lock
 
