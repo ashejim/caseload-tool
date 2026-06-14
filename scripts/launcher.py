@@ -389,6 +389,10 @@ class BrowserWorker:
         composer DOM (for building the texting send selectors)."""
         self.q.put(("PROBE_TEXT", on_done))
 
+    def submit_probe_caseload_row(self, on_done: Callable[[dict], None]) -> None:
+        """TEMP dev probe: capture caseload list row DOM (Salesforce-id harvest)."""
+        self.q.put(("PROBE_ROW", on_done))
+
     def submit_open_mongoose(self, on_done: Callable[[dict], None]) -> None:
         """Open the Mongoose texting dashboard as a tab in the launcher's OWN
         browser context (so the probe / texting automation can see it)."""
@@ -689,6 +693,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._probe_text(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "PROBE_ROW":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._probe_caseload_row(ctx)
             finally:
                 on_done(res)
         elif cmd[0] == "OPEN_MONGOOSE":
@@ -2483,6 +2494,66 @@ class BrowserWorker:
         try:
             tm.send_text(page, msg, on_status=self.on_status)
             return {"ok": True}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _probe_caseload_row(self, ctx) -> dict:
+        """TEMP dev probe: capture the caseload LIST row DOM (collapsed + any
+        expanded detail) so we can find the dropdown-arrow toggle and the 003
+        Contact-link selectors for harvesting Salesforce IDs. Run on the
+        Caseload list; to capture the detail, expand a row (dropdown arrow)
+        FIRST. → temp/caseload_row_probe.html. Returns {labels, n003, rows, html}."""
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        js = r'''
+        () => {
+          const KEEP=['class','data-label','title','role','aria-label',
+            'aria-expanded','href','name','value','data-aura-class',
+            'data-row-key-value','for','type','data-target-selection-name'];
+          const cls=el=>String((el.className&&el.className.baseVal!==undefined)
+            ?el.className.baseVal:(el.className||''));
+          function ser(el,d){
+            if(!el||d>25) return '';
+            const tag=(el.tagName||'').toLowerCase();
+            if(['script','style','svg','path','iframe','img'].includes(tag)) return '';
+            let s='<'+tag; const at=el.attributes;
+            if(at) for(let i=0;i<at.length;i++){const a=at[i];
+              if(a&&KEEP.includes(a.name))
+                s+=' '+a.name+'="'+String(a.value||'').slice(0,100).replace(/"/g,'')+'"';}
+            s+='>';
+            const sn=(n)=>{ if(n.nodeType===3){const t=n.textContent.trim();
+              return t?t.slice(0,120):'';} if(n.nodeType!==1) return ''; return ser(n,d+1); };
+            if(el.shadowRoot) s+='\n#shadow{'+[...el.shadowRoot.childNodes].map(sn).join('')+'}';
+            for(const c of el.childNodes) s+=sn(c);
+            return s+'</'+tag+'>\n';
+          }
+          const tables=[...document.querySelectorAll('table')].filter(t=>{
+            const hs=[...t.querySelectorAll('th')].map(h=>h.textContent||'');
+            return hs.some(h=>/Course Code/i.test(h)) && hs.some(h=>/Name/i.test(h));
+          });
+          let html=''; const labels=[];
+          const tbl=tables[0];
+          const dataRows=tbl?[...tbl.querySelectorAll('tr')].filter(
+            r=>[...r.querySelectorAll('td')].some(
+              td=>/^\d{9,10}$/.test((td.textContent||'').trim()))):[];
+          for(const r of dataRows.slice(0,2)) html+='\n=== CASELOAD ROW ===\n'+ser(r,0);
+          if(dataRows[0]) for(const el of dataRows[0].querySelectorAll('button,a,[role=button]')){
+            const t=((el.getAttribute('aria-label')||el.textContent||'')).trim().slice(0,60);
+            const exp=el.getAttribute('aria-expanded');
+            labels.push((t||'(no label)')+(exp!==null?' [aria-expanded='+exp+']':''));
+          }
+          const links003=[...document.querySelectorAll('a[href]')].filter(
+            a=>/003[0-9A-Za-z]{12,15}/.test(a.getAttribute('href')||''));
+          html+='\n=== 003 LINKS ('+links003.length+') ===\n';
+          for(const a of links003.slice(0,5)) html+=ser(a,0);
+          return {labels:labels.slice(0,40), n003:links003.length,
+            rows:dataRows.length, html:html.slice(0,500000)};
+        }
+        '''
+        try:
+            data = target.evaluate(js)
+            return data if isinstance(data, dict) else {"error": "no data"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -10976,6 +11047,14 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self._btn_probe_text.pack(side="left", padx=(8, 0))
+        # TEMP dev probe (Salesforce-id harvest investigation): capture a
+        # caseload list row's DOM. On the Caseload list, expand a row first.
+        self._btn_probe_row = ctk.CTkButton(
+            toggle_frame, text="🧪 Probe Row",
+            width=120, command=self._dev_probe_caseload_row,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_probe_row.pack(side="left", padx=(8, 0))
         # TEMP dev helper (remove with the text probe): open Mongoose in the
         # launcher's OWN browser context so the probe can see it. Click this,
         # navigate to your inbox + compose view, then click Probe Text.
@@ -17125,6 +17204,49 @@ class App:
             except Exception:
                 pass
         self.worker.submit_probe_text(on_done)
+
+    def _dev_probe_caseload_row(self) -> None:
+        """TEMP dev probe (Salesforce-id harvest): capture a caseload list row's
+        DOM. On the Caseload LIST, EXPAND a row (dropdown arrow) first so the
+        detail panel + its 003 Contact link are captured too, then click.
+        → temp/caseload_row_probe.html"""
+        try:
+            if not self.worker.ready_event.is_set():
+                self._append_log("Browser not ready yet.")
+                return
+        except Exception:
+            return
+        self._append_log(
+            "Probing a caseload row… be on the Caseload list; expand a row "
+            "(dropdown arrow) first so the detail + 003 link are captured.")
+
+        def on_done(res):
+            def show():
+                if not res or res.get("error"):
+                    self._append_log(
+                        f"Row probe failed: {(res or {}).get('error')}",
+                        error=True)
+                    return
+                self._append_log(
+                    f"Row probe: {res.get('rows')} data rows; "
+                    f"003 links on page = {res.get('n003')}")
+                self._append_log(
+                    "Row 0 clickables: "
+                    + (" | ".join(res.get("labels") or []) or "(none)"))
+                html = res.get("html") or ""
+                try:
+                    p = CASELOAD_CSV_PATH.parent / "temp" / "caseload_row_probe.html"
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(html, encoding="utf-8")
+                    self._append_log(f"Row deep DOM → {p}  ({len(html)} chars)")
+                except Exception as e:
+                    self._append_log(
+                        f"couldn't write row probe file: {e}", error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                pass
+        self.worker.submit_probe_caseload_row(on_done)
 
     def _set_followup_date_for(self, student_id: str, date_str: str,
                                on_apply=None) -> None:
