@@ -389,7 +389,8 @@ def add_recipient(page: Page, mobile: str, *, timeout_ms: int = 10_000) -> bool:
         return False
     box = _recipient_box(page)
     box.click()
-    box.fill(term)
+    box.fill("")
+    box.press_sequentially(term, delay=15)  # per-keystroke so the search fires
     # Results render in an overlay listbox of .v-list-item options.
     option = page.locator(
         '.v-overlay-container .v-list-item[role="option"], '
@@ -399,7 +400,11 @@ def add_recipient(page: Page, mobile: str, *, timeout_ms: int = 10_000) -> bool:
         option.first.wait_for(state="visible", timeout=timeout_ms)
     except PWTimeout:
         return False
-    option.first.click()
+    # Duplicate contacts can share a name/number; prefer the one "Assigned to
+    # You" (the user's own student) over an arbitrary first match.
+    assigned = option.filter(has_text="Assigned to")
+    target = assigned.first if assigned.count() > 0 else option.first
+    target.click()
     return True
 
 
