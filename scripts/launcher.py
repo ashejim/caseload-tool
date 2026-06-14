@@ -10764,6 +10764,11 @@ class App:
         self._is_busy = False
         self._busy_message = ""
         self._busy_spinner_index = 0
+        # True while the background pass/fail scrape is running/pending. Firing
+        # an action is blocked until it finishes (the scrape drives Salesforce
+        # and would contend with / re-cool a Mongoose text run). Separate from
+        # _is_busy so the scrape's own resume-when-idle check still works.
+        self._task_scrape_running = False
 
         self.root = ctk.CTk()
         self.root.title(f"Caseload Note Automation — v{__version__}")
@@ -13293,6 +13298,13 @@ class App:
                 f"firing {scenario.name!r}."
             )
             return
+        if getattr(self, "_task_scrape_running", False):
+            self._append_log(
+                "Updating live task pass/fail — wait for it to finish "
+                f"(\"Live task pass/fail: …\" in the log) before firing "
+                f"{scenario.name!r}. This avoids the scrape interrupting the "
+                "run.")
+            return
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
             return
@@ -14385,6 +14397,11 @@ class App:
                 f"Busy — wait for the current task to finish before "
                 f"firing {scenario.name!r}."
             )
+            return
+        if getattr(self, "_task_scrape_running", False):
+            self._append_log(
+                "Updating live task pass/fail — wait for it to finish before "
+                f"firing {scenario.name!r}.")
             return
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
@@ -17320,6 +17337,7 @@ class App:
                         self._append_log(
                             f"Live task pass/fail scrape failed: {m}",
                             error=True)
+                    self._task_scrape_running = False
                     _finish()
                     return
                 by_sid = res.get("by_sid") or {}
@@ -17354,6 +17372,7 @@ class App:
                 # glyphs and any open quick-view badges recolour.
                 self._apply_task_status_to_rows()
                 self._refresh_caseload_panel()
+                self._task_scrape_running = False
                 _finish()
             try:
                 self.root.after(0, apply)
@@ -17361,6 +17380,7 @@ class App:
                 pass
 
         self._append_log("Reading live task pass/fail in the background…")
+        self._task_scrape_running = True
         self.worker.submit_scrape_all_task_status(on_done)
 
     def _review_notes(self, query: str, label: str, panel) -> None:
