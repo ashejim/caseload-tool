@@ -400,6 +400,18 @@ class BrowserWorker:
         launcher joins to the caseload for Contact ids."""
         self.q.put(("EXPORT_SEGMENTS", list(courses), on_done))
 
+    def submit_open_mongoose(self, on_done: Callable[[dict], None]) -> None:
+        """Open (or focus) the Mongoose dashboard in the launcher's own browser
+        context — so the user can sign in. on_done({ok|error})."""
+        self.q.put(("OPEN_MONGOOSE", on_done))
+
+    def submit_mongoose_login_check(
+        self, on_done: Callable[[dict], None],
+    ) -> None:
+        """Open Mongoose if needed and report whether the session is signed in.
+        Brings the window forward (for sign-in) when it isn't. on_done({ok})."""
+        self.q.put(("MONGOOSE_LOGIN_CHECK", on_done))
+
     def submit_restart_browser(self, on_done: Callable[[dict], None]) -> None:
         """Tear down and reopen the browser context (hang recovery). Handled in
         _session, not _dispatch_command. on_done({ok}) fires once the fresh
@@ -698,6 +710,20 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._export_segments(ctx, courses)
+            finally:
+                on_done(res)
+        elif cmd[0] == "OPEN_MONGOOSE":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._open_mongoose(ctx, focus=True)
+            finally:
+                on_done(res)
+        elif cmd[0] == "MONGOOSE_LOGIN_CHECK":
+            _, on_done = cmd
+            res = {"ok": False}
+            try:
+                res = self._mongoose_login_check(ctx)
             finally:
                 on_done(res)
         elif cmd[0] == "SET_FOLLOWUP_DATE":
@@ -2396,6 +2422,31 @@ class BrowserWorker:
             except Exception:
                 continue
         return None
+
+    def _mongoose_login_check(self, ctx) -> dict:
+        """Open Mongoose if needed and report whether it's signed in. Brings the
+        window forward when it isn't, so the user can log in. Returns
+        {ok: bool, error?}."""
+        page = self._mongoose_page(ctx)
+        if page is None:
+            res = self._open_mongoose(ctx, focus=True)
+            if res.get("error"):
+                return {"ok": False, "error": res["error"]}
+            page = self._mongoose_page(ctx)
+            if page is None:
+                return {"ok": False, "error": "Mongoose didn't open."}
+            try:
+                page.wait_for_timeout(1500)  # let SSO / the SPA settle
+            except Exception:
+                pass
+        from src import text_message as tm
+        logged_in = tm.mongoose_logged_in(page)
+        if not logged_in:
+            try:
+                self._bring_browser_forward(page)
+            except Exception:
+                pass
+        return {"ok": logged_in}
 
     def _send_text(self, ctx, payload: dict) -> dict:
         """Drive the Mongoose compose modal from a fired text action. `payload`
@@ -10968,6 +11019,14 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self._btn_sync_ids.pack(side="left", padx=(8, 0))
+        # Open/focus the Mongoose dashboard in the launcher's own browser so the
+        # user can sign in (texting needs an active Mongoose session).
+        self._btn_open_mongoose = ctk.CTkButton(
+            toggle_frame, text="🐭 Mongoose",
+            width=120, command=self._open_mongoose_clicked,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_open_mongoose.pack(side="left", padx=(8, 0))
         # Discovery: capture Salesforce's note-submission network
         # traffic so we can later replay it via REST API instead of
         # driving the UI. One-click toggle; on stop, writes the
@@ -13352,6 +13411,11 @@ class App:
         student is already chosen: we navigate to them in the background
         and skip the find/pick prompt, then file against that record."""
 
+        # Pre-flight: a text-bearing action needs Mongoose signed in — check
+        # before any navigation/prompts so a lapsed session fails fast.
+        if scenario.text is not None and not self._ensure_mongoose_logged_in():
+            return
+
         # Pre-flight: if any note has Submit unchecked, confirm before
         # we ask the user to do anything else (FERPA: don't surprise
         # them with notes that need manual submission AFTER they've
@@ -13817,6 +13881,60 @@ class App:
         self.root.wait_variable(done_var)
         return holder["res"]
 
+    def _ensure_mongoose_logged_in(self) -> bool:
+        """Pre-flight for a text-bearing action: open Mongoose and confirm the
+        session is signed in BEFORE the user reviews emails/texts. On failure it
+        brings the Mongoose window forward and logs how to recover; returns
+        False so the caller aborts early (no wasted review, no half-run)."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.",
+                             error=True)
+            return False
+        self._append_log("Checking Mongoose sign-in…")
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"ok": False}
+
+        def on_done(res):
+            def set_main():
+                holder["ok"] = bool((res or {}).get("ok"))
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                set_main()
+
+        self.worker.submit_mongoose_login_check(on_done)
+        self.root.wait_variable(done_var)
+        if not holder["ok"]:
+            self._append_log(
+                "Mongoose isn't signed in — opened it for you. Sign in to "
+                "Mongoose, then re-fire the action. (Texts/emails/notes were "
+                "NOT run.)", error=True)
+        return holder["ok"]
+
+    def _open_mongoose_clicked(self) -> None:
+        """🐭 Mongoose toolbar button: open/focus the Mongoose dashboard so the
+        user can sign in or check it."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._append_log("Opening Mongoose…")
+
+        def on_done(res):
+            def set_main():
+                if res and res.get("error"):
+                    self._append_log(
+                        f"Open Mongoose failed: {res['error']}", error=True)
+                else:
+                    self._append_log(
+                        "Mongoose open — sign in if prompted.")
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                set_main()
+
+        self.worker.submit_open_mongoose(on_done)
+
     # Team timezone for converting a student-local schedule time to the tz
     # Mongoose's scheduler enters times in. The team is Eastern; TODO: make
     # this a setting (read Mongoose's .timezone-label) for non-Eastern teams.
@@ -13990,6 +14108,12 @@ class App:
         # driver (the note/email path below doesn't apply).
         if self._is_text_only(scenario):
             self._fire_batch_text(scenario)
+            return
+
+        # A combined action will send texts — confirm Mongoose is signed in
+        # BEFORE the (expensive) email review, so a lapsed session doesn't
+        # waste the review or half-run the action (texts→emails→notes).
+        if scenario.text is not None and not self._ensure_mongoose_logged_in():
             return
 
         # Pre-flight: if any note has Submit unchecked, confirm before
@@ -14166,6 +14290,10 @@ class App:
         from tkinter import messagebox
         from src import text_message as tm
 
+        # Confirm Mongoose is signed in before the review (avoids reviewing a
+        # whole batch only to hit a lapsed session at send time).
+        if not self._ensure_mongoose_logged_in():
+            return
         self._warn_if_caseload_stale("this batch")
         # Load rows (CSV cache preferred; DOM fallback).
         if self._caseload_rows is not None:
