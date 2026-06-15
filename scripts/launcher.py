@@ -320,15 +320,16 @@ class BrowserWorker:
         self.q.put(("FIND", query, new_tab, raise_after))
 
     def submit_find_and_settle(
-        self, query: str, on_done: Callable[[bool], None],
+        self, query: str, contact_id: str,
+        on_done: Callable[[dict], None],
     ) -> None:
-        """Navigate to a student via the FAST find path (Shift+X switch
-        on the live Caseload list, no reload), then poll until the note
-        panel is actually loaded. Used by fire-from-row so the note/email
-        steps run against a ready record without the slower
-        list-matches+click path. `on_done(success)` fires from the
-        worker thread."""
-        self.q.put(("FIND_AND_SETTLE", query, on_done))
+        """Navigate to a student, then poll until the note panel is loaded.
+        If `contact_id` (a 003… Salesforce id) is given, deep-link straight to
+        that Contact record (skips the Caseload search); otherwise use the FAST
+        find path (Shift+X switch, no reload), falling back to it if the deep
+        link fails. Either way the opened record's Contact id is harvested.
+        `on_done({ok, contact_id})` fires from the worker thread."""
+        self.q.put(("FIND_AND_SETTLE", query, contact_id, on_done))
 
     def submit_list_matches(
         self, query: str, on_results: Callable[[list[str]], None],
@@ -593,30 +594,46 @@ class BrowserWorker:
             raise_after = cmd[3] if len(cmd) > 3 else None
             self._handle_find(ctx, query, new_tab, raise_after)
         elif cmd[0] == "FIND_AND_SETTLE":
-            _, query, on_done = cmd
-            ok = False
+            _, query, contact_id, on_done = cmd
+            res = {"ok": False, "contact_id": ""}
             try:
-                # Fast navigation (Shift+X switch, no reload), kept in the
-                # background so it doesn't pop over the fire dialogs.
-                self._handle_find(ctx, query, new_tab=False, raise_after=False)
-                # Poll until the note panel is actually loaded — exits as
-                # soon as get_active_student_name (the same readiness
-                # check _handle_run uses) resolves, up to ~5s.
-                target = self._active_page(ctx)
-                if target is not None:
-                    for _ in range(25):
-                        try:
-                            if get_active_student_name(target):
-                                ok = True
+                # Fast path: deep-link straight to the Contact record when we
+                # have its id (skips the Caseload search + its flake).
+                if contact_id:
+                    res["ok"] = self._navigate_to_contact(ctx, contact_id)
+                if not res["ok"]:
+                    # No id, or deep link didn't land — fall back to the FAST
+                    # find path (Shift+X switch, no reload), in the background.
+                    self._handle_find(ctx, query, new_tab=False,
+                                      raise_after=False)
+                    # Poll until the note panel is actually loaded — exits as
+                    # soon as get_active_student_name resolves, up to ~5s.
+                    target = self._active_page(ctx)
+                    if target is not None:
+                        for _ in range(25):
+                            try:
+                                if get_active_student_name(target):
+                                    res["ok"] = True
+                                    break
+                            except Exception:
+                                pass
+                            try:
+                                target.wait_for_timeout(200)
+                            except Exception:
                                 break
-                        except Exception:
-                            pass
-                        try:
-                            target.wait_for_timeout(200)
-                        except Exception:
-                            break
+                # Collect-as-you-go: harvest the opened record's Contact id from
+                # its URL so an un-mapped student is fast next time.
+                if res["ok"]:
+                    try:
+                        tgt = self._active_page(ctx)
+                        m = re.search(r"/Contact/(003[0-9A-Za-z]{12,15})",
+                                      (tgt.url if tgt else "") or "")
+                        if m:
+                            res["contact_id"] = m.group(1)
+                    except Exception:
+                        pass
             finally:
-                on_done(ok)
+                on_done(res)
         elif cmd[0] == "LIST_MATCHES":
             _, query, on_results = cmd
             names: list[str] = []
@@ -840,6 +857,41 @@ class BrowserWorker:
                 .filter(has=target.locator('th:has-text("Name")'))
                 .count() > 0
             )
+        except Exception:
+            return False
+
+    def _navigate_to_contact(self, ctx, contact_id: str) -> bool:
+        """Deep-link straight to a Contact record (skips the Caseload search)
+        and wait until the note panel is ready. Returns True if the panel
+        appeared. Verified ~2.6s end-to-end vs. the slower search+click; the
+        record loads in the standard app but the note panel still renders."""
+        target = self._active_page(ctx)
+        if target is None or not contact_id:
+            return False
+        from urllib.parse import urlsplit
+        from src import selectors
+        parts = urlsplit(CASELOAD_URL or "https://srm.lightning.force.com")
+        url = (f"{parts.scheme}://{parts.netloc}"
+               f"/lightning/r/Contact/{contact_id}/view")
+        try:
+            target.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        except Exception:
+            return False
+        # Wait for the note panel to be rendered. Anchor on the note BODY
+        # EDITOR — an actual form field fill_note needs — not on the student
+        # name header, whose text ("…Note for ") is split across nodes on the
+        # standalone record view and so matches unreliably there.
+        try:
+            selectors.note_body_editor(target).wait_for(
+                state="visible", timeout=20_000)
+            return True
+        except Exception:
+            pass
+        # Fall back to the generic Submit button as a last resort.
+        try:
+            selectors.submit_button(target).wait_for(
+                state="visible", timeout=3_000)
+            return True
         except Exception:
             return False
 
@@ -13260,7 +13312,8 @@ class App:
 
     def _fire_per_student(self, scenario: ScenarioConfig, override: str,
                           *, prenav_query: str = "",
-                          prenav_label: str = "", course_hint: str = "") -> None:
+                          prenav_label: str = "", course_hint: str = "",
+                          prenav_student_id: str = "") -> None:
         """Per-student (non-batch) scenario fire — wraps the original
         in-line `_fire` body so we can sandwich it between _set_busy
         and _set_idle.
@@ -13298,7 +13351,9 @@ class App:
                 # Caseload reload, no fixed 2s settle. (A bare find returns
                 # before the panel renders, which made the note RUN bail with
                 # "no visible note panel".)
-                if not self._navigate_for_fire_blocking(prenav_query):
+                if not self._navigate_for_fire_blocking(
+                        prenav_query, student_id=prenav_student_id,
+                        allow_deeplink=(scenario.email is None)):
                     self._append_log(
                         f"Could not open {prenav_label or prenav_query!r}; "
                         "scenario not fired."
@@ -13430,7 +13485,9 @@ class App:
         if eas_read and ea_arg is None:
             nav_query = prenav_query or chosen_name
             if nav_query:
-                self._navigate_for_fire_blocking(nav_query)
+                self._navigate_for_fire_blocking(
+                    nav_query, student_id=prenav_student_id,
+                    allow_deeplink=(scenario.email is None))
 
         # Apply the fire-time course / academic-activity edits onto a copy
         # of the scenario (run_scenario reads note.course_code_override and
@@ -13452,11 +13509,28 @@ class App:
 
         # Note submit — skip for channel-only (text/email) actions with no notes.
         if scenario.notes:
+            # Supply the course from the caseload row when the user didn't type
+            # one. This makes note-filing independent of the on-page Caseload
+            # table — required for the deep-link fast path (a standalone record
+            # has no such table to auto-detect from), and more accurate than the
+            # name-matched scrape on the search path too.
+            note_override = override or self._norm_course_code(course_hint)
             self.worker.submit_scenario(
-                scenario, override, clipboard,
+                scenario, note_override, clipboard,
                 custom_bodies=custom_bodies,
                 prompt_vars=prompt_vars, ea=ea_arg,
             )
+
+    @staticmethod
+    def _norm_course_code(raw: str) -> str:
+        """Normalize a caseload CourseCode to the bare code (e.g. 'C769 - …'
+        -> 'C769'); '' if it doesn't contain one."""
+        try:
+            from src.student_lookup import COURSE_CODE_RE
+            m = COURSE_CODE_RE.match((raw or "").strip())
+            return m.group(1) if m else (raw or "").strip()
+        except Exception:
+            return (raw or "").strip()
 
     def _caseload_row_by_id(self, student_id: str) -> Optional[dict]:
         """The cached caseload CSV row for a Student ID, or None."""
@@ -14506,11 +14580,14 @@ class App:
             override = self.course_var.get().strip()
             course_hint = str(rows[0].get("CourseCode", "")
                               or rows[0].get("Course Code", "")).strip()
+            sid = str(rows[0].get("StudentID", "")
+                      or rows[0].get("Student ID", "")).strip()
             self._set_busy(f"Running {scenario.name}…")
             try:
                 self._fire_per_student(
                     scenario, override, prenav_query=query,
-                    prenav_label=name, course_hint=course_hint)
+                    prenav_label=name, course_hint=course_hint,
+                    prenav_student_id=sid)
             finally:
                 self._set_idle()
             return
@@ -14855,26 +14932,54 @@ class App:
         self.root.wait_window(dialog)
         return (result["mode"], result["ea"])
 
-    def _navigate_for_fire_blocking(self, query: str) -> bool:
-        """Fast-navigate to a student (Shift+X switch, no reload) and
-        block until the note panel is loaded. Used by fire-from-row so
-        the note files against a ready record without the slower
-        list-matches+click path. Returns True once the panel is ready."""
+    def _navigate_for_fire_blocking(self, query: str, *,
+                                    student_id: str = "",
+                                    allow_deeplink: bool = True) -> bool:
+        """Navigate to a student and block until the note panel is loaded.
+        When `student_id` maps to a known Contact id AND `allow_deeplink`, the
+        worker DEEP-LINKS straight to the record (fast, flake-free); otherwise
+        it uses the search path. `allow_deeplink` is False when the fire needs
+        the on-page Caseload table (e.g. an email step scrapes student/PM
+        context) — the deep link opens a standalone record without it. Either
+        way it harvests the opened record's Contact id, which we persist
+        (collect-as-you-go) so this student is fast next time. Returns True once
+        the panel is ready."""
+        contact_id = (self._contact_ids.get(student_id, "")
+                      if (student_id and allow_deeplink) else "")
         done_var = tk.BooleanVar(value=False)
-        holder: dict = {"ok": False}
+        holder: dict = {"ok": False, "contact_id": ""}
 
-        def on_done(ok: bool) -> None:
+        def on_done(res) -> None:
             def set_main() -> None:
-                holder["ok"] = ok
+                if isinstance(res, dict):
+                    holder["ok"] = bool(res.get("ok"))
+                    holder["contact_id"] = res.get("contact_id", "") or ""
+                else:
+                    holder["ok"] = bool(res)
                 done_var.set(True)
             try:
                 self.root.after(0, set_main)
             except Exception:
-                holder["ok"] = ok
-                done_var.set(True)
+                set_main()
 
-        self.worker.submit_find_and_settle(query, on_done)
+        self.worker.submit_find_and_settle(query, contact_id, on_done)
         self.root.wait_variable(done_var)
+        # Collect-as-you-go: persist a freshly-harvested id for this student.
+        harvested = holder["contact_id"]
+        if (student_id and harvested
+                and self._contact_ids.get(student_id) != harvested):
+            self._contact_ids[student_id] = harvested
+            try:
+                from src import mongoose_contacts as mc
+                row = self._caseload_row_by_id(student_id)
+                name = (row.get("Name") or "").strip() if row else ""
+                mc.persist_contact_ids(
+                    {student_id: harvested}, name_by_sid={student_id: name})
+                self._append_log(
+                    f"  (learned Contact id for {name or student_id} — faster "
+                    "next time)")
+            except Exception:
+                pass
         return holder["ok"]
 
     def _click_match_blocking(self, name: str) -> bool:
