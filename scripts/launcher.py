@@ -10790,6 +10790,10 @@ class App:
         # searches Mongoose by this (unique, works for blank-mobile students);
         # loaded from SQLite at startup and refreshed when an export is found.
         self._contact_ids: dict[str, str] = {}
+        # Activity-log write batching (see _append_log/_flush_log): collapse a
+        # burst of log lines into one redraw so busy runs stay snappy.
+        self._log_pending: list = []
+        self._log_flush_scheduled = False
         # Checked row keys for the caseload panel's multi-select. Held on
         # the app (not the panel) so the selection survives the panel
         # rebuild that pop-out / re-dock performs.
@@ -17359,16 +17363,38 @@ class App:
             return
         if error is None:
             error = bool(self._LOG_ERROR_RE.search(msg))
-        self.log.configure(state="normal")
-        start = self.log.index("end-1c")
-        self.log.insert("end", msg + "\n")
-        if error:
+        # Batch writes: a busy run emits many lines fast, and each
+        # insert + see("end") forces a scroll/redraw. Queue the line and
+        # flush them together on a short timer so it's one redraw per
+        # ~60ms instead of one per line — keeps the UI snappy mid-run.
+        self._log_pending.append((msg, error))
+        if not self._log_flush_scheduled:
+            self._log_flush_scheduled = True
             try:
-                self.log._textbox.tag_add("logerror", start, "end-1c")
+                self.root.after(60, self._flush_log)
             except Exception:
-                pass
-        self.log.see("end")
-        self.log.configure(state="disabled")
+                self._flush_log()
+
+    def _flush_log(self) -> None:
+        self._log_flush_scheduled = False
+        pending = self._log_pending
+        if not pending or not getattr(self, "log", None):
+            self._log_pending = []
+            return
+        self._log_pending = []
+        self.log.configure(state="normal")
+        try:
+            for msg, error in pending:
+                start = self.log.index("end-1c")
+                self.log.insert("end", msg + "\n")
+                if error:
+                    try:
+                        self.log._textbox.tag_add("logerror", start, "end-1c")
+                    except Exception:
+                        pass
+        finally:
+            self.log.see("end")          # one scroll/redraw for the whole batch
+            self.log.configure(state="disabled")
 
     def _set_followup_date_for(self, student_id: str, date_str: str,
                                on_apply=None) -> None:
