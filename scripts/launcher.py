@@ -446,20 +446,22 @@ class BrowserWorker:
         query: str,
         on_done: Callable[[bool, dict], None],
         expected_name: str = "",
+        contact_id: str = "",
     ) -> None:
         """Fast batch click: type `query` into Salesforce's row filter,
         wait for the table to narrow, then click the single matching
-        row. If `expected_name` is set and the filter returns more
-        than one row, only clicks if that name matches one — otherwise
-        aborts. ~1.5s per call vs ~25s for the full DOM scan.
+        row. If `contact_id` (003…) is given, DEEP-LINK straight to that
+        record instead (skips the filter/click). If `expected_name` is set
+        and the filter returns more than one row, only clicks if that name
+        matches one — otherwise aborts. ~1.5s per call vs ~25s for the full
+        DOM scan.
 
         on_done receives `(success, row_info)` where row_info carries
-        `student_email` and `pm_email` scraped from the row's
-        `mailto:` action link BEFORE the click (and the contact card
-        AFTER the click as a fallback). Either field can be empty if
-        the page didn't surface it."""
+        `student_email` and `pm_email` scraped from the row's `mailto:`
+        action link (empty on the deep-link path — no row to scrape) plus
+        `contact_id` harvested from the opened record's URL."""
         self.q.put((
-            "CLICK_MATCH_BY_FILTER", query, expected_name, on_done,
+            "CLICK_MATCH_BY_FILTER", query, expected_name, contact_id, on_done,
         ))
 
     def submit_download_caseload_csv(
@@ -729,17 +731,30 @@ class BrowserWorker:
             finally:
                 on_done(rows)
         elif cmd[0] == "CLICK_MATCH_BY_FILTER":
-            _, query, expected_name, on_done = cmd
+            _, query, expected_name, contact_id, on_done = cmd
             success = False
-            row_info: dict = {"pm_email": "", "student_email": ""}
+            row_info: dict = {"pm_email": "", "student_email": "",
+                              "contact_id": ""}
             try:
-                # _click_match_by_filter now owns the post-click
-                # settle wait (so its own contact-card scrape runs
-                # against a loaded page); the dispatch wrapper no
-                # longer adds a redundant second wait.
-                success, row_info = self._click_match_by_filter(
-                    ctx, query, expected_name=expected_name,
-                )
+                if contact_id:
+                    # Deep-link straight to the record (no row to scrape).
+                    success = self._navigate_to_contact(ctx, contact_id)
+                if not success:
+                    # No id, or deep link didn't land — the filter+click path
+                    # (which also owns its post-click settle + card scrape).
+                    success, row_info = self._click_match_by_filter(
+                        ctx, query, expected_name=expected_name,
+                    )
+                # Collect-as-you-go: harvest the opened record's Contact id.
+                if success:
+                    try:
+                        tgt = self._active_page(ctx)
+                        m = re.search(r"/Contact/(003[0-9A-Za-z]{12,15})",
+                                      (tgt.url if tgt else "") or "")
+                        if m:
+                            row_info["contact_id"] = m.group(1)
+                    except Exception:
+                        pass
             finally:
                 on_done(success, row_info)
         elif cmd[0] == "DOWNLOAD_CASELOAD_CSV":
@@ -14435,30 +14450,53 @@ class App:
             pass
         self._show_browser_lock()
 
-        # Step 7: loop. For each student: fast-find → auto-send
+        # Step 7: loop. For each student: navigate → auto-send
         # email (if configured) → file note.
+        # Deep-link straight to the record when we know its Contact id —
+        # but only for non-email fires (an email step needs the row's
+        # mailto/contact-card scrape, which the deep link skips).
+        allow_deeplink = not has_email
         processed = 0
         skipped: list[tuple[str, str]] = []
         try:
             for idx, row in enumerate(confirmed, start=1):
                 student_name, query = self._row_name_and_query(row)
+                sid = str(row.get("StudentID", "")
+                          or row.get("Student ID", "")).strip()
                 self._append_log(
                     f"--- {source} {idx}/{total}: {student_name!r} ---"
                 )
 
-                # 7a. Fast-find: row filter on Student ID, then click.
-                # The worker also scrapes mailto: emails off the row
-                # BEFORE clicking + the contact card AFTER, so we can
-                # fill in addresses the CSV view didn't include.
+                # 7a. Navigate: deep-link by Contact id when we have one
+                # (fast, flake-free), else Fast-find (row filter + click,
+                # which also scrapes mailto/contact-card emails). Either way
+                # the worker harvests the opened record's Contact id.
+                cid = (self._contact_ids.get(sid, "")
+                       if (sid and allow_deeplink) else "")
                 click_ok, row_emails = self._click_match_by_filter_blocking(
-                    query, expected_name=student_name,
+                    query, expected_name=student_name, contact_id=cid,
                 )
                 if not click_ok:
                     self._append_log(
-                        f"Skipping {student_name!r}: fast-find failed."
+                        f"Skipping {student_name!r}: navigation failed."
                     )
                     skipped.append((student_name, "find/click failed"))
                     continue
+                # Collect-as-you-go: persist a freshly-harvested Contact id.
+                harvested = (row_emails or {}).get("contact_id", "")
+                if (sid and harvested
+                        and self._contact_ids.get(sid) != harvested):
+                    self._contact_ids[sid] = harvested
+                    try:
+                        from src import mongoose_contacts as mc
+                        mc.persist_contact_ids(
+                            {sid: harvested},
+                            name_by_sid={sid: student_name})
+                        self._append_log(
+                            f"  (learned Contact id for {student_name} — "
+                            "faster next time)")
+                    except Exception:
+                        pass
 
                 # 7b. Auto-send email (if configured). Failure skips the
                 # note for this student but doesn't halt the run.
@@ -14512,8 +14550,13 @@ class App:
                 # 7c. Notes — block until the worker finishes this RUN.
                 # Worker returns True iff the run completed without
                 # errors; only count those as truly processed.
+                # Supply this row's course so the note doesn't rely on the
+                # on-page Caseload table (absent on a deep-linked record);
+                # also more accurate than the name-matched page scrape.
+                row_override = override or self._norm_course_code(
+                    row.get("CourseCode", "") or row.get("Course Code", ""))
                 if self._submit_scenario_blocking(
-                    scenario, override, clipboard, custom_bodies,
+                    scenario, row_override, clipboard, custom_bodies,
                     prompt_vars=prompt_vars,
                 ):
                     processed += 1
@@ -15027,18 +15070,18 @@ class App:
         return holder["success"], holder["message"]
 
     def _click_match_by_filter_blocking(
-        self, query: str, expected_name: str = "",
+        self, query: str, expected_name: str = "", contact_id: str = "",
     ) -> tuple[bool, dict]:
         """Batch fast path: type the unique value into Caseload's row
-        filter and click the result. Returns `(success, row_info)`
-        where row_info carries `student_email` and `pm_email`
-        scraped from the row before the click (and the contact card
-        after). Either email can be empty if the page didn't surface
-        it; caller decides how to handle the gap."""
+        filter and click the result — or, when `contact_id` is given,
+        DEEP-LINK straight to that record. Returns `(success, row_info)`
+        where row_info carries `student_email`/`pm_email` (empty on the
+        deep-link path) and the `contact_id` harvested from the opened
+        record. Either email can be empty if the page didn't surface it."""
         done_var = tk.BooleanVar(value=False)
         holder: dict = {
             "success": False,
-            "info": {"pm_email": "", "student_email": ""},
+            "info": {"pm_email": "", "student_email": "", "contact_id": ""},
         }
 
         def on_done(success: bool, info: dict) -> None:
@@ -15054,7 +15097,7 @@ class App:
                 done_var.set(True)
 
         self.worker.submit_click_match_by_filter(
-            query, on_done, expected_name=expected_name,
+            query, on_done, expected_name=expected_name, contact_id=contact_id,
         )
         self.root.wait_variable(done_var)
         return holder["success"], holder["info"]
