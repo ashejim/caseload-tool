@@ -12058,10 +12058,11 @@ class App:
                     pass
                 del self.scenario_editors[name]
 
-        # Build editors only for scenarios that don't have one yet.
-        for name in wanted:
-            if name not in self.scenario_editors:
-                self._build_one_editor(name, self.scenarios[name])
+        # LAZY: do NOT build an editor for every action here (each is a heavy
+        # CTkScrollableFrame; 20+ live at once made the whole window sluggish).
+        # The selected action's editor is built on demand by
+        # _select_editor_scenario; the rest are built only when first opened
+        # (and, transiently, at save time — see _save_yaml).
 
         # Keep the dict ordered like self.scenarios so the YAML save
         # order (which serializes from the editor dict) stays stable.
@@ -12226,9 +12227,18 @@ class App:
 
     def _select_editor_scenario(self, name: str) -> None:
         """Swap the content frame to `name`'s editor and update the
-        tab-button highlights. Replaces CTkTabview.set()."""
+        tab-button highlights. Replaces CTkTabview.set(). Builds the editor
+        lazily on first open (they're heavy, so we don't build all up front)."""
         if name not in self.scenario_editors:
-            return
+            if name not in self.scenarios:
+                return
+            # Lazy-build now. If the editor pane is currently clean, re-capture
+            # the unsaved-edits baseline AFTER building so the freshly-built
+            # (unedited) editor isn't mistaken for a change.
+            was_clean = not self._editor_is_dirty()
+            self._build_one_editor(name, self.scenarios[name])
+            if was_clean:
+                self._editor_baseline = self._editor_signature()
         cur = getattr(self, "_current_scenario", None)
         if cur and cur != name and cur in self.scenario_editors:
             try:
@@ -13104,6 +13114,25 @@ class App:
         )
 
     def _save_yaml(self) -> None:
+        # Editors are built lazily, so an action the user never opened has no
+        # editor. Build any missing ones now (from their loaded config — an
+        # unopened action is unedited) so the save covers EVERY action, not just
+        # the ones in view. force=True below tears them all down afterward,
+        # returning to the few-live-widgets state.
+        for name in list(self.scenarios):
+            if name not in self.scenario_editors:
+                try:
+                    self._build_one_editor(name, self.scenarios[name])
+                except Exception as e:
+                    self._append_log(
+                        f"!! Couldn't prepare {name!r} for save: {e}; "
+                        "aborting to avoid dropping it.", error=True)
+                    return
+        # Serialize in self.scenarios order so the YAML order stays stable.
+        self.scenario_editors = {
+            n: self.scenario_editors[n]
+            for n in self.scenarios if n in self.scenario_editors
+        }
         new_doc: dict = {"scenarios": {}}
         seen: set[str] = set()
         # Diagnostic latch: surface the submit state of every note
@@ -13176,8 +13205,10 @@ class App:
             return
 
         # Names may have changed — rebuild tabs and buttons so the new
-        # names show up everywhere.
-        self._rebuild_editor_tabs()
+        # names show up everywhere. force=True tears down ALL editors (incl. the
+        # ones built transiently just for this save) and lazy-rebuilds only the
+        # current one, returning to the snappy few-live-widgets state.
+        self._rebuild_editor_tabs(force=True)
         self._rebuild_scenario_buttons()
         self._restart_hotkeys()
         # Editor now matches disk — reset the unsaved-changes baseline.
