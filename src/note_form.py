@@ -89,6 +89,71 @@ def close_workspace_tab(page: Page) -> None:
     page.keyboard.press("Shift+X")
 
 
+def _note_form_diag(page) -> str:
+    """On a Submit-disabled failure, dump the live note-form state so we can see
+    WHY: duplicate forms (deep-link standalone records can render more than one
+    note component), the selected type, and whether each Academic Activity box
+    is actually checked. Cheap; runs only on failure."""
+    try:
+        d = page.evaluate(
+            """() => {
+              const vis = el => { const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0; };
+              const sels = [...document.querySelectorAll('select[name=\"noteType\"]')];
+              const submits = [...document.querySelectorAll('button')]
+                .filter(b => (b.textContent || '').trim() === 'Submit');
+              const acts = [...document.querySelectorAll('label[for]')]
+                .map(l => {
+                  const inp = document.getElementById(l.getAttribute('for'));
+                  return { t: (l.textContent || '').trim().slice(0, 36),
+                           checked: inp ? !!inp.checked : null,
+                           vis: vis(l) }; })
+                .filter(x => /Course\\/Program|Academic Goal|obstacle|Learning Occurred/i.test(x.t));
+              return {
+                noteTypeSelects: sels.map(s => ({ val: s.value,
+                  disabled: s.disabled, vis: vis(s) })),
+                submits: submits.map(b => ({ disabled: b.disabled, vis: vis(b) })),
+                activities: acts,
+              };
+            }"""
+        )
+        return f"form-diag: {d}"
+    except Exception as e:
+        return f"form-diag failed: {e}"
+
+
+def _activity_is_checked(page, label) -> bool:
+    """True if the Academic Activity checkbox for `label` is currently ticked
+    (read via the label's linked input). False if unknown/unchecked."""
+    try:
+        cb = selectors.academic_activity_checkbox(page, label)
+        forid = cb.get_attribute("for")
+        if not forid:
+            return False
+        # Attribute selector (not '#id') — Salesforce ids contain ':' which
+        # breaks CSS id syntax.
+        return page.locator(f'[id="{forid}"]').is_checked()
+    except Exception:
+        return False
+
+
+def _ensure_activity_checked(page, label, attempts: int = 5) -> bool:
+    """Click an Academic Activity checkbox and CONFIRM it ticked, re-clicking if
+    the click was lost to a Lightning re-render. Only ever clicks a box that's
+    confirmed unchecked, so it never toggles an already-ticked one back off.
+    Returns True once checked. This is the gate that enables Submit for
+    'Email from Student'-type notes."""
+    for _ in range(attempts):
+        if _activity_is_checked(page, label):
+            return True
+        _safe_click(selectors.academic_activity_checkbox(page, label))
+        try:
+            page.wait_for_timeout(300)
+        except Exception:
+            break
+    return _activity_is_checked(page, label)
+
+
 def _wait_enabled(locator, timeout_ms: int = 8_000) -> bool:
     """Poll until `locator` is enabled (no `disabled` attr), up to timeout_ms.
     A freshly opened record can render the note form's controls disabled for a
@@ -206,7 +271,13 @@ def fill_note(page: Page, data: NoteData, *, timeout_ms: int = 10_000) -> None:
                 pass
             page.wait_for_timeout(400)  # let the reactive re-render finish
             for label in data.academic_activities:
-                _safe_click(selectors.academic_activity_checkbox(page, label))
+                # Click + verify ticked (re-click if a re-render dropped it) —
+                # a lost tick leaves Submit gated. See _ensure_activity_checked.
+                if not _ensure_activity_checked(page, label):
+                    raise RuntimeError(
+                        f"Couldn't tick the Academic Activity {label!r} "
+                        "(required to enable Submit for this note type). "
+                        + _note_form_diag(page))
 
         if data.body:
             editor = selectors.note_body_editor(page)
@@ -240,7 +311,7 @@ def fill_note(page: Page, data: NoteData, *, timeout_ms: int = 10_000) -> None:
                 raise RuntimeError(
                     "Submit button is disabled — a required field is missing "
                     "(check Interaction Type, Subject/Course Code, body, and "
-                    "any Academic Activity gates)."
+                    "any Academic Activity gates). " + _note_form_diag(page)
                 )
             _safe_click(selectors.submit_button(page))
             wait_for_submit_complete(page)
