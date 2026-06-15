@@ -13589,6 +13589,15 @@ class App:
             if offer_ea and res.get("ea"):
                 ea_arg = res["ea"]
 
+        # Step 4b: TEXT REVIEW now (front-load all user input) — review/edit the
+        # text up front but DEFER the send until after the email below, so every
+        # prompt/review happens before any send and the user can walk away while
+        # the tool works. deferred_text = prepared payload, or False to skip.
+        deferred_text = False
+        if scenario.text is not None:
+            deferred_text = self._fire_text(
+                scenario, chosen_name, prompt_vars, defer_send=True)
+
         # Step 5: email (if scenario has one). Reviewed in the same in-app
         # previewer as batch/selection (incl. the fire-time template
         # dropdown when opted in), then auto-sent. Rendered from the
@@ -13644,10 +13653,11 @@ class App:
                 if 0 <= i < len(scenario.notes):
                     scenario.notes[i].academic_activities = acts
 
-        # Text (Mongoose) channel — fire before the note submit so a text-only
-        # action doesn't fall through to the note-form path.
-        if scenario.text is not None:
-            self._fire_text(scenario, chosen_name, prompt_vars)
+        # Send the text reviewed in step 4b (all user input is done now) —
+        # before the note submit so a text-only action doesn't fall through to
+        # the note-form path.
+        if deferred_text:
+            self._send_text_payload(deferred_text)
 
         # Note submit — skip for channel-only (text/email) actions with no notes.
         if scenario.notes:
@@ -14030,13 +14040,44 @@ class App:
     # this a setting (read Mongoose's .timezone-label) for non-Eastern teams.
     TEAM_IANA = "America/New_York"
 
+    def _send_text_payload(self, payload: dict) -> bool:
+        """Drive Mongoose to send an already-REVIEWED text payload. Split out of
+        _fire_text so a combined single fire can review the text up front
+        (defer_send) and send it later, after all user input is done."""
+        who = payload.get("_who", "this student")
+        scheduled = bool(payload.get("_scheduled", payload.get("schedule")))
+        sch = payload.get("schedule") or {}
+        when = (f"scheduling ({sch.get('student_local_str', '')} student-local)"
+                if scheduled else "sending now")
+        self._append_log(
+            f"Text: {when} for {who} via "
+            f"{payload.get('inbox_label') or 'current inbox'}…")
+        self._lock_browser_for_run()
+        try:
+            res = self._send_text_blocking(payload)
+        finally:
+            self._unlock_browser_after_run()
+        if not res or res.get("error"):
+            self._append_log(f"Text failed: {(res or {}).get('error')}",
+                             error=True)
+            return False
+        self._append_log(
+            f"Text: {'scheduled' if scheduled else 'sent'} in Mongoose "
+            f"for {who}.")
+        return True
+
     def _fire_text(self, scenario: ScenarioConfig, chosen_name: str,
-                   prompt_vars: Optional[dict]) -> bool:
+                   prompt_vars: Optional[dict], *,
+                   defer_send: bool = False):
         """Fire a scenario's text (Mongoose) channel for the active student.
         Resolves Mobile Phone + Timezone from the caseload CSV cache, renders
         the body, computes a timezone-aware schedule slot, and drives Mongoose
-        (commit=False stops at the confirm/schedule step for review). Returns
-        True on success."""
+        (commit=False stops at the confirm/schedule step for review).
+
+        Normally returns True on success / False on skip. With `defer_send`, it
+        does everything THROUGH the in-app review and returns the prepared
+        payload dict (to be sent later via _send_text_payload) — or False to
+        skip — so a combined fire can collect all user input before sending."""
         from src import text_message as tm
         tcfg = scenario.text
         # Resolve the student WITHOUT needing the Salesforce record open: prefer
@@ -14165,25 +14206,11 @@ class App:
             "schedule_name": sched_name,
             "course": variables.get("course_code", ""),
             "commit": True,  # tool finishes in Mongoose; review already happened
+            "_who": who, "_scheduled": scheduled,  # for the send-time log line
         }
-        when = (f"scheduling ({sch_payload['student_local_str']} student-local)"
-                if scheduled else "sending now")
-        self._append_log(
-            f"Text: {when} for {who} via {inbox_label or 'current inbox'}…")
-        # Lock the browser while the tool drives Mongoose (the review dialog
-        # already ran, so the scrim hides nothing the user needs).
-        self._lock_browser_for_run()
-        try:
-            res = self._send_text_blocking(payload)
-        finally:
-            self._unlock_browser_after_run()
-        if not res or res.get("error"):
-            self._append_log(f"Text failed: {(res or {}).get('error')}",
-                             error=True)
-            return False
-        self._append_log(
-            f"Text: {'scheduled' if scheduled else 'sent'} in Mongoose for {who}.")
-        return True
+        if defer_send:
+            return payload  # caller sends later via _send_text_payload
+        return self._send_text_payload(payload)
 
     def _fire_batch(self, scenario: ScenarioConfig, override: str) -> None:
         """Drive a batch scenario end-to-end: load caseload, filter,
