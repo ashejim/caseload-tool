@@ -928,6 +928,16 @@ class BrowserWorker:
         try:
             selectors.note_body_editor(target).wait_for(
                 state="visible", timeout=20_000)
+            # Give the form a moment to become INTERACTIVE (the type <select>
+            # enables a beat after the panel paints). fill_note re-checks this,
+            # but waiting here means we hand back a warmer form — fewer races on
+            # the reactive Academic Activity gate for "Email from Student" notes.
+            try:
+                selectors.interaction_type_select(target).wait_for(
+                    state="visible", timeout=4_000)
+                target.wait_for_timeout(300)
+            except Exception:
+                pass
             return True
         except Exception:
             pass

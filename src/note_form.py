@@ -89,6 +89,28 @@ def close_workspace_tab(page: Page) -> None:
     page.keyboard.press("Shift+X")
 
 
+def _wait_enabled(locator, timeout_ms: int = 8_000) -> bool:
+    """Poll until `locator` is enabled (no `disabled` attr), up to timeout_ms.
+    A freshly opened record can render the note form's controls disabled for a
+    beat — interacting then either silently fails or times out. Returns True if
+    it became enabled."""
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        try:
+            if locator.is_enabled():
+                return True
+        except Exception:
+            pass
+        try:
+            locator.page.wait_for_timeout(150)
+        except Exception:
+            break
+    try:
+        return locator.is_enabled()
+    except Exception:
+        return False
+
+
 def _safe_click(locator) -> None:
     """Click a Lightning form element robustly. The note panel often
     sits in a slide-out sidebar that's wider than the viewport; the
@@ -152,7 +174,13 @@ def fill_note(page: Page, data: NoteData, *, timeout_ms: int = 10_000) -> None:
             )
 
         if data.interaction_type:
-            selectors.interaction_type_select(page).select_option(label=data.interaction_type)
+            sel = selectors.interaction_type_select(page)
+            # On a freshly opened record (especially a fast deep-link nav) the
+            # type <select> can render disabled for a beat — wait for it to
+            # enable so we don't select into a dead control or time out (30s)
+            # on a still-initializing form.
+            _wait_enabled(sel, timeout_ms=12_000)
+            sel.select_option(label=data.interaction_type, timeout=12_000)
 
         if data.course_code:
             cc = selectors.course_code_input(page)
@@ -164,8 +192,21 @@ def fill_note(page: Page, data: NoteData, *, timeout_ms: int = 10_000) -> None:
             _safe_click(subj)
             subj.fill(data.subject)
 
-        for label in data.academic_activities:
-            _safe_click(selectors.academic_activity_checkbox(page, label))
+        # Academic activities: selecting a type like "Email from Student"
+        # REACTIVELY adds this section. Clicking before it has rendered +
+        # settled loses the tick — Submit then stays disabled ("required field
+        # missing"), the failure seen on fast deep-link fires. Wait for the
+        # section to appear, let the re-render settle, THEN click.
+        if data.academic_activities:
+            try:
+                selectors.academic_activity_checkbox(
+                    page, data.academic_activities[0]
+                ).wait_for(state="visible", timeout=8_000)
+            except Exception:
+                pass
+            page.wait_for_timeout(400)  # let the reactive re-render finish
+            for label in data.academic_activities:
+                _safe_click(selectors.academic_activity_checkbox(page, label))
 
         if data.body:
             editor = selectors.note_body_editor(page)
