@@ -13495,7 +13495,7 @@ class App:
                 # "no visible note panel".)
                 if not self._navigate_for_fire_blocking(
                         prenav_query, student_id=prenav_student_id,
-                        allow_deeplink=(scenario.email is None)):
+                        allow_deeplink=self._deeplink_ok(scenario)):
                     self._append_log(
                         f"Could not open {prenav_label or prenav_query!r}; "
                         "scenario not fired."
@@ -13629,7 +13629,7 @@ class App:
             if nav_query:
                 self._navigate_for_fire_blocking(
                     nav_query, student_id=prenav_student_id,
-                    allow_deeplink=(scenario.email is None))
+                    allow_deeplink=self._deeplink_ok(scenario))
 
         # Apply the fire-time course / academic-activity edits onto a copy
         # of the scenario (run_scenario reads note.course_code_override and
@@ -13901,6 +13901,23 @@ class App:
         they resolve everything from the caseload CSV."""
         return (scenario.text is not None and not scenario.notes
                 and scenario.email is None)
+
+    @staticmethod
+    def _deeplink_ok(scenario) -> bool:
+        """Whether a note fire may DEEP-LINK to the Contact record instead of
+        the Caseload search. The deep link opens the STANDARD record layout,
+        which differs from the Caseload console note panel in two ways that
+        break it: (1) an email step scrapes student/PM context from the on-page
+        Caseload table (absent there), and (2) its Academic Activity checkboxes
+        aren't the `label[for]` elements our selectors match — so a gated note
+        ("Email from Student" etc., which needs an activity) can't be completed.
+        Such fires use the proven console/search path; plain notes deep-link."""
+        if scenario.email is not None:
+            return False
+        for n in (scenario.notes or []):
+            if getattr(n, "academic_activities", None):
+                return False
+        return True
 
     @staticmethod
     def _texting_opted_in(row: dict) -> bool:
@@ -14677,10 +14694,10 @@ class App:
 
         # Step 7: loop. For each student: navigate → auto-send
         # email (if configured) → file note.
-        # Deep-link straight to the record when we know its Contact id —
-        # but only for non-email fires (an email step needs the row's
-        # mailto/contact-card scrape, which the deep link skips).
-        allow_deeplink = not has_email
+        # Deep-link straight to the record when we know its Contact id — but
+        # only when the deep link's standalone layout is safe (no email scrape,
+        # no Academic Activity gate); see _deeplink_ok. Others use Fast-find.
+        allow_deeplink = self._deeplink_ok(scenario)
         processed = 0
         skipped: list[tuple[str, str]] = []
         try:
