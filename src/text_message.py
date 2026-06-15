@@ -278,6 +278,20 @@ def current_department(page: Page) -> str:
         return ""
 
 
+def mongoose_logged_in(page: Page, *, timeout_ms: int = 6_000) -> bool:
+    """True if the Mongoose dashboard shell is present (signed in). False if a
+    login/SSO page is showing instead (session expired) — so the caller can fail
+    fast with a clear message instead of timing out per compose. The sidebar
+    department label is the shell marker; bounded wait so a slow dashboard load
+    isn't mistaken for a logout."""
+    try:
+        page.locator(".department-name").filter(visible=True).first.wait_for(
+            state="visible", timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
 def switch_department(page: Page, course: str, *, timeout_ms: int = 10_000) -> None:
     """Make Mongoose's selected department match `course` (e.g. 'C769') so the
     Compose modal offers that course's inbox. No-op if already on it. Raises if

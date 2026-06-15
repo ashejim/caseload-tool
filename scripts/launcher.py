@@ -2424,6 +2424,19 @@ class BrowserWorker:
         except Exception:
             pass
         from src import text_message as tm
+        # Fail fast if the Mongoose session has expired (the page is the SSO /
+        # login screen, not the dashboard). Otherwise switch_department would
+        # just time out 10s per group. Bring the window forward so the user can
+        # sign in, and signal "not logged in" so the caller aborts cleanly
+        # (incl. a combined action's email/note loop).
+        if not tm.mongoose_logged_in(page):
+            try:
+                self._bring_browser_forward(page)
+            except Exception:
+                pass
+            return {"error": "Mongoose isn't logged in (the browser is showing "
+                    "the sign-in page). Sign in to Mongoose, then re-fire.",
+                    "not_logged_in": True}
         # The first compose of a session is flaky (cold renderer); warm it once
         # with a throwaway open/search/close so the first real group goes through.
         if not self._mongoose_warmed:
@@ -14380,6 +14393,15 @@ class App:
                     f"  text: {grp['label']} - {len(mobiles)} recipient(s) "
                     f"({grp['when_str']})...")
                 res = self._send_text_blocking(payload)
+                if res and res.get("not_logged_in"):
+                    # Setup failure, not a per-group hiccup: stop immediately
+                    # (don't time out the remaining groups) and abort the whole
+                    # action so a combined fire doesn't go on to send emails.
+                    self._append_log(
+                        "Texts NOT sent — Mongoose isn't logged in. Restore the "
+                        "browser window, sign in to Mongoose, then re-fire. "
+                        "Email/notes were NOT run.", error=True)
+                    return False
                 if not res or res.get("error"):
                     self._append_log(
                         f"  text failed [{grp['label']}]: "
