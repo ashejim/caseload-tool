@@ -3,6 +3,38 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.11.0 — 2026-06-15
+
+Faster note filing, smoother fires, and a snappier window — building on the
+0.10.0 texting release.
+
+### Major features
+- **Faster note filing (Salesforce Contact id)** — when a student's Contact id
+  is known, the tool **deep-links straight to their record** (~2.6s to a ready
+  note panel) instead of searching the caseload list. Ids come from the
+  Mongoose segment export and are also **harvested as you work** ("collect-as-
+  you-go"), so coverage grows automatically and notes/texts get faster over
+  time. Gated notes ("Email from Student", which need an Academic Activity) and
+  email fires keep using the reliable search path.
+- **All input up front** — combined batch *and* single fires now show every
+  prompt/review (scenario prompts, note edits, email review, text review) at
+  the start, then send texts/emails and file notes **unattended**. No more
+  reviewing texts, waiting for them to send, then being pulled back for more.
+
+### Improvements
+- **Mongoose sign-in handling** — a text-bearing action checks the Mongoose
+  session **before** the review (clear "sign in, then re-fire" message + opens
+  Mongoose if logged out, instead of timing out); Mongoose also opens in the
+  background at startup with a sign-in heads-up. New **🐭 Mongoose** button.
+- **Snappier UI** — action editors build lazily (only the one you open, not all
+  ~20 at once), the activity log batches its redraws during a run, and email
+  templates are cached so a batch review doesn't re-read the file per student.
+
+### Fixes
+- Note "Submit is disabled" failures — the Academic Activity checkbox tick is
+  now verified and re-clicked if a Lightning re-render drops it; the note course
+  comes from the caseload row so filing doesn't depend on an on-page table.
+
 ## 0.10.0 — 2026-06-14
 
 Text messaging. An action can now **send a text** through Mongoose (the SMS
