@@ -6070,9 +6070,87 @@ def prompt_batch_text_review(
 
     body = ctk.CTkFrame(dialog, fg_color="transparent")
     body.pack(fill="both", expand=True, padx=8, pady=6)
-    left = ctk.CTkScrollableFrame(
-        body, label_text="Students by timezone", width=400)
-    left.pack(side="left", fill="y", padx=(0, 6))
+    # Left: native ttk.Treeview — timezone groups as parent rows, students as
+    # children, each with a ☐/☑ glyph in the 'sel' column (one Treeview is far
+    # lighter than a CTkCheckBox per member, and gives native expand/collapse).
+    left_col = ctk.CTkFrame(body, fg_color=("gray95", "gray16"))
+    left_col.pack(side="left", fill="y", padx=(0, 6))
+    tz_wrap = tk.Frame(left_col, bd=0, highlightthickness=0)
+    tz_wrap.pack(side="top", fill="both", expand=True, padx=4, pady=4)
+    tz_wrap.grid_rowconfigure(0, weight=1)
+    tz_wrap.grid_columnconfigure(0, weight=1)
+    tz_tree = ttk.Treeview(
+        tz_wrap, columns=("sel",), show="tree headings",
+        selectmode="browse", height=18, style="Caseload.Treeview",
+    )
+    tz_tree.heading("#0", text="Students by timezone")
+    tz_tree.column("#0", width=360, anchor="w")
+    tz_tree.heading("sel", text="")
+    tz_tree.column("sel", width=44, minwidth=44, stretch=False, anchor="center")
+    tz_tree.grid(row=0, column=0, sticky="nsew")
+    _tsb = ttk.Scrollbar(tz_wrap, command=tz_tree.yview)
+    _tsb.grid(row=0, column=1, sticky="ns")
+    tz_tree.configure(yscrollcommand=_tsb.set)
+    _tdark = ctk.get_appearance_mode() == "Dark"
+    tz_tree.tag_configure("issue",
+                          foreground=("#ff8a80" if _tdark else "#b00020"))
+    tz_tree.tag_configure("muted", foreground="gray55")
+
+    def _glyph(checked, textable=True):
+        if not textable:
+            return "—"
+        return "☑" if checked else "☐"
+
+    node_map: dict = {}  # iid -> ("group", i) | ("member", i, j)
+
+    def _refresh_group_glyph(i):
+        master = any(v.get() for v in member_vars[i])
+        try:
+            tz_tree.set(f"g{i}", "sel", _glyph(master))
+        except Exception:
+            pass
+
+    def _toggle_iid(iid):
+        info = node_map.get(iid)
+        if not info:
+            return
+        if info[0] == "group":
+            i = info[1]
+            members = groups[i].get("members", [])
+            gv = member_vars[i]
+            target = not any(v.get() for v in gv)
+            for j, (m, v) in enumerate(zip(members, gv)):
+                if m.get("term"):
+                    v.set(target)
+                    tz_tree.set(f"g{i}m{j}", "sel", _glyph(target))
+            _refresh_group_glyph(i)
+        else:
+            _, i, j = info
+            m = groups[i].get("members", [])[j]
+            if not m.get("term"):
+                return  # not textable — ignore
+            v = member_vars[i][j]
+            v.set(not v.get())
+            tz_tree.set(f"g{i}m{j}", "sel", _glyph(v.get()))
+            _refresh_group_glyph(i)
+        _update_sel_label()
+
+    def _on_tz_click(event):
+        iid = tz_tree.identify_row(event.y)
+        if not iid:
+            return
+        if tz_tree.identify_column(event.x) == "#1":  # the 'sel' column
+            _toggle_iid(iid)
+            return "break"  # toggle only — don't move the preview selection
+
+    def _on_tz_select(event=None):
+        info = node_map.get(tz_tree.focus())
+        if info:
+            _show(info[1])
+
+    tz_tree.bind("<Button-1>", _on_tz_click)
+    tz_tree.bind("<<TreeviewSelect>>", _on_tz_select)
+
     right = ctk.CTkFrame(body, fg_color=("gray95", "gray16"))
     right.pack(side="left", fill="both", expand=True)
     preview_hdr = ctk.CTkLabel(
@@ -6104,8 +6182,8 @@ def prompt_batch_text_review(
         preview_box.configure(state="disabled")
 
     if skipped_names:
-        skip_frame = ctk.CTkFrame(left, fg_color=("gray90", "gray22"))
-        skip_frame.pack(fill="x", pady=(0, 6))
+        skip_frame = ctk.CTkFrame(left_col, fg_color=("gray90", "gray22"))
+        skip_frame.pack(side="bottom", fill="x", padx=4, pady=(0, 4))
         ctk.CTkLabel(
             skip_frame,
             text=f"Skipped - not opted in ({len(skipped_names)})",
@@ -6118,48 +6196,22 @@ def prompt_batch_text_review(
             text_color=("gray45", "gray60"),
         ).pack(fill="x", padx=8, pady=(0, 4))
 
-    def _make_group(i):
-        g = groups[i]
+    # Populate the tree: a parent row per timezone group, a child per member.
+    for i, g in enumerate(groups):
         gv = member_vars[i]
-        sec = ctk.CTkFrame(left, fg_color=("gray94", "gray20"))
-        sec.pack(fill="x", pady=2)
-        head = ctk.CTkFrame(sec, fg_color="transparent")
-        head.pack(fill="x")
-        master = ctk.BooleanVar(value=any(v.get() for v in gv))
-        members_box = ctk.CTkFrame(sec, fg_color="transparent")
-        fold = {"open": True}
-
-        def _sync_master():
-            master.set(any(v.get() for v in gv))
-            _update_sel_label()
-
-        def _toggle_group():
-            on = master.get()
-            for m, v in zip(g.get("members", []), gv):
-                if m.get("term"):
-                    v.set(on)
-            _update_sel_label()
-
-        ctk.CTkCheckBox(
-            head, text="", width=24, variable=master, command=_toggle_group,
-        ).pack(side="left", anchor="n")
-        toggle_btn = ctk.CTkButton(
-            head, text="▾", width=24, fg_color="transparent",
-            text_color=("gray10", "gray90"), hover_color=("gray85", "gray25"))
-        toggle_btn.pack(side="left")
-        ntext = sum(1 for m in g.get("members", []) if m.get("term"))
-        warn = "⚠  " if g.get("issues") else ""
-        lbl = ctk.CTkLabel(
-            head,
-            text=f"{warn}{g['label']}\n{g['when_str']}  ·  {ntext} textable",
-            anchor="w", justify="left", wraplength=320,
-            font=ctk.CTkFont(size=11),
-            text_color=(("#a33", "#e88") if g.get("issues")
-                        else ("gray10", "gray90")))
-        lbl.pack(side="left", fill="x", expand=True)
-        lbl.bind("<Button-1>", lambda _ev, x=i: _show(x))
-
-        for m, v in zip(g.get("members", []), gv):
+        members = g.get("members", [])
+        ntext = sum(1 for m in members if m.get("term"))
+        master = any(v.get() for v in gv)
+        warn = "⚠ " if g.get("issues") else ""
+        gid = f"g{i}"
+        tz_tree.insert(
+            "", "end", iid=gid, open=True,
+            text=f"{warn}{g['label']}  ·  {g['when_str']}  ·  {ntext} textable",
+            values=(_glyph(master),),
+            tags=(("issue",) if g.get("issues") else ()),
+        )
+        node_map[gid] = ("group", i)
+        for j, (m, v) in enumerate(zip(members, gv)):
             has = bool(m.get("term"))
             if not has:
                 suffix = "   (no mobile / Contact id)"
@@ -6167,40 +6219,37 @@ def prompt_batch_text_review(
                 suffix = "   (via Contact id)"
             else:
                 suffix = ""
-            txt = m["name"] + suffix
-            ctk.CTkCheckBox(
-                members_box, text=txt, variable=v, command=_sync_master,
-                font=ctk.CTkFont(size=11),
-                state=("normal" if has else "disabled"),
-            ).pack(anchor="w", padx=(30, 8), pady=1)
-        members_box.pack(fill="x")
+            mid = f"g{i}m{j}"
+            tz_tree.insert(
+                gid, "end", iid=mid, text="   " + m["name"] + suffix,
+                values=(_glyph(v.get(), has),),
+                tags=(() if has else ("muted",)),
+            )
+            node_map[mid] = ("member", i, j)
 
-        def _fold():
-            if fold["open"]:
-                members_box.pack_forget()
-                toggle_btn.configure(text="▸")
-                fold["open"] = False
-            else:
-                members_box.pack(fill="x")
-                toggle_btn.configure(text="▾")
-                fold["open"] = True
-        toggle_btn.configure(command=_fold)
-
-    for i in range(len(groups)):
-        _make_group(i)
     _update_sel_label()
     if groups:
         _show(0)
+        try:
+            tz_tree.selection_set("g0")
+            tz_tree.focus("g0")
+        except Exception:
+            pass
 
     footer = ctk.CTkFrame(dialog, fg_color="transparent")
     footer.pack(fill="x", padx=8, pady=(0, 8))
 
     def _toggle_all():
         target = _count() == 0
-        for g, gv in zip(groups, member_vars):
-            for m, v in zip(g.get("members", []), gv):
+        for i, (g, gv) in enumerate(zip(groups, member_vars)):
+            for j, (m, v) in enumerate(zip(g.get("members", []), gv)):
                 if m.get("term"):
                     v.set(target)
+                    try:
+                        tz_tree.set(f"g{i}m{j}", "sel", _glyph(target))
+                    except Exception:
+                        pass
+            _refresh_group_glyph(i)
         _update_sel_label()
 
     def _close():
@@ -6363,12 +6412,108 @@ def prompt_batch_email_review(
     body.grid_columnconfigure(1, weight=1)
     body.grid_rowconfigure(0, weight=1)
 
-    # Left: scrollable student list with checkboxes.
-    list_frame = ctk.CTkScrollableFrame(
-        body, fg_color=("gray95", "gray16"), corner_radius=6,
-        label_text=f"Students ({len(rendered)})",
+    # Left: native ttk.Treeview list with a leading checkbox column. One
+    # Treeview is far lighter than a CTkCheckBox + CTkButton per student
+    # (which lagged on big batches) and gives free keyboard navigation.
+    list_col = ctk.CTkFrame(body, fg_color=("gray95", "gray16"),
+                            corner_radius=6)
+    list_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+    list_col.grid_rowconfigure(1, weight=1)
+    list_col.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(
+        list_col, text=f"Students ({len(rendered)})", anchor="w",
+        font=ctk.CTkFont(size=12, weight="bold"),
+    ).grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
+
+    _chk_un, _chk_ch = _build_checkbox_images()
+    dialog._chk_imgs = (_chk_un, _chk_ch)  # keep refs (else Tk GCs them)
+
+    def _chk_img(checked):
+        return _chk_ch if checked else _chk_un
+
+    tree_wrap = tk.Frame(list_col, bd=0, highlightthickness=0)
+    tree_wrap.grid(row=1, column=0, sticky="nsew", padx=(6, 2), pady=(0, 4))
+    tree_wrap.grid_rowconfigure(0, weight=1)
+    tree_wrap.grid_columnconfigure(0, weight=1)
+    review_tree = ttk.Treeview(
+        tree_wrap, columns=("student",), show="tree headings",
+        selectmode="browse", style="Caseload.Treeview",
     )
-    list_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+    review_tree.heading("#0", text="")
+    review_tree.column("#0", width=32, minwidth=32, stretch=False,
+                       anchor="center")
+    review_tree.heading("student", text="Student")
+    review_tree.column("student", width=250, anchor="w")
+    review_tree.grid(row=0, column=0, sticky="nsew")
+    _rsb = ttk.Scrollbar(tree_wrap, command=review_tree.yview)
+    _rsb.grid(row=0, column=1, sticky="ns")
+    review_tree.configure(yscrollcommand=_rsb.set)
+    _rdark = ctk.get_appearance_mode() == "Dark"
+    review_tree.tag_configure(
+        "issue", foreground=("#ff8a80" if _rdark else "#b00020"))
+
+    _syncing = {"on": False}
+
+    def _select_in_tree(idx: int) -> None:
+        iid = str(idx)
+        if not review_tree.exists(iid):
+            return
+        _syncing["on"] = True
+        try:
+            review_tree.selection_set(iid)
+            review_tree.focus(iid)
+            review_tree.see(iid)
+        finally:
+            _syncing["on"] = False
+
+    def _set_checked(idx: int, val: bool) -> None:
+        selected_vars[idx].set(val)
+        iid = str(idx)
+        if review_tree.exists(iid):
+            review_tree.item(iid, image=_chk_img(val))
+
+    def _on_review_click(event):
+        iid = review_tree.identify_row(event.y)
+        if not iid:
+            return
+        if review_tree.identify_column(event.x) == "#0":
+            idx = int(iid)
+            _set_checked(idx, not selected_vars[idx].get())
+            _update_selection_label()
+            return "break"  # toggle only — don't move the preview selection
+
+    def _on_tree_select(event=None):
+        if _syncing["on"]:
+            return
+        iid = review_tree.focus()
+        if iid:
+            _show(int(iid))
+
+    review_tree.bind("<Button-1>", _on_review_click)
+    review_tree.bind("<<TreeviewSelect>>", _on_tree_select)
+
+    # Select all / none footer.
+    list_actions = ctk.CTkFrame(list_col, fg_color="transparent")
+    list_actions.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
+
+    def _select_all() -> None:
+        for i in range(len(rendered)):
+            _set_checked(i, True)
+        _update_selection_label()
+
+    def _select_none() -> None:
+        for i in range(len(rendered)):
+            _set_checked(i, False)
+        _update_selection_label()
+
+    ctk.CTkButton(
+        list_actions, text="Select all", height=24, command=_select_all,
+        font=ctk.CTkFont(size=11), **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=2)
+    ctk.CTkButton(
+        list_actions, text="None", height=24, command=_select_none,
+        font=ctk.CTkFont(size=11), **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=2)
 
     # Right: preview pane.
     preview_frame = ctk.CTkFrame(body, fg_color=("gray95", "gray16"), corner_radius=6)
@@ -6416,9 +6561,6 @@ def prompt_batch_email_review(
     # Disable typing — preview is read-only.
     body_text.configure(state="disabled")
 
-    # ---- Build row widgets in the list. ----
-    row_buttons: list[ctk.CTkButton] = []
-
     def _row_label(entry: dict, idx: int) -> str:
         parts = [entry["name"]]
         sub = []
@@ -6451,14 +6593,8 @@ def prompt_batch_email_review(
             return
         state["current"] = idx
         entry = rendered[idx]
-        # Highlight the active row (border or fg change).
-        for i, b in enumerate(row_buttons):
-            if i == idx:
-                b.configure(border_width=2,
-                             border_color=("#1a73e8", "#79b8ff"))
-            else:
-                b.configure(border_width=1,
-                             border_color=("gray70", "gray35"))
+        # Keep the list selection in sync with the previewed student.
+        _select_in_tree(idx)
         # Issue banner.
         issues = entry.get("issues", [])
         if issues:
@@ -6504,70 +6640,16 @@ def prompt_batch_email_review(
         body_text.configure(state="disabled")
         _update_selection_label()
 
-    def _on_row_click(idx: int) -> None:
-        _show(idx)
-
-    def _on_checkbox_toggle() -> None:
-        _update_selection_label()
-
+    # Populate the student list. The leading (#0) column shows the checkbox
+    # image (toggled on click); the 'student' column shows name · id · course
+    # with a trailing (!) and red tint for rows with issues.
     for i, entry in enumerate(rendered):
-        row_wrap = ctk.CTkFrame(list_frame, fg_color="transparent")
-        row_wrap.pack(fill="x", pady=2)
-        cb = ctk.CTkCheckBox(
-            row_wrap, text="", variable=selected_vars[i],
-            command=_on_checkbox_toggle, width=20,
+        review_tree.insert(
+            "", "end", iid=str(i),
+            image=_chk_img(selected_vars[i].get()),
+            values=(_row_label(entry, i),),
+            tags=(("issue",) if entry.get("issues") else ()),
         )
-        cb.pack(side="left", padx=(2, 4))
-        # Reuse the same SECONDARY_BTN_KWARGS palette, but make the
-        # button look like a list row — left-aligned text, click
-        # selects this row for preview.
-        b_kwargs = dict(SECONDARY_BTN_KWARGS)
-        if entry.get("issues"):
-            # Red-tint the row to flag the issue at-a-glance.
-            b_kwargs["fg_color"] = ("#ffe0e0", "#4a1a1a")
-            b_kwargs["text_color"] = ("#990000", "#ffcccc")
-        btn = ctk.CTkButton(
-            row_wrap, text=_row_label(entry, i), anchor="w",
-            height=36, command=lambda idx=i: _on_row_click(idx),
-            font=ctk.CTkFont(size=12),
-            **b_kwargs,
-        )
-        btn.pack(side="left", fill="x", expand=True)
-        row_buttons.append(btn)
-        if entry.get("issues"):
-            issue_sub = ctk.CTkLabel(
-                list_frame,
-                text="    ↳ " + "  ·  ".join(entry["issues"]),
-                font=ctk.CTkFont(size=10),
-                text_color=("#990000", "#ffcccc"),
-                anchor="w", justify="left",
-            )
-            issue_sub.pack(fill="x", padx=4, pady=(0, 2))
-
-    # ---- List-level action buttons (select all / none). ----
-    list_actions = ctk.CTkFrame(list_frame, fg_color="transparent")
-    list_actions.pack(fill="x", pady=(8, 0))
-
-    def _select_all() -> None:
-        for v in selected_vars:
-            v.set(True)
-        _update_selection_label()
-
-    def _select_none() -> None:
-        for v in selected_vars:
-            v.set(False)
-        _update_selection_label()
-
-    ctk.CTkButton(
-        list_actions, text="Select all", height=24,
-        command=_select_all, **SECONDARY_BTN_KWARGS,
-        font=ctk.CTkFont(size=11),
-    ).pack(side="left", padx=2)
-    ctk.CTkButton(
-        list_actions, text="None", height=24,
-        command=_select_none, **SECONDARY_BTN_KWARGS,
-        font=ctk.CTkFont(size=11),
-    ).pack(side="left", padx=2)
 
     # ---- Bottom action row: prev/next, edge, send, cancel. ----
     bottom = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -8699,7 +8781,7 @@ class CaseloadPanel:
         # left of the Filters/Columns buttons (col 3; the search box at col 2
         # expands, pushing this into the right-side cluster).
         self.view_menu = ctk.CTkOptionMenu(
-            bar, values=["View ▾"], width=130, command=self._on_view_select,
+            bar, values=["★ Views"], width=130, command=self._on_view_select,
         )
         self.view_menu.grid(row=0, column=3, padx=(0, 4))
         self._refresh_view_menu()  # populate with any saved views
@@ -9122,6 +9204,12 @@ class CaseloadPanel:
         self.notes_holder.grid_columnconfigure(0, weight=1)
         # Ctrl +/- and Ctrl+wheel resize the note text while reading.
         bind_font_hotkeys("notes", self.detail_scroll)
+        # The notes themselves render into a single native tk.Text (created
+        # lazily) rather than one CTk card per note — a student can have dozens
+        # of notes, and N canvas-backed CTk widgets repaint slowly on resize.
+        self._notes_text = None
+        self._notes_open = set()
+        self._notes_last_w = None
         self._last_notes = None
         self._notes_hint()
 
@@ -9706,18 +9794,110 @@ class CaseloadPanel:
 
     # ----- note viewer -----
 
+    # The notes viewer is a single native tk.Text (built lazily). It holds
+    # either a plain message (hint / loading / error) or the rendered notes;
+    # headers are clickable to expand/collapse and the text auto-sizes its
+    # height so the outer CTkScrollableFrame scrolls everything together.
+
+    def _ensure_notes_text(self):
+        if getattr(self, "_notes_text", None) is not None:
+            return self._notes_text
+        dark = ctk.get_appearance_mode() == "Dark"
+        self._notes_dark = dark
+        txt = tk.Text(
+            self.notes_holder, wrap="word", bd=0, highlightthickness=0,
+            cursor="arrow", padx=6, pady=4, height=4,
+            bg=("#22232a" if dark else "#f2f3f5"),
+            fg=("#dce4ee" if dark else "#1a1a1a"),
+            spacing1=1, spacing3=2,
+        )
+        txt.grid(row=0, column=0, sticky="ew")
+        self._notes_text = txt
+        self._notes_open = set()
+        self._configure_note_tags()
+        # Channel font: applies the current size + binds Ctrl +/- / Ctrl+wheel.
+        register_font_box("notes", txt, hotkeys=True)
+        register_font_apply("notes", self._on_notes_font)
+        # The Text shouldn't swallow the wheel — forward it to the outer scroll.
+        txt.bind("<MouseWheel>", self._notes_wheel)
+        txt.bind("<Configure>", self._on_notes_configure)
+        return txt
+
+    def _configure_note_tags(self) -> None:
+        txt = self._notes_text
+        if txt is None:
+            return
+        n = font_size("notes")
+        dark = getattr(self, "_notes_dark", ctk.get_appearance_mode() == "Dark")
+        muted = "#9aa0a6" if dark else "#6b7280"
+        link = "#5aa9e6" if dark else "#1a6dc2"
+        err = "#ff7b72" if dark else "#b00020"
+        txt.tag_configure("hdr", font=("Segoe UI", n + 1, "bold"), spacing1=5)
+        txt.tag_configure("meta", font=("Segoe UI", max(8, n - 2)),
+                          foreground=muted, lmargin1=14, lmargin2=14)
+        txt.tag_configure("prev", font=("Segoe UI", max(8, n - 1)),
+                          foreground=muted, lmargin1=14, lmargin2=14)
+        txt.tag_configure("body", font=("Segoe UI", n),
+                          lmargin1=14, lmargin2=14)
+        txt.tag_configure("link", font=("Segoe UI", max(8, n - 1), "underline"),
+                          foreground=link, lmargin1=14)
+        txt.tag_configure("hint", font=("Segoe UI", n), foreground=muted)
+        txt.tag_configure("err", font=("Segoe UI", n), foreground=err)
+
+    def _notes_wheel(self, event):
+        try:
+            self.detail_scroll._parent_canvas.yview_scroll(
+                int(-event.delta / 120), "units")
+        except Exception:
+            pass
+        return "break"
+
+    def _on_notes_configure(self, event) -> None:
+        # Re-measure the wrapped height only when the width actually changes
+        # (setting `height` re-fires <Configure> with the same width).
+        if event.width == self._notes_last_w:
+            return
+        self._notes_last_w = event.width
+        self._size_notes_text()
+
+    def _on_notes_font(self, n) -> None:
+        if getattr(self, "_notes_text", None) is None:
+            return
+        self._configure_note_tags()
+        if self._last_notes:
+            self._render_notes()
+        else:
+            self._size_notes_text()
+
+    def _size_notes_text(self) -> None:
+        txt = getattr(self, "_notes_text", None)
+        if txt is None:
+            return
+        try:
+            txt.update_idletasks()
+            c = txt.count("1.0", "end-1c", "displaylines")
+            lines = (c[0] if isinstance(c, tuple) else c) or 1
+            txt.configure(height=max(2, min(int(lines) + 1, 600)))
+        except Exception:
+            txt.configure(height=12)
+
+    def _set_notes_plain(self, msg: str, kind: str = "hint") -> None:
+        txt = self._ensure_notes_text()
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        for t in txt.tag_names():
+            if t.startswith("tgl") or t.startswith("lnk"):
+                txt.tag_delete(t)
+        txt.insert("end", msg, (kind,))
+        txt.configure(state="disabled")
+        self._size_notes_text()
+
     def _notes_hint(self) -> None:
         self._last_notes = None
-        for w in self.notes_holder.winfo_children():
-            w.destroy()
         self.notes_title.configure(text="Notes")
-        ctk.CTkLabel(
-            self.notes_holder,
-            text="Press Enter (or Review notes) to load this\n"
-                 "student's notes from Salesforce.",
-            justify="left", text_color=("gray45", "gray60"),
-            font=ctk.CTkFont(size=12),
-        ).grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        self._set_notes_plain(
+            "Press Enter (or Review notes) to load this\n"
+            "student's notes from Salesforce.", "hint")
 
     def _review_focused(self) -> None:
         iid = self.tree.focus()
@@ -9727,13 +9907,22 @@ class CaseloadPanel:
 
     def review_notes(self, query: str, label: str) -> None:
         """Open the student (navigation) and load their notes into the
-        viewer. Guarded against running mid-batch."""
+        viewer. Guarded against running mid-batch, and against repeat
+        requests for a load already in flight (Enter held / mashed)."""
         if getattr(self.app, "_is_busy", False):
             self.show_notes_message("Busy — finish the current run first.")
             return
+        if getattr(self, "_notes_inflight", None) == query:
+            return  # same student already loading — ignore the repeat
+        self._notes_inflight = query
         self.show_notes_loading(label)
         self.app._append_log(f"Loading notes for {label}…")
         self.app._review_notes(query, label, self)
+
+    def _notes_load_done(self) -> None:
+        """Called when a notes fetch finishes (success or error) — clears the
+        in-flight guard so the student can be reloaded."""
+        self._notes_inflight = None
 
     def _scroll_to_notes(self) -> None:
         """Scroll the detail body so the notes section is at the top of the
@@ -9758,22 +9947,14 @@ class CaseloadPanel:
             do()
 
     def show_notes_loading(self, label: str) -> None:
-        for w in self.notes_holder.winfo_children():
-            w.destroy()
+        self._last_notes = None
         self.notes_title.configure(text="Notes")
-        ctk.CTkLabel(
-            self.notes_holder, text=f"Loading notes for {label}…  (~2–3s)",
-            text_color=("gray40", "gray65"), font=ctk.CTkFont(size=12),
-        ).grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        self._set_notes_plain(f"Loading notes for {label}…  (~2–3s)", "hint")
         self._scroll_to_notes()
 
     def show_notes_message(self, msg: str) -> None:
-        for w in self.notes_holder.winfo_children():
-            w.destroy()
-        ctk.CTkLabel(
-            self.notes_holder, text=msg, font=ctk.CTkFont(size=12),
-            text_color=("#b00020", "#ff7b72"), justify="left", wraplength=360,
-        ).grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        self._last_notes = None
+        self._set_notes_plain(msg, "err")
         self._scroll_to_notes()
 
     def show_notes_error(self, label: str, msg: str) -> None:
@@ -9781,96 +9962,95 @@ class CaseloadPanel:
 
     def _refresh_notes_font(self) -> None:
         """Re-render the currently shown notes at the new 'notes' text
-        size (called when the size changes via Settings or Ctrl +/-)."""
-        notes = getattr(self, "_last_notes", None)
-        if notes is not None:
-            self.show_notes(getattr(self, "_last_notes_label", ""), notes)
+        size (called when the size changes via Settings). Tag fonts +
+        re-render are already handled by the panel's own apply callback
+        (_on_notes_font), so re-render here only if notes are shown,
+        preserving the expand/collapse state."""
+        if getattr(self, "_notes_text", None) is None:
+            return
+        if self._last_notes:
+            self._configure_note_tags()
+            self._render_notes()
 
     def show_notes(self, label: str, notes: list) -> None:
         self._last_notes = notes
         self._last_notes_label = label
-        for w in self.notes_holder.winfo_children():
-            w.destroy()
+        self._ensure_notes_text()
         self.notes_title.configure(text=f"Notes for {label} ({len(notes)})")
+        self._notes_open = set()
         if not notes:
-            ctk.CTkLabel(
-                self.notes_holder, text="No notes found for this student.",
-                text_color=("gray45", "gray60"), font=ctk.CTkFont(size=12),
-            ).grid(row=0, column=0, sticky="w", padx=6, pady=6)
+            self._set_notes_plain("No notes found for this student.", "hint")
             self._scroll_to_notes()
             return
-        for i, nt in enumerate(notes):
-            self._render_note_row(i, nt)
+        self._render_notes()
         self._scroll_to_notes()
 
-    def _render_note_row(self, i: int, nt: dict) -> None:
-        date = fmt_note_date(nt.get("date", ""))
-        ntype = (nt.get("type") or "").strip()
-        subject = (nt.get("subject") or "").strip()
-        author = (nt.get("author") or "").strip()
-        url = (nt.get("url") or "").strip()
-        body = note_html_to_text(nt.get("text") or "")
-        head = subject or ntype or "(note)"
-        meta_bits = [b for b in (date, ntype, author) if b]
-        meta = "  ·  ".join(meta_bits)
+    def _toggle_note(self, idx: int) -> None:
+        if idx in self._notes_open:
+            self._notes_open.discard(idx)
+        else:
+            self._notes_open.add(idx)
+        self._render_notes()
 
-        card = ctk.CTkFrame(self.notes_holder, fg_color=("gray90", "gray22"))
-        card.grid(row=i, column=0, sticky="ew", padx=2, pady=2)
-        card.grid_columnconfigure(0, weight=1)
-        state = {"open": False}
-
-        preview = body.replace("\n", " ")
-        preview = (preview[:90] + "…") if len(preview) > 90 else preview
-
-        ns = font_size("notes")
-        btn = ctk.CTkButton(
-            card, text=f"▸ {head}", anchor="w", height=24,
-            fg_color="transparent", text_color=("gray10", "gray90"),
-            hover_color=("gray80", "gray30"),
-            font=ctk.CTkFont(size=ns + 1, weight="bold"),
-        )
-        btn.grid(row=0, column=0, sticky="ew", padx=2, pady=(2, 0))
-        meta_lbl = ctk.CTkLabel(
-            card, text=meta, anchor="w", justify="left",
-            text_color=("gray45", "gray60"),
-            font=ctk.CTkFont(size=max(8, ns - 2)),
-        )
-        meta_lbl.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 0))
-        prev_lbl = ctk.CTkLabel(
-            card, text=preview, anchor="w", justify="left",
-            text_color=("gray35", "gray70"),
-            font=ctk.CTkFont(size=max(8, ns - 1)), wraplength=420,
-        )
-        prev_lbl.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
-        full_lbl = ctk.CTkLabel(
-            card, text=body, anchor="w", justify="left",
-            font=ctk.CTkFont(size=ns), wraplength=420,
-        )
-        # Footer (only when expanded): open the full note record where the
-        # complete Text field lives.
-        footer = ctk.CTkFrame(card, fg_color="transparent")
-        if url:
-            ctk.CTkButton(
-                footer, text="Open full note ↗", width=130, height=22,
-                command=lambda u=url: self._open_note_record(u),
-                **SECONDARY_BTN_KWARGS,
-            ).pack(side="left", padx=2, pady=(0, 4))
-
-        def toggle():
-            state["open"] = not state["open"]
-            if state["open"]:
-                prev_lbl.grid_remove()
-                full_lbl.grid(row=2, column=0, sticky="ew", padx=10,
-                              pady=(0, 2))
-                footer.grid(row=3, column=0, sticky="ew", padx=6)
-                btn.configure(text=f"▾ {head}")
+    def _render_notes(self) -> None:
+        """Render every note into the single tk.Text. Each note is a clickable
+        header (▸/▾) over a meta line and either a one-line preview (collapsed)
+        or the full body + an 'Open full note' link (expanded)."""
+        txt = self._ensure_notes_text()
+        notes = self._last_notes or []
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        for t in txt.tag_names():
+            if t.startswith("tgl") or t.startswith("lnk"):
+                txt.tag_delete(t)
+        for i, nt in enumerate(notes):
+            date = fmt_note_date(nt.get("date", ""))
+            ntype = (nt.get("type") or "").strip()
+            subject = (nt.get("subject") or "").strip()
+            author = (nt.get("author") or "").strip()
+            url = (nt.get("url") or "").strip()
+            body = note_html_to_text(nt.get("text") or "")
+            head = subject or ntype or "(note)"
+            meta = "  ·  ".join(b for b in (date, ntype, author) if b)
+            open_ = i in self._notes_open
+            tgl = f"tgl{i}"
+            txt.insert("end", f"{'▾' if open_ else '▸'} {head}\n",
+                       ("hdr", tgl))
+            if meta:
+                txt.insert("end", f"{meta}\n", ("meta",))
+            if open_:
+                if body:
+                    txt.insert("end", f"{body}\n", ("body",))
+                if url:
+                    lnk = f"lnk{i}"
+                    txt.insert("end", "Open full note ↗\n", ("link", lnk))
+                    txt.tag_bind(
+                        lnk, "<Button-1>",
+                        lambda e, u=url: self._open_note_record(u))
+                    txt.tag_bind(
+                        lnk, "<Enter>",
+                        lambda e: txt.configure(cursor="hand2"))
+                    txt.tag_bind(
+                        lnk, "<Leave>",
+                        lambda e: txt.configure(cursor="arrow"))
             else:
-                full_lbl.grid_remove()
-                footer.grid_remove()
-                prev_lbl.grid(row=2, column=0, sticky="ew", padx=10,
-                              pady=(0, 4))
-                btn.configure(text=f"▸ {head}")
-        btn.configure(command=toggle)
+                preview = body.replace("\n", " ")
+                preview = (preview[:90] + "…") if len(preview) > 90 else preview
+                if preview:
+                    txt.insert("end", f"{preview}\n", ("prev",))
+            txt.insert("end", "\n")
+            txt.tag_bind(tgl, "<Button-1>",
+                         lambda e, idx=i: self._toggle_note(idx))
+            txt.tag_bind(tgl, "<Enter>",
+                         lambda e: txt.configure(cursor="hand2"))
+            txt.tag_bind(tgl, "<Leave>",
+                         lambda e: txt.configure(cursor="arrow"))
+        txt.configure(state="disabled")
+        self._size_notes_text()
+        try:
+            self.frame.after_idle(self._size_notes_text)
+        except Exception:
+            pass
 
     def _open_note_record(self, url: str) -> None:
         """Open a note record (the Record ID link) in the user's default
@@ -10032,6 +10212,46 @@ class CaseloadPanel:
         cols = self._disp_cols()
         return cols[idx] if 0 <= idx < len(cols) else None
 
+    def _col_edges(self) -> list:
+        """X boundaries (pixels) between visible columns — the left edge of the
+        first data column plus the right edge of each visible one. Used to snap
+        the drop-line indicator. Empty if no row is visible to measure from."""
+        vis = None
+        for iid in self.tree.get_children(""):
+            if self.tree.bbox(iid):
+                vis = iid
+                break
+        if vis is None:
+            return []
+        edges = []
+        for col in self._disp_cols():
+            bb = self.tree.bbox(vis, col)
+            if not bb:
+                continue
+            x, _y, w, _h = bb
+            if not edges:
+                edges.append(x)        # left edge of the first visible column
+            edges.append(x + w)        # right edge of each column
+        return edges
+
+    def _show_drop_line(self, x) -> None:
+        line = getattr(self, "_drop_line", None)
+        if line is None or not line.winfo_exists():
+            dark = ctk.get_appearance_mode() == "Dark"
+            line = tk.Frame(self.tree, width=2,
+                            bg=("#5aa9e6" if dark else "#1a6dc2"))
+            self._drop_line = line
+        line.place(x=max(0, int(x) - 1), y=0, relheight=1.0)
+        line.lift()
+
+    def _hide_drop_line(self) -> None:
+        line = getattr(self, "_drop_line", None)
+        if line is not None:
+            try:
+                line.place_forget()
+            except Exception:
+                pass
+
     def _on_head_drag(self, event):
         d = self._coldrag
         if not d:
@@ -10042,10 +10262,15 @@ class CaseloadPanel:
                 self.tree.configure(cursor="exchange")
             except Exception:
                 pass
+        if d["moved"]:
+            edges = self._col_edges()
+            if edges:
+                self._show_drop_line(min(edges, key=lambda e: abs(e - event.x)))
 
     def _on_head_release(self, event):
         d = self._coldrag
         self._coldrag = None
+        self._hide_drop_line()
         try:
             self.tree.configure(cursor="")
         except Exception:
@@ -10329,7 +10554,7 @@ class CaseloadPanel:
         self.view_menu.configure(values=values)
         cur = self.app.settings.caseload_current_view or ""
         self.view_menu.set(cur if cur in names else (names[0] if names
-                                                     else "View ▾"))
+                                                     else "★ Views"))
 
     def _on_view_select(self, choice: str) -> None:
         if choice == self._VIEW_SAVE:
@@ -10917,7 +11142,10 @@ class CaseloadPanel:
         query, label = self._query_label_for_iid(iid)
         if query:
             self.tree.selection_set(iid)
-            self.review_notes(query, label)
+            # selection_set queues a <<TreeviewSelect>> → show_quick_view →
+            # _notes_hint, which would overwrite the "Loading…" message. Defer
+            # the load so it runs after that highlight settles.
+            self.frame.after_idle(lambda: self.review_notes(query, label))
         return "break"
 
     def _on_row_context_menu(self, event=None) -> None:
@@ -12111,6 +12339,15 @@ class App:
                 pass
         self.caseload_toggle_btn.configure(
             text="Hide viewer", state="normal")
+        # Bring the main window back to the front — if it was minimized while
+        # the viewer was popped out, closing the pop-out should return a
+        # visible, quittable main window rather than leaving nothing on screen.
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
         self.root.after(0, self._restore_main_sash)
 
     def _toggle_caseload(self) -> None:
@@ -13891,25 +14128,20 @@ class App:
         # and avoids the intermittent "record didn't open" click flake).
         text_only = self._is_text_only(scenario)
         chosen_name = ""
+        deferred_nav = None  # (query, student_id) navigated AFTER input is in
         if prenav_query:
             if text_only:
                 chosen_name = prenav_label or prenav_query
             else:
-                # Student already chosen (caseload row). Use the FAST
-                # navigation (same Shift+X switch as a double-click), then
-                # wait only until the note panel is actually loaded — no
-                # Caseload reload, no fixed 2s settle. (A bare find returns
-                # before the panel renders, which made the note RUN bail with
-                # "no visible note panel".)
-                if not self._navigate_for_fire_blocking(
-                        prenav_query, student_id=prenav_student_id,
-                        allow_deeplink=self._deeplink_ok(scenario)):
-                    self._append_log(
-                        f"Could not open {prenav_label or prenav_query!r}; "
-                        "scenario not fired."
-                    )
-                    return
+                # Student already chosen (caseload row). DEFER the navigation
+                # until AFTER all user input is collected: the fire-time edit
+                # dialog then appears IMMEDIATELY (no waiting on Salesforce),
+                # and because no navigation runs while a dialog is open, the
+                # browser un-minimizing can't bury the dialog. The dialog's
+                # course comes from the caseload row and its EA offer from the
+                # dashboard scrape, so it needs no navigation to populate.
                 chosen_name = prenav_label
+                deferred_nav = (prenav_query, prenav_student_id)
         elif scenario.find_first:
             # Text-only actions search the cached CSV (instant, main-thread) so
             # Find doesn't queue behind a running background scrape; note/email
@@ -13979,22 +14211,30 @@ class App:
                 sep = "\n" if prefill and not prefill.endswith("\n") else ""
                 prefill = f"{prefill}{sep}{clipboard}"
             if not eas_read:
-                # Skip the (slow) per-student EA navigation when the startup EA
-                # dashboard scrape already tells us this student has no open EA
-                # — the edit dialog then opens immediately. Only skip on
-                # positive knowledge (we have a Student ID + dashboard data and
-                # the student isn't in it); otherwise read as before.
+                # Populate the dialog's EA offer from the startup EA DASHBOARD
+                # scrape (it carries reason + course per Student ID — exactly
+                # what the offer and the worker's attach need), so the dialog
+                # opens immediately without a per-student EA-tab navigation. The
+                # actual attach still happens in the worker (open_ea_note_form).
+                # Only fall back to a live read when we have no dashboard data
+                # AND no background nav is in flight (e.g. a hotkey fire against
+                # the already-open record) — there a blocking read is harmless.
                 sid = prenav_student_id or (
                     (self._caseload_row_by_name(chosen_name) or {}).get(
                         "StudentID", "") if chosen_name else "")
                 ea_by_sid = getattr(self, "_ea_by_sid", {}) or {}
-                if sid and ea_by_sid and not ea_by_sid.get(sid):
-                    eas = []
-                else:
+                if sid and ea_by_sid:
+                    ea_dash = ea_by_sid.get(sid)
+                    eas = [ea_dash] if ea_dash else []
+                elif deferred_nav is None:
+                    # No dashboard data AND no deferred navigation (e.g. a
+                    # hotkey fire against the already-open record) → read live.
                     self._append_log(
                         "Checking this student's Essential Actions…")
                     eas = self._read_eas_blocking()
                     eas_navigated = True
+                else:
+                    eas = []
                 eas_read = True
             course_default = (n.course_code_override or course_hint
                               or override or "")
@@ -14020,6 +14260,20 @@ class App:
         if scenario.text is not None:
             deferred_text = self._fire_text(
                 scenario, chosen_name, prompt_vars, defer_send=True)
+
+        # All up-front user input is collected — NOW navigate to the student
+        # (deferred from Step 1). Doing it here, with no dialog open, means the
+        # browser un-minimizing can't bury a popup, and the record is open
+        # before we read context for the email or file the note.
+        if deferred_nav is not None:
+            q, sid = deferred_nav
+            if not self._navigate_for_fire_blocking(
+                    q, student_id=sid,
+                    allow_deeplink=self._deeplink_ok(scenario)):
+                self._append_log(
+                    f"Could not open {prenav_label or prenav_query!r}; "
+                    "scenario not fired.")
+                return
 
         # Step 5: email (if scenario has one). Reviewed in the same in-app
         # previewer as batch/selection (incl. the fire-time template
@@ -14092,6 +14346,9 @@ class App:
             # has no such table to auto-detect from), and more accurate than the
             # name-matched scrape on the search path too.
             note_override = override or self._norm_course_code(course_hint)
+            self._append_log(
+                f"Filing {len(scenario.notes)} note(s) for "
+                f"{chosen_name or prenav_label or 'student'}…")
             self.worker.submit_scenario(
                 scenario, note_override, clipboard,
                 custom_bodies=custom_bodies,
@@ -15700,18 +15957,22 @@ class App:
         self.root.wait_window(dialog)
         return (result["mode"], result["ea"])
 
-    def _navigate_for_fire_blocking(self, query: str, *,
-                                    student_id: str = "",
-                                    allow_deeplink: bool = True) -> bool:
-        """Navigate to a student and block until the note panel is loaded.
+    def _start_navigate_for_fire(self, query: str, *,
+                                 student_id: str = "",
+                                 allow_deeplink: bool = True):
+        """Kick off the fire navigation on the worker WITHOUT blocking, and
+        return a `join()` callable. The event loop keeps pumping (so input
+        dialogs stay responsive and the worker navigates concurrently) until
+        `join()` is called, which blocks until the note panel is loaded,
+        harvests the opened record's Contact id (collect-as-you-go), and
+        returns True on success. This lets the caller front-load all user
+        input while Salesforce navigates in the background.
+
         When `student_id` maps to a known Contact id AND `allow_deeplink`, the
         worker DEEP-LINKS straight to the record (fast, flake-free); otherwise
         it uses the search path. `allow_deeplink` is False when the fire needs
         the on-page Caseload table (e.g. an email step scrapes student/PM
-        context) — the deep link opens a standalone record without it. Either
-        way it harvests the opened record's Contact id, which we persist
-        (collect-as-you-go) so this student is fast next time. Returns True once
-        the panel is ready."""
+        context) — the deep link opens a standalone record without it."""
         contact_id = (self._contact_ids.get(student_id, "")
                       if (student_id and allow_deeplink) else "")
         done_var = tk.BooleanVar(value=False)
@@ -15731,24 +15992,36 @@ class App:
                 set_main()
 
         self.worker.submit_find_and_settle(query, contact_id, on_done)
-        self.root.wait_variable(done_var)
-        # Collect-as-you-go: persist a freshly-harvested id for this student.
-        harvested = holder["contact_id"]
-        if (student_id and harvested
-                and self._contact_ids.get(student_id) != harvested):
-            self._contact_ids[student_id] = harvested
-            try:
-                from src import mongoose_contacts as mc
-                row = self._caseload_row_by_id(student_id)
-                name = (row.get("Name") or "").strip() if row else ""
-                mc.persist_contact_ids(
-                    {student_id: harvested}, name_by_sid={student_id: name})
-                self._append_log(
-                    f"  (learned Contact id for {name or student_id} — faster "
-                    "next time)")
-            except Exception:
-                pass
-        return holder["ok"]
+
+        def join() -> bool:
+            self.root.wait_variable(done_var)
+            # Collect-as-you-go: persist a freshly-harvested id for this student.
+            harvested = holder["contact_id"]
+            if (student_id and harvested
+                    and self._contact_ids.get(student_id) != harvested):
+                self._contact_ids[student_id] = harvested
+                try:
+                    from src import mongoose_contacts as mc
+                    row = self._caseload_row_by_id(student_id)
+                    name = (row.get("Name") or "").strip() if row else ""
+                    mc.persist_contact_ids(
+                        {student_id: harvested}, name_by_sid={student_id: name})
+                    self._append_log(
+                        f"  (learned Contact id for {name or student_id} — "
+                        "faster next time)")
+                except Exception:
+                    pass
+            return holder["ok"]
+
+        return join
+
+    def _navigate_for_fire_blocking(self, query: str, *,
+                                    student_id: str = "",
+                                    allow_deeplink: bool = True) -> bool:
+        """Navigate to a student and block until the note panel is loaded.
+        (Blocking convenience wrapper around _start_navigate_for_fire.)"""
+        return self._start_navigate_for_fire(
+            query, student_id=student_id, allow_deeplink=allow_deeplink)()
 
     def _click_match_blocking(self, name: str) -> bool:
         """Click the chosen match on the worker and block until the
@@ -17887,6 +18160,17 @@ class App:
                 self.hotkey_listener.stop()
         except Exception:
             pass
+        # Explicitly close the popped-out viewer window. A CTkToplevel can
+        # outlive root.destroy() in some customtkinter versions, which leaves
+        # the viewer on screen (with no Quit button) while the process lingers
+        # — exactly the "only the main closed" symptom.
+        try:
+            win = getattr(self, "caseload_window", None)
+            if win is not None:
+                win.destroy()
+                self.caseload_window = None
+        except Exception:
+            pass
         self.worker.shutdown()
         # Wait briefly for the worker to close Playwright cleanly, so the
         # process doesn't exit mid-teardown (which makes the driver print an
@@ -17897,7 +18181,34 @@ class App:
                 t.join(timeout=4)
         except Exception:
             pass
-        self.root.destroy()
+        # Cancel pending Tk `after` callbacks before destroying the root.
+        # customtkinter schedules recurring jobs (DPI-scaling checks, spinner
+        # ticks, button click animations); if any fire after destroy, Tcl spams
+        # the launching terminal with "invalid command name … / application has
+        # been destroyed" bgerrors. Harmless, but noisy — cancel them and
+        # silence the callback-exception handler for the teardown window.
+        try:
+            for aid in self.root.tk.call("after", "info"):
+                try:
+                    self.root.after_cancel(aid)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self.root.report_callback_exception = lambda *a, **k: None
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        # Guarantee the process actually ends. The worker is a daemon and was
+        # just shut down (Playwright closed above), but a lingering CTkToplevel
+        # or the pynput hotkey listener thread can otherwise keep the process —
+        # and its windows — alive after destroy(). os._exit is the hammer that
+        # makes Quit / window-close always fully terminate.
+        os._exit(0)
 
     # ----- Status / log -----
 
@@ -18240,6 +18551,7 @@ class App:
         def on_done(res):
             def render():
                 try:
+                    panel._notes_load_done()
                     if res and not res.get("error"):
                         notes = res.get("notes") or []
                         panel.show_notes(label, notes)
@@ -18589,6 +18901,41 @@ class App:
     # ----- Entry -----
 
     def run(self) -> None:
+        # Make Ctrl+C in the launching terminal close the app cleanly. Tk's
+        # mainloop runs in C and only lets Python service a pending SIGINT
+        # between bytecode ops, so on its own Ctrl+C is ignored while the GUI
+        # is up. We (a) install a handler that requests a clean close via the
+        # Tk event loop and (b) schedule a periodic no-op tick so the
+        # interpreter wakes often enough to actually run that handler (this
+        # also lets the handler fire while a modal dialog's nested wait loop is
+        # pumping). Second Ctrl+C hard-exits in case a clean close is wedged.
+        import signal as _signal
+        self._sigint_count = 0
+
+        def _sigint(_sig, _frame):
+            self._sigint_count += 1
+            if self._sigint_count >= 2:
+                os._exit(1)
+            try:
+                self.root.after(0, self._on_close)
+            except Exception:
+                os._exit(1)
+
+        try:
+            _signal.signal(_signal.SIGINT, _sigint)
+        except Exception:
+            pass
+
+        def _tick():
+            try:
+                self.root.after(250, _tick)
+            except Exception:
+                pass
+
+        try:
+            self.root.after(250, _tick)
+        except Exception:
+            pass
         self.root.mainloop()
 
 
