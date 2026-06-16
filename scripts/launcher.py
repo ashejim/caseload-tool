@@ -2973,13 +2973,23 @@ def font_size(channel: str) -> int:
     return _font_sizes.get(channel, 13)
 
 
+def _set_box_font(box, n: int) -> None:
+    """Apply font size `n` to a text box. CTk text boxes need a CTkFont (DPI
+    scaling); a native tk.Text (the activity log) takes a (family, size)
+    tuple."""
+    if hasattr(box, "_textbox"):          # CTkTextbox
+        box.configure(font=ctk.CTkFont(size=n))
+    else:                                  # native tk.Text
+        box.configure(font=("Segoe UI", n))
+
+
 def set_font_size(channel: str, n: int, persist: bool = True) -> None:
     """Set a channel's text size (clamped) and apply to all its widgets."""
     n = max(UI_FONT_MIN, min(UI_FONT_MAX, int(n)))
     _font_sizes[channel] = n
     for b in list(_font_boxes.get(channel, [])):
         try:
-            b.configure(font=ctk.CTkFont(size=n))
+            _set_box_font(b, n)
         except Exception:
             try:
                 _font_boxes[channel].remove(b)
@@ -3014,7 +3024,7 @@ def register_font_box(channel: str, box, hotkeys: bool = True) -> None:
     (optionally) bind the zoom hotkeys."""
     _font_boxes.setdefault(channel, []).append(box)
     try:
-        box.configure(font=ctk.CTkFont(size=_font_sizes[channel]))
+        _set_box_font(box, _font_sizes[channel])
     except Exception:
         pass
     if hotkeys:
@@ -11208,14 +11218,27 @@ class App:
         activity_tab = self.log_tabview.add("Activity")
         activity_tab.grid_columnconfigure(0, weight=1)
         activity_tab.grid_rowconfigure(0, weight=1)
-        self.log = ctk.CTkTextbox(activity_tab, wrap="word")
-        self.log.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-        self.log.configure(state="disabled")
+        # Native tk.Text (not CTkTextbox): the log gets a burst of lines during
+        # a run and repaints lighter/faster than a canvas-backed CTk box.
+        _log_dark = ctk.get_appearance_mode() == "Dark"
+        log_wrap = tk.Frame(activity_tab, bd=0, highlightthickness=0)
+        log_wrap.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        log_wrap.grid_rowconfigure(0, weight=1)
+        log_wrap.grid_columnconfigure(0, weight=1)
+        self.log = tk.Text(
+            log_wrap, wrap="word", bd=0, highlightthickness=0,
+            bg=("#1d1e1e" if _log_dark else "#f9f9fa"),
+            fg=("#dce4ee" if _log_dark else "#1a1a1a"),
+            insertbackground=("#dce4ee" if _log_dark else "#1a1a1a"),
+            padx=6, pady=4,
+        )
+        self.log.grid(row=0, column=0, sticky="nsew")
+        _log_sb = ttk.Scrollbar(log_wrap, command=self.log.yview)
+        _log_sb.grid(row=0, column=1, sticky="ns")
+        self.log.configure(yscrollcommand=_log_sb.set)
         # Red highlight for failure lines (see _append_log).
-        try:
-            self.log._textbox.tag_configure("logerror", foreground="#e0524f")
-        except Exception:
-            pass
+        self.log.tag_configure("logerror", foreground="#e0524f")
+        self.log.configure(state="disabled")
         register_font_box("activity", self.log)  # Ctrl +/-, Ctrl+wheel
         pane.grid_rowconfigure(6, weight=1)
 
@@ -17769,7 +17792,7 @@ class App:
                 self.log.insert("end", msg + "\n")
                 if error:
                     try:
-                        self.log._textbox.tag_add("logerror", start, "end-1c")
+                        self.log.tag_add("logerror", start, "end-1c")
                     except Exception:
                         pass
         finally:
