@@ -260,15 +260,33 @@ def fill_note(page: Page, data: NoteData, *, timeout_ms: int = 10_000) -> None:
         # Academic activities: selecting a type like "Email from Student"
         # REACTIVELY adds this section. Clicking before it has rendered +
         # settled loses the tick — Submit then stays disabled ("required field
-        # missing"), the failure seen on fast deep-link fires. Wait for the
-        # section to appear, let the re-render settle, THEN click.
+        # missing"). On a COLD first fire after launch the section can fail to
+        # render at all (the type's change event doesn't reach the still-
+        # initializing LWC), so a plain wait times out with no checkboxes
+        # ('activities: []'). Wait for the section; if it never appears,
+        # RE-SELECT the type to re-fire the reactive render, then wait again.
         if data.academic_activities:
-            try:
-                selectors.academic_activity_checkbox(
-                    page, data.academic_activities[0]
-                ).wait_for(state="visible", timeout=8_000)
-            except Exception:
-                pass
+            first_cb = selectors.academic_activity_checkbox(
+                page, data.academic_activities[0])
+
+            def _activities_present(timeout_ms: int) -> bool:
+                try:
+                    first_cb.wait_for(state="visible", timeout=timeout_ms)
+                    return True
+                except Exception:
+                    return False
+
+            if not _activities_present(12_000) and data.interaction_type:
+                # Re-select the interaction type to re-trigger the section
+                # render (Playwright dispatches change even for the same value).
+                try:
+                    sel = selectors.interaction_type_select(page)
+                    _wait_enabled(sel, timeout_ms=4_000)
+                    sel.select_option(label=data.interaction_type, timeout=8_000)
+                except Exception:
+                    pass
+                _activities_present(12_000)
+
             page.wait_for_timeout(400)  # let the reactive re-render finish
             for label in data.academic_activities:
                 # Click + verify ticked (re-click if a re-render dropped it) —
