@@ -10759,6 +10759,10 @@ class App:
         ctk.set_default_color_theme("blue")
 
         self.scenarios = load_scenarios()
+        # Raw per-action YAML dicts (name -> dict), so _save_yaml can serialize
+        # actions the user never opened WITHOUT building their (heavy) editor.
+        self._scenario_raw: dict = {}
+        self._refresh_scenario_raw()
         # User-defined scenario groupings — see Group dataclass.
         # Empty list means every scenario renders as ungrouped.
         self.groups: list[Group] = load_groups()
@@ -13043,6 +13047,7 @@ class App:
         try:
             self.scenarios = load_scenarios()
             self.groups = load_groups()
+            self._refresh_scenario_raw()
         except Exception as e:
             self._append_log(f"Loaded but reload failed: {e}", error=True)
             return
@@ -13166,6 +13171,7 @@ class App:
         try:
             self.scenarios = load_scenarios()
             self.groups = load_groups()
+            self._refresh_scenario_raw()
         except Exception as e:
             self._append_log(f"Revert failed: {e}")
             return
@@ -13221,61 +13227,72 @@ class App:
             msg, yes_label="Proceed", no_label="Abort",
         )
 
+    def _refresh_scenario_raw(self) -> None:
+        """Reload the raw per-action dicts from scenarios.yaml. Kept in sync
+        with self.scenarios (after every load/revert/save) so _save_yaml can
+        write an un-opened action straight from its stored config."""
+        try:
+            import yaml
+            raw = yaml.safe_load(SCENARIOS_YAML.read_text(encoding="utf-8")) or {}
+            self._scenario_raw = dict(raw.get("scenarios", {}) or {})
+        except Exception:
+            self._scenario_raw = {}
+
     def _save_yaml(self) -> None:
-        # Editors are built lazily, so an action the user never opened has no
-        # editor. Build any missing ones now (from their loaded config — an
-        # unopened action is unedited) so the save covers EVERY action, not just
-        # the ones in view. force=True below tears them all down afterward,
-        # returning to the few-live-widgets state.
-        for name in list(self.scenarios):
-            if name not in self.scenario_editors:
-                try:
-                    self._build_one_editor(name, self.scenarios[name])
-                except Exception as e:
-                    self._append_log(
-                        f"!! Couldn't prepare {name!r} for save: {e}; "
-                        "aborting to avoid dropping it.", error=True)
-                    return
-        # Serialize in self.scenarios order so the YAML order stays stable.
-        self.scenario_editors = {
-            n: self.scenario_editors[n]
-            for n in self.scenarios if n in self.scenario_editors
-        }
+        # Editors build lazily, so an action the user never opened has no
+        # editor. Serialize OPENED actions from their widgets and un-opened ones
+        # straight from their loaded config (kept in self._scenario_raw — an
+        # un-opened action can't have been edited). No building, so save stays
+        # fast no matter how many actions exist. Iterate self.scenarios so the
+        # saved YAML order is stable.
         new_doc: dict = {"scenarios": {}}
         seen: set[str] = set()
-        # Diagnostic latch: surface the submit state of every note
-        # being saved so the user can spot a stray-uncheck if it
-        # happens. Cheap to compute; logs once per save.
+        # Diagnostic latch: surface the submit state of every note being saved
+        # so the user can spot a stray-uncheck. Cheap; logged once per save.
         submit_summary: list[str] = []
-        for old_name, ed in list(self.scenario_editors.items()):
-            new_name = ed.current_name or old_name
-            if not new_name:
-                self._append_log(f"!! Empty action name (was {old_name!r}); aborting.")
+        for name in list(self.scenarios):
+            ed = self.scenario_editors.get(name)
+            if ed is not None:
+                out_name = ed.current_name or name
+                try:
+                    serialized = ed.serialize()
+                except Exception as e:
+                    self._append_log(f"Could not serialize {name!r}: {e}")
+                    return
+            else:
+                serialized = self._scenario_raw.get(name)
+                out_name = name
+                if serialized is None:
+                    # Never loaded raw AND never built (shouldn't happen) —
+                    # build as a safe fallback rather than drop the action.
+                    try:
+                        self._build_one_editor(name, self.scenarios[name])
+                        ed = self.scenario_editors[name]
+                        serialized = ed.serialize()
+                        out_name = ed.current_name or name
+                    except Exception as e:
+                        self._append_log(
+                            f"!! Couldn't serialize {name!r}: {e}; aborting to "
+                            "avoid dropping it.", error=True)
+                        return
+            if not out_name:
+                self._append_log(f"!! Empty action name (was {name!r}); aborting.")
                 return
-            if new_name in seen:
+            if out_name in seen:
                 self._append_log(
-                    f"!! Duplicate action name {new_name!r}; aborting save. "
+                    f"!! Duplicate action name {out_name!r}; aborting save. "
                     "Pick unique names then try again."
                 )
                 return
-            seen.add(new_name)
-            try:
-                serialized = ed.serialize()
-                new_doc["scenarios"][new_name] = serialized
-            except Exception as e:
-                self._append_log(f"Could not serialize {new_name!r}: {e}")
-                return
-            # Record which notes would land with Submit unchecked so
-            # the activity log surfaces it at save time — a stray
-            # uncheck stays visible instead of hiding until the next
-            # batch fire shows up with FALSE rows in note_log.csv.
+            seen.add(out_name)
+            new_doc["scenarios"][out_name] = serialized
             unchecked = [
-                i + 1 for i, n in enumerate(serialized.get("notes", []))
+                i + 1 for i, n in enumerate((serialized or {}).get("notes", []))
                 if not n.get("submit", True)
             ]
             if unchecked:
                 submit_summary.append(
-                    f"{new_name!r}: Note(s) "
+                    f"{out_name!r}: Note(s) "
                     + ", ".join(str(i) for i in unchecked)
                     + " have Submit unchecked"
                 )
@@ -13308,6 +13325,9 @@ class App:
         try:
             self.scenarios = load_scenarios()
             self.groups = load_groups()
+            # The just-saved doc IS the new on-disk state — use it directly so
+            # un-opened actions serialize from current data next save.
+            self._scenario_raw = dict(new_doc.get("scenarios", {}))
         except Exception as e:
             self._append_log(f"Saved but reload failed: {e}")
             return
