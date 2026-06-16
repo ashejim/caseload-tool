@@ -10879,6 +10879,21 @@ class App:
         self._build_editor_pane()
         self._build_caseload_pane()
 
+        # Window-resize smoothing. customtkinter repaints every widget's canvas
+        # on each resize event, so heavy panes trail the mouse during a drag.
+        # While actively drag-resizing, hide the heaviest CTk panes (the editor
+        # + the caseload detail/viewer) so only the light window frame redraws,
+        # then restore them shortly after the drag settles. (Opted-in: the panes
+        # briefly blank during the drag.)
+        self._resize_frozen = False
+        self._resize_restore_aid = None
+        self._frozen_panes: list = []
+        self._last_root_size = None
+        self._ui_ready = False
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+        # Don't freeze during the startup layout storm — arm after it settles.
+        self.root.after(900, lambda: setattr(self, "_ui_ready", True))
+
         # Place the dividers at their saved spots once the panes have a
         # real laid-out width.
         self.root.after(0, self._restore_main_sash)
@@ -11120,6 +11135,63 @@ class App:
         bottom.bind(
             "<Configure>",
             self._debounce_configure(self._relayout_bottom_row))
+
+    def _on_root_configure(self, event=None) -> None:
+        """Detect an active window drag-resize and freeze the heavy panes for
+        its duration (restored shortly after it settles). Guards: only the
+        toplevel's own size changes (ignore moves + child configures), and only
+        once the startup layout has settled."""
+        if event is None or event.widget is not self.root:
+            return
+        size = (event.width, event.height)
+        if size == self._last_root_size:
+            return  # a move (or non-size configure), not a resize
+        self._last_root_size = size
+        if not self._ui_ready:
+            return
+        if not self._resize_frozen:
+            self._resize_frozen = True
+            self._freeze_panes_for_resize()
+        if self._resize_restore_aid is not None:
+            try:
+                self.root.after_cancel(self._resize_restore_aid)
+            except Exception:
+                pass
+        self._resize_restore_aid = self.root.after(
+            160, self._unfreeze_panes_after_resize)
+
+    def _freeze_panes_for_resize(self) -> None:
+        """Hide the heaviest CTk panes that are currently shown, remembering
+        which so only those are restored. grid_remove keeps each widget's grid
+        config + its cell, so the surrounding layout doesn't shift."""
+        self._frozen_panes = []
+        candidates = []
+        cp = getattr(self, "caseload_panel", None)
+        ds = getattr(cp, "detail_scroll", None) if cp else None
+        if ds is not None:
+            candidates.append(ds)
+        ec = getattr(self, "editor_content", None)
+        if ec is not None and getattr(self, "_editor_visible", False):
+            candidates.append(ec)
+        for w in candidates:
+            try:
+                if w.winfo_ismapped():
+                    w.grid_remove()
+                    self._frozen_panes.append(w)
+            except Exception:
+                pass
+
+    def _unfreeze_panes_after_resize(self) -> None:
+        self._resize_restore_aid = None
+        if not self._resize_frozen:
+            return
+        self._resize_frozen = False
+        for w in self._frozen_panes:
+            try:
+                w.grid()
+            except Exception:
+                pass
+        self._frozen_panes = []
 
     def _debounce_configure(self, fn, delay_ms: int = 80):
         """Wrap a <Configure> handler so it runs at most once after resizing
