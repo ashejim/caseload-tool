@@ -572,6 +572,13 @@ def send_text(
     Returns True if it reached the confirm/schedule step without error (whether
     or not the final click was made). Raises on a hard driver failure."""
     say = on_status or _noop
+    # Clear any leftover compose modal FIRST. A previous group that failed (e.g.
+    # "no recipients could be added") raises with the modal still open, and its
+    # overlay intercepts pointer events — which would make the very next step
+    # (clicking the department dropdown) time out. close_compose is also called
+    # inside open_compose, but switch_department runs before that, so without
+    # this a failed group wedges every following text until the modal is gone.
+    close_compose(page)
     # Make sure Mongoose is on the right department first (Compose only offers
     # the current department's inbox). Playwright-driven, so it also wakes a
     # frozen/backgrounded renderer.
