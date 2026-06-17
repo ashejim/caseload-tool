@@ -18333,6 +18333,9 @@ class App:
         r"no match|skipp(?:ed|ing)|didn'?t open|timed? out|not found)\b",
         re.IGNORECASE,
     )
+    # Clear single-action success lines (e.g. the worker's "Done: 'X' (course
+    # 'Y')."). Auto-colored green when no error cue is present.
+    _LOG_OK_RE = re.compile(r"^\s*Done:\s", re.IGNORECASE)
 
     def _append_log(self, msg: str, error: Optional[bool] = None,
                     success: bool = False) -> None:
@@ -18342,14 +18345,20 @@ class App:
         if not hasattr(self, "log") or self.log is None:
             print(msg, file=sys.stderr)
             return
-        # `success` (green) wins; else auto-detect errors (red) unless the
-        # caller forced `error`. tag is "" for a normal/neutral line.
+        # Explicit success (green) or error (red) win; otherwise auto-detect —
+        # errors take priority over success cues. tag "" = normal/neutral.
         if success:
             tag = "logok"
+        elif error is True:
+            tag = "logerror"
+        elif error is False:
+            tag = ""
+        elif self._LOG_ERROR_RE.search(msg):
+            tag = "logerror"
+        elif self._LOG_OK_RE.search(msg):
+            tag = "logok"
         else:
-            if error is None:
-                error = bool(self._LOG_ERROR_RE.search(msg))
-            tag = "logerror" if error else ""
+            tag = ""
         # Batch writes: a busy run emits many lines fast, and each
         # insert + see("end") forces a scroll/redraw. Queue the line and
         # flush them together on a short timer so it's one redraw per
