@@ -11645,6 +11645,7 @@ class App:
         self.log.configure(yscrollcommand=_log_sb.set)
         # Red highlight for failure lines (see _append_log).
         self.log.tag_configure("logerror", foreground="#e0524f")
+        self.log.tag_configure("logok", foreground="#3fb950")  # success green
         self.log.configure(state="disabled")
         register_font_box("activity", self.log)  # Ctrl +/-, Ctrl+wheel
         pane.grid_rowconfigure(6, weight=1)
@@ -15304,6 +15305,7 @@ class App:
         """Show the batch-text reviewer, then send each selected group's text as
         one multi-recipient scheduled compose. Returns False if the user
         cancelled the review (so a combined action aborts), True otherwise."""
+        self._text_outcome = None  # set below; read by the per-action summary
         scheduled = True  # texts are always scheduled
         filter_summary = ""
         if scenario.batch is not None:
@@ -15321,10 +15323,13 @@ class App:
             return False
         if not any(selected):
             self._append_log("Batch text: 0 recipients selected; skipping texts.")
+            self._text_outcome = {"scheduled_recipients": 0, "groups": 0,
+                                  "failed": 0}
             return True
         self._lock_browser_for_run()
         sent = 0
         groups_sent = 0
+        failed = 0  # groups that were attempted but didn't schedule
         try:
             for i, grp in enumerate(review_groups):
                 mobiles = selected[i] if i < len(selected) else []
@@ -15334,6 +15339,7 @@ class App:
                     self._append_log(
                         f"  text: skipped {grp['label']} (unknown timezone).",
                         error=True)
+                    failed += 1
                     continue
                 payload = {
                     "body": grp["body"], "recipients": mobiles,
@@ -15359,13 +15365,26 @@ class App:
                     self._append_log(
                         f"  text failed [{grp['label']}]: "
                         f"{(res or {}).get('error')}", error=True)
+                    failed += 1
                 else:
                     sent += len(mobiles)
         finally:
             self._unlock_browser_after_run()
-        self._append_log(
-            f"Batch text complete: {sent} recipient(s) in {groups_sent} "
-            f"group(s) {'scheduled' if scheduled else 'sent'}.")
+        # Record the outcome so the per-action summary can roll texts in, and
+        # report it clearly: green when every attempted group scheduled, a loud
+        # red ⚠ when any failed (so a partial failure isn't lost in the log).
+        self._text_outcome = {"scheduled_recipients": sent,
+                              "groups": groups_sent, "failed": failed}
+        verb = "scheduled" if scheduled else "sent"
+        if failed:
+            self._append_log(
+                f"⚠ Texts: {groups_sent - failed} of {groups_sent} group(s) "
+                f"{verb} ({sent} recipient(s)); {failed} FAILED — see the red "
+                "lines above.", error=True)
+        else:
+            self._append_log(
+                f"Texts: {sent} recipient(s) in {groups_sent} group(s) {verb}.",
+                success=(groups_sent > 0))
         return True
 
     @staticmethod
@@ -15566,9 +15585,29 @@ class App:
             except Exception:
                 pass
 
+        # Roll up every channel into one verdict line: notes/email (the
+        # per-student loop) plus the text channel (sent up front). Green only
+        # when nothing was skipped AND no text group failed; red ⚠ otherwise so
+        # a partial failure (e.g. texts that didn't schedule) can't read as a
+        # clean success.
+        parts = [f"{processed}/{total} processed", f"{len(skipped)} skipped"]
+        text_failed = False
+        to = getattr(self, "_text_outcome", None)
+        if scenario.text is not None and to is not None:
+            if to["failed"]:
+                parts.append(
+                    f"texts {to['groups'] - to['failed']}/{to['groups']} "
+                    "scheduled ⚠")
+                text_failed = True
+            else:
+                parts.append(
+                    f"texts {to['scheduled_recipients']} scheduled")
+        self._text_outcome = None  # consume — don't leak into the next action
+        ok = (len(skipped) == 0 and not text_failed)
         self._append_log(
             f"{source.capitalize()} {scenario.name!r} complete: "
-            f"{processed}/{total} processed, {len(skipped)} skipped."
+            + ", ".join(parts) + ".",
+            success=ok, error=(not ok),
         )
         if skipped:
             for name, reason in skipped:
@@ -18247,20 +18286,27 @@ class App:
         re.IGNORECASE,
     )
 
-    def _append_log(self, msg: str, error: Optional[bool] = None) -> None:
+    def _append_log(self, msg: str, error: Optional[bool] = None,
+                    success: bool = False) -> None:
         # Defensive: if called before _build_main_pane has created
         # the widget (e.g. very early startup), fall back to stderr
         # so we don't crash the app with AttributeError.
         if not hasattr(self, "log") or self.log is None:
             print(msg, file=sys.stderr)
             return
-        if error is None:
-            error = bool(self._LOG_ERROR_RE.search(msg))
+        # `success` (green) wins; else auto-detect errors (red) unless the
+        # caller forced `error`. tag is "" for a normal/neutral line.
+        if success:
+            tag = "logok"
+        else:
+            if error is None:
+                error = bool(self._LOG_ERROR_RE.search(msg))
+            tag = "logerror" if error else ""
         # Batch writes: a busy run emits many lines fast, and each
         # insert + see("end") forces a scroll/redraw. Queue the line and
         # flush them together on a short timer so it's one redraw per
         # ~60ms instead of one per line — keeps the UI snappy mid-run.
-        self._log_pending.append((msg, error))
+        self._log_pending.append((msg, tag))
         if not self._log_flush_scheduled:
             self._log_flush_scheduled = True
             try:
@@ -18277,12 +18323,12 @@ class App:
         self._log_pending = []
         self.log.configure(state="normal")
         try:
-            for msg, error in pending:
+            for msg, tag in pending:
                 start = self.log.index("end-1c")
                 self.log.insert("end", msg + "\n")
-                if error:
+                if tag:
                     try:
-                        self.log.tag_add("logerror", start, "end-1c")
+                        self.log.tag_add(tag, start, "end-1c")
                     except Exception:
                         pass
         finally:
