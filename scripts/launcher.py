@@ -8765,7 +8765,8 @@ class CaseloadPanel:
     def _build(self) -> None:
         bar = ctk.CTkFrame(self.frame, fg_color="transparent")
         bar.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
-        bar.grid_columnconfigure(2, weight=1)
+        bar.grid_columnconfigure(2, weight=1)  # the search box gets the slack
+        self.bar = bar
         # Reload sits to the LEFT of the "Caseload" label.
         self.refresh_btn = ctk.CTkButton(
             bar, text="↻", width=36, command=self._on_refresh,
@@ -8778,63 +8779,73 @@ class CaseloadPanel:
         )
         self.caseload_label.grid(row=0, column=1, padx=(4, 8))
         self.search_var = ctk.StringVar()
+        # Search box: a little larger than the viewer rows for easy typing, and
+        # the highest-priority control — it keeps a usable width on the top row
+        # even when narrow (the action buttons reflow below it).
         self.search_entry = ctk.CTkEntry(
             bar, textvariable=self.search_var,
             placeholder_text="Search caseload…",
+            font=ctk.CTkFont(size=font_size("viewer") + 2),
         )
-        self.search_entry.grid(row=0, column=2, sticky="ew", padx=4)
+        self.search_entry.grid(row=0, column=2, sticky="ew", padx=(4, 0))
         self.search_var.trace_add("write", lambda *_: self._on_search())
-        # Down from the search box drops focus into the rows.
+        # Down from the search box drops focus into the rows; Esc clears it.
         self.search_entry.bind("<Down>", self._focus_first_row)
-        # (The old blue latest-task status dropdown lived here — removed.
-        # Task pass/fail is now a normal "Task Status" filter inside the
-        # Filters section below, so it works for the viewer AND batch
-        # actions via the shared filter engine.)
-        # Saved Views dropdown — switch column-set + filter bundles. Sits just
-        # left of the Filters/Columns buttons (col 3; the search box at col 2
-        # expands, pushing this into the right-side cluster).
-        self.view_menu = ctk.CTkOptionMenu(
-            bar, values=["★ Views"], width=130, command=self._on_view_select,
-        )
-        self.view_menu.grid(row=0, column=3, padx=(0, 4))
-        self._refresh_view_menu()  # populate with any saved views
-        # Filters toggle — shows/hides the collapsible column-filter
-        # section (same builder the batch scenarios use).
-        self.filters_toggle_btn = ctk.CTkButton(
-            bar, text="▸ Filters", width=80, command=self._toggle_filters,
+        self.search_entry.bind("<Escape>", lambda _e: self._clear_search())
+        # Clear (✕) button right next to the search box.
+        self.search_clear_btn = ctk.CTkButton(
+            bar, text="✕", width=28, command=self._clear_search,
             **SECONDARY_BTN_KWARGS,
         )
-        self.filters_toggle_btn.grid(row=0, column=4, padx=(0, 4))
+        self.search_clear_btn.grid(row=0, column=3, padx=(2, 6))
+
+        # All action buttons live in one sub-frame so they can reflow to a
+        # second row UNDER the search box when the panel is narrow (the search
+        # box always keeps its width on the top row). Packed left-to-right.
+        self.bar_actions = ctk.CTkFrame(bar, fg_color="transparent")
+        # Saved Views dropdown — switch column-set + filter bundles.
+        self.view_menu = ctk.CTkOptionMenu(
+            self.bar_actions, values=["★ Views"], width=120,
+            command=self._on_view_select,
+        )
+        self.view_menu.pack(side="left", padx=(0, 4))
+        self._refresh_view_menu()  # populate with any saved views
+        # Filters toggle — shows/hides the collapsible column-filter section.
+        self.filters_toggle_btn = ctk.CTkButton(
+            self.bar_actions, text="▸ Filters", width=80,
+            command=self._toggle_filters, **SECONDARY_BTN_KWARGS,
+        )
+        self.filters_toggle_btn.pack(side="left", padx=(0, 4))
         # Column chooser (show/hide + reorder + persisted widths).
         self.columns_btn = ctk.CTkButton(
-            bar, text="☰ Columns", width=90, command=self._open_columns_dialog,
-            **SECONDARY_BTN_KWARGS,
+            self.bar_actions, text="☰ Columns", width=90,
+            command=self._open_columns_dialog, **SECONDARY_BTN_KWARGS,
         )
-        self.columns_btn.grid(row=0, column=5, padx=(0, 4))
-        self.freshness_lbl = ctk.CTkLabel(
-            bar, text="", font=ctk.CTkFont(size=11),
-            text_color=("gray40", "gray65"),
-        )
-        self.freshness_lbl.grid(row=0, column=6, padx=8)
+        self.columns_btn.pack(side="left", padx=(0, 4))
         # Pop the panel into its own window (2nd monitor) / re-dock it.
         self.popout_btn = ctk.CTkButton(
-            bar, text=("⧉ Dock" if self.popped else "⧉ Pop out"),
+            self.bar_actions, text=("⧉ Dock" if self.popped else "⧉ Pop out"),
             width=80, command=self.app._toggle_caseload_popout,
             **SECONDARY_BTN_KWARGS,
         )
-        self.popout_btn.grid(row=0, column=7, padx=(0, 4))
-        # Local history: review students who left the caseload + export the
-        # snapshot DB for pandas/Excel.
+        self.popout_btn.pack(side="left", padx=(0, 4))
+        # Local history: review departures + export the snapshot DB.
         self.departures_btn = ctk.CTkButton(
-            bar, text="⚑ Departures", width=100,
+            self.bar_actions, text="⚑ Departures", width=100,
             command=self._open_departures_dialog, **SECONDARY_BTN_KWARGS,
         )
-        self.departures_btn.grid(row=0, column=8, padx=(0, 4))
+        self.departures_btn.pack(side="left", padx=(0, 4))
         self.export_history_btn = ctk.CTkButton(
-            bar, text="⤓ Export history", width=110,
+            self.bar_actions, text="⤓ Export history", width=110,
             command=self._export_history, **SECONDARY_BTN_KWARGS,
         )
-        self.export_history_btn.grid(row=0, column=9, padx=(0, 4))
+        self.export_history_btn.pack(side="left", padx=(0, 4))
+        self.freshness_lbl = ctk.CTkLabel(
+            self.bar_actions, text="", font=ctk.CTkFont(size=11),
+            text_color=("gray40", "gray65"),
+        )
+        self.freshness_lbl.pack(side="left", padx=8)
+        self._place_bar_actions()  # initial placement (corrected on resize)
 
         # Collapsible filters section (row 1) — hidden until toggled.
         self.filters_wrap = ctk.CTkFrame(self.frame)
@@ -8962,13 +8973,16 @@ class CaseloadPanel:
         self.fire_sel_btn.grid(row=0, column=2, padx=(0, 4))
         self.action_bar.grid_remove()  # shown on first selection
 
-        # Responsive bar: collapse labels to symbols when the panel is
-        # narrow (docked in a thin pane). Recomputed on resize.
+        # Responsive bar: stack the action buttons below the search box and/or
+        # collapse their labels to symbols when the panel is narrow (docked in a
+        # thin pane). Recomputed on resize.
         self._narrow = False
+        self._stacked = True
         self.frame.bind("<Configure>", self._on_panel_resize)
 
     def _bar_button_text(self) -> dict:
-        """Button/label text for the current narrow/wide + toggle state."""
+        """Button/label text for the current narrow/wide + toggle state. When
+        narrow, labels collapse to symbols so the action row fits."""
         n = self._narrow
         filt_arrow = "▾" if self._filters_open else "▸"
         popped = getattr(self, "popped", False)
@@ -8977,7 +8991,23 @@ class CaseloadPanel:
             "columns": "☰" if n else "☰ Columns",
             "popout": ("⧉" if popped else "⧉") if n
                       else ("⧉ Dock" if popped else "⧉ Pop out"),
+            "departures": "⚑" if n else "⚑ Departures",
+            "export": "⤓" if n else "⤓ Export history",
         }
+
+    def _place_bar_actions(self) -> None:
+        """Put the action-button group inline (right of the search box) when
+        the panel is wide, or on its own row beneath the search box when it's
+        narrow — so the search box never loses its width to the buttons."""
+        try:
+            self.bar_actions.grid_forget()
+        except Exception:
+            pass
+        if getattr(self, "_stacked", True):
+            self.bar_actions.grid(row=1, column=0, columnspan=4, sticky="w",
+                                  padx=2, pady=(2, 0))
+        else:
+            self.bar_actions.grid(row=0, column=4, sticky="e", padx=(4, 0))
 
     def _apply_bar_mode(self) -> None:
         t = self._bar_button_text()
@@ -8988,10 +9018,23 @@ class CaseloadPanel:
                 text=t["columns"], width=36 if self._narrow else 90)
             self.popout_btn.configure(
                 text=t["popout"], width=36 if self._narrow else 80)
+            self.departures_btn.configure(
+                text=t["departures"], width=36 if self._narrow else 100)
+            self.export_history_btn.configure(
+                text=t["export"], width=36 if self._narrow else 110)
             if self._narrow:
                 self.caseload_label.grid_remove()
             else:
                 self.caseload_label.grid()
+            self._place_bar_actions()
+        except Exception:
+            pass
+
+    def _clear_search(self) -> None:
+        """Clear the search box (the ✕ button / Esc) and refocus it."""
+        self.search_var.set("")
+        try:
+            self.search_entry.focus_set()
         except Exception:
             pass
 
@@ -9000,9 +9043,14 @@ class CaseloadPanel:
             w = self.frame.winfo_width()
         except Exception:
             return
-        narrow = w < 460
-        if narrow != self._narrow:
+        # Two breakpoints: stack the action buttons below the search box once
+        # they can't sit inline with a usable search box, and shrink their
+        # labels to symbols when even the stacked row is tight.
+        narrow = w < 620
+        stacked = w < 900
+        if narrow != self._narrow or stacked != getattr(self, "_stacked", None):
             self._narrow = narrow
+            self._stacked = stacked
             self._apply_bar_mode()
 
     def _init_sash(self) -> None:
