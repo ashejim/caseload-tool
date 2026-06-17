@@ -6081,7 +6081,7 @@ def prompt_batch_text_review(
     tz_wrap.grid_columnconfigure(0, weight=1)
     tz_tree = ttk.Treeview(
         tz_wrap, columns=("sel",), show="tree headings",
-        selectmode="browse", height=18, style="Caseload.Treeview",
+        selectmode="browse", height=10, style="Caseload.Treeview",
     )
     tz_tree.heading("#0", text="Students by timezone")
     tz_tree.column("#0", width=360, anchor="w")
@@ -6237,7 +6237,10 @@ def prompt_batch_text_review(
             pass
 
     footer = ctk.CTkFrame(dialog, fg_color="transparent")
-    footer.pack(fill="x", padx=8, pady=(0, 8))
+    # Reserve the footer at the bottom BEFORE the expanding body, so the action
+    # buttons are never pushed off-screen by a tall tree (the tree scrolls to
+    # fit the space that's left).
+    footer.pack(side="bottom", fill="x", padx=8, pady=(0, 8), before=body)
 
     def _toggle_all():
         target = _count() == 0
@@ -6661,7 +6664,9 @@ def prompt_batch_email_review(
 
     # ---- Bottom action row: prev/next, edge, send, cancel. ----
     bottom = ctk.CTkFrame(dialog, fg_color="transparent")
-    bottom.pack(fill="x", padx=8, pady=(0, 8))
+    # Reserve the action row at the bottom before the expanding body so it's
+    # never pushed off-screen.
+    bottom.pack(side="bottom", fill="x", padx=8, pady=(0, 8), before=body)
 
     def _prev() -> None:
         if state["current"] > 0:
