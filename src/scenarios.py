@@ -281,6 +281,123 @@ def load_groups(path: Path = SCENARIOS_YAML) -> list[Group]:
     return _groups_from_list(raw.get("groups"))
 
 
+# ----------------------------------------------------------------------
+# Success paths — per-course checklists driving the "recommended action".
+# Definitions are CONFIG (here, in scenarios.yaml under `success_paths:`);
+# the per-student state lives in success_path.db. See src/success_path.py.
+# ----------------------------------------------------------------------
+@dataclass
+class PathField:
+    """A course-scoped data field the user enters by hand (and actions may
+    set) — feeds success-path gate/skip conditions. Stored per student in
+    ``success_path.field_values`` under ``name``."""
+    name: str
+    label: str = ""
+    type: str = "text"        # text | date | checkbox | number
+
+
+@dataclass
+class PathStep:
+    """One step on a course's success path (a checklist item).
+
+    ``id`` is the stable key recorded in ``success_path.step_log``. ``action``
+    optionally binds a scenario/action that fulfils the step. ``gate`` and
+    ``skip_when`` are filter-predicate lists (same ``{column, op, value}``
+    shape as ``BatchConfig.filters``), evaluated by the recommendation engine:
+    an empty ``gate`` means 'previous step done' (linear default); an empty
+    ``skip_when`` means 'never auto-skip' (the step is mandatory)."""
+    id: str
+    description: str = ""
+    action: str = ""
+    gate: list[dict] = field(default_factory=list)
+    skip_when: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class SuccessPath:
+    """A course's success path: an ordered list of steps plus the data fields
+    its conditions reference. One per course code."""
+    course: str
+    steps: list[PathStep] = field(default_factory=list)
+    fields: list[PathField] = field(default_factory=list)
+
+
+def _path_field_from_dict(d) -> Optional[PathField]:
+    if not isinstance(d, dict):
+        return None
+    name = str(d.get("name", "") or "").strip()
+    if not name:
+        return None
+    return PathField(
+        name=name,
+        label=str(d.get("label", "") or name),
+        type=(str(d.get("type", "text") or "text").strip() or "text"),
+    )
+
+
+def _path_step_from_dict(d) -> Optional[PathStep]:
+    if not isinstance(d, dict):
+        return None
+    sid = str(d.get("id", "") or "").strip()
+    if not sid:
+        return None
+    return PathStep(
+        id=sid,
+        description=str(d.get("description", "") or ""),
+        action=str(d.get("action", "") or ""),
+        gate=[g for g in (d.get("gate") or []) if isinstance(g, dict)],
+        skip_when=[g for g in (d.get("skip_when") or []) if isinstance(g, dict)],
+    )
+
+
+def load_success_paths(path: Path = SCENARIOS_YAML) -> dict[str, SuccessPath]:
+    """Read ``success_paths:`` (a mapping course-code -> {fields, steps}) from
+    scenarios.yaml, keyed by course. Empty / missing / parse-error -> {} — it's
+    an optional feature block and must never block startup. Step + field order
+    is preserved."""
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    sp = raw.get("success_paths") or {}
+    if not isinstance(sp, dict):
+        return {}
+    out: dict[str, SuccessPath] = {}
+    for course, cfg in sp.items():
+        course = str(course or "").strip()
+        if not course or not isinstance(cfg, dict):
+            continue
+        steps = [s for s in (_path_step_from_dict(x)
+                             for x in (cfg.get("steps") or [])) if s]
+        fields = [f for f in (_path_field_from_dict(x)
+                              for x in (cfg.get("fields") or [])) if f]
+        out[course] = SuccessPath(course=course, steps=steps, fields=fields)
+    return out
+
+
+def success_path_to_dict(p: SuccessPath) -> dict:
+    """Serialize a SuccessPath's body for scenarios.yaml (the course code is
+    the mapping key, so it isn't repeated inside the value)."""
+    return {
+        "fields": [
+            {"name": f.name, "label": f.label, "type": f.type}
+            for f in p.fields
+        ],
+        "steps": [
+            {
+                "id": s.id,
+                "description": s.description,
+                "action": s.action,
+                "gate": list(s.gate),
+                "skip_when": list(s.skip_when),
+            }
+            for s in p.steps
+        ],
+    }
+
+
 def _prompts_from_list(items: Optional[list]) -> list[Prompt]:
     if not items:
         return []
@@ -403,9 +520,11 @@ def run_scenario(
                     f"Note body trimmed (max {MAX_BODY_LINES} lines / "
                     f"{MAX_BODY_CHARS} chars)."
                 )
-            note = replace(template, course_code=per_note_code, body=combined)
+            note = replace(template, course_code=per_note_code, body=combined,
+                           subject=_substitute_vars(template.subject, prompt_vars))
         else:
-            note = replace(template, course_code=per_note_code, body=base_body)
+            note = replace(template, course_code=per_note_code, body=base_body,
+                           subject=_substitute_vars(template.subject, prompt_vars))
         fill_note(target, note)
         if not template.submit:
             all_submitted = False

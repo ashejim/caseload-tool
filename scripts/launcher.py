@@ -43,6 +43,7 @@ except Exception:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import caseload_csv, caseload_filter, email_template, history
+from src import success_path as success_path_store
 from src.browser import persistent_context
 from src.config import (
     CASELOAD_CSV_PATH, CASELOAD_URL, DEFAULT_EMAIL_TEMPLATES_DIR,
@@ -53,8 +54,9 @@ from src.config import (
 from src.version import __version__
 from src.note_form import NoteData
 from src.scenarios import (
-    SCENARIOS_YAML, BatchConfig, EmailConfig, Group, ScenarioConfig,
-    load_groups, load_scenarios, run_scenario,
+    SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
+    ScenarioConfig, SuccessPath, load_groups, load_scenarios,
+    load_success_paths, run_scenario, success_path_to_dict,
 )
 from src.student_lookup import (
     click_caseload_row,
@@ -413,6 +415,14 @@ class BrowserWorker:
         startup passes False for a non-intrusive heads-up. on_done({ok})."""
         self.q.put(("MONGOOSE_LOGIN_CHECK", surface, on_done))
 
+    def submit_salesforce_login_check(
+        self, on_done: Callable[[dict], None], surface: bool = True,
+    ) -> None:
+        """Report whether the Salesforce session is still signed in (no
+        navigation). Pre-flight before a fire sends texts/emails so an SSO
+        logout aborts up front. on_done({ok})."""
+        self.q.put(("SALESFORCE_LOGIN_CHECK", surface, on_done))
+
     def submit_restart_browser(self, on_done: Callable[[dict], None]) -> None:
         """Tear down and reopen the browser context (hang recovery). Handled in
         _session, not _dispatch_command. on_done({ok}) fires once the fresh
@@ -725,6 +735,13 @@ class BrowserWorker:
             res = {"ok": False}
             try:
                 res = self._mongoose_login_check(ctx, surface)
+            finally:
+                on_done(res)
+        elif cmd[0] == "SALESFORCE_LOGIN_CHECK":
+            _, surface, on_done = cmd
+            res = {"ok": False}
+            try:
+                res = self._salesforce_login_check(ctx, surface)
             finally:
                 on_done(res)
         elif cmd[0] == "SET_FOLLOWUP_DATE":
@@ -2461,6 +2478,40 @@ class BrowserWorker:
                 pass
         return {"ok": logged_in}
 
+    def _salesforce_login_check(self, ctx, surface: bool = True) -> dict:
+        """Report whether the Salesforce session looks alive, WITHOUT
+        navigating (so an open record / batch position isn't disturbed) —
+        mirrors _mongoose_login_check. A live Lightning page (the caseload or
+        an open record) means the session is good; if SSO has bounced it to a
+        sign-in page there's no live Lightning page, so we treat that as logged
+        out, bring the browser forward (when `surface`) and report it. Lets a
+        fire abort BEFORE sending texts/emails instead of discovering the
+        logout at note-filing time. Returns {ok: bool}."""
+        live_sf = False
+        login_page = None
+        for page in list(ctx.pages):
+            try:
+                if page.is_closed():
+                    continue
+                url = (page.url or "").lower()
+            except Exception:
+                continue
+            if "lightning.force.com" in url or "caseload_app_page" in url:
+                live_sf = True
+            elif self._looks_like_login(page):
+                login_page = page
+        if live_sf:
+            return {"ok": True}
+        if surface:
+            try:
+                if login_page is not None:
+                    self._bring_browser_forward(login_page)
+                else:
+                    self._raise_browser_window()
+            except Exception:
+                pass
+        return {"ok": False}
+
     def _send_text(self, ctx, payload: dict) -> dict:
         """Drive the Mongoose compose modal from a fired text action. `payload`
         carries the rendered body, recipient mobiles, inbox label, an optional
@@ -3105,6 +3156,15 @@ def days_until(date_str: str) -> Optional[int]:
         return (d - datetime.now().date()).days
     except Exception:
         return None
+
+
+def days_since(date_str: str) -> Optional[int]:
+    """Whole days from an ISO date/timestamp until today (negative if the
+    date is in the future). None if unparseable. The inverse of days_until —
+    used for 'days since last contact / course start / last action'. Accepts a
+    full timestamp too (only the leading YYYY-MM-DD is read)."""
+    du = days_until(date_str)
+    return None if du is None else -du
 
 
 def parse_task_status(val: str) -> tuple[str, str, int]:
@@ -5470,12 +5530,13 @@ def prompt_additional_text(parent, label: str, prefilled: str,
 def prompt_edit_note(parent, label, body_prefill, course_default,
                      activities_on, eas, enter_submits: bool = True,
                      interaction_type: str = "",
-                     interaction_format: str = "Single Interaction"):
-    """Unified fire-time note dialog: edit the body, course code, note type,
-    and academic activities, and — when the student has open Essential
-    Actions — attach/close one. Returns
-    {body, course, type, activities, ea} (ea = (reason, course, close) or
-    None) or None if cancelled.
+                     interaction_format: str = "Single Interaction",
+                     subject_default: str = ""):
+    """Unified fire-time note dialog: edit the body, subject, course code,
+    note type, and academic activities, and — when the student has open
+    Essential Actions — attach/close one. Returns
+    {body, subject, course, type, activities, ea} (ea = (reason, course,
+    close) or None) or None if cancelled.
 
     The Note type dropdown defaults to the action's `interaction_type`;
     picking a type that doesn't take academic activities (e.g. "Email to
@@ -5526,6 +5587,15 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
         width=260, command=lambda _v=None: _sync_activities(),
     )
     type_combo.pack(side="left")
+
+    # Subject — Salesforce's note Subject line.
+    srow = ctk.CTkFrame(dialog, fg_color="transparent")
+    srow.pack(fill="x", padx=12, pady=(2, 2))
+    ctk.CTkLabel(srow, text="Subject:", width=90, anchor="w").pack(side="left")
+    subject_entry = ctk.CTkEntry(srow)
+    subject_entry.pack(side="left", fill="x", expand=True)
+    if subject_default:
+        subject_entry.insert(0, subject_default)
 
     ctk.CTkLabel(dialog, text="Note body:", anchor="w").pack(
         fill="x", padx=12, pady=(6, 0))
@@ -5615,6 +5685,7 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
                 else [l for l, vv in act_vars.items() if vv.get()])
         res["value"] = {
             "body": text_box.get("1.0", "end-1c"),
+            "subject": subject_entry.get().strip(),
             "course": course_entry.get().strip(),
             "type": chosen_type,
             "activities": acts,
@@ -7523,6 +7594,17 @@ class NoteEditor:
             cb.grid(row=i, column=0, sticky="w", pady=1)
             self.activity_checkboxes.append(cb)
 
+        # Subject — Salesforce's note Subject line. Optional; {{vars}} are
+        # substituted at fire time (same as the body).
+        row += 1
+        ctk.CTkLabel(content, text="Subject").grid(
+            row=row, column=0, sticky="w", padx=8, pady=(8, 0)
+        )
+        row += 1
+        self.subject_entry = ctk.CTkEntry(
+            content, placeholder_text="(optional; {{vars}} allowed)")
+        self.subject_entry.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 2))
+
         # Body
         row += 1
         ctk.CTkLabel(content, text="Body").grid(
@@ -7683,6 +7765,9 @@ class NoteEditor:
         self.type_combo.set(note.interaction_type)
         for label, var in self.activity_vars.items():
             var.set(label in note.academic_activities)
+        self.subject_entry.delete(0, "end")
+        if note.subject:
+            self.subject_entry.insert(0, note.subject)
         self.body_text.delete("1.0", "end")
         self.body_text.insert("1.0", note.body)
         self.submit_var.set(note.submit)
@@ -7750,6 +7835,9 @@ class NoteEditor:
         cc_override = self.course_code_override_entry.get().strip()
         if cc_override:
             out["course_code_override"] = cc_override
+        subject = self.subject_entry.get().strip()
+        if subject:
+            out["subject"] = subject
         return out
 
 
@@ -11686,6 +11774,9 @@ class App:
         # User-defined scenario groupings — see Group dataclass.
         # Empty list means every scenario renders as ungrouped.
         self.groups: list[Group] = load_groups()
+        # Per-course success paths (ordered step checklists) — see
+        # SuccessPath. Keyed by course code; empty until the user defines one.
+        self.success_paths: dict[str, SuccessPath] = load_success_paths()
         # User preferences (advanced/dev mode toggle + future settings).
         # Loaded once at startup; saved via the Settings dialog when
         # the user toggles. Default state hides advanced features.
@@ -13990,6 +14081,7 @@ class App:
         try:
             self.scenarios = load_scenarios()
             self.groups = load_groups()
+            self.success_paths = load_success_paths()
             self._refresh_scenario_raw()
         except Exception as e:
             self._append_log(f"Loaded but reload failed: {e}", error=True)
@@ -14114,6 +14206,7 @@ class App:
         try:
             self.scenarios = load_scenarios()
             self.groups = load_groups()
+            self.success_paths = load_success_paths()
             self._refresh_scenario_raw()
         except Exception as e:
             self._append_log(f"Revert failed: {e}")
@@ -14257,6 +14350,13 @@ class App:
                 for g in self.groups
             ]
 
+        # Persist per-course success paths alongside scenarios/groups.
+        if self.success_paths:
+            new_doc["success_paths"] = {
+                course: success_path_to_dict(p)
+                for course, p in self.success_paths.items()
+            }
+
         try:
             SCENARIOS_YAML.write_text(
                 yaml.safe_dump(new_doc, sort_keys=False, allow_unicode=True),
@@ -14268,6 +14368,7 @@ class App:
         try:
             self.scenarios = load_scenarios()
             self.groups = load_groups()
+            self.success_paths = load_success_paths()
             # The just-saved doc IS the new on-disk state — use it directly so
             # un-opened actions serialize from current data next save.
             self._scenario_raw = dict(new_doc.get("scenarios", {}))
@@ -14525,6 +14626,12 @@ class App:
         # before any navigation/prompts so a lapsed session fails fast.
         if scenario.text is not None and not self._ensure_mongoose_logged_in():
             return
+        # Pre-flight: a note-filing action needs Salesforce signed in. Check
+        # up front (before any text/email is sent) so an SSO logout aborts the
+        # run rather than surfacing only at note-filing time — after the
+        # texts/emails have already gone out.
+        if scenario.notes and not self._ensure_salesforce_logged_in():
+            return
 
         # Pre-flight: if any note has Submit unchecked, confirm before
         # we ask the user to do anything else (FERPA: don't surprise
@@ -14602,6 +14709,7 @@ class App:
         custom_courses: dict[int, str] = {}
         custom_activities: dict[int, list] = {}
         custom_types: dict[int, str] = {}
+        custom_subjects: dict[int, str] = {}
         ea_arg = None
         eas_read = False
         eas_navigated = False  # did we actually nav to the EA tab (needs re-nav)?
@@ -14662,7 +14770,8 @@ class App:
                 list(n.academic_activities), eas if offer_ea else [],
                 enter_submits=self.settings.enter_submits_note,
                 interaction_type=n.interaction_type,
-                interaction_format=n.interaction_format)
+                interaction_format=n.interaction_format,
+                subject_default=n.subject)
             if res is None:
                 self._append_log(f"{label} edit cancelled; action not fired.")
                 return
@@ -14672,6 +14781,8 @@ class App:
             custom_activities[i] = res.get("activities", [])
             if "type" in res:
                 custom_types[i] = res.get("type", "")
+            if "subject" in res:
+                custom_subjects[i] = res.get("subject", "")
             if offer_ea and res.get("ea"):
                 ea_arg = res["ea"]
 
@@ -14745,7 +14856,7 @@ class App:
         # Apply the fire-time course / academic-activity edits onto a copy
         # of the scenario (run_scenario reads note.course_code_override and
         # note.academic_activities); body edits go via custom_bodies.
-        if custom_courses or custom_activities or custom_types:
+        if custom_courses or custom_activities or custom_types or custom_subjects:
             import copy as _copy
             scenario = _copy.deepcopy(scenario)
             for i, cc in custom_courses.items():
@@ -14757,6 +14868,9 @@ class App:
             for i, typ in custom_types.items():
                 if 0 <= i < len(scenario.notes):
                     scenario.notes[i].interaction_type = typ
+            for i, subj in custom_subjects.items():
+                if 0 <= i < len(scenario.notes):
+                    scenario.notes[i].subject = subj
 
         # Send the text reviewed in step 4b (all user input is done now) —
         # before the note submit so a text-only action doesn't fall through to
@@ -15095,6 +15209,40 @@ class App:
                 "NOT run.)", error=True)
         return holder["ok"]
 
+    def _ensure_salesforce_logged_in(self) -> bool:
+        """Pre-flight for a note-filing action: confirm the Salesforce session
+        is still signed in BEFORE the user reviews / before any texts/emails
+        are sent. WGU's SSO logs you out often, and without this the logout
+        only surfaces at note-filing time — AFTER the texts/emails have gone
+        out. On failure it brings the browser forward and returns False so the
+        caller aborts cleanly (nothing sent). Mirrors
+        _ensure_mongoose_logged_in."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.",
+                             error=True)
+            return False
+        self._append_log("Checking Salesforce sign-in…")
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"ok": False}
+
+        def on_done(res):
+            def set_main():
+                holder["ok"] = bool((res or {}).get("ok"))
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                set_main()
+
+        self.worker.submit_salesforce_login_check(on_done)
+        self.root.wait_variable(done_var)
+        if not holder["ok"]:
+            self._append_log(
+                "Salesforce isn't signed in (SSO likely timed out) — brought "
+                "the browser forward. Sign in to Salesforce, then re-fire the "
+                "action. (Texts/emails/notes were NOT run.)", error=True)
+        return holder["ok"]
+
     def _open_mongoose_clicked(self) -> None:
         """🐭 Mongoose toolbar button: open/focus the Mongoose dashboard so the
         user can sign in or check it."""
@@ -15339,6 +15487,11 @@ class App:
         # BEFORE the (expensive) email review, so a lapsed session doesn't
         # waste the review or half-run the action (texts→emails→notes).
         if scenario.text is not None and not self._ensure_mongoose_logged_in():
+            return
+        # …and confirm Salesforce is signed in BEFORE any texts/emails go out,
+        # so an SSO logout aborts the whole batch up front instead of failing
+        # at note-filing time with the sends already done.
+        if scenario.notes and not self._ensure_salesforce_logged_in():
             return
 
         # Pre-flight: if any note has Submit unchecked, confirm before
@@ -16094,6 +16247,14 @@ class App:
 
         self._warn_if_caseload_stale("this fire")
 
+        # Pre-flight session checks before any review/sends (mirrors
+        # _fire_batch): Mongoose for texts, Salesforce for note-filing — so an
+        # SSO logout aborts here, not after texts/emails have gone out.
+        if scenario.text is not None and not self._ensure_mongoose_logged_in():
+            return
+        if scenario.notes and not self._ensure_salesforce_logged_in():
+            return
+
         override = self.course_var.get().strip()
         has_email = scenario.email is not None
 
@@ -16252,6 +16413,80 @@ class App:
             sid = str(r.get("StudentID", "") or r.get("Student ID", "")).strip()
             ea = by_sid.get(sid)
             r["EssentialAction"] = (ea.get("reason", "") if ea else "")
+
+    def _note_log_latest_maps(self):
+        """Latest note_log.csv entry per student and per (student, course),
+        read once. Each value is ``(timestamp_str, action_name)``. Lets the
+        derived columns get Last Action Type / Days Since Last Action without
+        re-reading the file per row. Recency by ISO-timestamp string compare
+        (matches last_logged_action)."""
+        by_sid: dict = {}
+        by_key: dict = {}
+        try:
+            with Path(NOTE_LOG_CSV).open(encoding="utf-8", newline="") as f:
+                for r in csv.DictReader(f):
+                    sid = (r.get("student_id") or "").strip()
+                    ts = (r.get("timestamp") or "").strip()
+                    if not sid or not ts:
+                        continue
+                    scen = (r.get("scenario") or "").strip()
+                    course = (r.get("course_code") or "").strip()
+                    if sid not in by_sid or ts > by_sid[sid][0]:
+                        by_sid[sid] = (ts, scen)
+                    k = (sid, course)
+                    if k not in by_key or ts > by_key[k][0]:
+                        by_key[k] = (ts, scen)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        return by_sid, by_key
+
+    def _apply_derived_columns_to_rows(self) -> None:
+        """Inject computed signal columns into each cached caseload row so
+        success-path gates / viewer filters can express the time- and
+        progress-based conditions the raw export lacks. Sources: CSV dates,
+        note_log.csv, and the history snapshots. Matched by Student ID (+
+        Course Code where available). Cheap; re-run after every cache reload.
+
+        Columns added (display names in caseload_csv.DISPLAY_TO_CSV):
+          DaysSinceLastContact  — today − 'Last Assigned CI Contact'
+          DaysSinceCourseStart  — today − Course Start Date
+          DaysUntilTermEnd      — Term End Date − today (negative if past)
+          LastActionType        — action name of the latest note we logged
+          DaysSinceLastAction   — today − that note's date
+          TaskStalledDays       — days the task status has been unchanged
+        Blank ('') where the source date/value is missing."""
+        rows = self._caseload_rows or []
+        if not rows:
+            return
+        by_sid, by_key = self._note_log_latest_maps()
+        try:
+            stall = history.task_stall_days()
+        except Exception:
+            stall = {}
+
+        def _num(v):
+            return "" if v is None else v
+
+        for r in rows:
+            sid = str(r.get("StudentID", "") or r.get("Student ID", "")).strip()
+            course = str(r.get("CourseCode", "")
+                         or r.get("Course Code", "")).strip()
+            r["DaysSinceLastContact"] = _num(
+                days_since(str(r.get("MyCourseContact", "") or "")))
+            r["DaysSinceCourseStart"] = _num(
+                days_since(str(r.get("CourseStartDate", "") or "")))
+            r["DaysUntilTermEnd"] = _num(
+                days_until(str(r.get("TermEndDate", "") or "")))
+            ent = by_key.get((sid, course)) or by_sid.get(sid)
+            if ent:
+                r["LastActionType"] = ent[1]
+                r["DaysSinceLastAction"] = _num(days_since(ent[0]))
+            else:
+                r["LastActionType"] = ""
+                r["DaysSinceLastAction"] = ""
+            r["TaskStalledDays"] = _num(stall.get((sid, course)))
 
     # Curated value vocabulary for the task-status filter columns (the
     # aggregate "Task Status" holds combos, so deriving from data would be
@@ -17363,6 +17598,411 @@ class App:
             side="right")
         dlg.protocol("WM_DELETE_WINDOW", _close)
 
+    def _edit_conditions_dialog(self, parent, title: str, conditions: list):
+        """Modal FilterRow editor for a step's gate / skip-when condition.
+        Returns the new list of {column, op, value} dicts (empty list is
+        meaningful), or None if cancelled. Reuses the caseload FilterRow so
+        conditions can reference the derived signal columns (Days Since Last
+        Contact, Task Stalled, …) just like batch filters."""
+        result = {"val": None}
+        d = ctk.CTkToplevel(parent)
+        d.title(title)
+        d.geometry("660x440")
+        try:
+            d.transient(parent)
+        except Exception:
+            pass
+        d.attributes("-topmost", True)
+        try:
+            d.grab_set()
+        except Exception:
+            pass
+        d.grid_columnconfigure(0, weight=1)
+        d.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            d, text="All conditions must match (AND).",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 2))
+        scroll = ctk.CTkScrollableFrame(d)
+        scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        scroll.grid_columnconfigure(0, weight=1)
+        cols = self._get_caseload_columns()
+        rows: list = []
+
+        def regrid():
+            for i, fr in enumerate(rows):
+                fr.frame.grid_configure(row=i)
+
+        def del_row(fr):
+            try:
+                fr.frame.destroy()
+            except Exception:
+                pass
+            if fr in rows:
+                rows.remove(fr)
+            regrid()
+
+        def add_row(filt=None):
+            fr = FilterRow(scroll, cols, on_delete=del_row,
+                           value_provider=self._filter_value_suggestions)
+            fr.frame.grid(row=len(rows), column=0, sticky="ew", padx=2, pady=2)
+            if filt:
+                try:
+                    fr.load(filt)
+                except Exception:
+                    pass
+            rows.append(fr)
+
+        for c in (conditions or []):
+            add_row(c)
+
+        btns = ctk.CTkFrame(d, fg_color="transparent")
+        btns.grid(row=2, column=0, sticky="ew", padx=8, pady=(2, 10))
+        ctk.CTkButton(
+            btns, text="+ Add condition", width=130, command=lambda: add_row(),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left")
+
+        def close():
+            try:
+                d.grab_release()
+            except Exception:
+                pass
+            d.destroy()
+            try:
+                parent.grab_set()
+            except Exception:
+                pass
+
+        def do_ok():
+            out = []
+            for fr in rows:
+                col = fr.column_combo.get().strip()
+                if not col or col == "(refresh columns)":
+                    continue
+                out.append(fr.serialize())
+            result["val"] = out
+            close()
+
+        ctk.CTkButton(btns, text="Cancel", width=90, command=close,
+                      **SECONDARY_BTN_KWARGS).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btns, text="OK", width=90, command=do_ok).pack(side="right")
+        d.protocol("WM_DELETE_WINDOW", close)
+        parent.wait_window(d)
+        return result["val"]
+
+    def _open_success_paths_dialog(self, parent=None) -> None:
+        """Editor for per-course Success Paths: pick a course, then build its
+        ordered step checklist (each step = description, bound action, gate,
+        skip-when) plus the course's data fields. Persists into scenarios.yaml
+        via _save_yaml. Per-student state is untouched (that's success_path.db)."""
+        import copy as _copy
+        import re as _re
+        parent = parent or self.root
+        # Working copy: {course: {"fields": [dict...], "steps": [dict...]}}.
+        work: dict = {}
+        for course, p in self.success_paths.items():
+            work[course] = {
+                "fields": [dict(name=f.name, label=f.label, type=f.type)
+                           for f in p.fields],
+                "steps": [dict(id=s.id, description=s.description,
+                               action=s.action, gate=_copy.deepcopy(s.gate),
+                               skip_when=_copy.deepcopy(s.skip_when))
+                          for s in p.steps],
+            }
+        caseload_courses = sorted({
+            str(r.get("CourseCode", "") or r.get("Course Code", "")).strip()
+            for r in (self._caseload_rows or [])
+            if str(r.get("CourseCode", "") or r.get("Course Code", "")).strip()
+        })
+        action_names = [""] + [s.name for s in self.scenarios.values()
+                               if s.batch is None]
+        field_types = ["text", "date", "checkbox", "number"]
+
+        dlg = ctk.CTkToplevel(parent)
+        dlg.title("Success paths")
+        dlg.geometry("780x640")
+        try:
+            dlg.transient(parent)
+        except Exception:
+            pass
+        dlg.attributes("-topmost", True)
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        dlg.grid_columnconfigure(0, weight=1)
+        dlg.grid_rowconfigure(1, weight=1)
+
+        state = {"course": None}
+        step_widgets: list = []   # (step_dict, desc_entry, action_combo)
+        field_widgets: list = []  # (field_dict, name_entry, label_entry, type_combo)
+
+        def course_choices():
+            return sorted(set(work.keys()) | set(caseload_courses))
+
+        def sync_from_widgets():
+            for sd, de, ac in step_widgets:
+                sd["description"] = de.get().strip()
+                sd["action"] = ac.get().strip()
+            for fd, ne, le, tc in field_widgets:
+                fd["name"] = ne.get().strip()
+                fd["label"] = le.get().strip()
+                fd["type"] = tc.get().strip()
+
+        def cur():
+            c = state["course"]
+            if not c:
+                return None
+            return work.setdefault(c, {"fields": [], "steps": []})
+
+        # ---- top bar: course selector + add/delete ----
+        top = ctk.CTkFrame(dlg, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
+        ctk.CTkLabel(top, text="Course:").pack(side="left")
+        course_var = ctk.StringVar(value="")
+        course_combo = ctk.CTkComboBox(
+            top, width=160, variable=course_var, values=course_choices(),
+            command=lambda _v=None: select_course(course_var.get()))
+        course_combo.pack(side="left", padx=(6, 6))
+
+        def use_course():
+            c = course_var.get().strip().upper()
+            if not c:
+                return
+            work.setdefault(c, {"fields": [], "steps": []})
+            course_combo.configure(values=course_choices())
+            course_var.set(c)
+            select_course(c)
+
+        ctk.CTkButton(top, text="Add / use", width=90, command=use_course,
+                      **SECONDARY_BTN_KWARGS).pack(side="left")
+
+        def delete_path():
+            c = state["course"]
+            if not c:
+                return
+            if not ask_yes_no_topmost(
+                    dlg, "Delete success path",
+                    f"Delete the entire success path for {c}? "
+                    "(Per-student data is kept.)"):
+                return
+            work.pop(c, None)
+            state["course"] = None
+            course_combo.configure(values=course_choices())
+            course_var.set("")
+            redraw()
+
+        ctk.CTkButton(top, text="Delete path", width=100, command=delete_path,
+                      **SECONDARY_BTN_KWARGS).pack(side="right")
+
+        body = ctk.CTkScrollableFrame(dlg)
+        body.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        body.grid_columnconfigure(0, weight=1)
+
+        def select_course(c):
+            sync_from_widgets()
+            state["course"] = (c or "").strip() or None
+            redraw()
+
+        def move_step(i, delta):
+            sync_from_widgets()
+            steps = cur()["steps"]
+            j = i + delta
+            if 0 <= j < len(steps):
+                steps[i], steps[j] = steps[j], steps[i]
+                redraw()
+
+        def del_step(i):
+            sync_from_widgets()
+            steps = cur()["steps"]
+            if 0 <= i < len(steps):
+                steps.pop(i)
+                redraw()
+
+        def add_step():
+            sync_from_widgets()
+            cur()["steps"].append(
+                dict(id="", description="", action="", gate=[], skip_when=[]))
+            redraw()
+
+        def edit_cond(sd, key, label):
+            new = self._edit_conditions_dialog(
+                dlg, f"{label} — {sd.get('description') or 'step'}",
+                sd.get(key) or [])
+            if new is not None:
+                sd[key] = new
+                redraw()
+
+        def add_field():
+            sync_from_widgets()
+            cur()["fields"].append(dict(name="", label="", type="text"))
+            redraw()
+
+        def del_field(i):
+            sync_from_widgets()
+            fields = cur()["fields"]
+            if 0 <= i < len(fields):
+                fields.pop(i)
+                redraw()
+
+        def redraw():
+            for w in body.winfo_children():
+                w.destroy()
+            step_widgets.clear()
+            field_widgets.clear()
+            if not state["course"]:
+                ctk.CTkLabel(
+                    body, text="Pick a course above (or type one + Add / use).",
+                    text_color=("gray40", "gray65"),
+                ).grid(row=0, column=0, padx=8, pady=20)
+                return
+            r = 0
+            ctk.CTkLabel(
+                body, text="Steps  (top = first; recommended = first Due step)",
+                font=ctk.CTkFont(size=13, weight="bold"),
+            ).grid(row=r, column=0, sticky="w", padx=6, pady=(4, 2))
+            r += 1
+            for i, sd in enumerate(cur()["steps"]):
+                fr = ctk.CTkFrame(body)
+                fr.grid(row=r, column=0, sticky="ew", padx=4, pady=3)
+                fr.grid_columnconfigure(1, weight=1)
+                r += 1
+                ctk.CTkButton(fr, text="▲", width=26,
+                              command=lambda ix=i: move_step(ix, -1),
+                              **SECONDARY_BTN_KWARGS).grid(row=0, column=0, padx=(4, 0), pady=4)
+                desc = ctk.CTkEntry(fr, placeholder_text="step description "
+                                    "(e.g. Task 2 guidance)")
+                if sd.get("description"):
+                    desc.insert(0, sd["description"])
+                desc.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+                ctk.CTkButton(fr, text="✕", width=26,
+                              command=lambda ix=i: del_step(ix),
+                              **SECONDARY_BTN_KWARGS).grid(row=0, column=2, padx=(0, 4), pady=4)
+                bar = ctk.CTkFrame(fr, fg_color="transparent")
+                bar.grid(row=1, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 4))
+                ctk.CTkButton(bar, text="▼", width=26,
+                              command=lambda ix=i: move_step(ix, 1),
+                              **SECONDARY_BTN_KWARGS).pack(side="left", padx=(0, 8))
+                ctk.CTkLabel(bar, text="Action:").pack(side="left")
+                action_combo = ctk.CTkComboBox(bar, width=200, values=action_names,
+                                               state="readonly")
+                action_combo.set(sd.get("action", "") if sd.get("action", "")
+                                 in action_names else "")
+                action_combo.pack(side="left", padx=(4, 10))
+                ngate = len(sd.get("gate") or [])
+                nskip = len(sd.get("skip_when") or [])
+                ctk.CTkButton(
+                    bar, text=f"Gate ({ngate})" if ngate else "Gate (prev step)",
+                    width=120, command=lambda s=sd: edit_cond(s, "gate", "Gate"),
+                    **SECONDARY_BTN_KWARGS).pack(side="left", padx=(0, 6))
+                ctk.CTkButton(
+                    bar, text=f"Skip-when ({nskip})" if nskip else "Skip-when (none)",
+                    width=140, command=lambda s=sd: edit_cond(s, "skip_when", "Skip-when"),
+                    **SECONDARY_BTN_KWARGS).pack(side="left")
+                step_widgets.append((sd, desc, action_combo))
+            ctk.CTkButton(body, text="+ Add step", width=120, command=add_step,
+                          **SECONDARY_BTN_KWARGS).grid(row=r, column=0, sticky="w", padx=6, pady=(2, 10))
+            r += 1
+            ctk.CTkLabel(
+                body, text="Data fields  (facts you enter; used in conditions)",
+                font=ctk.CTkFont(size=13, weight="bold"),
+            ).grid(row=r, column=0, sticky="w", padx=6, pady=(6, 2))
+            r += 1
+            for i, fd in enumerate(cur()["fields"]):
+                fr = ctk.CTkFrame(body)
+                fr.grid(row=r, column=0, sticky="ew", padx=4, pady=2)
+                fr.grid_columnconfigure(1, weight=1)
+                r += 1
+                name_e = ctk.CTkEntry(fr, width=160, placeholder_text="field key")
+                if fd.get("name"):
+                    name_e.insert(0, fd["name"])
+                name_e.grid(row=0, column=0, padx=(6, 4), pady=4)
+                label_e = ctk.CTkEntry(fr, placeholder_text="label (optional)")
+                if fd.get("label"):
+                    label_e.insert(0, fd["label"])
+                label_e.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+                type_c = ctk.CTkComboBox(fr, width=110, values=field_types,
+                                         state="readonly")
+                type_c.set(fd.get("type", "text") if fd.get("type", "text")
+                           in field_types else "text")
+                type_c.grid(row=0, column=2, padx=4, pady=4)
+                ctk.CTkButton(fr, text="✕", width=26,
+                              command=lambda ix=i: del_field(ix),
+                              **SECONDARY_BTN_KWARGS).grid(row=0, column=3, padx=(0, 6), pady=4)
+                field_widgets.append((fd, name_e, label_e, type_c))
+            ctk.CTkButton(body, text="+ Add field", width=120, command=add_field,
+                          **SECONDARY_BTN_KWARGS).grid(row=r, column=0, sticky="w", padx=6, pady=(2, 10))
+
+        def slug_id(text, existing):
+            base = _re.sub(r"[^a-z0-9]+", "_", (text or "").strip().lower()).strip("_") or "step"
+            sid, n = base, 2
+            while sid in existing:
+                sid, n = f"{base}_{n}", n + 1
+            return sid
+
+        def do_save():
+            sync_from_widgets()
+            new_paths: dict = {}
+            for course, bd in work.items():
+                steps, ids = [], set()
+                for sd in bd["steps"]:
+                    if not sd.get("description", "").strip() and not sd.get("action", "").strip():
+                        continue  # skip blank rows
+                    sid = (sd.get("id") or "").strip() or slug_id(sd.get("description", ""), ids)
+                    if sid in ids:
+                        sid = slug_id(sid, ids)
+                    ids.add(sid)
+                    steps.append(PathStep(
+                        id=sid, description=sd.get("description", "").strip(),
+                        action=sd.get("action", "").strip(),
+                        gate=list(sd.get("gate") or []),
+                        skip_when=list(sd.get("skip_when") or [])))
+                fields, fnames = [], set()
+                for fd in bd["fields"]:
+                    nm = (fd.get("name") or "").strip()
+                    if not nm or nm in fnames:
+                        continue
+                    fnames.add(nm)
+                    fields.append(PathField(
+                        name=nm, label=(fd.get("label") or nm).strip(),
+                        type=(fd.get("type") or "text").strip() or "text"))
+                if steps or fields:
+                    new_paths[course] = SuccessPath(
+                        course=course, steps=steps, fields=fields)
+            self.success_paths = new_paths
+            self._save_yaml()
+            self._append_log(
+                f"Saved success paths for {len(new_paths)} course(s).")
+            close_dlg()
+
+        def close_dlg():
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            dlg.destroy()
+            try:
+                if parent is not None and parent is not self.root:
+                    parent.grab_set()
+            except Exception:
+                pass
+
+        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row.grid(row=2, column=0, sticky="ew", padx=12, pady=(2, 12))
+        ctk.CTkButton(btn_row, text="Cancel", width=100, command=close_dlg,
+                      **SECONDARY_BTN_KWARGS).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Save", width=100, command=do_save).pack(side="right")
+        dlg.protocol("WM_DELETE_WINDOW", close_dlg)
+
+        # Open on the first existing path, else blank.
+        if work:
+            first = sorted(work.keys())[0]
+            course_var.set(first)
+            select_course(first)
+        else:
+            redraw()
+
     def _open_settings(self) -> None:
         """Modal for user preferences. Currently the advanced /
         developer-mode toggle + Caseload Tool view status. Designed
@@ -17789,6 +18429,23 @@ class App:
             dialog,
             text=("Choose which actions appear in the panel's right-click / "
                   "Right-arrow Fire menu, and their order."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
+        # Success paths: per-course step checklists driving recommended actions.
+        sp_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        sp_row.pack(fill="x", padx=20, pady=(0, 2))
+        ctk.CTkLabel(sp_row, text="Success paths:").pack(side="left")
+        ctk.CTkButton(
+            sp_row, text="Configure…", width=120,
+            command=lambda: self._open_success_paths_dialog(parent=dialog),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("Per-course step checklists (description, bound action, gate, "
+                  "skip-when) that drive each student's recommended next action."),
             wraplength=510, justify="left",
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
@@ -18699,11 +19356,12 @@ class App:
                     "emails will use the slower per-student row scrape. "
                     "Set up Caseload Tool view in ⚙ Settings to fix."
                 )
-        # Re-attach scraped Essential Actions + live task pass/fail to the
-        # freshly-loaded rows (reload rebuilds rows from the CSV, dropping
-        # the synthetic columns).
+        # Re-attach scraped Essential Actions + live task pass/fail + the
+        # derived signal columns to the freshly-loaded rows (reload rebuilds
+        # rows from the CSV, dropping all the synthetic columns).
         self._apply_ea_to_rows()
         self._apply_task_status_to_rows()
+        self._apply_derived_columns_to_rows()
         self._refresh_caseload_panel()
         self._check_required_caseload_columns(rows, silent=silent)
         # Snapshot the dynamic fields into the local history DB (non-fatal:

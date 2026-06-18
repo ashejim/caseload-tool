@@ -133,6 +133,14 @@ CASELOAD_CSV_PATH = USER_CONFIG_DIR / "caseload.csv"
 # straight into pandas; see src/history.py.
 HISTORY_DB = USER_CONFIG_DIR / "history.db"
 
+# Local per-student Success Path state (see src/success_path.py): the data
+# the user enters (field_values) plus an append-only log of step
+# completions/skips (step_log). Deliberately SEPARATE from history.db —
+# this is durable, mutable current state + an event log, not the
+# append-only time-series snapshots. Step/path *definitions* live in
+# scenarios.yaml; this DB holds only per-student data.
+SUCCESS_PATH_DB = USER_CONFIG_DIR / "success_path.db"
+
 # Default to WGU's standard Caseload page. Override via .env in the user
 # config dir if your campus / org uses a different Salesforce instance.
 DEFAULT_CASELOAD_URL = "https://srm.lightning.force.com/lightning/n/Caseload_App_Page"

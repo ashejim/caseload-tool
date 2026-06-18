@@ -53,6 +53,16 @@ DISPLAY_TO_CSV: dict[str, str] = {
     "Last Assigned CI Contact": "MyCourseContact",
     # Synthetic column injected from the Essential Actions dashboard scrape.
     "Essential Action": "EssentialAction",
+    # Derived signal columns computed by the launcher (App._apply_derived_
+    # columns_to_rows) from the CSV dates, note_log.csv, and history.db — so
+    # success-path gates / filters can express time- and progress-based
+    # conditions the raw export doesn't carry.
+    "Days Since Last Contact": "DaysSinceLastContact",
+    "Days Since Last Action": "DaysSinceLastAction",
+    "Last Action Type": "LastActionType",
+    "Days Since Course Start": "DaysSinceCourseStart",
+    "Days Until Term End": "DaysUntilTermEnd",
+    "Task Stalled (days)": "TaskStalledDays",
 }
 
 

@@ -453,6 +453,47 @@ def student_timeline(student_id: str, *, db_path=HISTORY_DB) -> list[dict]:
         conn.close()
 
 
+def task_stall_days(*, db_path=HISTORY_DB,
+                    now: Optional[datetime] = None) -> dict:
+    """Whole days that each student's task status has been unchanged, keyed
+    ``{(student_id, course_code): days}``.
+
+    Derived from the snapshot history: for each student+course, take the most
+    recent contiguous run of an identical ``latest_task_status`` and measure
+    from the first date of that run to today. So a student whose status last
+    changed 17 days ago reads 17; one who changed today reads 0. Keys with no
+    snapshots are omitted. Day-grained (matches the snapshot cadence).
+    """
+    from itertools import groupby
+    today = (now or datetime.now()).date()
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT student_id, course_code, collected_date, latest_task_status "
+            "FROM snapshots "
+            "ORDER BY student_id, course_code, collected_at ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    out: dict = {}
+    keyf = lambda r: (r["student_id"], r["course_code"])
+    for key, grp in groupby(rows, key=keyf):
+        seq = list(grp)
+        latest = (seq[-1]["latest_task_status"] or "")
+        run_start = seq[-1]["collected_date"]
+        for r in reversed(seq):  # walk back while the status is unchanged
+            if (r["latest_task_status"] or "") == latest:
+                run_start = r["collected_date"]
+            else:
+                break
+        try:
+            d = datetime.strptime(run_start[:10], "%Y-%m-%d").date()
+            out[key] = (today - d).days
+        except Exception:
+            pass
+    return out
+
+
 def export_to_csv(dest_path, *, db_path=HISTORY_DB) -> int:
     """Dump the whole snapshots table to a CSV at ``dest_path``. Returns the
     number of data rows written. Raises on a write error (caller reports it)."""
