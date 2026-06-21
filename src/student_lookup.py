@@ -658,57 +658,94 @@ def open_ea_note_form(page: Page, reason: str, course: str,
         return False
 
 
+_EA_READ_JS = """
+() => {
+  const labels = {
+    student_id: 'Student ID', name: 'Student Name', reason: 'Reason',
+    course: 'Course Code', event_progress: 'Event Progress',
+    followup_date: 'Follow-Up Date', intervention: 'Intervention',
+    date_added: 'Date Added to List'
+  };
+  const out = [];
+  document.querySelectorAll('tr').forEach(tr => {
+    const sidCell = tr.querySelector('td[data-label="Student ID"]');
+    if (!sidCell) return;
+    const sid = (sidCell.innerText || '').trim();
+    if (!sid) return;
+    const rec = {};
+    for (const k in labels) {
+      const c = tr.querySelector('td[data-label="' + labels[k] + '"]');
+      rec[k] = c ? (c.innerText || '').trim() : '';
+    }
+    out.push(rec);
+  });
+  return out;
+}
+"""
+
+# Scroll the first / last currently-rendered EA row into view (start the
+# accumulation from the top; advance the lazy-load by one window).
+_EA_SCROLL_JS = """
+(toEnd) => {
+  const trs = [...document.querySelectorAll('tr')].filter(
+    tr => tr.querySelector('td[data-label="Student ID"]'));
+  if (!trs.length) return;
+  const el = toEnd ? trs[trs.length - 1] : trs[0];
+  el.scrollIntoView({block: toEnd ? 'end' : 'start'});
+}
+"""
+
+
 def read_ea_dashboard_rows(page: Page, max_iters: int = 120) -> list[dict]:
     """On the Essential Actions DASHBOARD page: scroll-load every row and
     read each EA. Returns
     [{student_id, name, reason, course, event_progress, followup_date,
       intervention, date_added}]. Empty if the grid never loads / no EAs.
-    The dashboard grid is light-DOM (td[data-label=...]), so plain
-    locators read it directly."""
+
+    The grid is a virtualized + lazy-loading Lightning datatable: off-screen
+    rows get recycled out of the DOM and new chunks load as you scroll. So we
+    scroll to the TOP, then ACCUMULATE every rendered row (keyed by Student ID)
+    while scrolling down — capturing rows before they recycle — and stop only
+    after several iterations with no new IDs. The older "scroll to the bottom,
+    then read what's left" approach read a partial window (intermittently 10 of
+    14, depending on load timing). The grid is light-DOM, so one page.evaluate
+    reads the whole current window per iteration."""
     sid_sel = 'td[data-label="Student ID"]'
     try:
         page.locator(sid_sel).first.wait_for(state="visible", timeout=8000)
     except Exception:
-        pass  # possibly zero EAs — fall through and return []
-    rows = page.locator("tr").filter(has=page.locator(sid_sel))
-    # Scroll the last row into view until the count stops growing.
-    last, stable = -1, 0
+        return []  # zero EAs, or the grid never loaded
+    # Start from the top so the first window's rows aren't skipped when the
+    # page was left scrolled down by a previous scrape.
+    try:
+        page.evaluate(_EA_SCROLL_JS, False)
+        page.wait_for_timeout(250)
+    except Exception:
+        pass
+    seen: dict[str, dict] = {}
+    stable = 0
     for _ in range(max_iters):
-        cnt = rows.count()
-        if cnt == last:
+        before = len(seen)
+        try:
+            batch = page.evaluate(_EA_READ_JS) or []
+        except Exception:
+            batch = []
+        for rec in batch:
+            sid = (rec.get("student_id") or "").strip()
+            if sid and sid not in seen:
+                seen[sid] = rec
+        try:
+            page.evaluate(_EA_SCROLL_JS, True)  # reveal the next window
+        except Exception:
+            pass
+        if len(seen) == before:
             stable += 1
-            if stable >= 2:
+            if stable >= 3:  # ~3 quiet passes → the list is fully loaded
                 break
         else:
             stable = 0
-        last = cnt
-        if cnt > 0:
-            try:
-                rows.nth(cnt - 1).scroll_into_view_if_needed(timeout=1500)
-            except Exception:
-                pass
-        page.wait_for_timeout(300)
-    out: list[dict] = []
-    n = rows.count()
-    for i in range(n):
-        row = rows.nth(i)
-        try:
-            sid = _ea_cell(row, "Student ID")
-            if not sid:
-                continue
-            out.append({
-                "student_id": sid,
-                "name": _ea_cell(row, "Student Name"),
-                "reason": _ea_cell(row, "Reason"),
-                "course": _ea_cell(row, "Course Code"),
-                "event_progress": _ea_cell(row, "Event Progress"),
-                "followup_date": _ea_cell(row, "Follow-Up Date"),
-                "intervention": _ea_cell(row, "Intervention"),
-                "date_added": _ea_cell(row, "Date Added to List"),
-            })
-        except Exception:
-            continue
-    return out
+        page.wait_for_timeout(350)
+    return list(seen.values())
 
 
 def detect_course_code(page: Page, student_name: str) -> Optional[str]:

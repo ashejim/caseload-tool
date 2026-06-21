@@ -2163,6 +2163,26 @@ class BrowserWorker:
             pass
         return True, f"saved to {Path(save_path).name}"
 
+    def _scroll_datatable_to_bottom(self, table) -> None:
+        """Force the caseload datatable's scroll CONTAINER to its bottom to
+        trigger the next lazy-load chunk. More reliable than scroll-into-view
+        of the last row, which stops as soon as that row is visible and can
+        stall the infinite-load before the whole list is in the DOM (the cause
+        of the bulk scrapes intermittently loading only part of the caseload).
+        Walks up from the table to the first scrollable ancestor. No-op on
+        failure (the scroll-into-view fallback still runs)."""
+        try:
+            table.evaluate(
+                "(tbl) => { let el = tbl;"
+                " for (let i = 0; i < 10 && el; i++) {"
+                "   const oy = getComputedStyle(el).overflowY;"
+                "   if (el.scrollHeight > el.clientHeight + 4 &&"
+                "       (oy === 'auto' || oy === 'scroll')) {"
+                "     el.scrollTop = el.scrollHeight; return; }"
+                "   el = el.parentElement; } }")
+        except Exception:
+            pass
+
     def _read_all_caseload_rows(
         self, ctx,
         on_progress: Optional[Callable[[int], None]] = None,
@@ -2187,9 +2207,19 @@ class BrowserWorker:
         except Exception:
             pass
 
-        last_count = 0
+        # Start at the top so the first window's rows aren't skipped if the
+        # list was left scrolled down.
+        try:
+            r0 = table.locator("tr")
+            if r0.count() > 0:
+                r0.nth(0).scroll_into_view_if_needed(timeout=2000)
+                target.wait_for_timeout(250)
+        except Exception:
+            pass
+
+        last_count = -1
         stable = 0
-        MAX_ITERS = 200
+        MAX_ITERS = 300
         for _ in range(MAX_ITERS):
             rows = table.locator("tr")
             count = rows.count()
@@ -2198,13 +2228,18 @@ class BrowserWorker:
                     on_progress(max(count - 1, 0))  # subtract header
                 except Exception:
                     pass
+            # Stop only after the row count holds for THREE checks (was two) —
+            # the list lazy-loads in chunks and a single slow chunk could
+            # otherwise truncate the load (the same race that under-read the
+            # bulk task scrape).
             if count == last_count:
                 stable += 1
-                if stable >= 2:
+                if stable >= 3:
                     break
             else:
                 stable = 0
             last_count = count
+            self._scroll_datatable_to_bottom(table)
             try:
                 last_row = rows.nth(count - 1)
                 last_row.scroll_into_view_if_needed(timeout=2000)
@@ -2365,10 +2400,25 @@ class BrowserWorker:
                 _wait_grid_settled(target, 1500)
         except Exception:
             pass
-        # Scroll-load: drive the last <tr> into view until the row count is
-        # stable for two checks (Lightning lazy-loads rows on scroll).
-        last_count, stable = 0, 0
-        MAX_ITERS = 200
+        # Start at the top so the first window's rows aren't skipped.
+        try:
+            r0 = table.locator("tr")
+            if r0.count() > 0:
+                r0.nth(0).scroll_into_view_if_needed(timeout=2000)
+                target.wait_for_timeout(250)
+        except Exception:
+            pass
+        # Scroll-load + READ each window as we go, ACCUMULATING pass/fail by
+        # Student ID. The list lazy-loads (and may virtualize) rows on scroll;
+        # the old "scroll to the bottom, then read once" stopped as soon as the
+        # row count held for two 400ms checks and read only what was rendered —
+        # which intermittently truncated (e.g. 137 of 244 students). Reading
+        # every window and stopping only after the row count is stable for
+        # THREE passes captures rows before they recycle and survives a slow
+        # lazy-load chunk.
+        by_sid: dict = {}
+        last_count, stable = -1, 0
+        MAX_ITERS = 300
         for _ in range(MAX_ITERS):
             # Yield to the user: this background scroll-load is the slow part
             # (~5-9s), and the worker is single-threaded, so a note/email/text
@@ -2377,27 +2427,32 @@ class BrowserWorker:
             # re-runs the scrape once the worker is free again.
             if not self.q.empty():
                 return {"interrupted": True}
+            try:
+                window = read_loaded_task_status(table)
+            except Exception:
+                window = {}
+            for sid, st in window.items():
+                if sid not in by_sid:
+                    by_sid[sid] = st
             rows = table.locator("tr")
             count = rows.count()
             if count == last_count:
                 stable += 1
-                if stable >= 2:
+                if stable >= 3:
                     break
             else:
                 stable = 0
             last_count = count
+            self._scroll_datatable_to_bottom(table)
             try:
-                rows.nth(count - 1).scroll_into_view_if_needed(timeout=2000)
+                if count > 0:
+                    rows.nth(count - 1).scroll_into_view_if_needed(timeout=2000)
             except Exception:
                 pass
             try:
                 target.wait_for_timeout(400)
             except Exception:
                 pass
-        try:
-            by_sid = read_loaded_task_status(table)
-        except Exception as e:
-            return {"error": f"bulk task read failed: {e}"}
         return {"by_sid": by_sid, "count": len(by_sid)}
 
     MONGOOSE_DASHBOARD_URL = "https://sms.mongooseresearch.com/legacy-dashboard"
@@ -3444,11 +3499,26 @@ def build_ema_url(student_id: str, course_id: str, task_id: str) -> str:
 
 def _attach_tooltip(widget, text: str) -> None:
     """Lightweight hover tooltip for a widget (no dependency on any UI
-    framework — a borderless Toplevel shown on enter, hidden on leave)."""
-    state = {"tip": None}
+    framework — a borderless Toplevel shown on enter, hidden on leave).
+
+    Idempotent: calling it again with new text UPDATES the tooltip in place
+    rather than stacking another <Enter>/<Leave> binding. A widget repainted
+    with fresh text — e.g. a task badge whose 'submitted (loading…)' label
+    becomes 'passed' after the live status fetch — would otherwise keep the
+    first binding alive and show its STALE text on hover (green badge but a
+    'loading…' tooltip)."""
+    holder = getattr(widget, "_tooltip_state", None)
+    if holder is not None:
+        holder["text"] = text  # binding already exists — just update the text
+        return
+    holder = {"text": text, "tip": None}
+    try:
+        widget._tooltip_state = holder
+    except Exception:
+        pass
 
     def show(_e=None):
-        if state["tip"] is not None or not text:
+        if holder["tip"] is not None or not holder["text"]:
             return
         try:
             x = widget.winfo_rootx() + 10
@@ -3457,22 +3527,22 @@ def _attach_tooltip(widget, text: str) -> None:
             tip.wm_overrideredirect(True)
             tip.wm_geometry(f"+{x}+{y}")
             tk.Label(
-                tip, text=text, justify="left",
+                tip, text=holder["text"], justify="left",
                 background="#2b2b2b", foreground="#f0f0f0",
                 relief="solid", borderwidth=1, padx=6, pady=3,
                 font=("", 9),
             ).pack()
-            state["tip"] = tip
+            holder["tip"] = tip
         except Exception:
-            state["tip"] = None
+            holder["tip"] = None
 
     def hide(_e=None):
-        if state["tip"] is not None:
+        if holder["tip"] is not None:
             try:
-                state["tip"].destroy()
+                holder["tip"].destroy()
             except Exception:
                 pass
-            state["tip"] = None
+            holder["tip"] = None
 
     widget.bind("<Enter>", show, add="+")
     widget.bind("<Leave>", hide, add="+")
@@ -5882,6 +5952,73 @@ def ask_yes_no_topmost(
 
     parent.wait_window(dialog)
     return result["value"]
+
+
+def attach_listbox_drag_reorder(listbox, items, refresh, on_change=None):
+    """Make a native ``tk.Listbox`` drag-reorderable, backed by the Python
+    list ``items``. During a drag a thin accent line marks the drop gap
+    between two rows; the move commits on release. ``refresh(sel=None)``
+    re-renders the listbox from ``items`` (selecting ``sel`` when given);
+    ``on_change()`` (optional) runs after a committed reorder. Shared by the
+    Choose-columns and caseload-panel-actions choosers."""
+    dark = ctk.get_appearance_mode() == "Dark"
+    accent = "#4aa3df" if dark else "#1f6aa5"
+    line = tk.Frame(listbox, height=2, bg=accent, bd=0, highlightthickness=0)
+    state = {"src": None}
+
+    def gap_index(y):
+        n = listbox.size()
+        if n == 0:
+            return 0
+        j = listbox.nearest(y)
+        bbox = listbox.bbox(j)
+        if bbox:
+            _, by, _, bh = bbox
+            if y > by + bh / 2:
+                j += 1
+        return max(0, min(j, n))
+
+    def show_line(gap):
+        n = listbox.size()
+        if n == 0:
+            line.place_forget()
+            return
+        if gap >= n:
+            bbox = listbox.bbox(n - 1)
+            y = (bbox[1] + bbox[3]) if bbox else 0
+        else:
+            bbox = listbox.bbox(gap)
+            y = bbox[1] if bbox else 0
+        line.place(x=2, y=max(0, y - 1), relwidth=1.0)
+        line.lift()
+
+    def on_press(e):
+        state["src"] = listbox.nearest(e.y)
+
+    def on_motion(e):
+        if state["src"] is None:
+            return
+        show_line(gap_index(e.y))
+        return "break"
+
+    def on_release(e):
+        src = state["src"]
+        state["src"] = None
+        line.place_forget()
+        if src is None:
+            return
+        dst = gap_index(e.y)
+        if dst > src:
+            dst -= 1
+        if 0 <= src < len(items) and dst != src:
+            items.insert(dst, items.pop(src))
+            refresh(sel=dst)
+            if on_change:
+                on_change()
+
+    listbox.bind("<ButtonPress-1>", on_press, add="+")
+    listbox.bind("<B1-Motion>", on_motion, add="+")
+    listbox.bind("<ButtonRelease-1>", on_release, add="+")
 
 
 class _HTMLToTkRenderer(HTMLParser):
@@ -11369,29 +11506,9 @@ class CaseloadPanel:
             refresh_shown()
             refresh_avail()
 
-        # Drag within SHOWN to reorder (native Listbox; no rebuild storm).
-        drag = {"i": None}
-
-        def on_press(e):
-            drag["i"] = shown_lb.nearest(e.y)
-
-        def on_motion(e):
-            i = drag["i"]
-            if i is None:
-                return
-            j = shown_lb.nearest(e.y)
-            if j < 0 or j == i or j >= len(shown):
-                return
-            shown.insert(j, shown.pop(i))
-            drag["i"] = j
-            refresh_shown(sel=j)
-
-        def on_release(e):
-            drag["i"] = None
-
-        shown_lb.bind("<ButtonPress-1>", on_press, add="+")
-        shown_lb.bind("<B1-Motion>", on_motion)
-        shown_lb.bind("<ButtonRelease-1>", on_release)
+        # Drag within SHOWN to reorder — a thin line marks the drop gap and
+        # the move commits on release (native Listbox; no rebuild storm).
+        attach_listbox_drag_reorder(shown_lb, shown, refresh_shown)
         shown_lb.bind("<Double-Button-1>", lambda e: hide_selected())
         avail_lb.bind("<Double-Button-1>", lambda e: show_selected())
         search_var.trace_add("write", lambda *_: refresh_avail())
@@ -17481,9 +17598,10 @@ class App:
 
     def _open_panel_actions_dialog(self, parent=None) -> None:
         """Choose which actions appear in the caseload panel's 'Fire action'
-        menu (right-click / Right arrow) and in what order. Persists the
-        ordered list of chosen scenario names to settings.panel_action_order;
-        'Default' clears it to fall back to the per-scenario flags."""
+        menu (right-click / Right arrow) and in what order — same two-pane
+        Shown/Available chooser as the viewer's Choose-columns dialog. Persists
+        the ordered list to settings.panel_action_order; 'Default' clears it to
+        fall back to the per-scenario flags."""
         import json
         parent = parent or self.root
         nonbatch = [s for s in self.scenarios.values() if s.batch is None]
@@ -17498,13 +17616,12 @@ class App:
         if not selected:
             selected = [s.name for s in nonbatch
                         if getattr(s, "panel_action", False)]
-        rest = [n for n in names if n not in selected]
-        # Working model: [name, checked], chosen-in-order first.
-        work = [[n, True] for n in selected] + [[n, False] for n in rest]
+        shown = list(selected)
+        avail = [n for n in names if n not in shown]
 
         dlg = ctk.CTkToplevel(parent)
         dlg.title("Caseload panel actions")
-        dlg.geometry("420x460")
+        dlg.geometry("620x500")
         try:
             dlg.transient(parent)
         except Exception:
@@ -17517,47 +17634,115 @@ class App:
         dlg.grid_columnconfigure(0, weight=1)
         dlg.grid_rowconfigure(1, weight=1)
         ctk.CTkLabel(
-            dlg, text="Pick + order the actions in the panel's Fire menu",
+            dlg, text="Drag to reorder shown actions; double-click to move.",
             font=ctk.CTkFont(size=12, weight="bold"),
         ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
-        scroll = ctk.CTkScrollableFrame(dlg)
-        scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
-        scroll.grid_columnconfigure(2, weight=1)
 
-        def move(idx, delta):
-            j = idx + delta
-            if 0 <= j < len(work):
-                work[idx], work[j] = work[j], work[idx]
-                redraw()
+        body = ctk.CTkFrame(dlg, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(2, weight=1)
+        body.grid_rowconfigure(1, weight=1)
 
-        def redraw():
-            for w in scroll.winfo_children():
-                w.destroy()
-            if not work:
-                ctk.CTkLabel(
-                    scroll, text="No non-batch actions yet.",
-                    text_color=("gray40", "gray65"),
-                ).grid(row=0, column=0, columnspan=3, padx=8, pady=16)
+        _dark = ctk.get_appearance_mode() == "Dark"
+        lb_kw = dict(
+            bg=("#2b2b2b" if _dark else "#ffffff"),
+            fg=("#dce4ee" if _dark else "#1a1a1a"),
+            selectbackground=("#1f6aa5" if _dark else "#3b8ed0"),
+            selectforeground="#ffffff", highlightthickness=0, bd=1,
+            relief="flat", activestyle="none", exportselection=False,
+            selectmode="extended", font=("Segoe UI", 11),
+        )
+
+        ctk.CTkLabel(body, text="In the Fire menu (in order)").grid(
+            row=0, column=0, sticky="w", padx=2)
+        shown_wrap = tk.Frame(body, bd=0, highlightthickness=0)
+        shown_wrap.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+        shown_wrap.grid_rowconfigure(0, weight=1)
+        shown_wrap.grid_columnconfigure(0, weight=1)
+        shown_lb = tk.Listbox(shown_wrap, **lb_kw)
+        shown_lb.grid(row=0, column=0, sticky="nsew")
+        shown_sb = ttk.Scrollbar(shown_wrap, command=shown_lb.yview)
+        shown_sb.grid(row=0, column=1, sticky="ns")
+        shown_lb.configure(yscrollcommand=shown_sb.set)
+
+        mid = ctk.CTkFrame(body, fg_color="transparent")
+        mid.grid(row=1, column=1, padx=4)
+
+        right = ctk.CTkFrame(body, fg_color="transparent")
+        right.grid(row=0, column=2, rowspan=2, sticky="nsew", padx=(4, 0))
+        right.grid_rowconfigure(2, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(right, text="Available").grid(
+            row=0, column=0, sticky="w", padx=2)
+        search_var = tk.StringVar()
+        ctk.CTkEntry(
+            right, placeholder_text="Search actions...",
+            textvariable=search_var,
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        avail_wrap = tk.Frame(right, bd=0, highlightthickness=0)
+        avail_wrap.grid(row=2, column=0, sticky="nsew")
+        avail_wrap.grid_rowconfigure(0, weight=1)
+        avail_wrap.grid_columnconfigure(0, weight=1)
+        avail_lb = tk.Listbox(avail_wrap, **lb_kw)
+        avail_lb.grid(row=0, column=0, sticky="nsew")
+        avail_sb = ttk.Scrollbar(avail_wrap, command=avail_lb.yview)
+        avail_sb.grid(row=0, column=1, sticky="ns")
+        avail_lb.configure(yscrollcommand=avail_sb.set)
+
+        avail_view: list = []
+
+        def refresh_shown(sel=None):
+            shown_lb.delete(0, "end")
+            for n in shown:
+                shown_lb.insert("end", n)
+            if sel is not None and 0 <= sel < len(shown):
+                shown_lb.selection_clear(0, "end")
+                shown_lb.selection_set(sel)
+                shown_lb.activate(sel)
+
+        def refresh_avail():
+            nonlocal avail_view
+            q = search_var.get().strip().lower()
+            avail_view = [n for n in avail if q in n.lower()]
+            avail_lb.delete(0, "end")
+            for n in avail_view:
+                avail_lb.insert("end", n)
+
+        def hide_selected():
+            idxs = sorted(shown_lb.curselection(), reverse=True)
+            if not idxs:
                 return
-            for i, pair in enumerate(work):
-                var = ctk.BooleanVar(value=pair[1])
+            for i in idxs:
+                avail.append(shown.pop(i))
+            avail.sort(key=lambda n: n.lower())
+            refresh_shown()
+            refresh_avail()
 
-                def on_toggle(p=pair, v=var):
-                    p[1] = v.get()
+        def show_selected():
+            picks = [avail_view[i] for i in avail_lb.curselection()
+                     if 0 <= i < len(avail_view)]
+            if not picks:
+                return
+            for n in picks:
+                if n in avail:
+                    avail.remove(n)
+                shown.append(n)
+            refresh_shown()
+            refresh_avail()
 
-                ctk.CTkButton(
-                    scroll, text="▲", width=26,
-                    command=lambda ix=i: move(ix, -1), **SECONDARY_BTN_KWARGS,
-                ).grid(row=i, column=0, padx=(2, 0), pady=1)
-                ctk.CTkButton(
-                    scroll, text="▼", width=26,
-                    command=lambda ix=i: move(ix, 1), **SECONDARY_BTN_KWARGS,
-                ).grid(row=i, column=1, padx=(2, 4), pady=1)
-                ctk.CTkCheckBox(
-                    scroll, text=pair[0], variable=var, command=on_toggle,
-                ).grid(row=i, column=2, sticky="w", padx=4, pady=1)
+        attach_listbox_drag_reorder(shown_lb, shown, refresh_shown)
+        shown_lb.bind("<Double-Button-1>", lambda e: hide_selected())
+        avail_lb.bind("<Double-Button-1>", lambda e: show_selected())
+        search_var.trace_add("write", lambda *_: refresh_avail())
 
-        redraw()
+        ctk.CTkButton(mid, text="◄ Add", width=84, command=show_selected,
+                      **SECONDARY_BTN_KWARGS).pack(pady=(0, 6))
+        ctk.CTkButton(mid, text="Remove ►", width=84, command=hide_selected,
+                      **SECONDARY_BTN_KWARGS).pack()
+
+        refresh_shown()
+        refresh_avail()
 
         def _close():
             try:
@@ -17576,8 +17761,7 @@ class App:
         btns.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 10))
 
         def do_apply():
-            chosen = [p[0] for p in work if p[1]]
-            self.settings.panel_action_order = json.dumps(chosen)
+            self.settings.panel_action_order = json.dumps(list(shown))
             save_settings(self.settings)
             _close()
 
@@ -17715,8 +17899,8 @@ class App:
             for r in (self._caseload_rows or [])
             if str(r.get("CourseCode", "") or r.get("Course Code", "")).strip()
         })
-        action_names = [""] + [s.name for s in self.scenarios.values()
-                               if s.batch is None]
+        # Any action can fulfil a step — single-fire, panel, OR batch.
+        action_names = [""] + [s.name for s in self.scenarios.values()]
         field_types = ["text", "date", "checkbox", "number"]
 
         dlg = ctk.CTkToplevel(parent)
