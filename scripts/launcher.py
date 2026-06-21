@@ -311,6 +311,14 @@ class BrowserWorker:
         on_done({eas:[{student_id,name,reason,...}]})."""
         self.q.put(("READ_EA_DASHBOARD", on_done))
 
+    def submit_open_contact_global(
+        self, query: str, on_done: Callable[[dict], None],
+    ) -> None:
+        """Find a Contact ANYWHERE in Salesforce (global search) by Student ID
+        / email / name and open its record — for off-caseload students.
+        on_done({ok, name, contact_id} | {matches} | {error})."""
+        self.q.put(("OPEN_CONTACT_GLOBAL", query, on_done))
+
     def submit_find_student(self, query: str, new_tab: bool = False,
                             raise_after: Optional[bool] = None) -> None:
         """Navigate to a student record. When `new_tab` is True the
@@ -609,6 +617,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._read_ea_dashboard(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "OPEN_CONTACT_GLOBAL":
+            _, query, on_done = cmd
+            res = {}
+            try:
+                res = self._open_contact_by_global_search(ctx, query)
             finally:
                 on_done(res)
         elif cmd[0] == "FIND":
@@ -918,6 +933,158 @@ class BrowserWorker:
             )
         except Exception:
             return False
+
+    # Shadow-DOM-piercing scan for record links (Lightning's search results
+    # render inside web components). Search-result rows link as
+    # /lightning/r/<id>/view (NO object name); the open console tab links as
+    # /lightning/r/Contact/<id>/view — the caller's regex keeps only Contact
+    # ids (003…) right after /r/, which is the result row, not the tab.
+    _DEEP_CONTACT_LINKS_JS = """
+      () => {
+        const out = [], seen = new Set();
+        const visit = (root) => {
+          for (const a of root.querySelectorAll('a[href*="/lightning/r/"]')) {
+            const href = a.getAttribute('href') || '';
+            if (href && !seen.has(href)) {
+              seen.add(href);
+              out.push({href, text: (a.textContent || '').trim().slice(0, 120)});
+            }
+          }
+          for (const el of root.querySelectorAll('*'))
+            if (el.shadowRoot) visit(el.shadowRoot);
+        };
+        visit(document);
+        return out.slice(0, 60);
+      }
+    """
+
+    def _open_contact_by_global_search(self, ctx, query: str) -> dict:
+        """Resolve `query` (Student ID / email / name) to a Contact via
+        Salesforce's GLOBAL search, then deep-link to that record (note panel
+        ready) — the way to reach students outside the user's caseload.
+
+        Drives Salesforce's own search navigation: the `/one/one.app#<base64>`
+        URL with componentDef `forceSearch:searchPageDesktop` and the query as
+        `term` (mirrors what the browser's search bar produces). Returns
+        {ok, name, contact_id}; {matches:[{contact_id,name}…]} when ambiguous;
+        or {error}."""
+        import base64
+        import json as _json
+        from urllib.parse import urlsplit
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        try:
+            p = urlsplit(CASELOAD_URL or "https://srm.lightning.force.com")
+            base = f"{p.scheme}://{p.netloc}"
+        except Exception:
+            base = "https://srm.lightning.force.com"
+        payload = {
+            "componentDef": "forceSearch:searchPageDesktop",
+            "attributes": {
+                "term": query,
+                "scopeMap": {"type": "TOP_RESULTS"},
+                "context": {"FILTERS": {}, "searchSource": "ASSISTANT_DIALOG"},
+                "groupId": "DEFAULT",
+            },
+            "state": {},
+        }
+        enc = base64.b64encode(
+            _json.dumps(payload, separators=(",", ":")).encode()).decode()
+        self.on_status(f"Salesforce search for {query!r}…")
+
+        def _on_results() -> bool:
+            """True once the page is the forceSearch results view (not Home /
+            recently-viewed). Distinguishes a real search from the cold-goto
+            fallback that lands on Home and shows recently-viewed records."""
+            try:
+                t = (target.title() or "")
+            except Exception:
+                t = ""
+            if "Search" in t:
+                return True
+            # The results page also carries the term in its URL hash.
+            try:
+                if enc[:24] in (target.url or ""):
+                    # On the search route — but Home can briefly share the
+                    # hash; require a results container too.
+                    return bool(target.evaluate(
+                        """() => {
+                          const has = (root) => {
+                            if (root.querySelector('.slds-grid_search-results, '
+                                + '[data-aura-class*=\"forceSearchResults\"], '
+                                + 'records-record-layout, .search-results')) return true;
+                            for (const el of root.querySelectorAll('*'))
+                              if (el.shadowRoot && has(el.shadowRoot)) return true;
+                            return false;
+                          };
+                          return has(document);
+                        }"""))
+            except Exception:
+                pass
+            return False
+
+        # Drive the search the way the UI does — load the one.app shell, then
+        # set the search hash so the SPA fires its hashchange handler (a cold
+        # goto to the search URL just lands on Home / recently-viewed).
+        try:
+            target.goto(f"{base}/one/one.app#{enc}",
+                        wait_until="domcontentloaded", timeout=30_000)
+            target.wait_for_timeout(2500)
+            if not _on_results():
+                # Re-fire via an explicit hashchange (and a slightly different
+                # hash first to force the event even if the value matches).
+                target.evaluate(
+                    "(h) => { window.location.hash = ''; window.location.hash = h; }",
+                    enc)
+                target.wait_for_timeout(3000)
+        except Exception as e:
+            return {"error": f"search navigation failed: {e}"}
+        # Guard: if we never reached a results page, DON'T scrape — that would
+        # open a recently-viewed record (the wrong student).
+        if not _on_results():
+            return {"error": "Salesforce didn't open the search results page "
+                    f"for {query!r} (landed on Home). Try again, or open the "
+                    "student manually in the browser."}
+        # Poll for the Contact result row to render (~up to 10s). The result
+        # row links as /lightning/r/<id>/view (id straight after /r/) — that
+        # regex captures the Contact result and skips the open console tab,
+        # which uses /lightning/r/Contact/<id>/view (object name after /r/).
+        contacts: list = []
+        for _ in range(20):
+            try:
+                links = target.evaluate(self._DEEP_CONTACT_LINKS_JS)
+            except Exception:
+                links = []
+            seen: dict = {}
+            for lk in (links or []):
+                m = re.search(r"/lightning/r/(003[0-9A-Za-z]{12,15})/view",
+                              lk.get("href", "") or "")
+                if not m:
+                    continue
+                cid = m.group(1)
+                if cid in seen:
+                    continue
+                name = (lk.get("text", "") or "").split("|")[0].strip()
+                if name.lower().startswith("contact"):
+                    name = name[len("contact"):].strip()
+                seen[cid] = name
+            if seen:
+                contacts = list(seen.items())
+                break
+            try:
+                target.wait_for_timeout(500)
+            except Exception:
+                pass
+        if not contacts:
+            return {"error": f"no Salesforce Contact found for {query!r}"}
+        if len(contacts) > 1:
+            return {"matches": [{"contact_id": c, "name": n}
+                                for c, n in contacts]}
+        cid, name = contacts[0]
+        if self._navigate_to_contact(ctx, cid):
+            return {"ok": True, "contact_id": cid, "name": name or query}
+        return {"error": f"found {name or query} but couldn't open the record"}
 
     def _navigate_to_contact(self, ctx, contact_id: str) -> bool:
         """Deep-link straight to a Contact record (skips the Caseload search)
@@ -9188,6 +9355,7 @@ class CaseloadPanel:
         # Down from the search box drops focus into the rows; Esc clears it.
         self.search_entry.bind("<Down>", self._focus_first_row)
         self.search_entry.bind("<Escape>", lambda _e: self._clear_search())
+        self.search_entry.bind("<Return>", self._on_search_enter)
         # Clear (✕) button right next to the search box.
         self.search_clear_btn = ctk.CTkButton(
             bar, text="✕", width=28, command=self._clear_search,
@@ -10795,6 +10963,24 @@ class CaseloadPanel:
     def _on_search(self) -> None:
         self._query = self.search_var.get()
         self.populate()
+
+    def _on_search_enter(self, _e=None):
+        """Enter in the caseload search box. The box is a live caseload FILTER,
+        but Enter on a Student ID / email that ISN'T on your caseload runs a
+        Salesforce GLOBAL search and opens that student's record — the way to
+        reach students in your course but on another instructor's caseload."""
+        q = self.search_var.get().strip()
+        # Student ID (digits) or email → if not on the caseload, find anywhere.
+        if q and (re.fullmatch(r"\d{5,12}", q) or "@" in q):
+            rows = self.app._caseload_rows or []
+            ql = q.lower()
+            on_caseload = any(
+                str(r.get("StudentID", "") or r.get("Student ID", "")).strip() == q
+                or ql in str(r.get("StudentEmail", "") or "").lower()
+                for r in rows)
+            if not on_caseload:
+                self.app._open_student_global(q)
+        return "break"
 
     def _sort_by(self, col: str) -> None:
         # A heading drag (reorder) fires the heading command on release too;
@@ -14675,6 +14861,47 @@ class App:
             self._append_log(f"--- Searching {query!r}{where} ---")
         self.worker.submit_find_student(
             query, new_tab=new_tab, raise_after=raise_after)
+
+    def _open_student_global(self, query: str) -> None:
+        """Find a student ANYWHERE in Salesforce (global search) by Student ID
+        / email / name and open their Contact record — for students in our
+        course who are on another instructor's caseload. Once the record is
+        open, a Find-first-off note action files against it (the note panel is
+        rendered by the deep-link). Multiple matches → log them so the user can
+        refine with the (unique) Student ID or email."""
+        query = (query or "").strip()
+        if not query:
+            return
+        if self._is_busy:
+            self._append_log("Busy — finish the current task first.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._append_log(f"--- Searching all of Salesforce for {query!r} ---")
+
+        def on_done(res):
+            def show():
+                if res and res.get("ok"):
+                    self._append_log(
+                        f"Opened {res.get('name') or query} (off-caseload) — "
+                        "fire a Find-first-off note action to file a note.")
+                elif res and res.get("matches"):
+                    ms = res["matches"]
+                    names = ", ".join(m.get("name") or "?" for m in ms[:6])
+                    self._append_log(
+                        f"{len(ms)} matches for {query!r} — refine with the "
+                        f"Student ID or email. ({names})")
+                else:
+                    self._append_log(
+                        f"No Salesforce match for {query!r}: "
+                        f"{(res or {}).get('error', 'not found')}", error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_open_contact_global(query, on_done)
 
     def _email_uses_sample_placeholder(self, scenario: ScenarioConfig) -> bool:
         """True if the scenario's email still carries the shipped sample
