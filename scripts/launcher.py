@@ -311,6 +311,10 @@ class BrowserWorker:
         on_done({eas:[{student_id,name,reason,...}]})."""
         self.q.put(("READ_EA_DASHBOARD", on_done))
 
+    def submit_probe_unlock(self, on_done: Callable[[dict], None]) -> None:
+        """TEMP: dump the open task-unlock popup + EA row icons. on_done({path})."""
+        self.q.put(("PROBE_UNLOCK", on_done))
+
     def submit_open_contact_global(
         self, query: str, on_done: Callable[[dict], None],
     ) -> None:
@@ -617,6 +621,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._read_ea_dashboard(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "PROBE_UNLOCK":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._probe_unlock_action(ctx)
             finally:
                 on_done(res)
         elif cmd[0] == "OPEN_CONTACT_GLOBAL":
@@ -2890,6 +2901,113 @@ class BrowserWorker:
         if err:
             return {"error": err}
         return {"eas": rows}
+
+    def _probe_unlock_action(self, ctx) -> dict:
+        """TEMP probe for the task-unlock feature. Does NOT navigate — run it
+        on the EA dashboard with the 'Approve or Reject' popup already OPEN.
+        Dumps (A) the open modal's tabs / buttons / inputs / headings, and (B)
+        the leading clickable icons in the EA rows (to find the silhouette
+        selector). Writes unlock_probe.txt."""
+        from src.config import USER_CONFIG_DIR
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        lines: list[str] = []
+
+        def cap(s=""):
+            lines.append(str(s))
+
+        cap("=== task-unlock probe ===")
+        try:
+            cap(f"URL: {target.url}")
+        except Exception:
+            pass
+
+        # A) Any OPEN modal/dialog (shadow-pierced).
+        try:
+            modal = target.evaluate(
+                """() => {
+                  const out = {found:false, tabs:[], buttons:[], inputs:[], headings:[]};
+                  const roots = [];
+                  const findD = (root) => {
+                    for (const d of root.querySelectorAll('[role="dialog"], section.slds-modal__container, .slds-modal')) {
+                      roots.push(d); out.found = true;
+                    }
+                    for (const el of root.querySelectorAll('*')) if (el.shadowRoot) findD(el.shadowRoot);
+                  };
+                  findD(document);
+                  const scan = (root) => {
+                    for (const t of root.querySelectorAll('[role="tab"], a.slds-tabs_default__link, li.slds-tabs_default__item')) {
+                      const tx=(t.textContent||'').trim(); if(tx) out.tabs.push(tx.slice(0,60));
+                    }
+                    for (const b of root.querySelectorAll('button')) {
+                      const tx=((b.textContent||'').trim())||b.getAttribute('title')||b.getAttribute('aria-label')||'';
+                      if(tx) out.buttons.push({text:tx.slice(0,50), cls:(b.className||'').toString().slice(0,90)});
+                    }
+                    for (const i of root.querySelectorAll('input,textarea,select')) {
+                      out.inputs.push({tag:i.tagName.toLowerCase(), type:i.getAttribute('type')||'', ph:i.getAttribute('placeholder')||'', aria:i.getAttribute('aria-label')||''});
+                    }
+                    for (const h of root.querySelectorAll('h1,h2,h3,legend,[role="heading"]')) {
+                      const tx=(h.textContent||'').trim(); if(tx) out.headings.push(tx.slice(0,80));
+                    }
+                    for (const el of root.querySelectorAll('*')) if (el.shadowRoot) scan(el.shadowRoot);
+                  };
+                  for (const r of roots) scan(r);
+                  out.tabs=[...new Set(out.tabs)]; out.headings=[...new Set(out.headings)];
+                  return out;
+                }""")
+        except Exception as e:
+            modal = {}
+            cap(f"modal scan error: {e}")
+        cap(f"\n-- open modal/dialog: found={modal.get('found')} --")
+        cap(f"tabs: {modal.get('tabs')}")
+        cap(f"headings: {modal.get('headings')}")
+        cap("buttons:")
+        for b in (modal.get("buttons") or [])[:30]:
+            cap(f"  '{b.get('text')}'   cls={b.get('cls')}")
+        cap("inputs:")
+        for i in (modal.get("inputs") or [])[:20]:
+            cap(f"  <{i.get('tag')}> type={i.get('type')} ph={i.get('ph')!r} aria={i.get('aria')!r}")
+
+        # B) EA rows: leading clickable icons (silhouette candidates).
+        try:
+            rows = target.evaluate(
+                """() => {
+                  const out = [];
+                  const trs = [...document.querySelectorAll('tr')].filter(
+                    tr => tr.querySelector('td[data-label="Student ID"]')).slice(0,3);
+                  for (const tr of trs) {
+                    const c = tr.querySelector('td[data-label="Student ID"]');
+                    const sid = c ? (c.textContent||'').trim() : '';
+                    const els = [];
+                    for (const el of tr.querySelectorAll('button, a, lightning-icon, lightning-primitive-icon, [role="button"], svg')) {
+                      let icon='';
+                      const u = el.querySelector ? el.querySelector('use') : null;
+                      if (u) icon = u.getAttribute('xlink:href') || u.getAttribute('href') || '';
+                      els.push({tag:el.tagName.toLowerCase(), iconName:el.getAttribute('icon-name')||'', icon:icon, title:el.getAttribute('title')||'', aria:el.getAttribute('aria-label')||'', cls:(el.className||'').toString().slice(0,70)});
+                    }
+                    out.push({sid:sid, n:els.length, els: els.slice(0,18)});
+                  }
+                  return out;
+                }""")
+        except Exception as e:
+            rows = []
+            cap(f"row-icon scan error: {e}")
+        cap("\n-- EA row leading clickables (silhouette candidates) --")
+        for r in (rows or []):
+            cap(f"row sid={r.get('sid')!r}  ({r.get('n')} clickable els):")
+            for el in r.get("els", []):
+                cap(f"  <{el.get('tag')}> icon-name={el.get('iconName')!r} "
+                    f"icon={el.get('icon')!r} title={el.get('title')!r} "
+                    f"aria={el.get('aria')!r} cls={el.get('cls')!r}")
+
+        report = "\n".join(lines)
+        path = USER_CONFIG_DIR / "unlock_probe.txt"
+        try:
+            path.write_text(report, encoding="utf-8")
+        except Exception:
+            pass
+        return {"path": str(path), "modal_found": bool(modal.get("found"))}
 
     def _handle_run(
         self, ctx, scenario: ScenarioConfig, override: str,
@@ -11005,6 +11123,10 @@ class CaseloadPanel:
         Salesforce GLOBAL search and opens that student's record — the way to
         reach students in your course but on another instructor's caseload."""
         q = self.search_var.get().strip()
+        # TEMP: "unlockprobe:" dumps the open task-unlock popup DOM.
+        if q.lower().startswith("unlockprobe"):
+            self.app._probe_unlock()
+            return "break"
         # Student ID (digits) or email → if not on the caseload, find anywhere.
         if q and (re.fullmatch(r"\d{5,12}", q) or "@" in q):
             rows = self.app._caseload_rows or []
@@ -14896,6 +15018,31 @@ class App:
             self._append_log(f"--- Searching {query!r}{where} ---")
         self.worker.submit_find_student(
             query, new_tab=new_tab, raise_after=raise_after)
+
+    def _probe_unlock(self) -> None:
+        """TEMP: dump the open task-unlock popup + EA row icons (for building
+        the unlock feature). Run with the 'Approve or Reject' popup open."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._append_log("Probing the task-unlock popup…")
+
+        def on_done(res):
+            def show():
+                if res and res.get("path"):
+                    self._append_log(
+                        f"Unlock probe written to {res['path']} "
+                        f"(modal found: {res.get('modal_found')}).")
+                else:
+                    self._append_log(
+                        f"Unlock probe failed: {(res or {}).get('error')}",
+                        error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_probe_unlock(on_done)
 
     def _open_student_global(self, query: str) -> None:
         """Find a student ANYWHERE in Salesforce (global search) by Student ID
