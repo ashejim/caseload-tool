@@ -113,6 +113,41 @@ def set_templates_dir(path) -> Path:
     return p
 
 
+# Email link color — applied to the <a> tags the rich-text editor emits so
+# links render in a consistent color regardless of the recipient client's
+# default hyperlink style. Live-global, mirroring the templates_dir() pattern;
+# set from Settings on startup and when the user changes it.
+DEFAULT_EMAIL_LINK_COLOR = "#1a73e8"
+
+
+def _norm_hex_color(color) -> str:
+    """Normalize a #RGB / #RRGGBB hex string to lowercase #RRGGBB; fall back
+    to the default for anything malformed. Keeps the value safe to drop into a
+    style="" attribute (no injection from a hand-typed setting)."""
+    import re
+    s = (color or "").strip()
+    if re.fullmatch(r"#[0-9A-Fa-f]{6}", s):
+        return s.lower()
+    if re.fullmatch(r"#[0-9A-Fa-f]{3}", s):
+        return ("#" + "".join(c * 2 for c in s[1:])).lower()
+    return DEFAULT_EMAIL_LINK_COLOR
+
+
+_active_email_link_color = DEFAULT_EMAIL_LINK_COLOR
+
+
+def email_link_color() -> str:
+    """The active email link color (hex #RRGGBB)."""
+    return _active_email_link_color
+
+
+def set_email_link_color(color) -> str:
+    """Set the active email link color (normalized; invalid → default)."""
+    global _active_email_link_color
+    _active_email_link_color = _norm_hex_color(color)
+    return _active_email_link_color
+
+
 # Back-compat constant (snapshot of the default folder). New code should
 # call templates_dir() so folder switches take effect.
 TEMPLATES_DIR = EMAIL_TEMPLATES_DIR
@@ -314,6 +349,9 @@ class Settings:
     # Active email-templates folder (absolute path). Empty = the default
     # email_templates folder. Lets the user keep several template sets.
     email_templates_dir: str = ""
+    # Color (hex #RRGGBB) applied to links in emails composed with the
+    # rich-text editor. Default = the editor's standard preview blue.
+    email_link_color: str = "#1a73e8"
     # EMA Score Report links: per-course map of courseId + task ids, as a
     # JSON string {courseCode: {"1": {"course_id","task_id"}, ...}}. Seeded
     # by pasting a score-report URL the first time a task badge is clicked.

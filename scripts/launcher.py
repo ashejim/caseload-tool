@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
@@ -50,6 +51,7 @@ from src.config import (
     DEFAULT_SCENARIOS_FILE, EMAIL_TEMPLATES_DIR, HISTORY_DB, NOTE_LOG_CSV,
     USER_CONFIG_DIR, Settings, load_settings, save_settings,
     set_templates_dir, templates_dir,
+    DEFAULT_EMAIL_LINK_COLOR, email_link_color, set_email_link_color,
 )
 from src.version import __version__
 from src.note_form import NoteData
@@ -1117,37 +1119,54 @@ class BrowserWorker:
                f"/lightning/r/Contact/{contact_id}/view")
         self.on_status(
             "Deep-link: opening the record by Contact id (skipping search)…")
-        try:
-            target.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        except Exception:
-            return False
-        # Wait for the note panel to be rendered. Anchor on the note BODY
-        # EDITOR — an actual form field fill_note needs — not on the student
-        # name header, whose text ("…Note for ") is split across nodes on the
-        # standalone record view and so matches unreliably there.
-        try:
-            selectors.note_body_editor(target).wait_for(
-                state="visible", timeout=20_000)
-            # Give the form a moment to become INTERACTIVE (the type <select>
-            # enables a beat after the panel paints). fill_note re-checks this,
-            # but waiting here means we hand back a warmer form — fewer races on
-            # the reactive Academic Activity gate for "Email from Student" notes.
+        # The note panel occasionally doesn't render on the first deep-link (a
+        # Lightning load-timing flake — the "No visible note panel" skip), but a
+        # fresh load reliably brings it up. So try twice: load, wait for the
+        # panel; if it doesn't appear, RELOAD the record and wait again before
+        # giving up.
+        for attempt in range(2):
             try:
-                selectors.interaction_type_select(target).wait_for(
-                    state="visible", timeout=4_000)
-                target.wait_for_timeout(300)
+                if attempt == 0:
+                    target.goto(
+                        url, wait_until="domcontentloaded", timeout=30_000)
+                else:
+                    self.on_status(
+                        "  note panel didn't render — reloading the record…")
+                    target.reload(
+                        wait_until="domcontentloaded", timeout=30_000)
+            except Exception:
+                continue
+            # Wait for the note panel to be rendered. Anchor on the note BODY
+            # EDITOR — an actual form field fill_note needs — not on the student
+            # name header, whose text ("…Note for ") is split across nodes on
+            # the standalone record view and so matches unreliably there. First
+            # attempt waits a shorter beat so a flake retries sooner; the reload
+            # attempt waits the full timeout.
+            try:
+                selectors.note_body_editor(target).wait_for(
+                    state="visible", timeout=(12_000 if attempt == 0 else 20_000))
+                # Give the form a moment to become INTERACTIVE (the type
+                # <select> enables a beat after the panel paints). fill_note
+                # re-checks this, but waiting here hands back a warmer form —
+                # fewer races on the reactive Academic Activity gate for
+                # "Email from Student" notes.
+                try:
+                    selectors.interaction_type_select(target).wait_for(
+                        state="visible", timeout=4_000)
+                    target.wait_for_timeout(300)
+                except Exception:
+                    pass
+                return True
             except Exception:
                 pass
-            return True
-        except Exception:
-            pass
-        # Fall back to the generic Submit button as a last resort.
-        try:
-            selectors.submit_button(target).wait_for(
-                state="visible", timeout=3_000)
-            return True
-        except Exception:
-            return False
+            # Fall back to the generic Submit button as a last resort.
+            try:
+                selectors.submit_button(target).wait_for(
+                    state="visible", timeout=3_000)
+                return True
+            except Exception:
+                pass
+        return False
 
     def _handle_find(self, ctx, query: str, new_tab: bool = False,
                      raise_after: Optional[bool] = None) -> None:
@@ -1880,7 +1899,13 @@ class BrowserWorker:
                     return True
                 pid = wintypes.DWORD()
                 user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                cands.append((hwnd, pid.value))
+                title = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, title, 512)
+                r = wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(r))
+                area = max(0, r.right - r.left) * max(0, r.bottom - r.top)
+                iconic = bool(user32.IsIconic(hwnd))
+                cands.append((hwnd, pid.value, title.value, area, iconic))
             except Exception:
                 pass
             return True
@@ -1890,10 +1915,28 @@ class BrowserWorker:
         except Exception:
             return None
         mine = [c for c in cands if c[1] in ours]
-        chosen = mine[0] if mine else (cands[0] if len(cands) == 1 else None)
+        if not mine:
+            # Other Chromium apps (Claude, Discord, Spotify, the user's own
+            # Chrome/Vivaldi) ALL use the Chrome_WidgetWin_1 class, so a
+            # title/size guess across every candidate could grab one of THEM
+            # and (e.g.) shove the user's window off-screen. Only a single,
+            # unambiguous candidate is safe to assume is ours.
+            if len(cands) == 1:
+                mine = cands
+            else:
+                return None
+        # Edge spawns junk top-level windows alongside the real browser: the
+        # tiny "Restore pages" crash bubble (after an unclean exit) and other
+        # transient helpers. Picking the FIRST enumerated one grabbed that
+        # bubble, so minimize / raise / the off-screen scan move all targeted
+        # the wrong window. Pick the REAL browser window instead: drop the
+        # known bubble by title, then prefer a non-iconic window with the
+        # largest area (the actual page host).
+        real = [c for c in mine if c[2] != "Restore pages"] or mine
+        chosen = max(real, key=lambda c: (not c[4], c[3]), default=None)
         if chosen is None:
             return None
-        self._browser_hwnd, self._browser_pid = chosen
+        self._browser_hwnd, self._browser_pid = chosen[0], chosen[1]
         return chosen[0]
 
     def set_browser_enabled(self, enabled: bool) -> None:
@@ -1993,6 +2036,86 @@ class BrowserWorker:
                 user32.ShowWindow(hwnd, SW_MINIMIZE)
         except Exception:
             pass
+
+    @contextmanager
+    def _lean_scan_columns(self, table, target):
+        """Hide every datatable column EXCEPT the Student ID column for the
+        duration of the bulk pass/fail scan, then restore. This is the real
+        lag fix: rendering the caseload list's ~100 dead columns (course
+        dates, contacts, assessment statuses — none of which the scan reads)
+        is what made each scroll-jump re-layout + re-raster a huge grid and
+        stutter the whole machine. Hiding them with CSS collapses that to a
+        single narrow column.
+
+        Crucially this does NOT change what the scan reads or what the CSV
+        export contains:
+          - `scan_task_status_window` reads the task cells via
+            querySelectorAll, which still finds display:none nodes, and
+            Lightning still builds the full row DOM on lazy-load regardless of
+            our CSS — so every student's pass/fail is still captured.
+          - The CSV "Download" is driven by the Salesforce view's column
+            metadata, not the rendered DOM, so it stays complete. (Editing the
+            view's columns instead would shrink the export — the trap we're
+            avoiding.)
+        The SID column is kept VISIBLE so rows keep their height; if every
+        column were hidden the rows would collapse, the scroll container's
+        scrollHeight would go flat, and the infinite-scroll would stop firing.
+
+        Scoped to the one table via a marker class so the rule can't leak to
+        any other grid. No-op (yields False) on any failure, so the scan still
+        runs at full width rather than not at all."""
+        applied = False
+        try:
+            # 1-based index (for :nth-child) of the first column whose cell is
+            # a 9-10 digit Student ID — found from the rows already rendered.
+            idx = table.evaluate(r'''(tbl) => {
+                for (const r of tbl.querySelectorAll('tr')) {
+                  const tds = r.querySelectorAll('td');
+                  for (let i = 0; i < tds.length; i++) {
+                    if (/^\d{9,10}$/.test((tds[i].textContent || '').trim()))
+                      return i + 1;
+                  }
+                }
+                return 0;
+              }''')
+            if idx and idx > 0:
+                table.evaluate(
+                    "(tbl) => tbl.classList.add('__lean_scan__')")
+                target.evaluate(r'''([sid, styleId]) => {
+                    let st = document.getElementById(styleId);
+                    if (!st) {
+                      st = document.createElement('style');
+                      st.id = styleId;
+                      document.head.appendChild(st);
+                    }
+                    // :nth-child counts position within the <tr>, so this works
+                    // whether rows sit under <thead>/<tbody> or the table direct.
+                    st.textContent =
+                      'table.__lean_scan__ th,table.__lean_scan__ td' +
+                      '{display:none !important;}' +
+                      'table.__lean_scan__ th:nth-child(' + sid + '),' +
+                      'table.__lean_scan__ td:nth-child(' + sid + ')' +
+                      '{display:table-cell !important;}';
+                  }''', [idx, "__lean_scan_style__"])
+                applied = True
+        except Exception:
+            applied = False
+        try:
+            yield applied
+        finally:
+            if applied:
+                try:
+                    target.evaluate('''(styleId) => {
+                        const s = document.getElementById(styleId);
+                        if (s) s.remove();
+                      }''', "__lean_scan_style__")
+                except Exception:
+                    pass
+                try:
+                    table.evaluate(
+                        "(tbl) => tbl.classList.remove('__lean_scan__')")
+                except Exception:
+                    pass
 
     def _open_caseload_table(self, ctx):
         """Common helper: navigate to Caseload (if not already there)
@@ -2597,7 +2720,7 @@ class BrowserWorker:
         'scrolled past all expected' implies 'captured all that have cells'."""
         want = {s for s in (expected_sids or []) if s}
         from src.student_lookup import scan_task_status_window
-        from src.proc_priority import browser_low_priority
+        t_start = time.perf_counter()   # timing: total + nav/setup vs loop
         target, table = self._open_caseload_table(ctx)
         if table is None:
             return {"error": "caseload table didn't load"}
@@ -2640,8 +2763,13 @@ class BrowserWorker:
         last_count, stable = -1, 0
         iters, stop_reason = 0, "max_iters"
         MAX_ITERS = 300
-        with browser_low_priority() as lowered:
-            lowered_n = len(lowered or [])
+        # The browser priority/affinity drop was REMOVED from the scan: it ran
+        # at IDLE priority confined to a 5-core slice, which STARVED the browser
+        # so every scroll pass crawled (~5s/pass → 58s total). The lean-column
+        # hide is what actually keeps the stutter down, so the scan now runs at
+        # the browser's normal priority — ~10x faster.
+        with self._lean_scan_columns(table, target) as lean:
+            t_loop = time.perf_counter()   # nav/setup is everything before here
             for _ in range(MAX_ITERS):
                 iters += 1
                 # Yield to the user: this background scroll-load is the slow part
@@ -2650,7 +2778,10 @@ class BrowserWorker:
                 # thing. The moment any user command is queued, bail out — the
                 # caller re-runs the scrape once the worker is free again.
                 if not self.q.empty():
-                    return {"interrupted": True, "lowered": lowered_n}
+                    return {"interrupted": True, "lean": bool(lean),
+                            "secs": round(time.perf_counter() - t_start, 1),
+                            "setup_secs": round(t_loop - t_start, 1),
+                            "loop_secs": round(time.perf_counter() - t_loop, 1)}
                 # Read this window (skips already-seen Student IDs — the CPU win)
                 try:
                     new_status, count, sids = scan_task_status_window(
@@ -2681,7 +2812,11 @@ class BrowserWorker:
                     rows = table.locator("tr")
                     rc = rows.count()
                     if rc > 0:
-                        rows.nth(rc - 1).scroll_into_view_if_needed(timeout=2000)
+                        # 800ms (was 2000): this is just a backstop nudge after
+                        # the container-to-bottom scroll above. With lean columns
+                        # the last row is reachable fast, so a long timeout only
+                        # wastes time on the passes where it would have stalled.
+                        rows.nth(rc - 1).scroll_into_view_if_needed(timeout=800)
                 except Exception:
                     pass
                 try:
@@ -2690,7 +2825,11 @@ class BrowserWorker:
                     pass
         return {"by_sid": by_sid, "count": len(by_sid),
                 "rows": max(last_count, 0),
-                "lowered": lowered_n, "iters": iters, "stop": stop_reason}
+                "lean": bool(lean),
+                "secs": round(time.perf_counter() - t_start, 1),
+                "setup_secs": round(t_loop - t_start, 1),
+                "loop_secs": round(time.perf_counter() - t_loop, 1),
+                "iters": iters, "stop": stop_reason}
 
     MONGOOSE_DASHBOARD_URL = "https://sms.mongooseresearch.com/legacy-dashboard"
 
@@ -2946,10 +3085,13 @@ class BrowserWorker:
         if not ESSENTIAL_ACTIONS_URL:
             return {"error": "ESSENTIAL_ACTIONS_URL not set"}
         err, rows = "", []
+        t0 = time.perf_counter()
+        t_read = t0
         try:
             target.goto(ESSENTIAL_ACTIONS_URL, wait_until="domcontentloaded")
             target.wait_for_timeout(800)
             rows = read_ea_dashboard_rows(target)
+            t_read = time.perf_counter()   # before the nav back to caseload
         except Exception as e:
             err = str(e)
         try:
@@ -2959,7 +3101,9 @@ class BrowserWorker:
             pass
         if err:
             return {"error": err}
-        return {"eas": rows}
+        return {"eas": rows,
+                "secs": round(time.perf_counter() - t0, 1),
+                "read_secs": round(t_read - t0, 1)}
 
     def _probe_unlock_action(self, ctx) -> dict:
         """TEMP probe for the task-unlock feature. Does NOT navigate — run it
@@ -4860,9 +5004,12 @@ class RichTextEditor:
         self._link_seq += 1
         tag = f"link#{self._link_seq}"
         self._links[tag] = href
+        # Preview link color matches the configured email link color in light
+        # mode (WYSIWYG); dark mode keeps a lighter blue for readability on the
+        # dark editor background.
         dark = ctk.get_appearance_mode() == "Dark"
         self.text.tag_configure(
-            tag, foreground=("#79b8ff" if dark else "#1a73e8"),
+            tag, foreground=("#79b8ff" if dark else email_link_color()),
             underline=True)
         return tag
 
@@ -4968,13 +5115,21 @@ class RichTextEditor:
             else:
                 runs.append(([ch], key))
         out = []
+        color = email_link_color()
         for chars, (inline, link) in runs:
             text = html.escape("".join(chars))
             opens, closes = "", ""
             if link:
                 href = html.escape(self._links.get(link, ""), quote=True)
-                opens += f'<a href="{href}">'
-                closes = "</a>" + closes
+                # Color the link, and wrap its text in a <span> carrying the
+                # SAME color: Outlook's Word engine routinely strips color off
+                # the <a> itself but honors it on a child element, so the span
+                # is what actually makes the color stick. Color comes from
+                # config (Settings → Email link color; default blue).
+                opens += (f'<a href="{href}" '
+                          f'style="color:{color};text-decoration:underline;">'
+                          f'<span style="color:{color};">')
+                closes = "</span></a>" + closes
             for t, (o, c) in (("bold", ("<b>", "</b>")),
                               ("italic", ("<i>", "</i>")),
                               ("underline", ("<u>", "</u>"))):
@@ -9998,6 +10153,8 @@ class CaseloadPanel:
         self._last_notes = None
         self._last_notes_label = ""
         self._notes_text = None
+        self._notes_filter = ""        # active notes filter/search string
+        self._qv_row = None            # current student's CSV row (for filters)
         # Reflow (rebuild) when the pane crosses the width breakpoint.
         self.detail_frame.bind("<Configure>", self._on_detail_configure)
         self._apply_detail_layout(force=True)
@@ -10068,8 +10225,10 @@ class CaseloadPanel:
         )
         self.notes_title.grid(row=nb + 1, column=0, sticky="w",
                               padx=6, pady=(2, 0))
+        # Filter/search bar — shown only while notes are loaded.
+        self._build_notes_filterbar(notes_parent, nb + 2)
         self.notes_holder = ctk.CTkFrame(notes_parent, fg_color="transparent")
-        self.notes_holder.grid(row=nb + 2, column=0, sticky="ew", padx=2, pady=2)
+        self.notes_holder.grid(row=nb + 3, column=0, sticky="ew", padx=2, pady=2)
         self.notes_holder.grid_columnconfigure(0, weight=1)
 
         # Ctrl +/- and Ctrl+wheel resize the note text while reading.
@@ -10106,11 +10265,19 @@ class CaseloadPanel:
         # Preserve loaded notes + the current selection across the rebuild.
         prev_notes = getattr(self, "_last_notes", None)
         prev_label = getattr(self, "_last_notes_label", "")
+        prev_filter = getattr(self, "_notes_filter", "")
         self._build_detail_body(wide)
         row = self._focused_row()
         if row is not None:
-            self.show_quick_view(row)
+            self.show_quick_view(row)   # note: clears the notes filter
         if prev_notes:
+            # Restore the active filter (show_quick_view reset it) before the
+            # notes re-render so it survives the resize.
+            self._notes_filter = prev_filter
+            entry = getattr(self, "notes_filter_entry", None)
+            if entry is not None and prev_filter:
+                entry.delete(0, "end")
+                entry.insert(0, prev_filter)
             self.show_notes(prev_label, prev_notes)
         # If the pane was collapsed when the mode flipped, keep it collapsed.
         if getattr(self, "_detail_collapsed", False):
@@ -10577,6 +10744,7 @@ class CaseloadPanel:
     def show_quick_view(self, row: dict) -> None:
         """Fill the quick-view box from a cached CSV row — instant, no
         Salesforce. Rebuilds the body each highlight (simple + correct)."""
+        self._qv_row = row   # remembered for the notes course-code filter
         for w in self.qv_body.winfo_children():
             w.destroy()
         for w in self.qv_notehead.winfo_children():
@@ -11126,6 +11294,87 @@ class CaseloadPanel:
         _attach_tooltip(btn, "Copy")
         return btn
 
+    # ----- note filter/search bar -----
+
+    def _build_notes_filterbar(self, parent, row: int) -> None:
+        """A one-line filter bar above the notes: a search box that matches on
+        date/type/subject/author/body, a quick 'course code' toggle, and a
+        clear button. Hidden until notes are loaded. Re-created on every layout
+        reflow, so it stores its widgets on self and re-applies the active
+        filter string each time."""
+        bar = ctk.CTkFrame(parent, fg_color="transparent")
+        bar.grid(row=row, column=0, sticky="ew", padx=4, pady=(0, 2))
+        bar.grid_columnconfigure(0, weight=1)
+        self.notes_filterbar = bar
+        entry = ctk.CTkEntry(bar, placeholder_text="Filter notes…", height=26)
+        entry.grid(row=0, column=0, sticky="ew")
+        entry.bind("<KeyRelease>", self._apply_notes_filter)
+        # Esc clears the filter while typing in the box.
+        entry.bind("<Escape>", lambda _e: self._clear_notes_filter())
+        self.notes_filter_entry = entry
+        # Restore the active filter text after a reflow rebuild.
+        if getattr(self, "_notes_filter", ""):
+            entry.insert(0, self._notes_filter)
+        self.notes_course_btn = ctk.CTkButton(
+            bar, text="Course", width=72, height=26,
+            command=self._filter_notes_by_course, **SECONDARY_BTN_KWARGS)
+        self.notes_course_btn.grid(row=0, column=1, padx=(6, 0))
+        ctk.CTkButton(
+            bar, text="✕", width=28, height=26,
+            command=self._clear_notes_filter, **SECONDARY_BTN_KWARGS,
+        ).grid(row=0, column=2, padx=(6, 0))
+        bar.grid_remove()   # shown by show_notes when there are notes to filter
+
+    def _show_notes_filterbar(self) -> None:
+        bar = getattr(self, "notes_filterbar", None)
+        if bar is None:
+            return
+        code = self._cell(self._qv_row, "CourseCode") if getattr(
+            self, "_qv_row", None) else ""
+        btn = getattr(self, "notes_course_btn", None)
+        if btn is not None:
+            active = bool(code) and (self._notes_filter or "").lower() == code.lower()
+            style = dict(SECONDARY_BTN_KWARGS)
+            if active:   # highlight when this is the active filter
+                style.update(fg_color=("#3a7ebf", "#1f6aa5"),
+                             text_color=("white", "white"),
+                             hover_color=("#356da6", "#1b5e94"))
+            btn.configure(text=(code or "Course"),
+                          state=("normal" if code else "disabled"), **style)
+        bar.grid()
+
+    def _hide_notes_filterbar(self) -> None:
+        bar = getattr(self, "notes_filterbar", None)
+        if bar is not None:
+            bar.grid_remove()
+
+    def _apply_notes_filter(self, *_event) -> None:
+        entry = getattr(self, "notes_filter_entry", None)
+        self._notes_filter = entry.get().strip() if entry is not None else ""
+        if self._last_notes:
+            self._render_notes()
+            self._show_notes_filterbar()   # refresh the Course toggle highlight
+
+    def _clear_notes_filter(self) -> None:
+        entry = getattr(self, "notes_filter_entry", None)
+        if entry is not None:
+            entry.delete(0, "end")
+        self._apply_notes_filter()
+
+    def _filter_notes_by_course(self) -> None:
+        """Toggle the filter between 'this student's course code' and off."""
+        code = self._cell(self._qv_row, "CourseCode") if getattr(
+            self, "_qv_row", None) else ""
+        if not code:
+            return
+        entry = getattr(self, "notes_filter_entry", None)
+        if entry is None:
+            return
+        entry.delete(0, "end")
+        if (self._notes_filter or "").lower() != code.lower():
+            entry.insert(0, code)
+        self._apply_notes_filter()
+
     # ----- note viewer -----
 
     # The notes viewer is a single native tk.Text (built lazily). It holds
@@ -11229,9 +11478,17 @@ class CaseloadPanel:
         txt.insert("end", msg, (kind,))
         txt.configure(state="disabled")
         self._size_notes_text()
+        # Plain states (hint / loading / error / no-notes) have nothing to
+        # filter, so hide the bar.
+        self._hide_notes_filterbar()
 
     def _notes_hint(self) -> None:
         self._last_notes = None
+        # New student / reset → drop any active notes filter.
+        self._notes_filter = ""
+        entry = getattr(self, "notes_filter_entry", None)
+        if entry is not None:
+            entry.delete(0, "end")
         self.notes_title.configure(text="Notes")
         self._set_notes_plain(
             "Press Enter (or Review notes) to load this\n"
@@ -11321,6 +11578,7 @@ class CaseloadPanel:
             self._scroll_to_notes()
             return
         self._render_notes()
+        self._show_notes_filterbar()
         self._scroll_to_notes()
 
     def _toggle_note(self, idx: int) -> None:
@@ -11336,11 +11594,13 @@ class CaseloadPanel:
         or the full body + an 'Open full note' link (expanded)."""
         txt = self._ensure_notes_text()
         notes = self._last_notes or []
+        flt = (self._notes_filter or "").lower()
         txt.configure(state="normal")
         txt.delete("1.0", "end")
         for t in txt.tag_names():
             if t.startswith("tgl") or t.startswith("lnk"):
                 txt.tag_delete(t)
+        shown = 0
         for i, nt in enumerate(notes):
             date = fmt_note_date(nt.get("date", ""))
             ntype = (nt.get("type") or "").strip()
@@ -11350,6 +11610,12 @@ class CaseloadPanel:
             body = note_html_to_text(nt.get("text") or "")
             head = subject or ntype or "(note)"
             meta = "  ·  ".join(b for b in (date, ntype, author) if b)
+            # Filter: match the search text against everything visible in the
+            # note (header, meta, and full body — not just the preview).
+            if flt and flt not in " ".join(
+                    (date, ntype, subject, author, body)).lower():
+                continue
+            shown += 1
             open_ = i in self._notes_open
             tgl = f"tgl{i}"
             txt.insert("end", f"{'▾' if open_ else '▸'} {head}\n",
@@ -11383,6 +11649,17 @@ class CaseloadPanel:
                          lambda e: txt.configure(cursor="hand2"))
             txt.tag_bind(tgl, "<Leave>",
                          lambda e: txt.configure(cursor="arrow"))
+        if flt and shown == 0:
+            txt.insert("end", f'No notes match "{self._notes_filter}".\n',
+                       ("hint",))
+        # Title reflects how many of the total are showing while filtering.
+        label = self._last_notes_label or ""
+        total = len(notes)
+        if flt:
+            self.notes_title.configure(
+                text=f"Notes for {label} ({shown} of {total})")
+        elif label:
+            self.notes_title.configure(text=f"Notes for {label} ({total})")
         txt.configure(state="disabled")
         self._size_notes_text()
         try:
@@ -13354,6 +13631,9 @@ class App:
         _tpl = (self.settings.email_templates_dir or "").strip()
         if _tpl and Path(_tpl).is_dir():
             set_templates_dir(_tpl)
+        # Apply the saved email link color (normalizes + persists back).
+        self.settings.email_link_color = set_email_link_color(
+            self.settings.email_link_color)
 
         # In-memory caseload cache populated from CASELOAD_CSV_PATH.
         # Set by _reload_caseload_cache() (called on startup and via
@@ -19102,6 +19382,11 @@ class App:
                         f"EA dashboard scrape failed: {res['error']}",
                         error=True)
                 self._apply_ea_scrape((res or {}).get("eas") or [])
+                if (res or {}).get("secs") is not None:
+                    self._append_log(
+                        f"  ↳ EA scrape took {res.get('secs')}s "
+                        f"(read {res.get('read_secs')}s + nav back to "
+                        f"caseload {round(res.get('secs', 0) - res.get('read_secs', 0), 1)}s)")
                 self._set_idle()
                 # Kick the background live task pass/fail pass (startup), then
                 # minimize the browser once it's done — after the scrape, since
@@ -19919,6 +20204,66 @@ class App:
         ctk.CTkButton(
             tpl_row, text="Open folder", width=110,
             command=self._on_open_templates_folder,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+
+        # ---- Email link color ----
+        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
+            fill="x", padx=20, pady=(2, 8))
+        ctk.CTkLabel(
+            dialog, text="Email link color",
+            font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 2))
+        ctk.CTkLabel(
+            dialog,
+            text="Color applied to links in emails written with the rich-text "
+                 "editor (forced so they don't fall back to the recipient's "
+                 "client default). Default is the standard blue.",
+            wraplength=510, justify="left", anchor="w",
+            text_color=("gray45", "gray60"), font=ctk.CTkFont(size=11),
+        ).pack(fill="x", padx=32, pady=(0, 6))
+        lc_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        lc_row.pack(fill="x", padx=32, pady=(0, 10))
+        lc_state = {"color": email_link_color()}
+        lc_swatch = ctk.CTkFrame(
+            lc_row, width=26, height=26, corner_radius=4,
+            fg_color=lc_state["color"],
+            border_width=1, border_color=("gray60", "gray45"))
+        lc_swatch.pack(side="left")
+        lc_swatch.pack_propagate(False)
+        lc_entry = ctk.CTkEntry(lc_row, width=100)
+        lc_entry.insert(0, lc_state["color"])
+        lc_entry.pack(side="left", padx=(8, 0))
+
+        def _apply_link_color(color: str) -> None:
+            norm = set_email_link_color(color)
+            lc_state["color"] = norm
+            self.settings.email_link_color = norm
+            save_settings(self.settings)
+            lc_swatch.configure(fg_color=norm)
+            lc_entry.delete(0, "end")
+            lc_entry.insert(0, norm)
+
+        def _choose_link_color() -> None:
+            from tkinter import colorchooser
+            res = colorchooser.askcolor(
+                color=lc_state["color"], title="Email link color",
+                parent=dialog)
+            if res and res[1]:
+                _apply_link_color(res[1])
+
+        ctk.CTkButton(
+            lc_row, text="Choose…", width=90, command=_choose_link_color,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            lc_row, text="Apply", width=70,
+            command=lambda: _apply_link_color(lc_entry.get()),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            lc_row, text="Reset", width=70,
+            command=lambda: _apply_link_color(DEFAULT_EMAIL_LINK_COLOR),
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
 
@@ -21628,13 +21973,19 @@ class App:
                 self._append_log(
                     f"Live task pass/fail: {len(by_sid)} student(s) scraped, "
                     f"{matched} joined to caseload rows. Tasks: {tstr}")
-                # Diagnostics for the perf work: did the browser get de-
-                # prioritized (option 2), and how did the scroll-load end?
+                # Diagnostics for the perf work: lean-column hide + timing.
                 self._append_log(
                     f"  ↳ scan: reached {res.get('rows', 0)} of {len(csv_sids)} "
-                    f"list rows ({len(by_sid)} have tasks); de-prioritized "
-                    f"{res.get('lowered', 0)} browser process(es); "
-                    f"{res.get('iters', 0)} passes; stop={res.get('stop', '?')}")
+                    f"list rows ({len(by_sid)} have tasks)"
+                    + ("; lean columns (hid all but Student ID)"
+                       if res.get('lean') else
+                       "; FULL columns (lean hide did NOT apply — check)")
+                    + f"; {res.get('iters', 0)} passes; "
+                    f"stop={res.get('stop', '?')}"
+                    + (f"; took {res.get('secs')}s "
+                       f"(nav/setup {res.get('setup_secs')}s + "
+                       f"loop {res.get('loop_secs')}s)"
+                       if res.get('secs') is not None else ""))
                 if by_sid and matched < len(by_sid):
                     self._append_log(
                         f"  ⚠ {len(by_sid) - matched} scraped student(s) "
