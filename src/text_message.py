@@ -591,16 +591,33 @@ def fill_schedule(page: Page, slot: ScheduleSlot) -> None:
     page.wait_for_timeout(300)
 
 
+class TextAborted(Exception):
+    """Raised inside send_text when the user hit STOP — bail out of the compose
+    flow (before the final commit) and leave the modal closed."""
+
+
 def send_text(
     page: Page, msg: TextMessage, *, on_status: Optional[Callable[[str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """Drive the Mongoose compose modal: open -> select inbox -> add
     recipient(s) -> set message -> advance to confirm -> Send Now or fill
     Schedule. Stops before the final commit click unless msg.commit is True.
 
+    `should_stop`, if given, is polled between steps; when it returns True we
+    raise TextAborted and close the modal — so the STOP button can abort a group
+    mid-compose, and (critically) BEFORE the final Schedule/Send click, so a
+    half-built text is never actually sent.
+
     Returns True if it reached the confirm/schedule step without error (whether
     or not the final click was made). Raises on a hard driver failure."""
     say = on_status or _noop
+    stop = should_stop or (lambda: False)
+
+    def _ck() -> None:
+        if stop():
+            raise TextAborted()
+
     # Clear any leftover compose modal FIRST. A previous group that failed (e.g.
     # "no recipients could be added") raises with the modal still open, and its
     # overlay intercepts pointer events — which would make the very next step
@@ -608,17 +625,20 @@ def send_text(
     # inside open_compose, but switch_department runs before that, so without
     # this a failed group wedges every following text until the modal is gone.
     close_compose(page)
+    _ck()
     # Make sure Mongoose is on the right department first (Compose only offers
     # the current department's inbox). Playwright-driven, so it also wakes a
     # frozen/backgrounded renderer.
     if msg.course:
         switch_department(page, msg.course)
+    _ck()
     # Open Compose + select the inbox, retrying once if it doesn't reach the
     # recipient step (the first compose of a session is flaky — warm-up).
     open_compose_to_recipient_step(page, msg.inbox_label, say)
 
     added = 0
     for raw in msg.recipients_mobile:
+        _ck()
         if add_recipient(page, raw):
             added += 1
         else:
@@ -627,14 +647,17 @@ def send_text(
         raise RuntimeError("No recipients could be added to the text.")
     say(f"  text: {added} recipient(s) added")
 
+    _ck()
     set_message(page, msg.body)
 
+    _ck()
     # Advance from compose to the confirm step.
     _click_button(page, "Preview")
 
     if msg.schedule is None:
         say("  text: composed — review and click Send Now" if not msg.commit
             else "  text: sending now…")
+        _ck()   # last chance to bail before the text actually goes out
         if msg.commit:
             _click_button(page, "Send Now")
         return True
@@ -654,6 +677,7 @@ def send_text(
     say(f"  text: scheduled for {msg.schedule.student_local_str} "
         f"(student-local) — review and click Schedule" if not msg.commit
         else f"  text: scheduling for {msg.schedule.student_local_str}…")
+    _ck()   # last chance to bail before the text is actually scheduled
     if msg.commit:
         _click_button(page, "Schedule")
     return True

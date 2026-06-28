@@ -269,6 +269,10 @@ class BrowserWorker:
         # a fresh Mongoose tab is opened.
         self._mongoose_warmed = False
         self.ready_event = threading.Event()
+        # Shared STOP signal (set by App._request_stop). Replaced with App's own
+        # Event right after construction; the default keeps the worker usable
+        # standalone. Long worker steps (e.g. tm.send_text) check it to abort.
+        self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -316,6 +320,13 @@ class BrowserWorker:
     def submit_probe_unlock(self, on_done: Callable[[dict], None]) -> None:
         """TEMP: dump the open task-unlock popup + EA row icons. on_done({path})."""
         self.q.put(("PROBE_UNLOCK", on_done))
+
+    def submit_close_record_tabs(
+        self, on_done: Callable[[dict], None],
+    ) -> None:
+        """Close all open console record subtabs (back to the Caseload list).
+        on_done({closed: N})."""
+        self.q.put(("CLOSE_RECORD_TABS", on_done))
 
     def submit_open_contact_global(
         self, query: str, on_done: Callable[[dict], None],
@@ -637,6 +648,13 @@ class BrowserWorker:
                 res = self._probe_unlock_action(ctx)
             finally:
                 on_done(res)
+        elif cmd[0] == "CLOSE_RECORD_TABS":
+            _, on_done = cmd
+            res = {"closed": 0}
+            try:
+                res = {"closed": self._close_all_record_subtabs(ctx)}
+            finally:
+                on_done(res)
         elif cmd[0] == "OPEN_CONTACT_GLOBAL":
             _, query, on_done = cmd
             res = {}
@@ -909,6 +927,39 @@ class BrowserWorker:
         except Exception:
             pass
         return False
+
+    def _close_all_record_subtabs(self, ctx) -> int:
+        """Close all open console tabs via the Salesforce console shortcut
+        'Shift+W then X' (close all tabs), then make sure the Caseload list is
+        back. Batches that deep-link to records leave a workspace subtab open
+        per student; across runs they pile up and each keeps its own Lightning
+        DOM + components alive (real browser memory/CPU).
+
+        Focus may be sitting in a note field where the shortcut won't fire, so
+        we blur with Escape first. The 'close all' can drop the Caseload tab
+        too, so we re-open the list afterward if it's gone. Returns 1 if it ran
+        (best-effort — the console shortcut doesn't report a count), 0 if there
+        was no page. Never raises."""
+        target = self._active_page(ctx)
+        if target is None:
+            return 0
+        try:
+            target.keyboard.press("Escape")    # blur any focused field/editor
+            target.wait_for_timeout(120)
+            target.keyboard.press("Shift+W")   # SF console close-all: leader…
+            target.wait_for_timeout(180)
+            target.keyboard.press("x")         # …then X = close all tabs
+            target.wait_for_timeout(700)
+        except Exception:
+            return 0
+        # 'Close all' can take the Caseload tab with it — restore the list so
+        # the app still has it to search/click against.
+        try:
+            if "Caseload_App_Page" not in (target.url or ""):
+                self._ensure_caseload_list(target)
+        except Exception:
+            pass
+        return 1
 
     def _ensure_caseload_list(self, target) -> bool:
         """Navigate `target` to the Caseload list and wait for the list
@@ -3012,8 +3063,17 @@ class BrowserWorker:
             commit=bool(payload.get("commit", False)),
         )
         try:
-            tm.send_text(page, msg, on_status=self.on_status)
+            tm.send_text(page, msg, on_status=self.on_status,
+                         should_stop=self.stop_event.is_set)
             return {"ok": True}
+        except tm.TextAborted:
+            # User hit STOP mid-compose — close the half-built modal so the next
+            # action starts clean, and report the abort (NOT a failure).
+            try:
+                tm.close_compose(page)
+            except Exception:
+                pass
+            return {"aborted": True}
         except Exception as e:
             return {"error": str(e)}
 
@@ -13681,6 +13741,14 @@ class App:
         self._is_busy = False
         self._busy_message = ""
         self._busy_spinner_index = 0
+        # Set by the STOP button to abort a running batch/fire at the next safe
+        # point. A threading.Event (not a bool) so the WORKER thread can read it
+        # too — tm.send_text checks it between compose steps to abort a text
+        # group mid-flight (before the commit click). Reset on a new action (the
+        # idle->busy transition in _set_busy); shared with the worker right after
+        # it's constructed. We can't interrupt a single in-flight Playwright call
+        # mid-step, but we stop before the next one.
+        self._stop_event = threading.Event()
         # True while the background pass/fail scrape is running/pending. Firing
         # an action is blocked until it finishes (the scrape drives Salesforce
         # and would contend with / re-cool a Mongoose text run). Separate from
@@ -13746,6 +13814,7 @@ class App:
             on_note_filed=self._post_note_filed,
             on_multiple_matches=self._post_multiple_matches,
         )
+        self.worker.stop_event = self._stop_event   # share the STOP signal
         self.worker.start()
 
         self.hotkey_listener: Optional[keyboard.Listener] = None
@@ -13808,6 +13877,17 @@ class App:
             text_color=("#7a4f00", "#ffd166"), corner_radius=6,
         )
         self.busy_label.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        # Always-visible, loud STOP button: aborts a running batch/fire at the
+        # next safe point (e.g. an action fired by accident). Pinned top-right so
+        # it's instantly findable. Stays clickable during a run because
+        # _set_busy only disables the scenario/refresh buttons, not this one.
+        self._btn_stop = ctk.CTkButton(
+            topbar, text="■ STOP", width=104, height=32,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color="#c0392b", hover_color="#a93226", text_color="white",
+            command=self._request_stop,
+        )
+        self._btn_stop.grid(row=0, column=2, sticky="e", padx=(10, 0))
 
         # Find student — searches the in-DOM Caseload table.
         # HIDDEN from view (2026-05-31): the caseload panel's own search
@@ -17103,6 +17183,44 @@ class App:
         self.root.wait_variable(done_var)
         return holder["res"]
 
+    def _close_record_tabs_blocking(self) -> int:
+        """Queue a CLOSE_RECORD_TABS and block until the worker returns how many
+        console record subtabs it closed. Returns 0 if the worker isn't ready."""
+        try:
+            if not self.worker.ready_event.is_set():
+                return 0
+        except Exception:
+            return 0
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"res": None}
+
+        def on_done(res):
+            def set_main():
+                holder["res"] = res
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["res"] = res
+                done_var.set(True)
+
+        self.worker.submit_close_record_tabs(on_done)
+        self.root.wait_variable(done_var)
+        return int((holder["res"] or {}).get("closed", 0))
+
+    def _cleanup_record_tabs(self, *, quiet: bool = False) -> None:
+        """Close stray console record subtabs back to the Caseload list and log
+        how many. `quiet` suppresses the 'nothing to close' line (used by the
+        automatic batch-end cleanup so it stays silent when there's nothing)."""
+        ran = self._close_record_tabs_blocking()
+        if quiet:
+            return
+        if ran:
+            self._append_log(
+                "Closed open student record tabs — back to the Caseload list.")
+        else:
+            self._append_log("Couldn't close tabs — browser not ready.")
+
     def _ensure_mongoose_logged_in(self) -> bool:
         """Pre-flight for a text-bearing action: open Mongoose and confirm the
         session is signed in BEFORE the user reviews emails/texts. On failure it
@@ -17820,8 +17938,15 @@ class App:
         sent = 0
         groups_sent = 0
         failed = 0  # groups that were attempted but didn't schedule
+        stopped = False
         try:
             for i, grp in enumerate(review_groups):
+                if self._stop_event.is_set():
+                    self._append_log(
+                        "⛔ Stopped by user — remaining text group(s) not "
+                        "sent.", error=True)
+                    stopped = True
+                    break
                 mobiles = selected[i] if i < len(selected) else []
                 if not mobiles:
                     continue
@@ -17842,6 +17967,15 @@ class App:
                     f"  text: {grp['label']} - {len(mobiles)} recipient(s) "
                     f"({grp['when_str']})...")
                 res = self._send_text_blocking(payload)
+                if res and res.get("aborted"):
+                    # STOP hit mid-compose — this group did NOT go out. Don't
+                    # count it; stop the loop and abort the whole action.
+                    groups_sent -= 1
+                    self._append_log(
+                        f"  text: ⛔ stopped before sending {grp['label']} — "
+                        "remaining group(s) not sent.", error=True)
+                    stopped = True
+                    break
                 if res and res.get("not_logged_in"):
                     # Setup failure, not a per-group hiccup: stop immediately
                     # (don't time out the remaining groups) and abort the whole
@@ -17875,7 +18009,9 @@ class App:
             self._append_log(
                 f"Texts: {sent} recipient(s) in {groups_sent} group(s) {verb}.",
                 success=(groups_sent > 0))
-        return True
+        # Returning False on STOP makes a combined action abort before its
+        # email/note phase (same contract as a cancelled review).
+        return not stopped
 
     @staticmethod
     def _row_name_and_query(row: dict) -> tuple[str, str]:
@@ -17966,6 +18102,16 @@ class App:
         skipped: list[tuple[str, str]] = []
         try:
             for idx, row in enumerate(confirmed, start=1):
+                # STOP: bail before touching the next student. Mark every
+                # not-yet-started student as skipped so the summary is accurate.
+                if self._stop_event.is_set():
+                    for r in confirmed[idx - 1:]:
+                        nm, _ = self._row_name_and_query(r)
+                        skipped.append((nm, "stopped by user"))
+                    self._append_log(
+                        f"⛔ Stopped by user at student {idx} of {total}.",
+                        error=True)
+                    break
                 student_name, query = self._row_name_and_query(row)
                 sid = str(row.get("StudentID", "")
                           or row.get("Student ID", "")).strip()
@@ -18104,6 +18250,11 @@ class App:
         if skipped:
             for name, reason in skipped:
                 self._append_log(f"  skipped: {name!r} ({reason})")
+        # Tidy up: each student's note/email navigation leaves a console record
+        # subtab open (Salesforce doesn't close them), and they pile up across a
+        # batch — each keeps its own Lightning DOM alive. Close them back to the
+        # Caseload list. Quiet: stay silent when there was nothing to close.
+        self._cleanup_record_tabs(quiet=True)
 
     def _fire_on_selected(
         self, scenario: ScenarioConfig, rows: list[dict],
@@ -21069,6 +21220,10 @@ class App:
             return
         self._set_busy("Refreshing caseload + Essential Actions…")
         self._append_log("Refreshing caseload CSV (manual)...")
+        # Clear any console record subtabs that prior batch / find activity left
+        # open before we reload — they accumulate and bloat the browser. (The
+        # refresh navigates back to the Caseload list anyway.)
+        self._cleanup_record_tabs(quiet=True)
         try:
             success, message = self._download_caseload_csv_blocking()
             if success:
@@ -21224,11 +21379,35 @@ class App:
             pass
         self.root.after(150, self._track_lock_overlay)
 
+    def _request_stop(self) -> None:
+        """STOP button: ask the running batch/fire to abort at the next safe
+        point. We can't kill a single in-flight Playwright step mid-execution
+        (it finishes), but the run loops + tm.send_text check _stop_event
+        between students / channels / compose steps and bail out, so nothing
+        further is touched (and an un-committed text is never sent)."""
+        if not self._is_busy:
+            self._append_log("Nothing is running to stop.")
+            return
+        if self._stop_event.is_set():
+            self._append_log("Already stopping — finishing the current step…")
+            return
+        self._stop_event.set()
+        self._append_log(
+            "⛔ STOP requested — aborting now. A page step already in progress "
+            "finishes first; a text won't be sent if STOP beats the final "
+            "Schedule/Send click.", error=True)
+        try:
+            self.status_var.set("⛔ Stopping…")
+        except Exception:
+            pass
+
     def _set_busy(self, message: str) -> None:
         """Enter a busy state: disable action buttons, show a spinner
         + status label, and start the animation. Idempotent — calling
         again while busy just updates the message."""
         was_already_busy = self._is_busy
+        if not was_already_busy:
+            self._stop_event.clear()   # fresh action — clear any old STOP
         self._is_busy = True
         self._busy_message = message
         try:
