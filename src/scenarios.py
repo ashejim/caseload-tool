@@ -152,6 +152,14 @@ class ScenarioConfig:
     # so the editor disables this for batch scenarios. If NO scenario sets
     # it, the panel falls back to listing every non-batch scenario.
     panel_action: bool = False
+    # Record-only support: when True the action fires NO channels (no note,
+    # email, or text) — it just logs the bound success-path SUPPORT as done for
+    # the student. Used to record a support delivered another way (and to safely
+    # test the success-path logging without sending anything). `marks_step`
+    # names the step id to record (in the student's course path); empty = record
+    # steps whose `action` equals this scenario's name.
+    record_only: bool = False
+    marks_step: str = ""
 
 
 @dataclass
@@ -430,8 +438,10 @@ def load_scenarios(path: Path = SCENARIOS_YAML) -> dict[str, ScenarioConfig]:
         notes = [_note_from_dict(n) for n in cfg.get("notes", [])]
         text = _text_from_dict(cfg.get("text"))
         # A scenario needs at least one channel. Notes are the usual one, but a
-        # scenario can be email-only or text-only too.
-        if not notes and cfg.get("email") is None and text is None:
+        # scenario can be email-only or text-only too — OR record-only (no
+        # channel, just logs a success-path support).
+        if (not notes and cfg.get("email") is None and text is None
+                and not cfg.get("record_only")):
             raise ValueError(
                 f"Scenario {name!r} has no notes, email, or text defined")
         out[name] = ScenarioConfig(
@@ -445,6 +455,8 @@ def load_scenarios(path: Path = SCENARIOS_YAML) -> dict[str, ScenarioConfig]:
             prompts=_prompts_from_list(cfg.get("prompts")),
             notes=notes,
             panel_action=bool(cfg.get("panel_action", False)),
+            record_only=bool(cfg.get("record_only", False)),
+            marks_step=str(cfg.get("marks_step", "") or "").strip(),
         )
     return out
 

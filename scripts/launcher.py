@@ -8608,6 +8608,11 @@ class ScenarioEditor:
         # `email` is now fully exposed via the editor; `batch.preview`
         # still rides as a passive round-trip field for now.
         self._batch_preview = scenario.batch.preview if scenario.batch else True
+        # Record-only support fields have no editor UI yet — stash + re-emit so
+        # a GUI re-save doesn't strip them off a (hand-authored) record-only
+        # action.
+        self._record_only = getattr(scenario, "record_only", False)
+        self._marks_step = getattr(scenario, "marks_step", "")
         self.capture_handler = capture_handler  # callable(on_done)
         # Caseload-column hooks for the Filters section. `get_columns`
         # returns whatever's cached now; `refresh_columns` triggers a
@@ -9618,6 +9623,11 @@ class ScenarioEditor:
         # there. Only written when True to keep the YAML uncluttered.
         if self.panel_action_var.get() and not self.batch_mode_var.get():
             out["panel_action"] = True
+        # Re-emit record-only fields (no editor UI) so they survive a GUI save.
+        if getattr(self, "_record_only", False):
+            out["record_only"] = True
+        if getattr(self, "_marks_step", ""):
+            out["marks_step"] = self._marks_step
         if self.send_email_var.get():
             tpl = self.email_body_combo.get().strip()
             if "(none" in tpl:  # placeholder for empty templates folder
@@ -16713,6 +16723,15 @@ class App:
         student is already chosen: we navigate to them in the background
         and skip the find/pick prompt, then file against that record."""
 
+        # Record-only support: no Salesforce, no sends — just log the bound
+        # success-path support for this student and stop. (Fire it from the
+        # caseload panel so we know who + which course.)
+        if getattr(scenario, "record_only", False):
+            self._fire_record_only(
+                scenario, prenav_student_id, course_hint or override,
+                prenav_label or prenav_query)
+            return
+
         # Pre-flight: a text-bearing action needs Mongoose signed in — check
         # before any navigation/prompts so a lapsed session fails fast.
         if scenario.text is not None and not self._ensure_mongoose_logged_in():
@@ -16985,6 +17004,65 @@ class App:
                 custom_bodies=custom_bodies,
                 prompt_vars=prompt_vars, ea=ea_arg,
             )
+
+    def _fire_record_only(self, scenario: ScenarioConfig, student_id: str,
+                          course_raw: str, who: str) -> None:
+        """Fire a record-only action: log its bound success-path support(s) as
+        done for one student, with NO Salesforce note / email / text. The
+        support is `scenario.marks_step` (if set) or any step whose `action`
+        equals the scenario name, in the student's course path. Dedupes an
+        already-done support. Best-effort; reports what it did in the log."""
+        sid = (student_id or "").strip()
+        course = self._norm_course_code((course_raw or "").strip())
+        if not sid:
+            self._append_log(
+                f"{scenario.name!r}: record-only — fire it from the caseload "
+                "panel (right-click a student) so I know who to record it for.")
+            return
+        if not course:
+            self._append_log(
+                f"{scenario.name!r}: no course for this student — can't pick a "
+                "success path.")
+            return
+        path = (getattr(self, "success_paths", {}) or {}).get(course)
+        if not path or not path.steps:
+            self._append_log(
+                f"{scenario.name!r}: {course} has no success path defined.")
+            return
+        marks = (getattr(scenario, "marks_step", "") or "").strip()
+        try:
+            current = success_path_store.step_status(sid, course)
+        except Exception:
+            current = {}
+        logged, already = [], []
+        for step in path.steps:
+            hit = (step.id == marks) if marks else (
+                (step.action or "").strip() == scenario.name.strip())
+            if not hit:
+                continue
+            label = step.description or step.id
+            if current.get(step.id) == success_path_store.EVENT_COMPLETED:
+                already.append(label)
+                continue
+            if success_path_store.log_step(
+                    sid, course, step.id, success_path_store.EVENT_COMPLETED,
+                    source=f"action:{scenario.name}"):
+                logged.append(label)
+        if logged:
+            self._append_log(
+                f"✓ Recorded support for {who or sid} ({course}): "
+                + ", ".join(f"'{x}'" for x in logged)
+                + " — no note/email/text sent.")
+            self._refresh_success_path_if_shown(sid)
+        elif already:
+            self._append_log(
+                f"{scenario.name!r}: already recorded for {who or sid} "
+                f"({', '.join(already)}).")
+        else:
+            tgt = f"support '{marks}'" if marks else f"action {scenario.name!r}"
+            self._append_log(
+                f"{scenario.name!r}: no {tgt} on {course}'s success path "
+                "to record.")
 
     @staticmethod
     def _norm_course_code(raw: str) -> str:
@@ -18373,6 +18451,22 @@ class App:
         rows = [r for r in (rows or []) if r]
         if not rows:
             self._append_log("No students selected.")
+            return
+
+        # Record-only support: no Salesforce, no sends — just log the bound
+        # success-path support for each selected student and stop.
+        if getattr(scenario, "record_only", False):
+            self._set_busy(f"Recording {scenario.name}…")
+            try:
+                for r in rows:
+                    nm, _ = self._row_name_and_query(r)
+                    sid = str(r.get("StudentID", "")
+                              or r.get("Student ID", "")).strip()
+                    course = (r.get("CourseCode", "")
+                              or r.get("Course Code", ""))
+                    self._fire_record_only(scenario, sid, course, nm)
+            finally:
+                self._set_idle()
             return
 
         # Edit-note action on a SINGLE student → route through the
@@ -22484,6 +22578,68 @@ class App:
         self._append_to_csv(entry)
         self._ensure_note_tab(entry.tab_key)
         self._append_to_note_tab(entry)
+        # Success Path: if this action fulfils a step on the student's course
+        # path, mark it done. Only when the note actually FILED (submitted) — a
+        # form left for manual review hasn't completed the step yet.
+        if entry.submitted:
+            self._log_path_step_done(
+                entry.scenario, entry.student_id, entry.course_code)
+
+    def _log_path_step_done(self, scenario_name: str, student_id: str,
+                            course_code: str) -> None:
+        """If `scenario_name` is the action bound to one or more steps on
+        `course_code`'s success path, log them completed for this student — the
+        write that grows the step_log and flips the viewer step to Done. Skips a
+        step already completed (dedupes a multi-note scenario's repeated
+        note-filed events). Best-effort: never raises into the fire flow."""
+        try:
+            sid = (student_id or "").strip()
+            course = self._norm_course_code((course_code or "").strip())
+            name = (scenario_name or "").strip()
+            if not (sid and course and name):
+                return
+            path = (getattr(self, "success_paths", {}) or {}).get(course)
+            if not path:
+                return
+            try:
+                current = success_path_store.step_status(sid, course)
+            except Exception:
+                current = {}
+            changed = []
+            for step in path.steps:
+                if (step.action or "").strip() != name:
+                    continue
+                if current.get(step.id) == success_path_store.EVENT_COMPLETED:
+                    continue   # already done — don't append a duplicate event
+                if success_path_store.log_step(
+                        sid, course, step.id,
+                        success_path_store.EVENT_COMPLETED,
+                        source=f"action:{name}"):
+                    changed.append(step.description or step.id)
+            if changed:
+                self._append_log(
+                    "  ↳ Success Path: marked "
+                    + ", ".join(f"'{c}'" for c in changed)
+                    + f" done ({course}).")
+                self._refresh_success_path_if_shown(sid)
+        except Exception:
+            pass
+
+    def _refresh_success_path_if_shown(self, student_id: str) -> None:
+        """Re-render the viewer's Success Path panel if the student it shows is
+        the one whose step just changed, so a fired step flips to Done live."""
+        panel = getattr(self, "caseload_panel", None)
+        if panel is None:
+            return
+        row = getattr(panel, "_qv_row", None)
+        if not row:
+            return
+        rid = (row.get("StudentID") or row.get("Student ID") or "").strip()
+        if rid == (student_id or "").strip():
+            try:
+                panel._render_success_path(row)
+            except Exception:
+                pass
 
     def _append_to_csv(self, entry: NoteLogEntry) -> None:
         try:
