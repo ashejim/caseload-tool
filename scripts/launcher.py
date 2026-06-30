@@ -21886,6 +21886,42 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        # Data-at-rest encryption: how often the app password is required.
+        enc_active = (getattr(self, "_vault", None) is not None
+                      and self._vault.is_setup)
+        enc_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        enc_row.pack(fill="x", padx=20, pady=(0, 2))
+        ctk.CTkLabel(enc_row, text="Require app password:").pack(side="left")
+        _ENC_LABELS = {
+            "Every launch": "every_launch",
+            "After each restart": "per_restart",
+            "Weekly": "weekly",
+        }
+        _ENC_TO_LABEL = {v: k for k, v in _ENC_LABELS.items()}
+        cur_enc = (getattr(self.settings, "vault_unlock_mode", "per_restart")
+                   or "per_restart")
+        enc_var = ctk.StringVar(
+            value=_ENC_TO_LABEL.get(cur_enc, "After each restart"))
+        ctk.CTkComboBox(
+            enc_row, width=170, variable=enc_var, state="readonly",
+            values=list(_ENC_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+        if enc_active:
+            ctk.CTkButton(
+                enc_row, text="Change password…", width=150,
+                command=lambda: self._change_vault_password(parent=dialog),
+                **SECONDARY_BTN_KWARGS,
+            ).pack(side="left", padx=(8, 0))
+        _enc_hint = ("Encrypts your local student data (caseload, history, "
+                     "success-path, note log) at rest. "
+                     + ("On — change the unlock frequency above."
+                        if enc_active else
+                        "Off — you'll be offered setup on the next launch."))
+        ctk.CTkLabel(
+            dialog, text=_enc_hint, wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
         # Caseload panel "Fire action" menu: which actions show + their order.
         pa_row = ctk.CTkFrame(dialog, fg_color="transparent")
         pa_row.pack(fill="x", padx=20, pady=(0, 2))
@@ -21967,6 +22003,15 @@ class App:
                 self.worker.note_api_enabled = self.settings.note_save_via_api
             except Exception:
                 pass
+            # Data-at-rest unlock frequency. Switching to "every launch" drops
+            # any DPAPI-remembered key so it actually prompts next time.
+            new_unlock = _ENC_LABELS.get(enc_var.get().strip(), "per_restart")
+            self.settings.vault_unlock_mode = new_unlock
+            if new_unlock == "every_launch" and getattr(self, "_vault", None):
+                try:
+                    self._vault.forget()
+                except Exception:
+                    pass
             # Per-area font sizes already persist live via set_font_size.
             save_settings(self.settings)
             if changed:
@@ -23119,6 +23164,68 @@ class App:
         self._vault, self._managed = vault, managed
         if errs:
             print("Migration issues: " + "; ".join(errs), file=sys.stderr)
+
+    def _change_vault_password(self, parent=None) -> None:
+        """In-session password change: re-key the vault and re-encrypt every
+        managed file under the new key (plaintext kept for the session)."""
+        if not (getattr(self, "_vault", None) and self._vault.is_unlocked
+                and self._managed is not None):
+            return
+        dlg = ctk.CTkToplevel(parent or self.root)
+        dlg.title("Change app password")
+        dlg.transient(parent or self.root)
+        dlg.resizable(False, False)
+        frm = ctk.CTkFrame(dlg, fg_color="transparent")
+        frm.pack(fill="both", expand=True, padx=20, pady=16)
+        ctk.CTkLabel(frm, text="Set a new app password",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(
+            frm, justify="left", wraplength=380, text_color=("gray35", "gray70"),
+            text=("Re-encrypts your local data under the new password. There is "
+                  "no recovery if you forget it."),
+        ).pack(anchor="w", pady=(4, 10))
+        e1 = ctk.CTkEntry(frm, show="•", width=300, placeholder_text="New password")
+        e1.pack(pady=4); e1.focus_set()
+        e2 = ctk.CTkEntry(frm, show="•", width=300, placeholder_text="Confirm")
+        e2.pack(pady=4)
+        msg = ctk.CTkLabel(frm, text="", text_color="#c0392b")
+        msg.pack(anchor="w", pady=(4, 0))
+
+        def save() -> None:
+            p1, p2 = e1.get(), e2.get()
+            if not p1 or p1 != p2:
+                msg.configure(text="Passwords must match and be non-empty.")
+                return
+            if len(p1) < 4:
+                msg.configure(text="Use at least 4 characters.")
+                return
+            try:
+                self._vault.change_password(p1)
+                errs = self._managed.reencrypt_all()
+                mode = getattr(self.settings, "vault_unlock_mode", "per_restart")
+                if mode in ("per_restart", "weekly"):
+                    self._vault.remember_on_this_machine()
+                if errs:
+                    self._append_log("Password changed, but: " + "; ".join(errs))
+                else:
+                    self._append_log("App password changed — data re-encrypted.")
+            except Exception as e:
+                self._append_log(f"Password change failed: {e}")
+            try: dlg.grab_release()
+            except Exception: pass
+            dlg.destroy()
+
+        btns = ctk.CTkFrame(frm, fg_color="transparent")
+        btns.pack(fill="x", pady=(12, 0))
+        ctk.CTkButton(btns, text="Save", width=90, command=save).pack(side="right")
+        ctk.CTkButton(btns, text="Cancel", width=90, command=dlg.destroy,
+                      **SECONDARY_BTN_KWARGS).pack(side="right", padx=(0, 8))
+        dlg.bind("<Return>", lambda _e: save())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        try:
+            dlg.after(60, lambda: (dlg.grab_set(), dlg.lift()))
+        except Exception:
+            pass
 
     def _lock_vault_on_exit(self) -> None:
         """Re-encrypt the managed plaintext files and shred them. Called from

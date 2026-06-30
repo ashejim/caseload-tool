@@ -419,6 +419,24 @@ class ManagedFiles:
                 errors.append(f"{plain.name}: {e} — kept plaintext")
         return errors
 
+    def reencrypt_all(self) -> list[str]:
+        """Rewrite every .enc from the current plaintext (used after a password
+        change) WITHOUT shredding the plaintext — the session keeps using it.
+        Verifies each round-trip. Returns error strings."""
+        errors: list[str] = []
+        for plain in self.files:
+            if not plain.exists():
+                continue
+            enc = self.enc_path(plain)
+            try:
+                original = plain.read_bytes()
+                self.vault.encrypt_file(plain, enc)
+                if self.vault.decrypt_bytes_of(enc) != original:
+                    errors.append(f"{plain.name}: verify mismatch")
+            except Exception as e:
+                errors.append(f"{plain.name}: {e}")
+        return errors
+
     def migrate_existing(self) -> list[str]:
         """First-time: encrypt any plaintext that has no .enc yet, verifying the
         round-trip. Plaintext is LEFT in place (in use this session; shredded on
