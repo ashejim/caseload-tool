@@ -416,8 +416,17 @@ class BrowserWorker:
         self, query: str, on_done: Callable[[dict], None],
     ) -> None:
         """Open the student's record, wait for their notes to load, and
-        scrape them. on_done({notes, count, timings})."""
+        scrape them (ALL authors). on_done({notes, count, timings})."""
         self.q.put(("FETCH_NOTES", query, on_done))
+
+    def submit_fetch_my_notes(
+        self, query: str, on_done: Callable[[dict], None],
+    ) -> None:
+        """Fast read of the CURRENT USER's notes for the student (via the Aura
+        API, no navigation). on_done({notes, source:'mine'}) or {notes: None}
+        when the grid/creds aren't available (caller then loads the full
+        scrape)."""
+        self.q.put(("FETCH_MY_NOTES", query, on_done))
 
     def submit_fetch_task_status(
         self, query: str, on_done: Callable[[dict], None],
@@ -787,6 +796,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._fetch_student_notes(ctx, query)
+            finally:
+                on_done(res)
+        elif cmd[0] == "FETCH_MY_NOTES":
+            _, query, on_done = cmd
+            res = {"notes": None}
+            try:
+                res = self._fetch_my_notes(ctx, query)
             finally:
                 on_done(res)
         elif cmd[0] == "FETCH_TASK_STATUS":
@@ -2588,6 +2604,114 @@ class BrowserWorker:
         except Exception:
             pass
         return False
+
+    def _grid_note_lookup(self, sid: str):
+        """(contact_id, course, logged_in_user_id) for a Student ID, read from
+        the captured caseload grid. (None, None, None) if not found / no grid."""
+        grid = self._grid_data
+        if not grid or not sid:
+            return None, None, None
+        for (gsid, gcourse), row in (grid.get("by_key") or {}).items():
+            if gsid == sid:
+                cid = str(row.get("contactID") or "").strip()
+                uid = str(row.get("LoggedInUserId") or "").strip()
+                return ((cid if cid.startswith("003") else None),
+                        gcourse, (uid or None))
+        return None, None, None
+
+    def _fetch_notes_via_api(self, target, contact_id, course, user_id,
+                             max_notes):
+        """Read the CURRENT USER's notes for a student+course via the
+        getAllStudentCourseNotes Aura action (fetch, no navigation). Returns
+        notes in the SAME shape the scrape produces (but only this CM's notes,
+        course-scoped — server filters by CMUserId + CourseCode), or None on any
+        failure."""
+        import json as _json
+        creds = self._aura_creds
+        if not (creds and contact_id and user_id and target is not None):
+            return None
+        params = {"StudentContactId": contact_id, "CMUserId": user_id,
+                  "CourseCode": course or ""}
+        message = _json.dumps({"actions": [{
+            "id": "1;a",
+            "descriptor":
+                "apex://MentorForceAuraMethods/ACTION$getAllStudentCourseNotes",
+            "callingDescriptor": "markup://c:MentorCMGridAndDetailGrid",
+            "params": params}]})
+        page_uri = f"/lightning/r/Contact/{contact_id}/view"
+        js = """async ([message, ctxs, token, pageUri]) => {
+            const body = new URLSearchParams();
+            body.set('message', message);
+            body.set('aura.context', ctxs);
+            body.set('aura.pageURI', pageUri);
+            body.set('aura.token', token);
+            const resp = await fetch(
+                '/aura?other.MentorForceAuraMethods.getAllStudentCourseNotes=1',
+                {method: 'POST', credentials: 'include',
+                 headers: {'Content-Type':
+                           'application/x-www-form-urlencoded;charset=UTF-8'},
+                 body: body.toString()});
+            return {status: resp.status, body: await resp.text()};
+        }"""
+        try:
+            res = target.evaluate(
+                js, [message, creds["context"], creds["token"], page_uri])
+        except Exception:
+            return None
+        body = (res or {}).get("body", "") or ""
+        i = body.find("{")
+        try:
+            env = _json.loads(body[i:]) if i >= 0 else {}
+        except Exception:
+            return None
+        actions = env.get("actions") or []
+        if not actions or actions[0].get("state") != "SUCCESS":
+            return None
+        rv = actions[0].get("returnValue")
+        if not isinstance(rv, list):
+            return None
+        out = []
+        for n in rv[:max_notes]:
+            out.append({
+                "type": (n.get("Type__c") or ""),
+                "course": (n.get("CourseCode__c") or ""),
+                "subject": (n.get("Name") or ""),
+                "text": (n.get("Text__c") or n.get("ShortText__c") or ""),
+                "author": ((n.get("Author__r") or {}).get("Name") or ""),
+                "date": (n.get("WGUCreationDateTime__c")
+                         or n.get("CreatedDate") or ""),
+                "url": "",
+            })
+        return out
+
+    def _fetch_my_notes(self, ctx, query: str, max_notes: int = 60) -> dict:
+        """Fast first-pass: the current user's notes for the student, via the
+        API. {"notes": [...], "source": "mine"} on success, or {"notes": None,
+        "reason": ...} to signal the caller to load the full all-author scrape.
+        Carries timing to diagnose the cold-first-read slowness."""
+        import time as _t
+        sid = (query or "").strip()
+        if not sid.isdigit():
+            return {"notes": None, "reason": "non-numeric query"}
+        cid, course, uid = self._grid_note_lookup(sid)
+        if not (cid and uid):
+            return {"notes": None, "reason": "no grid contact-id/user-id"}
+        # A note read right after startup can beat the Aura-creds harvest — wait
+        # briefly for it rather than falling back to the slow all-author scrape
+        # (the cause of the one-off ~15s first read).
+        deadline = _t.time() + 3.0
+        while not self._aura_creds and _t.time() < deadline:
+            _t.sleep(0.15)
+        if not self._aura_creds:
+            return {"notes": None, "reason": "no Aura creds harvested yet"}
+        t_eval = _t.time()
+        notes = self._fetch_notes_via_api(
+            self._active_page(ctx), cid, course, uid, max_notes)
+        eval_ms = int((_t.time() - t_eval) * 1000)
+        if notes is None:
+            return {"notes": None, "reason": f"API call failed ({eval_ms}ms)"}
+        return {"notes": notes, "source": "mine", "course": course or "",
+                "eval_ms": eval_ms}
 
     def _fetch_student_notes(
         self, ctx, query: str, max_notes: int = 60,
@@ -11967,6 +12091,14 @@ class CaseloadPanel:
             bar, text="✕", width=28, height=26,
             command=self._clear_notes_filter, **SECONDARY_BTN_KWARGS,
         ).grid(row=0, column=2, padx=(6, 0))
+        # "Load all" — when only the user's own notes are shown (fast API pass),
+        # this fetches everyone's via the full scrape. Hidden otherwise.
+        self.notes_loadall_btn = ctk.CTkButton(
+            bar, text="⤓ All notes", width=90, height=26,
+            command=self._load_all_notes, **SECONDARY_BTN_KWARGS)
+        self.notes_loadall_btn.grid(row=0, column=3, padx=(6, 0))
+        if not getattr(self, "_notes_partial", False):
+            self.notes_loadall_btn.grid_remove()
         bar.grid_remove()   # shown by show_notes when there are notes to filter
 
     def _show_notes_filterbar(self) -> None:
@@ -12128,8 +12260,9 @@ class CaseloadPanel:
 
     def _notes_hint(self) -> None:
         self._last_notes = None
-        # New student / reset → drop any active notes filter.
+        # New student / reset → drop any active notes filter + the Load-all btn.
         self._notes_filter = ""
+        self._hide_load_all_btn()
         entry = getattr(self, "notes_filter_entry", None)
         if entry is not None:
             entry.delete(0, "end")
@@ -12224,6 +12357,44 @@ class CaseloadPanel:
         self._render_notes()
         self._show_notes_filterbar()
         self._scroll_to_notes()
+
+    def show_my_notes(self, label: str, notes: list, query: str,
+                      course: str) -> None:
+        """Render the CURRENT USER's notes (fast API pass) + reveal the 'Load
+        all' button to fetch everyone's notes via the full scrape."""
+        self._notes_partial = True
+        self._notes_all_query = query
+        self._notes_base_label = label
+        suffix = " · your notes" + (f" ({course})" if course else "")
+        self.show_notes(label + suffix, notes)
+        self._show_load_all_btn()
+
+    def _show_load_all_btn(self) -> None:
+        btn = getattr(self, "notes_loadall_btn", None)
+        if btn is not None:
+            try:
+                btn.grid()
+            except Exception:
+                pass
+
+    def _hide_load_all_btn(self) -> None:
+        self._notes_partial = False
+        btn = getattr(self, "notes_loadall_btn", None)
+        if btn is not None:
+            try:
+                btn.grid_remove()
+            except Exception:
+                pass
+
+    def _load_all_notes(self) -> None:
+        """'Load all' button: fetch everyone's notes via the full scrape."""
+        q = getattr(self, "_notes_all_query", None)
+        if not q:
+            return
+        self._hide_load_all_btn()
+        lbl = getattr(self, "_notes_base_label", "") or self._last_notes_label
+        self.app._append_log("Loading all notes (everyone's)…")
+        self.app._review_notes_scrape(q, lbl, self)
 
     def _toggle_note(self, idx: int) -> None:
         if idx in self._notes_open:
@@ -23044,10 +23215,44 @@ class App:
         self.worker.submit_scrape_all_task_status(on_done, expected_sids=expected)
 
     def _review_notes(self, query: str, label: str, panel) -> None:
-        """Fetch a student's notes on the worker thread and render them into
-        the caseload panel's note viewer. Non-blocking — the callback
-        marshals back to the UI thread. The fetch navigates to the record
-        (that's the 'open student' part of the flow)."""
+        """Two-phase note load. FAST first: the current user's own notes via the
+        Aura API (no navigation), shown instantly with a 'Load all' affordance.
+        If the API isn't available (no grid/creds, or a non-numeric query), go
+        straight to the full all-author scrape."""
+        def on_fast(res):
+            def render():
+                try:
+                    notes = (res or {}).get("notes")
+                    if notes is None:
+                        # API unavailable → full scrape now.
+                        self._append_log(
+                            f"  (your-notes API skipped: "
+                            f"{(res or {}).get('reason', '?')}; full scrape…)")
+                        self._review_notes_scrape(query, label, panel)
+                        return
+                    panel._notes_load_done()
+                    panel.show_my_notes(label, notes, query,
+                                        (res or {}).get("course", ""))
+                    self._append_log(
+                        f"Notes for {label}: {len(notes)} of yours — click "
+                        "'Load all' for everyone's.")
+                except Exception:
+                    self._review_notes_scrape(query, label, panel)
+            try:
+                self.root.after(0, render)
+            except Exception:
+                pass
+        self.worker.submit_fetch_my_notes(query, on_fast)
+
+    def _review_notes_scrape(self, query: str, label: str, panel) -> None:
+        """Fetch a student's FULL note history (all authors) on the worker
+        thread and render them. Navigates to the record + scrapes the Notes
+        History tab — slower, but complete."""
+        try:
+            panel.show_notes_loading(label)
+        except Exception:
+            pass
+
         def on_done(res):
             def render():
                 try:
@@ -23055,9 +23260,11 @@ class App:
                     if res and not res.get("error"):
                         notes = res.get("notes") or []
                         panel.show_notes(label, notes)
+                        panel._hide_load_all_btn()   # full set now shown
                         if notes:
                             self._append_log(
-                                f"Notes for {label}: {len(notes)} loaded.")
+                                f"Notes for {label}: {len(notes)} loaded "
+                                "(everyone's).")
                         else:
                             t = res.get("timings", {})
                             self._append_log(
