@@ -89,3 +89,4 @@ temp/
 # writes them under USER_CONFIG_DIR — a repo-root copy is a stale artifact.
 flup_probe.txt
 unlock_probe.txt
+aura_probe.txt

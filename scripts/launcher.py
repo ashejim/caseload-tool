@@ -255,6 +255,15 @@ class BrowserWorker:
         # before sharing.
         self._capture_active = False
         self._capture_log: list[dict] = []
+        # Phase-1 API fast path: the caseload page fires the Aura action
+        # `getCaseLoadMainGridData` on load, whose response carries the WHOLE
+        # caseload grid (per-task pass/fail + Contact ids + momentum). We
+        # passively capture that response here (see _on_response /
+        # _capture_grid_data) so the bulk pass/fail scan can read it instead of
+        # the slow scroll-scrape. The page fetches the grid in ~100-row PAGES,
+        # so we ACCUMULATE: {"by_key": {(StudentID, CourseCode): row}, "ts":
+        # epoch} or None.
+        self._grid_data: Optional[dict] = None
         # One-shot diagnostic latches for the batch-email scrape path
         # in `_click_match_by_filter`. The first batch of the session
         # logs WHAT the row mailto carried (or didn't), and WHAT the
@@ -320,6 +329,11 @@ class BrowserWorker:
     def submit_probe_unlock(self, on_done: Callable[[dict], None]) -> None:
         """TEMP: dump the open task-unlock popup + EA row icons. on_done({path})."""
         self.q.put(("PROBE_UNLOCK", on_done))
+
+    def submit_probe_aura(self, on_done: Callable[[dict], None]) -> None:
+        """PROBE: test whether the Aura token/context needed to replay the note-
+        save action are reachable from page JS. on_done({path, reachable, …})."""
+        self.q.put(("PROBE_AURA", on_done))
 
     def submit_close_record_tabs(
         self, on_done: Callable[[dict], None],
@@ -569,6 +583,7 @@ class BrowserWorker:
                     pass
             try:
                 ctx.on("request", self._on_request)
+                ctx.on("response", self._on_response)
             except Exception:
                 pass
             self.on_status("Browser ready." if first else "Browser restarted.")
@@ -646,6 +661,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._probe_unlock_action(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "PROBE_AURA":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._probe_aura(ctx)
             finally:
                 on_done(res)
         elif cmd[0] == "CLOSE_RECORD_TABS":
@@ -1725,6 +1747,7 @@ class BrowserWorker:
             return
         try:
             self._capture_log.append({
+                "kind": "request",
                 "url": url,
                 "method": method,
                 "headers": dict(request.headers),
@@ -1732,6 +1755,161 @@ class BrowserWorker:
             })
         except Exception:
             pass
+
+    def _on_response(self, response) -> None:
+        """Context-level RESPONSE listener. ALWAYS watches for the caseload grid
+        data response (the Phase-1 API fast path); ADDITIONALLY, in capture
+        mode, records Salesforce data-response bodies for probing."""
+        try:
+            url = response.url or ""
+        except Exception:
+            return
+        # Always-on: harvest the caseload grid (per-task pass/fail + ids) the
+        # page already fetches, so the scan can skip the scroll-scrape.
+        if "getCaseLoadMainGridData" in url:
+            self._capture_grid_data(response)
+        if not self._capture_active:
+            return
+        if not any(d in url for d in (
+                "salesforce.com", "force.com", "lightning.com")):
+            return
+        # Data endpoints only (Aura's generic action endpoint carries the
+        # Lightning datatable's rows); skip auth/session + static assets.
+        low = url.lower()
+        if not ("/aura" in low or "apexremote" in low or "apex" in low
+                or "/services/data" in low or "/api/" in low):
+            return
+        if any(skip in url for skip in (
+                "/auth/", "/oauth", "/token", "/aura?aura.token",
+                "/visualforce/session")):
+            return
+        try:
+            ctype = (response.headers or {}).get("content-type", "")
+        except Exception:
+            ctype = ""
+        body = ""
+        try:
+            body = response.text()
+        except Exception:
+            body = ""
+        try:
+            self._capture_log.append({
+                "kind": "response",
+                "url": url,
+                "status": getattr(response, "status", None),
+                "content_type": ctype,
+                "body_len": len(body or ""),
+                "body_preview": (body or "")[:60000],
+            })
+        except Exception:
+            pass
+
+    def _capture_grid_data(self, response) -> None:
+        """Parse + ACCUMULATE the getCaseLoadMainGridData Aura response. The page
+        fetches the grid in PAGES (~100 rows each), so we merge each page into a
+        running {(StudentID, CourseCode): row} map (newest wins) rather than
+        overwriting — otherwise we'd only ever hold the last page. Best-effort:
+        a read/parse failure just leaves the prior accumulation in place."""
+        import json
+        try:
+            body = response.text()
+            env = json.loads(body)
+        except Exception:
+            return
+        rows = None
+        for a in (env.get("actions") or []):
+            if (a.get("state") == "SUCCESS"
+                    and isinstance(a.get("returnValue"), list)):
+                rows = a["returnValue"]
+                break
+        if not rows:
+            return
+        store = self._grid_data or {"by_key": {}, "ts": 0.0}
+        by_key = store["by_key"]
+        for row in rows:
+            sid = str(row.get("StudentID") or "").strip()
+            if not sid:
+                continue
+            course = str(row.get("CourseCode") or "").strip()
+            by_key[(sid, course)] = row
+        store["ts"] = time.time()
+        self._grid_data = store   # silent — the scan's result line reports it
+
+    def _grid_rows_to_task_status(self, rows) -> dict:
+        """Convert getCaseLoadMainGridData rows → {sid: {tnum: info}} — the SAME
+        shape the scroll-scan produces — by reusing _parse_task_cell on each
+        TaskNhoverText (title) with a color class synthesized from TaskNStatus.
+        Downstream (badges, _apply_task_status_to_rows) can't tell the data came
+        from the API vs the scrape."""
+        from src.student_lookup import _parse_task_cell
+        status_to_cls = {
+            "passed": "cellColorGreen",
+            "returned": "cellColorRed", "revisions needed": "cellColorRed",
+            "not passed": "cellColorRed",
+            "task submitted": "cellColorBlue", "submitted": "cellColorBlue",
+            "pending": "cellColorBlue", "in progress": "cellColorBlue",
+        }
+        by_sid: dict = {}
+        for row in (rows or []):
+            try:
+                sid = str(row.get("StudentID") or "").strip()
+            except Exception:
+                continue
+            if not sid:
+                continue
+            statuses: dict = {}
+            for n in range(1, 16):
+                title = (row.get(f"Task{n}hoverText") or "").strip()
+                if not title:
+                    continue
+                st = (row.get(f"Task{n}Status") or "").strip().lower()
+                parsed = _parse_task_cell(status_to_cls.get(st, ""), title)
+                if parsed:
+                    tnum, info = parsed
+                    statuses[tnum] = info
+            if statuses:
+                by_sid[sid] = statuses
+        return by_sid
+
+    def _task_status_from_grid_api(self, want, t_start):
+        """Phase-1 fast path: build pass/fail from the ACCUMULATED
+        getCaseLoadMainGridData pages if they're fresh AND cover the expected
+        task-bearers. Returns the scan-result dict (source='api'), or None to
+        fall back to the scroll-scrape — so any doubt = no regression. Polls up
+        to ~6s for the grid pages to finish arriving (the page fetches ~100 rows
+        at a time, and the caseload nav that triggers them just happened)."""
+        deadline = time.time() + 6.0
+        best_cov = -1
+        while True:
+            grid = self._grid_data
+            if grid and (time.time() - grid.get("ts", 0)) < 180:
+                rows = list((grid.get("by_key") or {}).values())
+                try:
+                    by_sid = self._grid_rows_to_task_status(rows)
+                except Exception:
+                    by_sid = {}
+                if by_sid:
+                    cov = len(want & set(by_sid)) if want else len(by_sid)
+                    best_cov = max(best_cov, cov)
+                    enough = (cov >= 0.9 * len(want)) if want else True
+                    if enough:
+                        secs = round(time.perf_counter() - t_start, 1)
+                        return {"by_sid": by_sid, "count": len(by_sid),
+                                "rows": len(rows), "source": "api",
+                                "lean": False, "secs": secs,
+                                "setup_secs": secs, "loop_secs": 0.0,
+                                "iters": 0, "stop": "api"}
+            if time.time() >= deadline:
+                break
+            time.sleep(0.25)
+        if want and best_cov >= 0:
+            try:
+                self.on_status(
+                    f"  [grid] API covered {best_cov}/{len(want)} expected "
+                    "— falling back to the scroll-scrape.")
+            except Exception:
+                pass
+        return None
 
     @staticmethod
     def _active_page(ctx):
@@ -2772,6 +2950,15 @@ class BrowserWorker:
         want = {s for s in (expected_sids or []) if s}
         from src.student_lookup import scan_task_status_window
         t_start = time.perf_counter()   # timing: total + nav/setup vs loop
+        # PHASE-1 API FAST PATH: the caseload page already fetched
+        # getCaseLoadMainGridData (per-task pass/fail for the whole caseload).
+        # If that capture is fresh + covers the expected task-bearers, read
+        # pass/fail straight from it and skip the ~30-40s scroll-scrape. Any
+        # doubt (stale / partial / parse miss) falls through to the proven
+        # scrape below — never a regression.
+        api = self._task_status_from_grid_api(want, t_start)
+        if api is not None:
+            return api
         target, table = self._open_caseload_table(ctx)
         if table is None:
             return {"error": "caseload table didn't load"}
@@ -3164,6 +3351,65 @@ class BrowserWorker:
         return {"eas": rows,
                 "secs": round(time.perf_counter() - t0, 1),
                 "read_secs": round(t_read - t0, 1)}
+
+    def _probe_aura(self, ctx) -> dict:
+        """PROBE (Aura-replay phase): on the active Salesforce Lightning page,
+        run a battery of `$A` / aura-context expressions to learn whether the
+        token + context needed to replay the `saveNoteCmpValues` Aura action are
+        reachable from page JS. Read-only — evaluates JS, changes nothing.
+        Writes the full result to aura_probe.txt and returns a short summary."""
+        from src.config import USER_CONFIG_DIR
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        js = r'''() => {
+          const out = {};
+          const probe = (name, fn) => {
+            try {
+              const v = fn();
+              if (v === undefined) out[name] = '<undefined>';
+              else if (typeof v === 'string')
+                out[name] = 'str(' + v.length + '): ' + v.slice(0, 800);
+              else if (typeof v === 'object')
+                out[name] = 'obj: ' + JSON.stringify(v).slice(0, 800);
+              else out[name] = typeof v + ': ' + String(v);
+            } catch (e) { out[name] = 'ERR: ' + ((e && e.message) || e); }
+          };
+          probe('typeof_$A', () => typeof window.$A);
+          probe('getContext', () => typeof ($A && $A.getContext && $A.getContext()));
+          probe('getToken()', () => $A.getContext().getToken());
+          probe('encodeForServer()', () => $A.getContext().encodeForServer());
+          probe('fwuid', () => $A.getContext().fwuid);
+          probe('getMode()', () => $A.getContext().getMode());
+          probe('getPathPrefix()', () => $A.getContext().getPathPrefix());
+          probe('getApp()', () => $A.getContext().getApp());
+          probe('typeof_clientService', () => typeof $A.clientService);
+          probe('clientService._token', () => $A.clientService && $A.clientService._token);
+          probe('clientService.token', () => $A.clientService && $A.clientService.token);
+          probe('typeof_enqueueAction', () => typeof ($A && $A.enqueueAction));
+          probe('meta_aura_token', () => { const m = document.querySelector('meta[name="aura.token"]'); return m && m.content; });
+          probe('location', () => location.pathname + location.search);
+          probe('href', () => location.href);
+          return out;
+        }'''
+        try:
+            res = target.evaluate(js)
+        except Exception as e:
+            return {"error": f"evaluate failed: {e}"}
+        lines = [f"=== Aura probe @ {target.url} ===", ""]
+        for k, v in (res or {}).items():
+            lines.append(f"{k}: {v}")
+        path = USER_CONFIG_DIR / "aura_probe.txt"
+        try:
+            path.write_text("\n".join(lines), encoding="utf-8")
+        except Exception:
+            pass
+        tok = str((res or {}).get("getToken()", ""))
+        ctxs = str((res or {}).get("encodeForServer()", ""))
+        reachable = tok.startswith("str(") and ctxs.startswith("str(")
+        return {"path": str(path), "reachable": reachable,
+                "has_aura": str((res or {}).get("typeof_$A", "")),
+                "token": tok[:70], "context": ctxs[:70]}
 
     def _probe_unlock_action(self, ctx) -> dict:
         """TEMP probe for the task-unlock feature. Does NOT navigate — run it
@@ -11973,6 +12219,11 @@ class CaseloadPanel:
         if q.lower().startswith("unlockprobe"):
             self.app._probe_unlock()
             return "break"
+        # PROBE: "auraprobe:" tests whether the Aura token/context for replaying
+        # the note-save action are reachable from page JS (writes aura_probe.txt).
+        if q.lower().startswith("auraprobe"):
+            self.app._probe_aura()
+            return "break"
         # Student ID (digits) or email → if not on the caseload, find anywhere.
         if q and (re.fullmatch(r"\d{5,12}", q) or "@" in q):
             rows = self.app._caseload_rows or []
@@ -16641,6 +16892,36 @@ class App:
                 show()
 
         self.worker.submit_probe_unlock(on_done)
+
+    def _probe_aura(self) -> None:
+        """PROBE: check whether the Aura token/context for replaying the note-
+        save action are reachable from page JS. Run on a Salesforce page (the
+        caseload or an open record)."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._append_log("Probing Aura context on the active Salesforce page…")
+
+        def on_done(res):
+            def show():
+                if res and res.get("path"):
+                    self._append_log(
+                        f"Aura probe → {res['path']}. "
+                        f"$A={res.get('has_aura')}; token={res.get('token')}; "
+                        f"context={res.get('context')}; "
+                        f"REPLAYABLE={res.get('reachable')}.",
+                        success=bool(res.get("reachable")),
+                        error=not res.get("reachable"))
+                else:
+                    self._append_log(
+                        f"Aura probe failed: {(res or {}).get('error')}",
+                        error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_probe_aura(on_done)
 
     def _open_student_global(self, query: str) -> None:
         """Find a student ANYWHERE in Salesforce (global search) by Student ID
@@ -21406,17 +21687,20 @@ class App:
             self._capture_active = True
             self.capture_btn.configure(text="⏹ Stop capture")
             self._append_log(
-                "Network capture STARTED. Fire a note manually (use a "
-                "action or click Submit in Salesforce yourself). "
-                "Click ⏹ Stop capture when done."
+                "Network capture STARTED (requests + data responses). To probe "
+                "READING data, click ↻ Caseload (or scroll the list / open a "
+                "student) so Salesforce sends the rows. To probe note SAVES, "
+                "file a note. Click ⏹ Stop capture when done."
             )
             return
         log = self.worker.stop_request_capture()
         self._capture_active = False
         self.capture_btn.configure(text="🔬 Capture")
         if not log:
-            self._append_log("Capture stopped; no Salesforce write requests recorded.")
+            self._append_log("Capture stopped; no Salesforce traffic recorded.")
             return
+        _nreq = sum(1 for e in log if e.get("kind") == "request")
+        _nresp = sum(1 for e in log if e.get("kind") == "response")
         import json
         from datetime import datetime
         out_path = (
@@ -21431,8 +21715,8 @@ class App:
             self._append_log(f"Capture stopped but save failed: {e}")
             return
         self._append_log(
-            f"Capture stopped. {len(log)} request(s) saved to "
-            f"{out_path.name} in {USER_CONFIG_DIR}. Scrub auth tokens "
+            f"Capture stopped. {_nreq} request(s) + {_nresp} data response(s) "
+            f"saved to {out_path.name} in {USER_CONFIG_DIR}. Scrub auth tokens "
             "from the headers before sharing."
         )
 
@@ -22405,19 +22689,27 @@ class App:
                 self._append_log(
                     f"Live task pass/fail: {len(by_sid)} student(s) scraped, "
                     f"{matched} joined to caseload rows. Tasks: {tstr}")
-                # Diagnostics for the perf work: lean-column hide + timing.
-                self._append_log(
-                    f"  ↳ scan: reached {res.get('rows', 0)} of {len(csv_sids)} "
-                    f"list rows ({len(by_sid)} have tasks)"
-                    + ("; lean columns (hid all but Student ID)"
-                       if res.get('lean') else
-                       "; FULL columns (lean hide did NOT apply — check)")
-                    + f"; {res.get('iters', 0)} passes; "
-                    f"stop={res.get('stop', '?')}"
-                    + (f"; took {res.get('secs')}s "
-                       f"(nav/setup {res.get('setup_secs')}s + "
-                       f"loop {res.get('loop_secs')}s)"
-                       if res.get('secs') is not None else ""))
+                # Diagnostics for the perf work. The API fast path reports a
+                # short, distinct line; the scroll-scrape keeps its detailed one.
+                if res.get("source") == "api":
+                    self._append_log(
+                        f"  ↳ scan: ⚡ via Aura API (getCaseLoadMainGridData) — "
+                        f"{res.get('rows', 0)} caseload rows, "
+                        f"{len(by_sid)} have tasks; took {res.get('secs')}s "
+                        "(NO scroll-scrape)")
+                else:
+                    self._append_log(
+                        f"  ↳ scan: reached {res.get('rows', 0)} of {len(csv_sids)} "
+                        f"list rows ({len(by_sid)} have tasks)"
+                        + ("; lean columns (hid all but Student ID)"
+                           if res.get('lean') else
+                           "; FULL columns (lean hide did NOT apply — check)")
+                        + f"; {res.get('iters', 0)} passes; "
+                        f"stop={res.get('stop', '?')}"
+                        + (f"; took {res.get('secs')}s "
+                           f"(nav/setup {res.get('setup_secs')}s + "
+                           f"loop {res.get('loop_secs')}s)"
+                           if res.get('secs') is not None else ""))
                 if by_sid and matched < len(by_sid):
                     self._append_log(
                         f"  ⚠ {len(by_sid) - matched} scraped student(s) "
