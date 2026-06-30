@@ -14504,7 +14504,7 @@ def _center_tk(win, w: int, h: int) -> None:
 
 
 _GITHUB_URL = "https://github.com/ashejim/WGU-Caseload-Note-Tool"
-_AUTHOR_NAME = "Jim"
+_AUTHOR_NAME = "Dr. Jim Ashe"
 _AUTHOR_EMAIL = "ashejim@gmail.com"
 
 
