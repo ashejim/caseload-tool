@@ -1982,7 +1982,7 @@ class BrowserWorker:
                 body: body.toString(),
             });
             const txt = await resp.text();
-            return {status: resp.status, body: txt.slice(0, 4000)};
+            return {status: resp.status, body: txt.slice(0, 20000)};
         }"""
         try:
             res = target.evaluate(
@@ -1998,6 +1998,15 @@ class BrowserWorker:
             env = {}
         actions = env.get("actions") or []
         state = actions[0].get("state") if actions else ""
+        # The body is capped (the returnValue echoes the whole saved note,
+        # which can exceed the cap and TRUNCATE the JSON → parse fails even
+        # though the save SUCCEEDED). Fall back to a truncation-proof scan for
+        # the first action's state so a real success is never misread as a
+        # failure — that misread would wrongly fall back to the form and FILE
+        # THE NOTE TWICE.
+        if not state:
+            m = re.search(r'"state"\s*:\s*"([A-Z]+)"', body)
+            state = m.group(1) if m else ""
         if state == "SUCCESS":
             return {"ok": True}
         # surface the server's error (e.g. expired token, validation) for the log
