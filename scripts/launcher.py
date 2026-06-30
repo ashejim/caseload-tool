@@ -10557,7 +10557,7 @@ class CaseloadPanel:
         # caseload list view to "Archive (Last 30 Days)", exports, switches back.
         self.update_archive_btn = ctk.CTkButton(
             self.bar_actions, text="⟳ Archive", width=95,
-            command=lambda: self._update_outcomes_archive(manual=True),
+            command=lambda: self.app._update_outcomes_archive(manual=True),
             **SECONDARY_BTN_KWARGS,
         )
         self.update_archive_btn.pack(side="left", padx=(0, 4))
@@ -11301,7 +11301,8 @@ class CaseloadPanel:
         ).pack(side="left")
         ctk.CTkButton(
             btns, text="⤓ Update archive", width=140,
-            command=self._update_outcomes_archive, **SECONDARY_BTN_KWARGS,
+            command=lambda: self.app._update_outcomes_archive(manual=True),
+            **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
         ctk.CTkButton(
             btns, text="⤒ Ingest archive", width=140,
