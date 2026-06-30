@@ -3,6 +3,48 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.13.0 — 2026-06-30
+
+A performance leap from reading Salesforce's own data feed instead of scraping
+the rendered page, a full **Success Path** workflow, and a batch of reliability
+fixes.
+
+### Major features
+- **Instant pass/fail via the Aura API.** The caseload page already fetches its
+  whole grid from a Salesforce endpoint (`getCaseLoadMainGridData`) — every
+  student's per-task pass/fail, Contact id, momentum, and more. The tool now
+  reads that response directly instead of scroll-scraping the rendered list, so
+  the live task pass/fail goes from **~30–40 seconds to instant** — with the
+  proven scroll-scrape kept as an automatic fallback (so it can never show less
+  than before). The desktop no longer stutters during the update.
+- **Complete contact-id map + richer data.** From the same grid read: a complete
+  Student→Contact-id map (covers texting opt-ins the segment export missed), and
+  the grid's rich per-student fields (academic standing, planned graduation,
+  last academic activity, course/student status, …) are layered onto the
+  caseload for **history/data collection** and made available as **viewer
+  fields** (opt-in via the detail panel's ⚙).
+- **Success Paths.** Per-course checklists that show, per student, each step's
+  status (Done / Due / Blocked / Skipped) and the recommended next action,
+  right in the student detail. Steps are marked done automatically when their
+  action fires, or manually (tick / skip / reset) from the panel. A new
+  *record-only* action type (shown with a ✎) records a support without sending
+  anything.
+
+### Reliability + safety
+- **Loud STOP button** — a red, always-visible button aborts a running batch or
+  fire at the next safe point, including a text mid-compose (before it's sent).
+- **Auto-close stray console tabs** — batches no longer leave a pile of open
+  Salesforce record tabs; they're closed on refresh and at batch end.
+- **Texting** — survive Mongoose's loading overlay and the first-compose
+  cold-start so one timezone group can't sink the whole batch.
+- **Notes** — deep-linked record retries when the note panel doesn't render on
+  the first load (was an intermittent "No visible note panel" skip).
+
+### Under the hood
+- Network-capture now records response bodies; an `auraprobe:` probe and a
+  tested note-save Aura replay (`apinote:`) lay the groundwork for filing notes
+  via the API (not yet wired into firing).
+
 ## 0.12.0 — 2026-06-23
 
 Momentum calibration and a new **Data** tab, support for students who aren't on
