@@ -1871,6 +1871,25 @@ class BrowserWorker:
                 by_sid[sid] = statuses
         return by_sid
 
+    def grid_student_contact_map(self) -> dict:
+        """{StudentID: contactID} harvested from the accumulated caseload grid
+        (getCaseLoadMainGridData) — a COMPLETE, authoritative SF-sourced map
+        (every caseload student, not just the texting opt-ins the segment export
+        covers, and no fuzzy mobile/name join). {} if no grid captured yet."""
+        out: dict = {}
+        grid = self._grid_data
+        if not grid:
+            return out
+        for row in (grid.get("by_key") or {}).values():
+            try:
+                sid = str(row.get("StudentID") or "").strip()
+                cid = str(row.get("contactID") or "").strip()
+            except Exception:
+                continue
+            if sid and cid and cid.startswith("003"):
+                out[sid] = cid
+        return out
+
     def _task_status_from_grid_api(self, want, t_start):
         """Phase-1 fast path: build pass/fail from the ACCUMULATED
         getCaseLoadMainGridData pages if they're fresh AND cover the expected
@@ -17518,10 +17537,45 @@ class App:
                 changed += c
             except Exception:
                 pass
+        # Top tier: the caseload grid's StudentID -> Contact id, straight from
+        # Salesforce (getCaseLoadMainGridData). Authoritative + complete — it
+        # OVERRIDES the mobile/name-joined ids and covers students the segment
+        # export missed. Persist the new/changed ones so they survive a session
+        # even before the grid is re-fetched.
+        grid_added = grid_changed = 0
+        try:
+            grid_map = self.worker.grid_student_contact_map()
+        except Exception:
+            grid_map = {}
+        if grid_map:
+            new_ids = {}
+            for sid, cid in grid_map.items():
+                cur = merged.get(sid)
+                if cur != cid:
+                    grid_changed += 1 if cur else 0
+                    grid_added += 0 if cur else 1
+                    new_ids[sid] = cid
+                merged[sid] = cid
+            if new_ids:
+                try:
+                    name_by_sid = {
+                        (r.get("StudentID") or "").strip():
+                            (r.get("Name") or "").strip()
+                        for r in (rows or [])}
+                    mc.persist_contact_ids(new_ids, name_by_sid=name_by_sid)
+                except Exception:
+                    pass
         self._contact_ids = merged
-        if not silent and (exports or merged):
+        added += grid_added
+        changed += grid_changed
+        if not silent and (exports or merged or grid_map):
             n = len(merged)
-            src = (f" from {len(exports)} export(s)" if exports else "")
+            srcs = []
+            if grid_map:
+                srcs.append("grid")
+            if exports:
+                srcs.append(f"{len(exports)} export(s)")
+            src = (f" from {', '.join(srcs)}" if srcs else "")
             extra = (f"; {added} new, {changed} updated"
                      if (added or changed) else "")
             self._append_log(
