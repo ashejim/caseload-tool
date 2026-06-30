@@ -486,9 +486,16 @@ def run_scenario(
     custom_bodies: Optional[dict[int, str]] = None,
     prompt_vars: Optional[dict[str, str]] = None,
     on_status: Optional[Callable[[str], None]] = None,
+    api_save: Optional[Callable[["NoteData", int], bool]] = None,
 ) -> bool:
     """Fill (and optionally submit) every note in the scenario against
     the active student.
+
+    - `api_save`, when given, is tried for each fully-built note BEFORE the
+      on-page form. It returns True if it filed the note through Salesforce's
+      note-save endpoint (so the form is skipped) or False to fall back to
+      `fill_note`. The caller owns eligibility (Contact id, creds, opt-in
+      setting, submit/EA gating) and any status logging.
 
     - `custom_bodies` maps note-index -> body text. When present, that
       body replaces the template's body for that note (the user
@@ -537,7 +544,18 @@ def run_scenario(
         else:
             note = replace(template, course_code=per_note_code, body=base_body,
                            subject=_substitute_vars(template.subject, prompt_vars))
-        fill_note(target, note)
+        # Prefer Salesforce's note-save endpoint when the caller offers it and
+        # the note is eligible — this avoids the form's cold-start Academic-
+        # Activity gate. On anything but a confirmed True, fall through to the
+        # proven on-page form.
+        filed_via_api = False
+        if api_save is not None:
+            try:
+                filed_via_api = bool(api_save(note, i))
+            except Exception:
+                filed_via_api = False
+        if not filed_via_api:
+            fill_note(target, note)
         if not template.submit:
             all_submitted = False
             if on_status:

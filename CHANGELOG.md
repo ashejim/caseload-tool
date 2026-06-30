@@ -44,11 +44,20 @@ fixes.
   cold-start so one timezone group can't sink the whole batch.
 - **Notes** — deep-linked record retries when the note panel doesn't render on
   the first load (was an intermittent "No visible note panel" skip).
+- **File notes via the Salesforce API (opt-in, on by default).** Eligible notes
+  are filed through Salesforce's own note-save endpoint instead of driving the
+  on-page form, which removes the intermittent "Couldn't tick the Academic
+  Activity … Submit disabled" cold-start failure (and is faster). The on-page
+  form remains the automatic fallback for anything not eligible (no Contact id,
+  an Essential-Action-attached note, a note left unsubmitted) or if the API
+  call fails, so nothing is lost. Toggle in **Settings → "File notes via the
+  Salesforce API."**
 
 ### Under the hood
-- Network-capture now records response bodies; an `auraprobe:` probe and a
-  tested note-save Aura replay (`apinote:`) lay the groundwork for filing notes
-  via the API (not yet wired into firing).
+- Network-capture now records response bodies; an `auraprobe:` probe and the
+  note-save Aura replay (`apinote:`) underpin the new API note filing above.
+- Captured network logs now scrub session tokens before they touch disk, and
+  old capture/probe/screenshot debug artifacts are auto-deleted after 7 days.
 
 ## 0.12.0 — 2026-06-23
 

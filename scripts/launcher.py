@@ -231,6 +231,19 @@ def _wait_record_ready(page, max_ms: int = 2000) -> None:
             return
 
 
+def _note_body_to_html(text: str) -> str:
+    """Convert a plain-text note body into the simple paragraph HTML the
+    Salesforce note-save endpoint stores (each line a <p>; blank lines a
+    <p><br></p>) so an API-filed note reads the same as a form-typed one.
+    HTML-special characters are escaped."""
+    lines = (text or "").split("\n")
+    parts = [
+        ("<p>" + html.escape(ln) + "</p>") if ln.strip() else "<p><br></p>"
+        for ln in lines
+    ]
+    return "".join(parts) or "<p><br></p>"
+
+
 class BrowserWorker:
     SHUTDOWN = object()
 
@@ -268,6 +281,10 @@ class BrowserWorker:
         # POSTs — reused to REPLAY the note-save action via fetch (no flaky
         # form). {"token","context","ts"} or None. See _harvest_aura_creds.
         self._aura_creds: Optional[dict] = None
+        # Opt-in (mirrors Settings.note_save_via_api): file notes through the
+        # Aura note-save endpoint when eligible instead of driving the form.
+        # The App keeps this in sync at startup + when settings change.
+        self.note_api_enabled: bool = True
         # One-shot diagnostic latches for the batch-email scrape path
         # in `_click_match_by_filter`. The first batch of the session
         # logs WHAT the row mailto carried (or didn't), and WHAT the
@@ -3941,6 +3958,60 @@ class BrowserWorker:
             # Small settle; fill_note then waits for the form's Submit
             # button to be visible, so no long blind sleep is needed.
             target.wait_for_timeout(200)
+        # Resolve the SF Contact id (003…) for the API note-save path: prefer
+        # the record URL we're grounded on (it IS the student), else the grid's
+        # Student→Contact map. Empty → the API path is simply skipped (form used).
+        api_contact_id = ""
+        try:
+            m = re.search(r"/Contact/(003[0-9A-Za-z]{12,15})", target.url or "")
+            api_contact_id = m.group(1) if m else ""
+        except Exception:
+            api_contact_id = ""
+        if not api_contact_id:
+            sid = (info.get("student_id") or "").strip()
+            if sid:
+                try:
+                    api_contact_id = (
+                        self.grid_student_contact_map().get(sid) or "").strip()
+                except Exception:
+                    api_contact_id = ""
+
+        def _api_save_note(note, idx: int) -> bool:
+            """Try to file `note` via Salesforce's note-save endpoint (skips the
+            form's cold-start Academic-Activity gate). Returns True if filed,
+            False to fall back to the on-page form. Eligible only when: the
+            opt-in is on, we have creds + a Contact id, the note auto-submits
+            (the API commits immediately, so an unsubmitted note must stay in
+            the form), it has an explicit note type, and it isn't EA-attached
+            (EA junctions aren't handled here yet)."""
+            if not getattr(self, "note_api_enabled", True):
+                return False
+            if ea is not None:
+                return False
+            if not getattr(note, "submit", False):
+                return False
+            if not (note.interaction_type or "").strip():
+                return False
+            if not api_contact_id or not self._aura_creds:
+                return False
+            res = self._save_note_via_api(
+                ctx, contact_id=api_contact_id,
+                note_type=note.interaction_type,
+                course_code=note.course_code,
+                subject=note.subject,
+                body_html=_note_body_to_html(note.body),
+                activities=note.academic_activities,
+            )
+            if res.get("ok"):
+                self.on_status(
+                    f"  ✓ Note {idx + 1} filed via Salesforce API "
+                    f"(no form — bypasses the Academic-Activity gate).")
+                return True
+            self.on_status(
+                f"  Note {idx + 1}: API save unavailable "
+                f"({res.get('error', '?')}) — using the form.")
+            return False
+
         self.on_status(f"Running {scenario.name!r}...")
         try:
             all_submitted = run_scenario(
@@ -3948,6 +4019,7 @@ class BrowserWorker:
                 clipboard=clipboard, custom_bodies=custom_bodies,
                 prompt_vars=prompt_vars,
                 on_status=self.on_status,
+                api_save=_api_save_note,
             )
             tail = "" if all_submitted else "  (left open — submit unchecked)"
             self.on_status(f"Done: {scenario.name!r} (course {course_code!r}).{tail}")
@@ -14580,6 +14652,8 @@ class App:
             on_multiple_matches=self._post_multiple_matches,
         )
         self.worker.stop_event = self._stop_event   # share the STOP signal
+        self.worker.note_api_enabled = bool(
+            getattr(self.settings, "note_save_via_api", True))
         self.worker.start()
         self._cleanup_sensitive_artifacts()   # purge old captures/probes/shots
 
@@ -21640,6 +21714,25 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        # File notes via Salesforce's note-save endpoint (opt-in).
+        noteapi_var = ctk.BooleanVar(
+            value=getattr(self.settings, "note_save_via_api", True))
+        ctk.CTkCheckBox(
+            dialog,
+            text="File notes via the Salesforce API (skips the note form)",
+            variable=noteapi_var, font=ctk.CTkFont(size=13),
+        ).pack(anchor="w", padx=20, pady=(8, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("Files eligible notes through Salesforce's own note-save "
+                  "endpoint instead of the on-page form, avoiding the "
+                  "intermittent “Couldn't tick the Academic Activity” "
+                  "cold-start failure. The form stays the automatic fallback. "
+                  "Turn off to always use the form."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
         # Caseload panel "Fire action" menu: which actions show + their order.
         pa_row = ctk.CTkFrame(dialog, fg_color="transparent")
         pa_row.pack(fill="x", padx=20, pady=(0, 2))
@@ -21715,6 +21808,12 @@ class App:
             self._sync_name_cap_mode()  # apply immediately to the builders
             # Note editors: Enter-to-submit vs Enter-for-newline.
             self.settings.enter_submits_note = bool(enter_var.get())
+            # File notes via the Salesforce API (opt-in) — keep the worker in sync.
+            self.settings.note_save_via_api = bool(noteapi_var.get())
+            try:
+                self.worker.note_api_enabled = self.settings.note_save_via_api
+            except Exception:
+                pass
             # Per-area font sizes already persist live via set_font_size.
             save_settings(self.settings)
             if changed:

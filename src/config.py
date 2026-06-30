@@ -382,6 +382,15 @@ class Settings:
     # Shift+Enter inserts a newline. When False, Enter inserts a newline like
     # a normal text box and the note is submitted only via the button.
     enter_submits_note: bool = True
+    # File notes through Salesforce's own note-save endpoint (the same Aura
+    # action the Note form posts) instead of driving the on-page form, when a
+    # student's Contact id + a harvested session token are available. This
+    # sidesteps the form's cold-start Academic-Activity gate (the intermittent
+    # "Couldn't tick the Academic Activity … Submit disabled" failure) and is
+    # faster. The on-page form stays the automatic fallback for anything not
+    # eligible (no Contact id, EA-attached notes, a note left unsubmitted) or
+    # if the API call fails. Toggle off to file every note via the form.
+    note_save_via_api: bool = True
     # Caseload-panel "Fire action" menu: JSON list of scenario names, in the
     # order they appear in the right-click / Right-arrow action menu. Empty =
     # fall back to the per-scenario "Show as a caseload-panel action" flags
