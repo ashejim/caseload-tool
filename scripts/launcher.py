@@ -23219,7 +23219,9 @@ class App:
     # Failure-ish phrasing that should stand out in red. Deliberately
     # excludes plain user "cancelled" (that's a choice, not a failure).
     _LOG_ERROR_RE = re.compile(
-        r"\b(fail(?:ed|ure|s)?|error|couldn'?t|could not|abort(?:ed)?|"
+        # The (?<!pass/) guard keeps the feature name "pass/fail" from tripping
+        # the bare-"fail" match (that line is normal output, not an error).
+        r"\b((?<!pass/)fail(?:ed|ure|s)?|error|couldn'?t|could not|abort(?:ed)?|"
         r"crash(?:ed)?|not fired|no visible note panel|not delivered|"
         r"no match|skipp(?:ed|ing)|didn'?t open|timed? out|not found)\b",
         re.IGNORECASE,
