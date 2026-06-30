@@ -14581,6 +14581,7 @@ class App:
         )
         self.worker.stop_event = self._stop_event   # share the STOP signal
         self.worker.start()
+        self._cleanup_sensitive_artifacts()   # purge old captures/probes/shots
 
         self.hotkey_listener: Optional[keyboard.Listener] = None
         self._hotkeys: list[keyboard.HotKey] = []
@@ -22173,6 +22174,7 @@ class App:
         _nresp = sum(1 for e in log if e.get("kind") == "response")
         import json
         from datetime import datetime
+        log = self._scrub_capture(log)   # redact tokens/cookies before disk
         out_path = (
             USER_CONFIG_DIR / f"capture-{datetime.now():%Y%m%d-%H%M%S}.json"
         )
@@ -22186,9 +22188,71 @@ class App:
             return
         self._append_log(
             f"Capture stopped. {_nreq} request(s) + {_nresp} data response(s) "
-            f"saved to {out_path.name} in {USER_CONFIG_DIR}. Scrub auth tokens "
-            "from the headers before sharing."
+            f"saved to {out_path.name} in {USER_CONFIG_DIR} "
+            "(aura.token/context + cookies redacted). Still contains student "
+            "PII — keep it local."
         )
+
+    @staticmethod
+    def _scrub_capture(log):
+        """Redact secrets from a capture before it touches disk: the Aura
+        token/context (form body), Authorization/Cookie/CSRF headers, and any
+        `sid=` session id in URLs. Leaves the structure intact for analysis.
+        (Doesn't strip student PII from response bodies — those files stay
+        local.)"""
+        import re
+        sens = {"authorization", "cookie", "set-cookie", "x-csrf-token"}
+        out = []
+        for e in (log or []):
+            e = dict(e)
+            pd = e.get("post_data")
+            if pd:
+                for k in ("aura.token", "aura.context"):
+                    pd = re.sub(rf"({re.escape(k)}=)[^&]*", r"\1[REDACTED]", pd)
+                e["post_data"] = pd
+            h = e.get("headers")
+            if isinstance(h, dict):
+                e["headers"] = {
+                    k: ("[REDACTED]" if k.lower() in sens else v)
+                    for k, v in h.items()}
+            url = e.get("url") or ""
+            if "sid=" in url:
+                e["url"] = re.sub(r"(sid=)[^&]*", r"\1[REDACTED]", url)
+            out.append(e)
+        return out
+
+    def _cleanup_sensitive_artifacts(self, days: int = 7) -> None:
+        """Delete debug/probe artifacts older than `days` — capture JSON, the
+        *_probe.txt dumps, and error screenshots (they hold tokens / DOM / PII).
+        Run once on startup. Best-effort; never raises. Does NOT touch the
+        working data (caseload.csv / history.db / success_path.db)."""
+        cutoff = time.time() - days * 86400
+        removed = 0
+        try:
+            targets = list(USER_CONFIG_DIR.glob("capture-*.json"))
+            targets += list(USER_CONFIG_DIR.glob("*_probe.txt"))
+            targets.append(USER_CONFIG_DIR / "aura_probe.txt")
+            try:
+                from src.config import SCREENSHOTS_DIR
+                targets += list(SCREENSHOTS_DIR.glob("*.png"))
+            except Exception:
+                pass
+            for p in targets:
+                try:
+                    if p.exists() and p.stat().st_mtime < cutoff:
+                        p.unlink()
+                        removed += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if removed:
+            try:
+                self._append_log(
+                    f"Cleaned up {removed} old debug artifact(s) "
+                    f"(captures / probes / screenshots > {days}d).")
+            except Exception:
+                pass
 
     def _on_open_templates_folder(self) -> None:
         """Open the user's templates directory in Explorer / Finder.
