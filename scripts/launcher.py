@@ -1452,6 +1452,29 @@ class BrowserWorker:
 
         try:
             if not self._try_match_or_navigate(target, query, raise_after):
+                # Recovery: the row filter found nothing — most often because
+                # the Student ID column isn't in the caseload list view (the
+                # filter can't match a hidden column). If we know this student's
+                # Contact id from the live grid, deep-link straight to the record
+                # instead of giving up (column-independent).
+                q = (query or "").strip()
+                cid = ""
+                if re.fullmatch(r"\d{5,12}", q):
+                    try:
+                        cid = (self.grid_student_contact_map().get(q)
+                               or "").strip()
+                    except Exception:
+                        cid = ""
+                if cid.startswith("003") and self._navigate_to_contact(ctx, cid):
+                    self.on_status(
+                        f"  Row filter missed {q!r} (Student ID column not in "
+                        "the caseload view?) — deep-linked by Contact id.")
+                    if raise_after:
+                        try:
+                            self._bring_browser_forward(target)
+                        except Exception:
+                            pass
+                    return
                 self.on_status(
                     f"No match for {query!r} after filtering. "
                     "Try Salesforce global search for students outside your caseload."
@@ -3321,6 +3344,19 @@ class BrowserWorker:
         q = (query or "").strip()
         if not q:
             return {"error": "no student id"}
+        # Prefer the live grid JSON we already captured — it holds every
+        # student's per-task pass/fail, so no row filter (and no Student ID
+        # column) is needed. Fall through to the list scrape if this student
+        # isn't in the grid yet.
+        try:
+            rows_for_sid = [r for (sid, _c), r in self.grid_rows_by_key().items()
+                            if sid == q]
+            if rows_for_sid:
+                st = self._grid_rows_to_task_status(rows_for_sid).get(q)
+                if st:
+                    return {"statuses": st}
+        except Exception:
+            pass
         target, table = self._open_caseload_table(ctx)
         if table is None:
             return {"error": "caseload table didn't load"}
