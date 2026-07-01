@@ -547,8 +547,18 @@ def add_recipient(page: Page, recipient: str, *, timeout_ms: int = 10_000) -> bo
         return False
     box = _recipient_box(page)
     box.click()
-    box.fill("")
-    box.press_sequentially(term, delay=15)  # per-keystroke so the search fires
+    # Speed: set all-but-the-last character instantly, then TYPE only the final
+    # one — Mongoose's autocomplete still fires on that real keystroke (a bare
+    # fill() doesn't reliably trigger the search), but we skip ~15ms × every
+    # character (an 18-char Contact id was ~270ms of pure typing). The
+    # autocomplete debounces, so the single search still runs on the COMPLETE
+    # term (no stale partial-match result).
+    if len(term) > 1:
+        box.fill(term[:-1])
+        box.press_sequentially(term[-1], delay=15)
+    else:
+        box.fill("")
+        box.press_sequentially(term, delay=15)
     # Results render in an overlay listbox of .v-list-item options.
     option = page.locator(
         '.v-overlay-container .v-list-item[role="option"], '
