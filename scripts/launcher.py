@@ -3695,7 +3695,8 @@ class BrowserWorker:
         )
         try:
             tm.send_text(page, msg, on_status=self.on_status,
-                         should_stop=self.stop_event.is_set)
+                         should_stop=self.stop_event.is_set,
+                         emit_timing=bool(payload.get("emit_timing")))
             return {"ok": True}
         except tm.TextAborted:
             # User hit STOP mid-compose — close the half-built modal so the next
@@ -18515,6 +18516,10 @@ class App:
                 holder["res"] = res
                 done_var.set(True)
 
+        # Per-group timing breadcrumb (⏱) only in dev/advanced mode — it's a
+        # diagnostic, not everyday output.
+        payload["emit_timing"] = bool(
+            getattr(self.settings, "advanced_mode", False))
         self.worker.submit_send_text(payload, on_done)
         self.root.wait_variable(done_var)
         return holder["res"]

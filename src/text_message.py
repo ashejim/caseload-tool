@@ -626,6 +626,7 @@ class TextAborted(Exception):
 def send_text(
     page: Page, msg: TextMessage, *, on_status: Optional[Callable[[str], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    emit_timing: bool = False,
 ) -> bool:
     """Drive the Mongoose compose modal: open -> select inbox -> add
     recipient(s) -> set message -> advance to confirm -> Send Now or fill
@@ -654,6 +655,8 @@ def send_text(
         _t[k] = time.monotonic()
 
     def _emit_timing(added: int) -> None:
+        if not emit_timing:
+            return
         g = lambda a, b: _t.get(b, _t["start"]) - _t.get(a, _t["start"])
         recip = g("compose", "recips")
         say("  ⏱ text[{}]: reset {:.1f} · dept {:.1f} · compose {:.1f} · "
