@@ -23756,21 +23756,23 @@ class App:
             out["reason"] = "grid feed absent (not captured this session)"
             return out
 
-        def _key(r):
-            return (str(r.get("StudentID") or r.get("Student ID") or "").strip(),
-                    str(r.get("CourseCode") or r.get("Course Code") or "").strip())
-
+        # Coverage = does the grid carry ~the full caseload roster? Measured by
+        # ROW COUNT, NOT a StudentID join against the CSV. The CSV can LOSE its
+        # StudentID column (if the user drops it from the caseload view), which
+        # would make a join read 0% even though the grid is complete — and then
+        # we'd wrongly fall back to that same broken CSV. The grid IS the caseload
+        # feed, so grid-count vs csv-count is the right, column-independent check.
         if csv_rows:
-            hit = sum(1 for r in csv_rows
-                      if _key(r) in grid or (_key(r)[0], "") in grid)
-            out["coverage"] = hit / len(csv_rows)
-        # Sample the first few grid rows for core-field presence.
+            out["coverage"] = min(1.0, len(grid) / max(1, len(csv_rows)))
+        else:
+            out["coverage"] = 1.0
+        # Sample the first grid rows for core-field presence (incl. StudentID —
+        # so the grid can supply what a stripped CSV can't).
         sample = list(grid.values())[:5]
         missing = [f for f in self._GRID_HEALTH_FIELDS
                    if not any(f in g for g in sample)]
         out["missing_fields"] = missing
-        out["ok"] = (not missing
-                     and (not csv_rows or out["coverage"] >= 0.95))
+        out["ok"] = (not missing and out["coverage"] >= 0.9)
         if not out["ok"]:
             if missing:
                 out["reason"] = f"grid missing core field(s): {', '.join(missing)}"
@@ -24228,6 +24230,12 @@ class App:
             result.append(j)
         for r in csv_rows:                    # keep CSV students the grid missed
             ck = ckey(r)
+            # A CSV row with no StudentID can't be identified (e.g. the view
+            # dropped the Student ID column) — it's already represented by the
+            # grid, so appending it would just duplicate every row with a blank
+            # id. Skip it; the grid is the roster.
+            if not ck[0]:
+                continue
             if ck not in seen_sc and ck[0] not in seen_sid:
                 result.append(r)
         return result
