@@ -21595,13 +21595,28 @@ class App:
         win.minsize(520, 420)
         win.lift()
         win.focus_force()
-        # Pinned action bar (bottom) + a SCROLLABLE body, so the dialog never
-        # needs to be enlarged to reach a control. Everything below is built into
-        # `dialog` — now the scroll frame — so the section code stays unchanged.
+        # Pinned action bar (bottom) + a TABVIEW body (each tab scrollable), so
+        # settings are grouped/navigable and nothing ever falls off-screen.
+        # Sections below build into `dialog`, which is reassigned to the right
+        # tab's scroll frame before each group.
         footer = ctk.CTkFrame(win, fg_color="transparent")
         footer.pack(side="bottom", fill="x")
-        dialog = ctk.CTkScrollableFrame(win, fg_color="transparent")
-        dialog.pack(side="top", fill="both", expand=True)
+        tabview = ctk.CTkTabview(win)
+        tabview.pack(side="top", fill="both", expand=True, padx=8, pady=(2, 0))
+
+        def _tab_body(name: str):
+            tabview.add(name)
+            sf = ctk.CTkScrollableFrame(
+                tabview.tab(name), fg_color="transparent")
+            sf.pack(fill="both", expand=True)
+            return sf
+
+        tab_general = _tab_body("General")
+        tab_caseload = _tab_body("Caseload & Data")
+        tab_actions = _tab_body("Actions & Email")
+        tab_appearance = _tab_body("Appearance")
+        tab_security = _tab_body("Security")
+        dialog = tab_general
 
         def _refit() -> None:
             """No-op: the body scrolls now, so the window keeps its fixed size
@@ -21611,12 +21626,6 @@ class App:
             return
 
         advanced_var = ctk.BooleanVar(value=self.settings.advanced_mode)
-        ctk.CTkLabel(
-            dialog, text="Settings",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            anchor="w",
-        ).pack(fill="x", padx=20, pady=(16, 4))
-
         ctk.CTkCheckBox(
             dialog,
             text="Advanced / developer mode",
@@ -21655,11 +21664,8 @@ class App:
             anchor="w",
         ).pack(fill="x", padx=32, pady=(0, 14))
 
+        dialog = tab_caseload
         # Caseload Tool view section — status + setup button.
-        # Separator
-        sep = ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35"))
-        sep.pack(fill="x", padx=20, pady=(2, 10))
-
         ctk.CTkLabel(
             dialog, text="Salesforce Caseload view",
             font=ctk.CTkFont(size=13, weight="bold"),
@@ -21685,7 +21691,7 @@ class App:
 
         ctk.CTkButton(
             dialog, text="Set up Caseload Tool view (instructions)",
-            command=lambda: self._setup_caseload_tool_view_with_help(dialog),
+            command=lambda: self._setup_caseload_tool_view_with_help(win),
             width=260,
         ).pack(anchor="w", padx=32, pady=(0, 8))
 
@@ -21705,9 +21711,8 @@ class App:
             placeholder_text="LatestCourseNote, MyCourseContact",
         ).pack(anchor="w", padx=32, pady=(0, 12))
 
-        # ---- Scenarios ----
-        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
-            fill="x", padx=20, pady=(2, 8))
+        dialog = tab_actions
+        # ---- Actions ----
         ctk.CTkLabel(
             dialog, text="Actions",
             font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
@@ -21724,11 +21729,11 @@ class App:
         scen_row.pack(fill="x", padx=32, pady=(0, 10))
         ctk.CTkButton(
             scen_row, text="+ New", width=70,
-            command=lambda: self._settings_new_scenario(dialog),
+            command=lambda: self._settings_new_scenario(win),
         ).pack(side="left")
         ctk.CTkButton(
             scen_row, text="Load file…", width=100,
-            command=lambda: self._load_scenarios_dialog(dialog),
+            command=lambda: self._load_scenarios_dialog(win),
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
         ctk.CTkButton(
@@ -21738,7 +21743,7 @@ class App:
         ).pack(side="left", padx=(8, 0))
         ctk.CTkButton(
             scen_row, text="Load samples", width=110,
-            command=lambda: self._load_sample_scenarios(dialog),
+            command=lambda: self._load_sample_scenarios(win),
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
 
@@ -21814,7 +21819,7 @@ class App:
             from tkinter import colorchooser
             res = colorchooser.askcolor(
                 color=lc_state["color"], title="Email link color",
-                parent=dialog)
+                parent=win)
             if res and res[1]:
                 _apply_link_color(res[1])
 
@@ -21833,9 +21838,8 @@ class App:
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
 
-        # ---- Display (foldable) ----
-        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
-            fill="x", padx=20, pady=(2, 8))
+        dialog = tab_appearance
+        # ---- Display ----
         disp_open = {"v": False}
         disp_body = ctk.CTkFrame(dialog, fg_color="transparent")
 
@@ -21920,10 +21924,10 @@ class App:
             anchor="w", justify="left", wraplength=480,
         ).pack(fill="x", padx=12, pady=(2, 8))
 
-        # ---- Alerts ----
-        alerts_sep = ctk.CTkFrame(dialog, height=1,
-                                  fg_color=("gray70", "gray35"))
-        alerts_sep.pack(fill="x", padx=20, pady=(6, 8))
+        dialog = tab_caseload
+        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
+            fill="x", padx=20, pady=(10, 8))
+        # ---- Alerts + data collection ----
         ctk.CTkLabel(
             dialog, text="Alerts",
             font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
@@ -22013,6 +22017,7 @@ class App:
             values=list(_HIST_LABELS.keys()),
         ).pack(side="left", padx=(8, 0))
 
+        dialog = tab_general
         # Name capitalization — how student/PM names are cased in template
         # variables (papers over CSV data-entry casing errors).
         nc_row = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -22050,6 +22055,7 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        dialog = tab_actions
         # File notes via Salesforce's note-save endpoint (opt-in).
         noteapi_var = ctk.BooleanVar(
             value=getattr(self.settings, "note_save_via_api", True))
@@ -22069,6 +22075,7 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        dialog = tab_security
         # Data-at-rest encryption: how often the app password is required.
         enc_active = (getattr(self, "_vault", None) is not None
                       and self._vault.is_setup)
@@ -22092,7 +22099,7 @@ class App:
         if enc_active:
             ctk.CTkButton(
                 enc_row, text="Change password…", width=150,
-                command=lambda: self._change_vault_password(parent=dialog),
+                command=lambda: self._change_vault_password(parent=win),
                 **SECONDARY_BTN_KWARGS,
             ).pack(side="left", padx=(8, 0))
         _enc_hint = ("Encrypts your local student data (caseload, history, "
@@ -22105,13 +22112,14 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        dialog = tab_actions
         # Caseload panel "Fire action" menu: which actions show + their order.
         pa_row = ctk.CTkFrame(dialog, fg_color="transparent")
         pa_row.pack(fill="x", padx=20, pady=(0, 2))
         ctk.CTkLabel(pa_row, text="Caseload panel actions:").pack(side="left")
         ctk.CTkButton(
             pa_row, text="Configure…", width=120,
-            command=lambda: self._open_panel_actions_dialog(parent=dialog),
+            command=lambda: self._open_panel_actions_dialog(parent=win),
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
         ctk.CTkLabel(
@@ -22128,7 +22136,7 @@ class App:
         ctk.CTkLabel(sp_row, text="Success paths:").pack(side="left")
         ctk.CTkButton(
             sp_row, text="Configure…", width=120,
-            command=lambda: self._open_success_paths_dialog(parent=dialog),
+            command=lambda: self._open_success_paths_dialog(parent=win),
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
         ctk.CTkLabel(
