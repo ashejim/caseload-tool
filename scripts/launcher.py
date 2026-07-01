@@ -23303,6 +23303,48 @@ class App:
             for sid, cvv, gvv in examples:
                 lines.append(f"      [{sid}] csv={cvv!r} grid={gvv!r}")
 
+        # --- CRITICAL-GAP DEEP SEARCH: for each unresolved critical column,
+        # search the WHOLE nested grid row (dicts + lists, any depth) for the
+        # CSV value — so we see exactly where the data lives, or that it's truly
+        # absent, instead of guessing at field names.
+        if gaps:
+            def deep_find(obj, target, path=""):
+                hits = []
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        hits += deep_find(v, target, f"{path}.{k}" if path else k)
+                elif isinstance(obj, list):
+                    for i, v in enumerate(obj):
+                        hits += deep_find(v, target, f"{path}[{i}]")
+                elif target:
+                    nv = nval(obj)
+                    if nv == target:
+                        hits.append(f"{path} (exact)")
+                    elif len(target) > 8 and target in nv:
+                        hits.append(f"{path} (contains)")
+                return hits
+
+            lines += ["", "-" * 90,
+                      "CRITICAL-GAP DEEP SEARCH — where does the CSV value live "
+                      "in the JSON row?"]
+            for col in gaps:
+                lines.append(f"  {col}:")
+                shown = 0
+                for r, g in joined:
+                    cval = r.get(col)
+                    if not str(cval or "").strip():
+                        continue
+                    paths = deep_find(g, nval(cval))
+                    lines.append(
+                        f"    [{r.get('StudentID', '')}] csv={str(cval)[:60]!r} → "
+                        f"{', '.join(paths) if paths else 'NOT FOUND anywhere in grid row'}")
+                    shown += 1
+                    if shown >= 4:
+                        break
+                if shown == 0:
+                    lines.append("    (no student currently has a non-empty CSV "
+                                 "value here — nothing to migrate)")
+
         # --- GRID-ONLY fields: what the JSON carries that the CSV does NOT.
         # A non-empty sample value per field, flagged whether the app already
         # consumes it — so the "unused" ones surface data we could add.
