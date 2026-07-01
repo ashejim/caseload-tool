@@ -3412,10 +3412,15 @@ class BrowserWorker:
                 _wait_grid_settled(target, 1200)
         except Exception as e:
             return {"ok": False, "error": f"row filter failed: {e}"}
+        cap: list = []
+        _stop = self._arm_flup_save_capture(target, cap)
         try:
             res = set_followup_date(target, date_str)
         except Exception as e:
             res = {"ok": False, "value": "", "error": str(e)}
+        finally:
+            _stop()
+        self._dump_flup_save_capture(cap, date_str, "date")
         self._persist_followup_diag(res, "date")
         # Restore the filter so the live list is whole again.
         try:
@@ -3446,10 +3451,15 @@ class BrowserWorker:
                 _wait_grid_settled(target, 1200)
         except Exception as e:
             return {"ok": False, "error": f"row filter failed: {e}"}
+        cap: list = []
+        _stop = self._arm_flup_save_capture(target, cap)
         try:
             res = set_followup_note(target, note_text)
         except Exception as e:
             res = {"ok": False, "value": "", "error": str(e)}
+        finally:
+            _stop()
+        self._dump_flup_save_capture(cap, note_text, "note")
         self._persist_followup_diag(res, "note")
         try:
             if fi is not None and fi.count() > 0:
@@ -3458,6 +3468,74 @@ class BrowserWorker:
         except Exception:
             pass
         return res
+
+    def _arm_flup_save_capture(self, target, sink: list):
+        """Attach a temporary /aura POST request-body capture (for discovering
+        the follow-up SAVE Aura action so it can be replayed via the API). Returns
+        a stop() that detaches the listener. Best-effort."""
+        def _cap(req):
+            try:
+                if "/aura" in (req.url or "") and (req.method or "") == "POST":
+                    pd = req.post_data or ""
+                    if pd:
+                        sink.append(pd)
+            except Exception:
+                pass
+        try:
+            target.on("request", _cap)
+        except Exception:
+            return lambda: None
+
+        def _stop():
+            try:
+                target.remove_listener("request", _cap)
+            except Exception:
+                pass
+        return _stop
+
+    def _dump_flup_save_capture(self, captured: list, needle: str,
+                               kind: str) -> None:
+        """Write the Aura actions captured during a follow-up save to
+        flup_save_probe.txt, flagging the one carrying the value we set — so we
+        can build the API write. One-shot discovery; gitignored + auto-cleaned."""
+        if not captured:
+            return
+        from src.config import USER_CONFIG_DIR
+        import urllib.parse as _up
+        import json as _json
+        nd = (needle or "").strip().lower()
+        lines = [f"=== follow-up {kind} save capture — {len(captured)} /aura "
+                 f"POST(s); value set = {needle!r} ===", ""]
+        for pd in captured:
+            try:
+                params = _up.parse_qs(pd)
+                msg = (params.get("message") or [""])[0]
+                env = _json.loads(msg) if msg else {}
+            except Exception:
+                env = {}
+            for a in (env.get("actions") or []):
+                desc = a.get("descriptor", "")
+                ps = _json.dumps(a.get("params", {}))
+                low = ps.lower()
+                flag = ""
+                if nd and nd in low:
+                    flag = "   <<<<< CARRIES THE VALUE WE SET"
+                elif any(k in low for k in ("followup", "follow_up",
+                                            "smfollowup")):
+                    flag = "   <<< follow-up field"
+                elif any(k in desc.lower() for k in ("save", "update",
+                                                     "commit")):
+                    flag = "   <<< save/update action"
+                lines.append(f"descriptor: {desc}{flag}")
+                lines.append(f"  params: {ps[:900]}")
+                lines.append("")
+        try:
+            path = USER_CONFIG_DIR / "flup_save_probe.txt"
+            path.write_text("\n".join(lines), encoding="utf-8")
+            self.on_status(f"  [flup] save capture → {path.name} "
+                           f"({len(captured)} aura POST(s))")
+        except Exception:
+            pass
 
     def _persist_followup_diag(self, res: dict, kind: str) -> None:
         """When a Followup write fails to commit, dump the captured editor DOM
