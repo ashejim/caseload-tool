@@ -39,6 +39,7 @@ vault.json
 # values (PII).
 griddiff_report.txt
 gridbuild_report.txt
+gridschema_report.txt
 
 # Cached caseload export — student PII, FERPA, never commit.
 caseload.csv

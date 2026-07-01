@@ -12805,6 +12805,11 @@ class CaseloadPanel:
         if q.lower().startswith("gridbuild"):
             self.app._grid_build_parity()
             return "break"
+        # DIAGNOSTIC: "gridschema:" recursively maps the FULL grid JSON structure
+        # (nested objects + lists) across all students — the complete superset.
+        if q.lower().startswith("gridschema"):
+            self.app._grid_schema_dump()
+            return "break"
         # Student ID (digits) or email → if not on the caseload, find anywhere.
         if q and (re.fullmatch(r"\d{5,12}", q) or "@" in q):
             rows = self.app._caseload_rows or []
@@ -22710,6 +22715,7 @@ class App:
             targets.append(USER_CONFIG_DIR / "aura_probe.txt")
             targets.append(USER_CONFIG_DIR / "griddiff_report.txt")
             targets.append(USER_CONFIG_DIR / "gridbuild_report.txt")
+            targets.append(USER_CONFIG_DIR / "gridschema_report.txt")
             try:
                 from src.config import SCREENSHOTS_DIR
                 targets += list(SCREENSHOTS_DIR.glob("*.png"))
@@ -23492,6 +23498,85 @@ class App:
                else "Every app-read column matches the CSV (or is a CSV-only "
                "overlay).")
             + f" Full report → {report.name}")
+
+    def _grid_schema_dump(self) -> None:
+        """Recursively map the FULL structure of the grid JSON across ALL
+        students — every field path (nested objects + lists included), its
+        type(s), how many student-rows have it POPULATED, and a sample. Reveals
+        the complete superset (assessment history, notes lists, assignment
+        metadata) beyond the flat fields. Read-only. 'gridschema:' keyword.
+        Report holds student values (PII) → gitignored + auto-cleaned."""
+        try:
+            grid = self.worker.grid_rows_by_key()
+        except Exception:
+            grid = {}
+        if not grid:
+            self._append_log("gridschema: no grid captured yet — refresh first.")
+            return
+        schema: dict = {}
+
+        def rec(path):
+            return schema.setdefault(
+                path, {"types": set(), "sample": None, "pop": 0})
+
+        def walk(obj, path):
+            if isinstance(obj, dict):
+                if path:
+                    r = rec(path)
+                    r["types"].add("object")
+                    if obj:
+                        r["pop"] += 1
+                for k, v in obj.items():
+                    walk(v, f"{path}.{k}" if path else k)
+            elif isinstance(obj, list):
+                r = rec(path)
+                r["types"].add("list")
+                if obj:
+                    r["pop"] += 1
+                    if not r["sample"]:
+                        r["sample"] = f"[{len(obj)} item(s)]"
+                for v in obj:
+                    walk(v, f"{path}[]")
+            else:
+                r = rec(path)
+                r["types"].add(type(obj).__name__)
+                if obj not in (None, ""):
+                    r["pop"] += 1
+                    if r["sample"] in (None, ""):
+                        r["sample"] = obj
+
+        for g in grid.values():
+            walk(g, "")
+
+        n = len(grid)
+        lines = [f"gridschema — full JSON structure across {n} student-course rows",
+                 f"(pop = how many rows have this path populated)", "",
+                 f"{'path':56}{'type':12}{'pop':>6}  sample", "-" * 110]
+        for path in sorted(schema):
+            r = schema[path]
+            t = "/".join(sorted(r["types"]))
+            samp = "" if r["sample"] in (None, "") else repr(r["sample"])[:70]
+            lines.append(f"{path:56}{t:12}{r['pop']:6}  {samp}")
+
+        # Highlight the nested LISTS and how often they carry data.
+        lists = sorted((p, schema[p]) for p in schema
+                       if "list" in schema[p]["types"])
+        lines += ["", "NESTED LISTS (populated-row counts):"]
+        for p, r in lists:
+            lines.append(f"  {p:52} {r['pop']:>5} rows populated")
+
+        from src.config import USER_CONFIG_DIR as _UCD
+        report = _UCD / "gridschema_report.txt"
+        try:
+            report.write_text("\n".join(lines), encoding="utf-8")
+        except Exception as e:
+            self._append_log(f"gridschema: couldn't write report: {e}")
+        populated_lists = [p for p, r in lists if r["pop"] > 0]
+        self._append_log(
+            f"gridschema: {len(schema)} distinct field paths across {n} rows. "
+            f"Populated nested lists: "
+            + (", ".join(populated_lists) if populated_lists else "none")
+            + f". Full map → {report.name}")
 
     def _merge_grid_and_csv_rows(self, built, csv_rows):
         """JSON-primary caseload rows with CSV-only columns overlaid: the live
