@@ -23280,6 +23280,38 @@ class App:
             for sid, cvv, gvv in examples:
                 lines.append(f"      [{sid}] csv={cvv!r} grid={gvv!r}")
 
+        # --- GRID-ONLY fields: what the JSON carries that the CSV does NOT.
+        # A non-empty sample value per field, flagged whether the app already
+        # consumes it — so the "unused" ones surface data we could add.
+        csv_nkeys = {nkey(c) for c in csv_rows[0].keys()}
+        grid_sample = {}
+        for g in grid.values():
+            for f, v in g.items():
+                cur = grid_sample.get(f)
+                if f not in grid_sample or (
+                        cur in (None, "", [], {}) and v not in (None, "", [], {})):
+                    grid_sample[f] = v
+        known_used = set(self._GRID_ENRICH_FIELDS) | {
+            "StudentID", "CourseCode", "PIDM", "contactID", "LoggedInUserId",
+            "Name", "Momentum"}
+        for _n in range(1, 16):
+            known_used |= {f"Task{_n}", f"Task{_n}Status", f"Task{_n}hoverText"}
+        grid_only = sorted(f for f in grid_sample if nkey(f) not in csv_nkeys)
+        unused = [f for f in grid_only if f not in known_used]
+        lines += ["", "=" * 90,
+                  f"GRID-ONLY FIELDS — in the JSON, NOT in the CSV export "
+                  f"({len(grid_only)} total, {len(unused)} not yet used):", ""]
+        for f in grid_only:
+            v = grid_sample.get(f)
+            if isinstance(v, dict):
+                sample = f"<object: {', '.join(list(v.keys())[:8])}…>"
+            elif isinstance(v, list):
+                sample = f"<list[{len(v)}]: {v[:2]}>"
+            else:
+                sample = repr(v)[:80]
+            tag = "USED  " if f in known_used else "unused"
+            lines.append(f"  [{tag}] {f:38} e.g. {sample}")
+
         health = self._grid_feed_health(csv_rows)
         lines += ["", f"feed health: {'OK' if health['ok'] else 'DEGRADED'} — "
                   f"{health['reason'] or 'covers all rows + core fields'}"]
@@ -23293,9 +23325,10 @@ class App:
         # Concise summary to the log; details (with values) go to the file.
         self._append_log(
             f"griddiff: {len(joined)} joined · {only_csv} CSV-only · "
-            f"{only_grid} grid-only. "
+            f"{only_grid} grid-only rows. "
             + (f"Critical gaps: {', '.join(gaps)}." if gaps
                else "All critical columns have a grid field.")
+            + f" {len(unused)} JSON field(s) not currently used."
             + f" Full report → {report.name}")
 
     def _reload_caseload_cache(self, *, silent: bool = False) -> bool:
