@@ -3846,41 +3846,63 @@ class BrowserWorker:
         except Exception:
             pass
 
-        HINTS = ("Reason", "EssentialAction", "Intervention", "EventProgress",
-                 "Event Progress", "Follow-Up", "FollowUp", "DateAdded",
-                 "Date Added", "StudentID", "Student ID", "InterventionType")
+        # The DATA rows are a list of dicts whose KEYS are EA field API names
+        # (the earlier detector wrongly flagged the column SCHEMA, which only has
+        # those names as string VALUES). Score each list-of-dicts by how many EA
+        # field keys its records carry, and dump the structure of every data list
+        # so the feed is unambiguous.
+        EA_KEYS = {"EventProgress__c", "Intervention__c", "CourseCode__c",
+                   "Contact__r", "VisibilityStartDate__c", "TermProgress__c",
+                   "Student__c", "StudentID__c", "FollowUpDate__c"}
+
+        def _struct(v):
+            if isinstance(v, list):
+                if v and isinstance(v[0], dict):
+                    return f"list[{len(v)}] of dict; keys={list(v[0].keys())[:16]}"
+                return f"list[{len(v)}]"
+            if isinstance(v, dict):
+                return f"dict; keys={list(v.keys())[:16]}"
+            return type(v).__name__
+
         lines = [f"=== EA feed probe @ {ESSENTIAL_ACTIONS_URL} ===",
-                 f"captured {len(captured)} /aura response(s)", ""]
-        best = None
-        for url, body in captured:
+                 f"captured {len(captured)} /aura response(s)", "",
+                 "--- data-bearing actions (returnValue that is a list/dict) ---"]
+        best = None      # (score, list) — most EA-key-bearing list of records
+        idx = 0
+        for _url, body in captured:
             try:
                 i = (body or "").find("{")
                 env = _json.loads(body[i:]) if i >= 0 else {}
             except Exception:
                 env = {}
             for a in (env.get("actions") or []):
-                desc = a.get("descriptor", "")
                 rv = a.get("returnValue")
-                s = _json.dumps(rv)[:300000] if rv is not None else ""
-                hits = sum(1 for h in HINTS if h in s)
-                n = 0
+                # candidate row lists: top-level list, or a list nested one deep
+                cands = []
                 if isinstance(rv, list):
-                    n = len(rv)
+                    cands.append(rv)
                 elif isinstance(rv, dict):
                     for v in rv.values():
                         if isinstance(v, list):
-                            n = max(n, len(v))
-                lines.append(f"action {desc}  state={a.get('state')}  "
-                             f"listlen~{n}  ea_hits={hits}  bodylen={len(s)}")
-                if hits >= 3 and (best is None or hits > best[0]):
-                    best = (hits, desc, rv)
+                            cands.append(v)
+                if not cands:
+                    continue
+                idx += 1
+                lines.append(f"[{idx}] state={a.get('state')} :: {_struct(rv)}")
+                for c in cands:
+                    if c and isinstance(c[0], dict):
+                        score = len(EA_KEYS & set(c[0].keys()))
+                        if score >= 2 and (best is None or len(c) > len(best[1])
+                                           or score > best[0]):
+                            best = (score, c)
         if best:
-            lines += ["", f">>> LIKELY EA FEED: {best[1]}  (ea_hits={best[0]})",
-                      "", "sample returnValue (first 6000 chars):",
-                      _json.dumps(best[2], indent=1)[:6000]]
+            rec = best[1][0]
+            lines += ["", f">>> EA DATA FEED: list of {len(best[1])} records, "
+                      f"EA-key score {best[0]}", "",
+                      "first record:", _json.dumps(rec, indent=1)[:5000]]
         else:
-            lines += ["", "No obvious EA feed among the aura responses "
-                      "(descriptors listed above)."]
+            lines += ["", "No list-of-records with EA field keys found — "
+                      "structures listed above; paste them and I'll pick it."]
         path = USER_CONFIG_DIR / "ea_feed_probe.txt"
         try:
             path.write_text("\n".join(lines), encoding="utf-8")
