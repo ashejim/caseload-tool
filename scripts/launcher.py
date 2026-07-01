@@ -449,10 +449,12 @@ class BrowserWorker:
 
     def submit_fetch_notes(
         self, query: str, on_done: Callable[[dict], None],
+        contact_id: str = "",
     ) -> None:
         """Open the student's record, wait for their notes to load, and
-        scrape them (ALL authors). on_done({notes, count, timings})."""
-        self.q.put(("FETCH_NOTES", query, on_done))
+        scrape them (ALL authors). Deep-links via `contact_id` when given
+        (independent of the caseload view's columns). on_done({notes, …})."""
+        self.q.put(("FETCH_NOTES", query, contact_id, on_done))
 
     def submit_fetch_my_notes(
         self, query: str, on_done: Callable[[dict], None],
@@ -844,10 +846,11 @@ class BrowserWorker:
             finally:
                 on_done(info)
         elif cmd[0] == "FETCH_NOTES":
-            _, query, on_done = cmd
+            _, query, contact_id, on_done = cmd
             res = {}
             try:
-                res = self._fetch_student_notes(ctx, query)
+                res = self._fetch_student_notes(ctx, query,
+                                                contact_id=contact_id)
             finally:
                 on_done(res)
         elif cmd[0] == "FETCH_MY_NOTES":
@@ -2821,7 +2824,7 @@ class BrowserWorker:
                 "eval_ms": eval_ms}
 
     def _fetch_student_notes(
-        self, ctx, query: str, max_notes: int = 60,
+        self, ctx, query: str, max_notes: int = 60, contact_id: str = "",
     ) -> dict:
         """Open the student's record and scrape their note history.
 
@@ -2836,9 +2839,16 @@ class BrowserWorker:
         timings: dict = {}
         t0 = _t.time()
         # 1. Navigate to the student's record (foregrounds the subtab so
-        #    the hidden global table drops out of :visible).
+        #    the hidden global table drops out of :visible). Prefer a deep-link
+        #    by Contact id — works even when the Student ID column isn't in the
+        #    caseload view (which breaks the row-filter search); fall back to
+        #    the search when no id / the deep-link doesn't render a record.
         try:
-            self._handle_find(ctx, query, new_tab=False, raise_after=False)
+            navigated = False
+            if (contact_id or "").startswith("003"):
+                navigated = self._navigate_to_contact(ctx, contact_id)
+            if not navigated:
+                self._handle_find(ctx, query, new_tab=False, raise_after=False)
         except Exception as e:
             return {"error": f"navigation failed: {e}", "timings": timings}
         timings["nav_ms"] = int((_t.time() - t0) * 1000)
@@ -19885,6 +19895,22 @@ class App:
                 click_ok, row_emails = self._click_match_by_filter_blocking(
                     query, expected_name=student_name, contact_id=cid,
                 )
+                if not click_ok and not cid:
+                    # Fast-find (row filter) missed — most often because the
+                    # Student ID column isn't in the caseload list view. Recover
+                    # by deep-linking with a Contact id from the JSON row or the
+                    # grid map (works regardless of the view's columns).
+                    fb_cid = (str(row.get("contactID") or "").strip()
+                              or (self._contact_ids.get(sid, "") if sid else ""))
+                    if fb_cid:
+                        self._append_log(
+                            f"  Fast-find missed {query!r} (Student ID column "
+                            "not in the caseload view?) — deep-linking by "
+                            "Contact id instead.")
+                        click_ok, row_emails = \
+                            self._click_match_by_filter_blocking(
+                                query, expected_name=student_name,
+                                contact_id=fb_cid)
                 if not click_ok:
                     self._append_log(
                         f"Skipping {student_name!r}: navigation failed."
@@ -25044,7 +25070,11 @@ class App:
                 self.root.after(0, render)
             except Exception:
                 pass
-        self.worker.submit_fetch_notes(query, on_done)
+        # Deep-link by Contact id when we know it (grid map) so the all-authors
+        # scrape doesn't depend on the Student ID column being in the caseload
+        # view — the search path stays the fallback for off-caseload lookups.
+        cid = self._contact_ids.get(str(query).strip(), "") if query else ""
+        self.worker.submit_fetch_notes(query, on_done, contact_id=cid)
 
     def _reapply_notes_font(self, size=None) -> None:
         p = getattr(self, "caseload_panel", None)
