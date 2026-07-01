@@ -23172,7 +23172,17 @@ class App:
             return _re.sub(r"[^a-z0-9]", "", str(s).lower())
 
         def nval(x):
-            return _re.sub(r"\s+", " ", str(x or "").strip()).lower()
+            # str(x), NOT str(x or "") — bool False / int 0 are real values, and
+            # `x or ""` collapses them to "" and fakes mismatches vs the CSV's
+            # 'false' / '0' strings. Also make grid floats compare to CSV ints
+            # (23.0 -> "23") so numeric columns don't look different.
+            if x is None:
+                return ""
+            if isinstance(x, float) and x.is_integer():
+                x = int(x)
+            if isinstance(x, bool):
+                x = "true" if x else "false"
+            return _re.sub(r"\s+", " ", str(x).strip()).lower()
 
         def ckey(r):
             return (str(r.get("StudentID") or r.get("Student ID") or "").strip(),
@@ -23195,6 +23205,29 @@ class App:
             for f in g.keys():
                 gfields.setdefault(nkey(f), f)
 
+        all_gfields = {f for g in list(grid.values())[:5] for f in g.keys()}
+
+        def _best_value_field(col):
+            """Find the grid field whose values best match this CSV column — for
+            RENAMED fields the name-match missed (e.g. CourseFollowupNote may be
+            SMFollowupNote in the grid). Returns (field, pct) or (None, 0)."""
+            cvs = [(nval(r.get(col)), g) for r, g in joined]
+            best_f, best_pct = None, 0.0
+            for gf2 in all_gfields:
+                n2 = m2 = 0
+                for cv, g in cvs:
+                    gv = nval(g.get(gf2))
+                    if cv == "" and gv == "":
+                        continue
+                    n2 += 1
+                    if cv == gv:
+                        m2 += 1
+                if n2 >= max(5, len(joined) * 0.3):
+                    pct = 100.0 * m2 / n2
+                    if pct > best_pct:
+                        best_f, best_pct = gf2, pct
+            return best_f, best_pct
+
         critical = self._required_caseload_columns()
         cols = sorted(set(csv_rows[0].keys()) | critical)
         lines = [
@@ -23210,10 +23243,19 @@ class App:
             is_task = bool(_re.fullmatch(r"Task\d+", col))
             gf = gfields.get(nkey(col))
             if not gf:
-                lines.append(f"{col:34}{'— (none)':26}{'—':>7}{'':>6}  "
-                             f"{'CRITICAL — no grid field' if col in critical else ''}")
-                if col in critical and not is_task:
-                    gaps.append(col)
+                # Name didn't match — for a critical column, hunt for a RENAMED
+                # grid field by value before declaring it a gap.
+                vf, vpct = (None, 0.0)
+                if col in critical:
+                    vf, vpct = _best_value_field(col)
+                if vf and vpct >= 80:
+                    lines.append(f"{col:34}{vf + ' (by value)':26}"
+                                 f"{vpct:6.0f}%{'':>6}  renamed field")
+                else:
+                    lines.append(f"{col:34}{'— (none)':26}{'—':>7}{'':>6}  "
+                                 f"{'CRITICAL — no grid field' if col in critical else ''}")
+                    if col in critical and not is_task:
+                        gaps.append(col)
                 continue
             n = m = 0
             examples = []
