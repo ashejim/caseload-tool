@@ -21616,6 +21616,7 @@ class App:
         tab_actions = _tab_body("Actions & Email")
         tab_appearance = _tab_body("Appearance")
         tab_security = _tab_body("Security")
+        tab_about = _tab_body("About")
         dialog = tab_general
 
         def _refit() -> None:
@@ -22146,6 +22147,70 @@ class App:
             wraplength=510, justify="left",
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
+
+        # ---- About ----
+        dialog = tab_about
+        import webbrowser as _wb
+        _rel_url = f"{_GITHUB_URL}/releases"
+        _iss_url = f"{_GITHUB_URL}/issues"
+
+        def _link(parent, text, url):
+            lbl = ctk.CTkLabel(
+                parent, text=text, anchor="w", cursor="hand2",
+                text_color=("#1a56c4", "#5b9bff"),
+                font=ctk.CTkFont(size=13, underline=True))
+            lbl.bind("<Button-1>", lambda _e, u=url: _wb.open(u))
+            return lbl
+
+        ctk.CTkLabel(
+            dialog, text="WGU Caseload Note Tool",
+            font=ctk.CTkFont(size=17, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(14, 0))
+        ctk.CTkLabel(
+            dialog, text=f"Version {__version__}",
+            text_color=("gray40", "gray65"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 12))
+
+        ctk.CTkLabel(
+            dialog, text=f"Created by {_AUTHOR_NAME}",
+            font=ctk.CTkFont(size=13), anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 0))
+        _link(dialog, _AUTHOR_EMAIL, f"mailto:{_AUTHOR_EMAIL}").pack(
+            fill="x", padx=20, pady=(2, 14))
+
+        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
+            fill="x", padx=20, pady=(0, 8))
+        ctk.CTkLabel(
+            dialog, text="Links", font=ctk.CTkFont(size=13, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 4))
+        _link(dialog, "Latest releases & updates  →", _rel_url).pack(
+            fill="x", padx=28, pady=2)
+        _link(dialog, "Report a bug or suggest a feature  →", _iss_url).pack(
+            fill="x", padx=28, pady=2)
+        _link(dialog, "Source code on GitHub  →", _GITHUB_URL).pack(
+            fill="x", padx=28, pady=(2, 14))
+
+        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
+            fill="x", padx=20, pady=(0, 8))
+        ctk.CTkLabel(
+            dialog, text="Suggestions & issues",
+            font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 4))
+        ctk.CTkLabel(
+            dialog,
+            text=("Found a bug or have an idea? Please open a GitHub issue:\n\n"
+                  "1.  Click “Report a bug or suggest a feature” above "
+                  "(it opens the GitHub Issues page).\n"
+                  "2.  Click the green “New issue” button "
+                  "(a free GitHub account is needed to post).\n"
+                  "3.  Describe your suggestion, or for a bug what happened and "
+                  "the steps to reproduce it — paste any red error text from the "
+                  "activity log.\n\n"
+                  "You can also email me directly at the address above."),
+            wraplength=520, justify="left", anchor="w",
+            text_color=("gray30", "gray72"), font=ctk.CTkFont(size=12),
+        ).pack(fill="x", padx=28, pady=(0, 14))
 
         # Save/Cancel live in the pinned footer (outside the scroll body), with
         # a hairline separator above so they read as an action bar.
