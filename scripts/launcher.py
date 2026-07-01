@@ -12793,6 +12793,12 @@ class CaseloadPanel:
         if q.lower().startswith("apinote"):
             self.app._test_api_note()
             return "break"
+        # DIAGNOSTIC: "griddiff:" compares the intercepted grid JSON against the
+        # CSV column by column (writes griddiff_report.txt) — proves whether the
+        # JSON can replace the CSV before switching the data path. Read-only.
+        if q.lower().startswith("griddiff"):
+            self.app._grid_vs_csv_diff()
+            return "break"
         # Student ID (digits) or email → if not on the caseload, find anywhere.
         if q and (re.fullmatch(r"\d{5,12}", q) or "@" in q):
             rows = self.app._caseload_rows or []
@@ -22696,6 +22702,7 @@ class App:
             targets = list(USER_CONFIG_DIR.glob("capture-*.json"))
             targets += list(USER_CONFIG_DIR.glob("*_probe.txt"))
             targets.append(USER_CONFIG_DIR / "aura_probe.txt")
+            targets.append(USER_CONFIG_DIR / "griddiff_report.txt")
             try:
                 from src.config import SCREENSHOTS_DIR
                 targets += list(SCREENSHOTS_DIR.glob("*.png"))
@@ -23095,6 +23102,160 @@ class App:
             except Exception:
                 pass
 
+    # Core fields the intercepted grid JSON must carry for it to be a viable
+    # substitute for the CSV (key presence, not value — task-less students have
+    # empty Task1 but the key is still there).
+    _GRID_HEALTH_FIELDS = ("StudentID", "CourseCode", "Momentum", "Task1")
+
+    def _grid_feed_health(self, csv_rows=None) -> dict:
+        """CHEAP check (safe every reload) of whether the intercepted grid JSON
+        is a healthy stand-in for the CSV: present, covers ~all caseload rows,
+        and carries the core fields. This is the guard that lets a future
+        JSON-primary path auto-fall-back to the CSV if WGU ever changes/removes
+        the feed — never silently show partial data. Returns
+        {ok, grid_count, csv_count, coverage, missing_fields, reason}."""
+        try:
+            grid = self.worker.grid_rows_by_key()
+        except Exception:
+            grid = {}
+        csv_rows = csv_rows if csv_rows is not None else (self._caseload_rows or [])
+        out = {"ok": False, "grid_count": len(grid), "csv_count": len(csv_rows),
+               "coverage": 0.0, "missing_fields": [], "reason": ""}
+        if not grid:
+            out["reason"] = "grid feed absent (not captured this session)"
+            return out
+
+        def _key(r):
+            return (str(r.get("StudentID") or r.get("Student ID") or "").strip(),
+                    str(r.get("CourseCode") or r.get("Course Code") or "").strip())
+
+        if csv_rows:
+            hit = sum(1 for r in csv_rows
+                      if _key(r) in grid or (_key(r)[0], "") in grid)
+            out["coverage"] = hit / len(csv_rows)
+        # Sample the first few grid rows for core-field presence.
+        sample = list(grid.values())[:5]
+        missing = [f for f in self._GRID_HEALTH_FIELDS
+                   if not any(f in g for g in sample)]
+        out["missing_fields"] = missing
+        out["ok"] = (not missing
+                     and (not csv_rows or out["coverage"] >= 0.95))
+        if not out["ok"]:
+            if missing:
+                out["reason"] = f"grid missing core field(s): {', '.join(missing)}"
+            else:
+                out["reason"] = (
+                    f"grid covers {out['coverage'] * 100:.0f}% of caseload rows "
+                    f"({out['grid_count']} grid vs {out['csv_count']} CSV)")
+        return out
+
+    def _grid_vs_csv_diff(self) -> None:
+        """READ-ONLY: compare rows built from the intercepted grid JSON against
+        the CSV rows, column by column, and write a coverage report. Proves
+        whether the JSON can fully replace the CSV before we ever switch the
+        data path — changes nothing. Triggered by the 'griddiff:' viewer keyword.
+        The report file holds student values (PII) → gitignored + auto-cleaned."""
+        import re as _re
+        csv_rows = self._caseload_rows or []
+        try:
+            grid = self.worker.grid_rows_by_key()
+        except Exception:
+            grid = {}
+        if not csv_rows:
+            self._append_log("griddiff: no CSV loaded — refresh the caseload first.")
+            return
+        if not grid:
+            self._append_log("griddiff: no grid captured yet — refresh, then retry.")
+            return
+
+        def nkey(s):
+            return _re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+        def nval(x):
+            return _re.sub(r"\s+", " ", str(x or "").strip()).lower()
+
+        def ckey(r):
+            return (str(r.get("StudentID") or r.get("Student ID") or "").strip(),
+                    str(r.get("CourseCode") or r.get("Course Code") or "").strip())
+
+        joined, only_csv = [], 0
+        for r in csv_rows:
+            k = ckey(r)
+            g = grid.get(k) or grid.get((k[0], ""))
+            if g:
+                joined.append((r, g))
+            else:
+                only_csv += 1
+        csv_sids = {ckey(r)[0] for r in csv_rows}
+        only_grid = sum(1 for (sid, _c) in grid.keys() if sid not in csv_sids)
+
+        # Normalized-name index of grid fields (from a sample of rows).
+        gfields = {}
+        for g in list(grid.values())[:20]:
+            for f in g.keys():
+                gfields.setdefault(nkey(f), f)
+
+        critical = self._required_caseload_columns()
+        cols = sorted(set(csv_rows[0].keys()) | critical)
+        lines = [
+            f"griddiff — grid JSON vs CSV coverage",
+            f"joined {len(joined)} · CSV-only {only_csv} · grid-only {only_grid} "
+            f"· grid {len(grid)} / csv {len(csv_rows)}",
+            "",
+            f"{'CSV column':34}{'grid field':26}{'match%':>7}{'n':>6}  note",
+            "-" * 90,
+        ]
+        gaps = []
+        for col in cols:
+            is_task = bool(_re.fullmatch(r"Task\d+", col))
+            gf = gfields.get(nkey(col))
+            if not gf:
+                lines.append(f"{col:34}{'— (none)':26}{'—':>7}{'':>6}  "
+                             f"{'CRITICAL — no grid field' if col in critical else ''}")
+                if col in critical and not is_task:
+                    gaps.append(col)
+                continue
+            n = m = 0
+            examples = []
+            for r, g in joined:
+                cv, gv = nval(r.get(col)), nval(g.get(gf))
+                if cv == "" and gv == "":
+                    continue
+                n += 1
+                if cv == gv or (is_task and cv[:10] and cv[:10] == gv[:10]):
+                    m += 1
+                elif len(examples) < 4:
+                    examples.append((r.get("StudentID", ""), r.get(col), g.get(gf)))
+            pct = (100.0 * m / n) if n else 100.0
+            note = ""
+            if is_task and pct < 100:
+                note = "(task cell format differs — handled by transform)"
+            elif pct < 95 and n:
+                note = "<-- differs"
+                if col in critical:
+                    gaps.append(col)
+            lines.append(f"{col:34}{gf:26}{pct:6.0f}%{n:6}  {note}")
+            for sid, cvv, gvv in examples:
+                lines.append(f"      [{sid}] csv={cvv!r} grid={gvv!r}")
+
+        health = self._grid_feed_health(csv_rows)
+        lines += ["", f"feed health: {'OK' if health['ok'] else 'DEGRADED'} — "
+                  f"{health['reason'] or 'covers all rows + core fields'}"]
+
+        from src.config import USER_CONFIG_DIR as _UCD
+        report = _UCD / "griddiff_report.txt"
+        try:
+            report.write_text("\n".join(lines), encoding="utf-8")
+        except Exception as e:
+            self._append_log(f"griddiff: couldn't write report: {e}")
+        # Concise summary to the log; details (with values) go to the file.
+        self._append_log(
+            f"griddiff: {len(joined)} joined · {only_csv} CSV-only · "
+            f"{only_grid} grid-only. "
+            + (f"Critical gaps: {', '.join(gaps)}." if gaps
+               else "All critical columns have a grid field.")
+            + f" Full report → {report.name}")
+
     def _reload_caseload_cache(self, *, silent: bool = False) -> bool:
         """Read CASELOAD_CSV_PATH into self._caseload_rows. Returns
         True on success, False if the file doesn't exist or can't be
@@ -23147,6 +23308,23 @@ class App:
         self._apply_derived_columns_to_rows()
         self._refresh_caseload_panel()
         self._check_required_caseload_columns(rows, silent=silent)
+        # Cheap grid-feed health check: if the intercepted JSON stops covering
+        # the caseload (e.g. WGU changes the endpoint), say so ONCE — so we lean
+        # on the CSV instead of silently trusting a degraded feed. Quiet when
+        # healthy or when no grid is captured yet (that's normal early startup).
+        try:
+            h = self._grid_feed_health(rows)
+            if h["grid_count"] and not h["ok"] and not getattr(
+                    self, "_grid_health_warned", False):
+                self._grid_health_warned = True
+                self._append_log(
+                    f"⚠ Grid data feed degraded ({h['reason']}) — relying on the "
+                    "caseload CSV. Run 'griddiff:' in search for details.",
+                    error=True)
+            elif h["ok"]:
+                self._grid_health_warned = False
+        except Exception:
+            pass
         # Snapshot the dynamic fields into the local history DB (non-fatal:
         # the panel is already rendered, and a DB failure must not break the
         # reload). Runs on the silent startup reload too — that's the
