@@ -284,6 +284,12 @@ class BrowserWorker:
         # archive's (passed-student) rows don't pollute the My-Students grid
         # (pass/fail + contact-id map). See _download_outcomes_archive.
         self._suppress_grid_capture = False
+        # EA dashboard JSON feed: while _ea_capture_armed (set around the EA
+        # dashboard navigation), _on_response accumulates the EmployeeEvent__c
+        # records the page fetches into _ea_data — so EAs can be read from JSON
+        # (path 2) regardless of the EA list-view's displayed columns.
+        self._ea_data = None
+        self._ea_capture_armed = False
         # Freshest harvested Aura credentials (token + context) from live /aura
         # POSTs — reused to REPLAY the note-save action via fetch (no flaky
         # form). {"token","context","ts"} or None. See _harvest_aura_creds.
@@ -1865,6 +1871,9 @@ class BrowserWorker:
         # page already fetches, so the scan can skip the scroll-scrape.
         if "getCaseLoadMainGridData" in url:
             self._capture_grid_data(response)
+        # While reading the EA dashboard, grab its EmployeeEvent__c JSON feed.
+        if self._ea_capture_armed and "/aura" in url:
+            self._capture_ea_data(response)
         if not self._capture_active:
             return
         if not any(d in url for d in (
@@ -1900,6 +1909,38 @@ class BrowserWorker:
             })
         except Exception:
             pass
+
+    def _capture_ea_data(self, response) -> None:
+        """When armed, find the EA dashboard's data feed in an /aura response: a
+        list of EmployeeEvent__c records (each with a Contact__r object +
+        Intervention__c + CourseCode__c). Keeps the longest such list seen.
+        Cheap-skips non-EA responses via a substring check before parsing."""
+        try:
+            body = response.text()
+        except Exception:
+            return
+        if "Intervention__c" not in body:
+            return
+        import json
+        try:
+            i = body.find("{")
+            env = json.loads(body[i:]) if i >= 0 else {}
+        except Exception:
+            return
+        for a in (env.get("actions") or []):
+            rv = a.get("returnValue")
+            cands = []
+            if isinstance(rv, list):
+                cands.append(rv)
+            elif isinstance(rv, dict):
+                cands += [v for v in rv.values() if isinstance(v, list)]
+            for c in cands:
+                if (c and isinstance(c[0], dict)
+                        and isinstance(c[0].get("Contact__r"), dict)
+                        and "Intervention__c" in c[0]
+                        and "CourseCode__c" in c[0]):
+                    if self._ea_data is None or len(c) > len(self._ea_data):
+                        self._ea_data = c
 
     def _capture_grid_data(self, response) -> None:
         """Parse + ACCUMULATE the getCaseLoadMainGridData Aura response. The page
@@ -3782,22 +3823,37 @@ class BrowserWorker:
         all EAs, then return to the caseload list so subsequent finds/fires
         start from the right page."""
         from src.config import ESSENTIAL_ACTIONS_URL
-        from src.student_lookup import read_ea_dashboard_rows
+        from src.student_lookup import (read_ea_dashboard_rows,
+                                        ea_rows_from_records)
         target = self._active_page(ctx)
         if target is None:
             return {"error": "no active page"}
         if not ESSENTIAL_ACTIONS_URL:
             return {"error": "ESSENTIAL_ACTIONS_URL not set"}
-        err, rows = "", []
+        err, rows, source = "", [], "scrape"
         t0 = time.perf_counter()
         t_read = t0
+        self._ea_data = None
+        self._ea_capture_armed = True
         try:
             target.goto(ESSENTIAL_ACTIONS_URL, wait_until="domcontentloaded")
-            target.wait_for_timeout(800)
-            rows = read_ea_dashboard_rows(target)
+            # Prefer the JSON feed the page fetches (path 2) — independent of the
+            # EA view's displayed columns. Wait briefly for it, else DOM-scrape.
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline and not self._ea_data:
+                target.wait_for_timeout(200)
+            if self._ea_data:
+                rows = ea_rows_from_records(self._ea_data)
+                source = "JSON"
+            if not rows:                       # feed missing → proven scrape
+                target.wait_for_timeout(400)
+                rows = read_ea_dashboard_rows(target)
+                source = "scrape"
             t_read = time.perf_counter()   # before the nav back to caseload
         except Exception as e:
             err = str(e)
+        finally:
+            self._ea_capture_armed = False
         try:
             if CASELOAD_URL:
                 target.goto(CASELOAD_URL, wait_until="domcontentloaded")
@@ -3805,7 +3861,7 @@ class BrowserWorker:
             pass
         if err:
             return {"error": err}
-        return {"eas": rows,
+        return {"eas": rows, "source": source,
                 "secs": round(time.perf_counter() - t0, 1),
                 "read_secs": round(t_read - t0, 1)}
 
@@ -20154,6 +20210,7 @@ class App:
         def on_done(res) -> None:
             def set_main() -> None:
                 holder["eas"] = (res or {}).get("eas") or []
+                self._ea_source = (res or {}).get("source", "scrape")
                 if (res or {}).get("error"):
                     self._append_log(
                         f"EA dashboard scrape failed: {res['error']}",
@@ -20191,8 +20248,11 @@ class App:
                 f"⚠ Essential Actions dashboard listed {who!r} more than "
                 "once — showing only the first. The design expects one EA "
                 "per student; check this student.", error=True)
+        _src = getattr(self, "_ea_source", "scrape")
         self._append_log(
-            f"Essential Actions: {len(by_sid)} student(s) with an open EA.")
+            f"Essential Actions: {len(by_sid)} student(s) with an open EA."
+            + ("  ↳ ⚡ via JSON feed (EA view columns no longer matter)"
+               if _src == "JSON" else "  ↳ via DOM scrape"))
         self._apply_ea_to_rows()
         self._refresh_caseload_panel()
 

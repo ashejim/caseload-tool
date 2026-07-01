@@ -940,6 +940,34 @@ def read_ea_dashboard_rows(page: Page, max_iters: int = 120) -> list[dict]:
     return list(seen.values())
 
 
+def ea_rows_from_records(records) -> list[dict]:
+    """Map the EA dashboard's JSON feed (a list of EmployeeEvent__c records) to
+    the SAME row shape read_ea_dashboard_rows produces, deduped to one row per
+    student (matching the DOM scrape — a student with 2 EAs shows once). Reading
+    from the feed means the EA list-VIEW column config no longer matters, since
+    every field is in the record regardless of what the view displays."""
+    seen: dict[str, dict] = {}
+    for r in records or []:
+        if not isinstance(r, dict):
+            continue
+        c = r.get("Contact__r") or {}
+        sid = str(c.get("StudentID__c") or "").strip()
+        if not sid or sid in seen:
+            continue
+        seen[sid] = {
+            "student_id": sid,
+            "name": (c.get("Name") or "").strip(),
+            "reason": (r.get("Name") or "").strip(),
+            "course": (r.get("CourseCode__c") or "").strip(),
+            "event_progress": (r.get("Status__c")
+                               or r.get("StatusCategory__c") or "").strip(),
+            "followup_date": (r.get("DueDate__c") or "").strip(),
+            "intervention": (r.get("Intervention__c") or "").strip(),
+            "date_added": (r.get("VisibilityStartDate__c") or "").strip(),
+        }
+    return list(seen.values())
+
+
 def detect_course_code(page: Page, student_name: str) -> Optional[str]:
     """Backward-compatible thin wrapper: returns just the course code,
     or None if not found."""
