@@ -23436,9 +23436,17 @@ class App:
                  f"{len(joined)} joined", "",
                  f"{'column':34}{'match%':>7}{'n':>6}{'in build':>10}  note",
                  "-" * 88]
+        def _ascii_norm(s):
+            # The CSV export is ASCII-lossy (drops em-dashes / smart quotes); the
+            # grid keeps them. For note/text fields, compare after stripping
+            # non-ASCII so the grid's RICHER version isn't flagged as wrong.
+            return re.sub(r"\s+", " ",
+                          "".join(c for c in s if ord(c) < 128)).strip().lower()
+
         gaps = []
         for col in cols:
             in_build = any(col in b for _c, b in joined)
+            lenient = col.endswith("Note") or col in ("LatestCaseloadNote",)
             n = m = 0
             ex = []
             for c, b in joined:
@@ -23448,12 +23456,21 @@ class App:
                 n += 1
                 if cv == bv:
                     m += 1
+                elif lenient and (
+                        _ascii_norm(cv) == _ascii_norm(bv)
+                        or _ascii_norm(bv).startswith(_ascii_norm(cv))
+                        or _ascii_norm(cv).startswith(_ascii_norm(bv))):
+                    m += 1              # grid keeps richer text — accepted
                 elif len(ex) < 4:
                     ex.append((c.get("StudentID", ""), cv, bv))
             pct = (100.0 * m / n) if n else 100.0
             note = ""
             if not in_build:
                 note = "CSV-only — overlay from CSV"
+            elif lenient and pct >= 99:
+                note = "grid-richer text (accepted)" if any(
+                    str(c.get(col) or "") != str(b.get(col) or "")
+                    for c, b in joined) else ""
             elif pct < 99 and n:
                 note = "<-- DIFFERS"
                 if col in critical:
