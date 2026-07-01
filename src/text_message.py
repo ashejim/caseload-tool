@@ -502,9 +502,26 @@ def open_compose_to_recipient_step(
     for attempt in range(attempts):
         try:
             open_compose(page)              # closes any leftover modal first
-            select_inbox(page, inbox_label)
-            _recipient_box(page).wait_for(state="visible", timeout=12_000)
-            return
+            # Mongoose REMEMBERS the last inbox, so on later groups the "Select
+            # Inbox" step is skipped and compose lands straight on the recipient
+            # box. Waiting out select_inbox's timeout in that case burned ~6s per
+            # group. Instead RACE: return as soon as the recipient box is visible
+            # (inbox auto-selected), or click the inbox the instant its step
+            # appears (multi-inbox department), whichever comes first.
+            deadline = time.monotonic() + 12.0
+            selected = False
+            while time.monotonic() < deadline:
+                box = _recipient_box(page)
+                if box.count() > 0 and box.first.is_visible():
+                    return               # already at the recipient step
+                if not selected:
+                    inbox = page.locator(".inbox-select").filter(visible=True)
+                    if inbox.count() > 0:
+                        select_inbox(page, inbox_label)   # click the matching one
+                        selected = True
+                        continue         # loop back to wait for the recipient box
+                page.wait_for_timeout(120)
+            raise RuntimeError("recipient step never appeared")
         except Exception as e:
             last_err = e
             if attempt + 1 < attempts:
