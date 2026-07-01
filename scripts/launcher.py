@@ -249,6 +249,12 @@ def _note_body_to_html(text: str) -> str:
 class BrowserWorker:
     SHUTDOWN = object()
 
+    # Columns the caseload CSV MUST keep for the CSV fallback to stay usable.
+    # StudentID is the join key every CSV-side path relies on; if a download
+    # drops it, the anti-clobber guard rejects that export and keeps the
+    # previous good CSV (see _download_caseload_csv).
+    _CSV_CRITICAL_COLUMNS = ("StudentID",)
+
     def __init__(
         self,
         on_status: Callable[[str], None],
@@ -1965,7 +1971,16 @@ class BrowserWorker:
                         and isinstance(c[0].get("Contact__r"), dict)
                         and "Intervention__c" in c[0]
                         and "CourseCode__c" in c[0]):
-                    if self._ea_data is None or len(c) > len(self._ea_data):
+                    # Prefer a feed whose Contact__r actually carries a
+                    # StudentID__c (the join key) over a leaner competing action
+                    # that merely mentions Intervention__c — otherwise we can
+                    # latch the wrong list and map every row to nothing. Rank by
+                    # (has-usable-StudentID, length).
+                    def _score(lst):
+                        con = lst[0].get("Contact__r") or {}
+                        return (1 if str(con.get("StudentID__c") or "").strip()
+                                else 0, len(lst))
+                    if self._ea_data is None or _score(c) > _score(self._ea_data):
                         self._ea_data = c
 
     def _capture_grid_data(self, response) -> None:
@@ -3095,26 +3110,57 @@ class BrowserWorker:
             # the existing cache (e.g. the browser view lost columns), keep
             # the previous file as .bak and warn — silent data loss here is
             # how a wrong view quietly breaks viewer features.
+            #
+            # HARDENING: the caseload "Download" occasionally drifts its
+            # column set between runs (a render/timing hiccup). If a run drops
+            # a CRITICAL join column — above all StudentID, which every CSV
+            # fallback path keys on — we REJECT the new file and keep the
+            # previous good CSV in place, so the CSV fallback stays valid even
+            # when the export hiccups. (The JSON grid feed already carries
+            # StudentID, so the primary path is unaffected either way.)
             dropped: list[str] = []
+            critical_dropped: list[str] = []
             if sp.exists():
                 try:
                     old_h = caseload_csv.csv_header(sp)
                     new_h = caseload_csv.csv_header(tmp)
                     dropped = [c for c in old_h if c and c not in new_h]
+                    critical_dropped = [
+                        c for c in self._CSV_CRITICAL_COLUMNS if c in dropped]
                 except Exception:
                     dropped = []
+                    critical_dropped = []
+            if critical_dropped:
+                # Keep the existing good CSV; stash the bad export for
+                # inspection rather than overwriting.
                 try:
-                    sp.replace(sp.with_name(sp.name + ".bak"))
+                    tmp.replace(sp.with_name(sp.name + ".rejected"))
                 except Exception:
-                    pass
-            tmp.replace(sp)
-            if dropped:
+                    try:
+                        tmp.unlink()
+                    except Exception:
+                        pass
                 self.on_status(
-                    "  [export] WARNING: new download dropped "
-                    f"{len(dropped)} column(s) vs the previous CSV "
-                    f"({', '.join(dropped[:6])}"
-                    f"{'…' if len(dropped) > 6 else ''}). Previous saved as "
-                    f"{sp.name}.bak — check your Caseload view if unintended.")
+                    "  [export] WARNING: new download dropped critical "
+                    f"column(s) ({', '.join(critical_dropped)}) — KEPT the "
+                    f"previous CSV instead of overwriting it. Bad export "
+                    f"saved as {sp.name}.rejected. Check your Caseload view "
+                    "if unintended. (The JSON grid feed is unaffected.)")
+            else:
+                if sp.exists():
+                    try:
+                        sp.replace(sp.with_name(sp.name + ".bak"))
+                    except Exception:
+                        pass
+                tmp.replace(sp)
+                if dropped:
+                    self.on_status(
+                        "  [export] WARNING: new download dropped "
+                        f"{len(dropped)} column(s) vs the previous CSV "
+                        f"({', '.join(dropped[:6])}"
+                        f"{'…' if len(dropped) > 6 else ''}). Previous saved "
+                        f"as {sp.name}.bak — check your Caseload view if "
+                        "unintended.")
         except Exception as e:
             return False, f"download save failed: {e}"
 
@@ -3948,13 +3994,15 @@ class BrowserWorker:
         start from the right page."""
         from src.config import ESSENTIAL_ACTIONS_URL
         from src.student_lookup import (read_ea_dashboard_rows,
-                                        ea_rows_from_records)
+                                        ea_rows_from_records,
+                                        ea_view_missing_student_id)
         target = self._active_page(ctx)
         if target is None:
             return {"error": "no active page"}
         if not ESSENTIAL_ACTIONS_URL:
             return {"error": "ESSENTIAL_ACTIONS_URL not set"}
         err, rows, source = "", [], "scrape"
+        view_missing_sid = False
         t0 = time.perf_counter()
         t_read = t0
         self._ea_data = None
@@ -3966,13 +4014,39 @@ class BrowserWorker:
             deadline = time.monotonic() + 8.0
             while time.monotonic() < deadline and not self._ea_data:
                 target.wait_for_timeout(200)
+            feed_n = len(self._ea_data) if self._ea_data else 0
+            # Always log the feed outcome so the JSON-vs-scrape decision is never
+            # ambiguous (and a MISSING [EA feed] line means stale code ran).
+            if feed_n:
+                sample = self._ea_data[0] if isinstance(
+                    self._ea_data[0], dict) else {}
+                c = sample.get("Contact__r") or {}
+                self.on_status(
+                    f"  [EA feed] captured {feed_n} record(s); Contact__r keys: "
+                    f"{', '.join(list(c)[:10]) or 'none'}; "
+                    f"StudentID__c={str(c.get('StudentID__c') or '')!r}")
+            else:
+                self.on_status(
+                    "  [EA feed] not captured within the wait window.")
             if self._ea_data:
                 rows = ea_rows_from_records(self._ea_data)
                 source = "JSON"
+                if not rows:
+                    # The feed arrived but every record mapped to no usable row
+                    # — almost always because Contact__r has no StudentID__c
+                    # (the feed's field set follows the EA view's columns).
+                    self.on_status(
+                        "  [EA feed] produced 0 usable rows — falling back to "
+                        "DOM scrape.")
             if not rows:                       # feed missing → proven scrape
                 target.wait_for_timeout(400)
                 rows = read_ea_dashboard_rows(target)
                 source = "scrape"
+                # If the scrape found nothing, tell "0 EAs" apart from "the EA
+                # view dropped the Student ID column" (which the scrape keys on)
+                # so the app can warn the user to re-add it for the fallback.
+                if not rows:
+                    view_missing_sid = ea_view_missing_student_id(target)
             t_read = time.perf_counter()   # before the nav back to caseload
         except Exception as e:
             err = str(e)
@@ -3986,6 +4060,7 @@ class BrowserWorker:
         if err:
             return {"error": err}
         return {"eas": rows, "source": source,
+                "view_missing_sid": view_missing_sid,
                 "secs": round(time.perf_counter() - t0, 1),
                 "read_secs": round(t_read - t0, 1)}
 
@@ -15120,7 +15195,7 @@ class SplashScreen:
     Close it with .close() (idempotent)."""
 
     def __init__(self, master, gif_path, max_size=460, max_frames=32,
-                 loop_ms=2500):
+                 loop_ms=3000):
         self.win = None
         self._job = None
         self._frames = []
@@ -20351,6 +20426,8 @@ class App:
             def set_main() -> None:
                 holder["eas"] = (res or {}).get("eas") or []
                 self._ea_source = (res or {}).get("source", "scrape")
+                self._ea_view_missing_sid = bool(
+                    (res or {}).get("view_missing_sid"))
                 if (res or {}).get("error"):
                     self._append_log(
                         f"EA dashboard scrape failed: {res['error']}",
@@ -20393,6 +20470,18 @@ class App:
             f"Essential Actions: {len(by_sid)} student(s) with an open EA."
             + ("  ↳ ⚡ via JSON feed (EA view columns no longer matter)"
                if _src == "JSON" else "  ↳ via DOM scrape"))
+        # Mirror the caseload column-drop guard for the EA view: if the JSON
+        # feed was unavailable, the scrape found no rows, and the grid had rows
+        # but no Student ID cell, the EA view is missing that column. Warn so
+        # the user can re-add it (the scrape fallback keys on it).
+        if getattr(self, "_ea_view_missing_sid", False) and not by_sid:
+            self._append_log(
+                "⚠ Essential Actions view is missing the 'Student ID' column — "
+                "found EAs in the grid but couldn't read them. The live JSON "
+                "feed was unavailable, so the app fell back to reading the EA "
+                "table, which needs that column. Add 'Student ID' back to your "
+                "Essential Actions view (or reload to retry the JSON feed).",
+                error=True)
         self._apply_ea_to_rows()
         self._refresh_caseload_panel()
 

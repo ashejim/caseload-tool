@@ -875,6 +875,38 @@ _EA_READ_JS = """
 }
 """
 
+# Column-presence probe: does the EA grid have rendered DATA rows, and do any
+# carry a Student ID cell? Used to tell "genuinely zero EAs" apart from "the EA
+# view is missing the Student ID column" (which makes the DOM scrape read 0).
+_EA_COLCHECK_JS = """
+() => {
+  let dataRows = 0, sidRows = 0;
+  const cols = new Set();
+  document.querySelectorAll('tr').forEach(tr => {
+    const cells = tr.querySelectorAll('td[data-label]');
+    if (!cells.length) return;
+    dataRows++;
+    cells.forEach(c => cols.add(c.getAttribute('data-label')));
+    if (tr.querySelector('td[data-label="Student ID"]')) sidRows++;
+  });
+  return {dataRows, sidRows, columns: [...cols]};
+}
+"""
+
+
+def ea_view_missing_student_id(page: Page) -> bool:
+    """True when the EA dashboard grid rendered data rows but NONE carry a
+    Student ID cell — i.e. the EA list-view is missing the 'Student ID' column
+    that the DOM scrape keys on. Lets the caller distinguish a misconfigured
+    view (warn: re-add the column) from a genuinely empty EA queue. Only
+    meaningful when the JSON feed was unavailable and the scrape ran."""
+    try:
+        info = page.evaluate(_EA_COLCHECK_JS) or {}
+    except Exception:
+        return False
+    return bool(info.get("dataRows")) and not info.get("sidRows")
+
+
 # Scroll the first / last currently-rendered EA row into view (start the
 # accumulation from the top; advance the lazy-load by one window).
 _EA_SCROLL_JS = """

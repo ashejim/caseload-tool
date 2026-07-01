@@ -69,6 +69,12 @@ mongoose*.csv
 # Single-instance lock file (runtime).
 launcher.lock
 
+# Local working folder of source/branding art — includes THIRD-PARTY logos
+# (Salesforce, Mongoose) and large source GIFs. Never commit: trademark/
+# copyright + repo bloat. Shipped app assets live in resources/ (app.ico,
+# splash.gif), which are whitelisted above.
+branding images/
+
 # The user's live scenarios (their personal batches/scenarios/emails).
 # Only the bundled sample, default_scenarios.yaml, is tracked. The legacy
 # notes.yaml name + its backups are ignored too.
