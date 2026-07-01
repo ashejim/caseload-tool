@@ -26,9 +26,14 @@ from __future__ import annotations
 
 import re
 
-# Leading pass/fail glyph the grid prepends to the LatestTask summary cell (the
-# numbered Task1..Task15 cells match the CSV as-is; only LatestTask carries it).
-_LEAD_GLYPH = re.compile(r"^[✓✗✔✘]\s*")
+# Task cells (Task1..Task15 + the LatestTask summary) carry a status glyph the
+# CSV export strips — the grid puts it INSIDE the cell (e.g. '2026-05-26✓ (1)')
+# or leading (e.g. '⌛06/30/2026 (0)'). The cell is otherwise just a date +
+# attempt count, so strip anything that isn't part of that date/count format to
+# match the CSV byte-for-byte, then re-collapse whitespace.
+_TASK_FIELD = re.compile(r"^(Task\d+|LatestTask)$")
+_TASK_JUNK = re.compile(r"[^\d/()\s-]")
+_WS = re.compile(r"\s+")
 
 
 def grid_val_to_csv_str(field: str, v) -> str:
@@ -42,8 +47,8 @@ def grid_val_to_csv_str(field: str, v) -> str:
     if isinstance(v, (dict, list)):
         return ""            # nested — not a flat caseload column
     s = str(v)
-    if field == "LatestTask":
-        s = _LEAD_GLYPH.sub("", s)
+    if _TASK_FIELD.match(field):
+        s = _WS.sub(" ", _TASK_JUNK.sub("", s)).strip()
     return s
 
 
