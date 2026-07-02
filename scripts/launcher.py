@@ -2177,6 +2177,105 @@ class BrowserWorker:
                 by_sid[sid] = statuses
         return by_sid
 
+    def _grid_acacourse_id(self, sid: str, course: str = "") -> str:
+        """Resolve the StudentAcademicCourse id (a6d…) for a student from the
+        accumulated grid — the key the follow-up save Aura action wants
+        (theStudentAcaCourseId). Prefer the row matching `course` when given;
+        else the first row for the student. '' if unknown."""
+        grid = self._grid_data
+        if not grid:
+            return ""
+        want_sid = str(sid or "").strip()
+        want_course = str(course or "").strip()
+        fallback = ""
+        for (s, c), row in (grid.get("by_key") or {}).items():
+            if str(s).strip() != want_sid:
+                continue
+            v = str(row.get("StudentAcademicCourseId") or "").strip()
+            if not v:
+                continue
+            if want_course and str(c).strip() == want_course:
+                return v
+            fallback = fallback or v
+        return fallback
+
+    def _save_followup_via_api(self, ctx, *, acacourse_id, note=None,
+                               date=None) -> dict:
+        """Replay the MentorForceAuraMethods follow-up save Aura action via
+        fetch() from inside the page — persists the Course Followup Note or Date
+        directly, bypassing the flaky inline list-cell edit (which sometimes
+        committed a null value → the 'doesn't persist' bug). Pass note= OR date=
+        (one field per call). Returns {"ok": True} or {"error": ...}; caller
+        falls back to the inline edit on error."""
+        import json as _json
+        creds = self._aura_creds
+        if not creds:
+            return {"error": "no Aura credentials harvested yet"}
+        acac = (acacourse_id or "").strip()
+        if not acac.startswith("a6d"):
+            return {"error": f"bad StudentAcademicCourseId {acacourse_id!r}"}
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        if note is not None:
+            method = "saveCourseFollowupNoteToSF"
+            params = {"theStudentAcaCourseId": acac,
+                      "theCourseFollowupNote": note}
+        elif date is not None:
+            method = "saveCourseFollowupDateToSF"
+            params = {"theStudentAcaCourseId": acac,
+                      "theCourseFollowupDate": date}
+        else:
+            return {"error": "nothing to save (note/date both None)"}
+        descriptor = f"apex://MentorForceAuraMethods/ACTION${method}"
+        message = _json.dumps({"actions": [{
+            "id": "1;a", "descriptor": descriptor,
+            "callingDescriptor": "UNKNOWN", "params": params}]})
+        page_uri = "/lightning/n/Caseload_App_Page"
+        endpoint = f"/aura?other.MentorForceAuraMethods.{method}=1"
+        js = """async ([message, ctxs, token, pageUri, endpoint]) => {
+            const body = new URLSearchParams();
+            body.set('message', message);
+            body.set('aura.context', ctxs);
+            body.set('aura.pageURI', pageUri);
+            body.set('aura.token', token);
+            const resp = await fetch(endpoint, {
+                method: 'POST', credentials: 'include',
+                headers: {'Content-Type':
+                          'application/x-www-form-urlencoded;charset=UTF-8'},
+                body: body.toString(),
+            });
+            const txt = await resp.text();
+            return {status: resp.status, body: txt.slice(0, 20000)};
+        }"""
+        try:
+            res = target.evaluate(
+                js, [message, creds["context"], creds["token"], page_uri,
+                     endpoint])
+        except Exception as e:
+            return {"error": f"fetch failed: {e}"}
+        body = (res or {}).get("body", "") or ""
+        i = body.find("{")
+        try:
+            env = _json.loads(body[i:]) if i >= 0 else {}
+        except Exception:
+            env = {}
+        actions = env.get("actions") or []
+        state = actions[0].get("state") if actions else ""
+        if not state:
+            m = re.search(r'"state"\s*:\s*"([A-Z]+)"', body)
+            state = m.group(1) if m else ""
+        if state == "SUCCESS":
+            return {"ok": True}
+        err = ""
+        try:
+            err = (actions[0].get("error") if actions else "") \
+                or env.get("exceptionMessage") or ""
+        except Exception:
+            err = ""
+        return {"error": f"state={state!r} http={res.get('status')} "
+                f"{str(err)[:200] or body[:200]}"}
+
     def grid_rows_by_key(self) -> dict:
         """The accumulated caseload-grid rows keyed by (StudentID, CourseCode).
         {} if no grid captured yet. Shallow copy — the App reads it on reload to
@@ -3484,6 +3583,19 @@ class BrowserWorker:
         q = (query or "").strip()
         if not q:
             return {"ok": False, "error": "no student id"}
+        # Fast path: persist via the Aura API (saveCourseFollowupNoteToSF). This
+        # fixes the flaky inline list-cell edit that sometimes committed a null
+        # value (the 'follow-up doesn't persist' bug). No nav/filter needed.
+        acac = self._grid_acacourse_id(q)
+        if acac and self._aura_creds:
+            api = self._save_followup_via_api(ctx, acacourse_id=acac,
+                                              note=note_text)
+            if api.get("ok"):
+                return {"ok": True, "value": note_text,
+                        "committed_via": "API"}
+            self.on_status(
+                f"  ↳ follow-up note API save failed "
+                f"({api.get('error')}); using inline edit")
         target, table = self._open_caseload_table(ctx)
         if table is None:
             return {"ok": False, "error": "caseload table didn't load"}
@@ -3573,6 +3685,9 @@ class BrowserWorker:
                                                      "commit")):
                     flag = "   <<< save/update action"
                 lines.append(f"descriptor: {desc}{flag}")
+                cd = a.get("callingDescriptor", "")
+                if cd:
+                    lines.append(f"  callingDescriptor: {cd}")
                 lines.append(f"  params: {ps[:900]}")
                 lines.append("")
         try:
