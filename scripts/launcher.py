@@ -15031,7 +15031,7 @@ def _center_tk(win, w: int, h: int) -> None:
         pass
 
 
-_GITHUB_URL = "https://github.com/ashejim/WGU-Caseload-Note-Tool"
+_GITHUB_URL = "https://github.com/ashejim/caseload-tool"
 _AUTHOR_NAME = "Dr. Jim Ashe"
 _AUTHOR_EMAIL = "ashejim@gmail.com"
 
@@ -21576,6 +21576,12 @@ class App:
 
         def on_ea_done(res) -> None:
             def apply() -> None:
+                # Propagate the read's source + column-health so _apply_ea_scrape
+                # labels JSON-vs-scrape correctly (this startup path used to drop
+                # them, so a working JSON feed was mislabeled "via DOM scrape").
+                self._ea_source = (res or {}).get("source", "scrape")
+                self._ea_view_missing_sid = bool(
+                    (res or {}).get("view_missing_sid"))
                 if (res or {}).get("error"):
                     self._append_log(
                         f"EA dashboard scrape failed: {res['error']}",
@@ -21583,7 +21589,7 @@ class App:
                 self._apply_ea_scrape((res or {}).get("eas") or [])
                 if (res or {}).get("secs") is not None:
                     self._append_log(
-                        f"  ↳ EA scrape took {res.get('secs')}s "
+                        f"  ↳ EA read took {res.get('secs')}s "
                         f"(read {res.get('read_secs')}s + nav back to "
                         f"caseload {round(res.get('secs', 0) - res.get('read_secs', 0), 1)}s)")
                 self._set_idle()

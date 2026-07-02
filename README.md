@@ -29,7 +29,7 @@ Salesforce admin permissions are required.
 ### 1. Download and extract
 
 Download the `CaseloadNotes` zip from
-[Releases](https://github.com/ashejim/WGU-Caseload-Note-Tool/releases) and
+[Releases](https://github.com/ashejim/caseload-tool/releases) and
 extract it anywhere — your Desktop, Documents, wherever.
 
 ### 2. First-run setup — Smart App Control

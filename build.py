@@ -80,7 +80,7 @@ is available.
 Reporting issues
 ----------------
 Open an issue at:
-  https://github.com/ashejim/WGU-Caseload-Note-Tool/issues
+  https://github.com/ashejim/caseload-tool/issues
 
 — Jim
 """
