@@ -425,6 +425,11 @@ class Settings:
     # view is configured (no manual column setup). Falls back to the CSV
     # automatically when the feed is degraded. Toggle off to always use the CSV.
     caseload_source_json: bool = True
+    # Advanced: enable ACTION BRANCHING — conditional sub-actions inside one
+    # action (e.g. a single "welcome" that sends the right email/text per
+    # course). When off, the "+ branch" button is hidden and branched actions
+    # still load/run (routing works) — the toggle only gates the editing UI.
+    enable_branching: bool = False
     # Local data-at-rest encryption: how often the app password is required.
     #   "every_launch" — prompt on every start (nothing remembered)
     #   "per_restart"  — remember within a boot session; re-prompt after a

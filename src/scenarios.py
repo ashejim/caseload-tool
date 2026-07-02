@@ -135,6 +135,20 @@ class BatchConfig:
 
 
 @dataclass
+class BranchConfig:
+    """One conditional branch of a branched action. On fire, each target student
+    is routed to the FIRST branch (top-to-bottom) whose `conditions` they match,
+    and THAT branch's email/text/notes fire for them. A branch with no
+    conditions matches everyone (a catch-all 'else' — put it last). `conditions`
+    use the same filter shape + engine as BatchConfig.filters."""
+    title: str = ""
+    conditions: list[dict] = field(default_factory=list)
+    email: Optional[EmailConfig] = None
+    text: Optional[TextConfig] = None
+    notes: list[NoteData] = field(default_factory=list)
+
+
+@dataclass
 class ScenarioConfig:
     name: str
     hotkey: str
@@ -166,6 +180,10 @@ class ScenarioConfig:
     # Same filter shape as BatchConfig.filters. Mutually exclusive with `batch`
     # (batch SELECTS students; fire_filters GATES the ones you're firing on).
     fire_filters: list[dict] = field(default_factory=list)
+    # Branched action: conditional sub-actions. When non-empty, firing routes
+    # each student to the first branch whose conditions match (see BranchConfig)
+    # and fires that branch's content instead of the top-level email/text/notes.
+    branches: list[BranchConfig] = field(default_factory=list)
 
 
 @dataclass
@@ -240,6 +258,21 @@ def _text_from_dict(d: Optional[dict]) -> Optional[TextConfig]:
         inbox_label=str(d.get("inbox_label", "") or ""),
         commit=bool(d.get("commit", False)),
     )
+
+
+def _branches_from_list(items) -> list["BranchConfig"]:
+    out: list[BranchConfig] = []
+    for d in (items or []):
+        if not isinstance(d, dict):
+            continue
+        out.append(BranchConfig(
+            title=str(d.get("title", "") or "").strip(),
+            conditions=list(d.get("conditions") or []),
+            email=_email_from_dict(d.get("email")),
+            text=_text_from_dict(d.get("text")),
+            notes=[_note_from_dict(n) for n in (d.get("notes") or [])],
+        ))
+    return out
 
 
 def _batch_from_dict(d: Optional[dict]) -> Optional[BatchConfig]:
@@ -447,9 +480,10 @@ def load_scenarios(path: Path = SCENARIOS_YAML) -> dict[str, ScenarioConfig]:
         # scenario can be email-only or text-only too — OR record-only (no
         # channel, just logs a success-path support).
         if (not notes and cfg.get("email") is None and text is None
-                and not cfg.get("record_only")):
+                and not cfg.get("record_only") and not cfg.get("branches")):
             raise ValueError(
-                f"Scenario {name!r} has no notes, email, or text defined")
+                f"Scenario {name!r} has no notes, email, text, or branches "
+                "defined")
         out[name] = ScenarioConfig(
             name=name,
             hotkey=cfg.get("hotkey", ""),
@@ -464,6 +498,7 @@ def load_scenarios(path: Path = SCENARIOS_YAML) -> dict[str, ScenarioConfig]:
             record_only=bool(cfg.get("record_only", False)),
             marks_step=str(cfg.get("marks_step", "") or "").strip(),
             fire_filters=list(cfg.get("fire_filters") or []),
+            branches=_branches_from_list(cfg.get("branches")),
         )
     return out
 

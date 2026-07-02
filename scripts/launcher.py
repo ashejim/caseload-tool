@@ -23377,6 +23377,25 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        # Advanced: action branching (conditional sub-actions).
+        branching_var = ctk.BooleanVar(
+            value=getattr(self.settings, "enable_branching", False))
+        ctk.CTkCheckBox(
+            dialog,
+            text="Enable action branching (conditional sub-actions)",
+            variable=branching_var, font=ctk.CTkFont(size=13),
+        ).pack(anchor="w", padx=20, pady=(6, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("Advanced. Adds a “+ branch” button to the action editor so "
+                  "one action can fire different email/text/notes per condition "
+                  "— e.g. a single Welcome that sends each student their own "
+                  "course's message. Branched actions still run when this is "
+                  "off; the toggle only shows the editing UI."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
         dialog = tab_security
         # Data-at-rest encryption: how often the app password is required.
         enc_active = (getattr(self, "_vault", None) is not None
@@ -23564,6 +23583,8 @@ class App:
                 self.worker.note_api_enabled = self.settings.note_save_via_api
             except Exception:
                 pass
+            # Action branching (advanced) — gates the "+ branch" editor UI.
+            self.settings.enable_branching = bool(branching_var.get())
             # Data-at-rest unlock frequency. Switching to "every launch" drops
             # any DPAPI-remembered key so it actually prompts next time.
             new_unlock = _ENC_LABELS.get(enc_var.get().strip(), "per_restart")
