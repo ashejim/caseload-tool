@@ -9533,18 +9533,14 @@ class PromptRow:
 
 
 def _option_checkbox(parent, text, variable=None, command=None, **kw):
-    """A SMALL sub-option checkbox — visually subordinate to the bold major-part
-    toggles (Send email / Send text / Notes). Smaller box + font so an option
-    inside a part doesn't compete with 'include this whole part'. Grid/pack it
-    with a left indent to nest it under its part."""
+    """A standard option checkbox (normal size — the major parts are set apart
+    by their own headers/buttons, not by shrinking every other checkbox)."""
     return ctk.CTkCheckBox(
-        parent, text=text, variable=variable, command=command,
-        font=ctk.CTkFont(size=11), checkbox_width=16, checkbox_height=16,
-        **kw)
+        parent, text=text, variable=variable, command=command, **kw)
 
 
 # Left indent (px) for a sub-option so it sits under its major part.
-_OPT_INDENT = 30
+_OPT_INDENT = 8
 
 # Vivid blue for the "+ Add …" affordance buttons in the editor, so the
 # add-a-thing actions stand out from other controls. (light, dark) tuples.
@@ -10077,44 +10073,57 @@ class ScenarioEditor:
         self.panel_action_hint.grid_remove()  # shown only in batch mode
 
         # ===== MAJOR PART: EMAIL =====
-        # Send-email toggle + email section (sub-frame visible only
-        # when toggle is on). Toggle commands grid_remove/.grid so
-        # the row collapses to nothing when emails aren't used. The
-        # part-level toggle is bold/larger + preceded by a divider so it
-        # reads as a section header, not just another option.
+        # Email is opt-in via a blue "Send email" button; adding it reveals the
+        # section with a gray "Delete email" button to remove it again (same
+        # add/delete model as notes). No checkbox — send_email_var mirrors the
+        # added/removed state purely for save + load. Three stacked rows: the
+        # add button (shown when off), and the header + section (shown when on);
+        # _on_send_email_toggled swaps between them.
         row += 1
         self._section_divider(row)
         row += 1
         self.send_email_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            self.frame,
-            text="✉  Send email  (open Outlook draft before filing notes)",
-            variable=self.send_email_var,
-            command=self._on_send_email_toggled,
+        self._email_addbtn_row = row
+        self._email_add_btn = ctk.CTkButton(
+            self.frame, text="✉  Send email", width=160, height=34,
             font=self._part_font(),
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(2, 4))
+            fg_color=_ADD_BTN_BLUE, hover_color=_ADD_BTN_BLUE_HOVER,
+            command=self._add_email,
+        )
+        self._email_add_btn.grid(row=row, column=0, sticky="w", padx=8,
+                                 pady=(2, 4))
+        row += 1
+        self._email_header_row = row
+        self._email_header = self._build_part_header(
+            "✉  Email  (opens an Outlook draft before filing notes)",
+            self._delete_email)
         row += 1
         self._email_section_row = row
         self._build_email_section()
-        # Visibility set by load() based on scenario.email != None.
+        # Visibility set by load() / the add + delete buttons.
 
         # ===== MAJOR PART: TEXT =====
-        # Send-text toggle + text (Mongoose) section, same collapse pattern.
         row += 1
         self._section_divider(row)
         row += 1
         self.send_text_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            self.frame,
-            text="💬  Send text  (Mongoose)",
-            variable=self.send_text_var,
-            command=self._on_send_text_toggled,
+        self._text_addbtn_row = row
+        self._text_add_btn = ctk.CTkButton(
+            self.frame, text="💬  Send text", width=160, height=34,
             font=self._part_font(),
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(2, 4))
+            fg_color=_ADD_BTN_BLUE, hover_color=_ADD_BTN_BLUE_HOVER,
+            command=self._add_text,
+        )
+        self._text_add_btn.grid(row=row, column=0, sticky="w", padx=8,
+                                pady=(2, 4))
+        row += 1
+        self._text_header_row = row
+        self._text_header = self._build_part_header(
+            "💬  Text  (Mongoose)", self._delete_text)
         row += 1
         self._text_section_row = row
         self._build_text_section()
-        # Visibility set by load() based on scenario.text != None.
+        # Visibility set by load() / the add + delete buttons.
 
         # ===== MAJOR PART: NOTES =====
         # Notes are always-on (a header, not a toggle), styled to match the
@@ -10157,6 +10166,37 @@ class ScenarioEditor:
         ctk.CTkFrame(
             self.frame, height=2, fg_color=("#c9c9c9", "#3a3a3a"),
         ).grid(row=row, column=0, sticky="ew", padx=8, pady=(10, 2))
+
+    def _build_part_header(self, text: str, on_delete):
+        """A header row for an added Email/Text part: bold title + a gray
+        'Delete' button (mirrors the per-note delete affordance). Created hidden;
+        gridded by the part's toggle handler. Returns the header frame."""
+        hdr = ctk.CTkFrame(self.frame, fg_color="transparent")
+        hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(hdr, text=text, font=self._part_font()).grid(
+            row=0, column=0, sticky="w", padx=8)
+        ctk.CTkButton(
+            hdr, text="✕  Delete", width=90, height=28,
+            fg_color=("gray80", "gray30"), hover_color=("#e74c3c", "#c0392b"),
+            text_color=("gray10", "gray90"), command=on_delete,
+        ).grid(row=0, column=1, sticky="e", padx=8)
+        return hdr
+
+    def _add_email(self) -> None:
+        self.send_email_var.set(True)
+        self._on_send_email_toggled()
+
+    def _delete_email(self) -> None:
+        self.send_email_var.set(False)
+        self._on_send_email_toggled()
+
+    def _add_text(self) -> None:
+        self.send_text_var.set(True)
+        self._on_send_text_toggled()
+
+    def _delete_text(self) -> None:
+        self.send_text_var.set(False)
+        self._on_send_text_toggled()
 
     @staticmethod
     def _part_font():
@@ -10518,14 +10558,22 @@ class ScenarioEditor:
             return []
 
     def _on_send_email_toggled(self) -> None:
-        """Show or hide the email section based on the checkbox."""
+        """Swap between the blue 'Send email' add button (when off) and the
+        email header + section (when on)."""
         if self.send_email_var.get():
+            self._email_add_btn.grid_remove()
+            self._email_header.grid(
+                row=self._email_header_row, column=0,
+                sticky="ew", padx=8, pady=(2, 0))
             self._email_section.grid(
                 row=self._email_section_row, column=0,
-                sticky="ew", padx=8, pady=(0, 8),
-            )
+                sticky="ew", padx=8, pady=(0, 8))
         else:
+            self._email_header.grid_remove()
             self._email_section.grid_remove()
+            self._email_add_btn.grid(
+                row=self._email_addbtn_row, column=0,
+                sticky="w", padx=8, pady=(2, 4))
 
     # 12-hour labels for the text-schedule window pickers, mapped to/from the
     # 24-hour window_start_hour / window_end_hour stored in TextConfig.
@@ -10616,14 +10664,22 @@ class ScenarioEditor:
         ).grid(row=5, column=1, sticky="w", padx=8, pady=(4, 8))
 
     def _on_send_text_toggled(self) -> None:
-        """Show or hide the text section based on the checkbox."""
+        """Swap between the blue 'Send text' add button (when off) and the
+        text header + section (when on)."""
         if self.send_text_var.get():
+            self._text_add_btn.grid_remove()
+            self._text_header.grid(
+                row=self._text_header_row, column=0,
+                sticky="ew", padx=8, pady=(2, 0))
             self._text_section.grid(
                 row=self._text_section_row, column=0,
-                sticky="ew", padx=8, pady=(0, 8),
-            )
+                sticky="ew", padx=8, pady=(0, 8))
         else:
+            self._text_header.grid_remove()
             self._text_section.grid_remove()
+            self._text_add_btn.grid(
+                row=self._text_addbtn_row, column=0,
+                sticky="w", padx=8, pady=(2, 4))
 
     def _current_prompt_var_names(self) -> list[str]:
         """Return the live list of `var` names from the prompts
@@ -10873,17 +10929,22 @@ class ScenarioEditor:
         self._add_note_editor(default)
 
     def _delete_note(self, ne: NoteEditor) -> None:
-        # load_scenarios() rejects scenarios with zero notes, so
-        # deleting the last would just cause Save to fail.
+        # Deleting the LAST note is allowed — an action can be email-only or
+        # text-only — but warn first, since an action with no note, email, OR
+        # text can't be saved.
         if len(self.note_editors) <= 1:
-            from tkinter import messagebox
-            messagebox.showinfo(
-                "Can't delete",
-                "An action needs at least one note. Use 'Delete "
-                "action' in the editor's action row if you want to "
-                "remove the whole action.",
-            )
-            return
+            has_other = self.send_email_var.get() or self.send_text_var.get()
+            tail = ("The action will still send its email/text."
+                    if has_other else
+                    "The action will then have NO note, email, or text — add "
+                    "an email, a text, or a note before saving.")
+            if not ask_yes_no_topmost(
+                self.frame.winfo_toplevel(), "Delete the last note?",
+                "This is the only note in this action.\n\n" + tail
+                + "\n\nDelete it anyway?",
+                yes_label="Delete note", no_label="Keep note",
+            ):
+                return
         self.note_editors.remove(ne)
         ne.frame.destroy()
         for i, e in enumerate(self.note_editors):
