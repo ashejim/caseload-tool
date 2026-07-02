@@ -9367,12 +9367,18 @@ class FilterRow:
             except Exception:
                 pass
         elif op == "is within":
-            self.value_combo.configure(
-                state="normal", values=list(caseload_filter.WITHIN_PRESETS),
-            )
+            presets = list(caseload_filter.WITHIN_PRESETS)
+            self.value_combo.configure(state="normal", values=presets)
+            # "is within" ONLY accepts a preset. If the box still holds a value
+            # from a previous op (e.g. 'today+30d' left over from a date op), it
+            # resolves to no range → the filter silently matches NOBODY. Snap to
+            # a valid preset so the filter actually works. Default: 'this month'.
+            cur = (self.value_combo.get() or "").strip().lower()
+            if cur not in [p.lower() for p in presets]:
+                default = "this month" if "this month" in presets else presets[0]
+                self.value_combo.set(default)
             self.hint_label.configure(
-                text="Pick a preset: "
-                     + ", ".join(caseload_filter.WITHIN_PRESETS) + ".",
+                text="Pick a preset: " + ", ".join(presets) + ".",
             )
         elif op in numeric_ops:
             col_refs = self._column_value_suggestions(op)
