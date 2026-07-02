@@ -15561,6 +15561,14 @@ class App:
         # searches Mongoose by this (unique, works for blank-mobile students);
         # loaded from SQLite at startup and refreshed when an export is found.
         self._contact_ids: dict[str, str] = {}
+        # Texting opt-in truth, from the Mongoose segment export(s): only truly
+        # opted-in contacts sync to Mongoose, so membership here is the reliable
+        # signal (Salesforce's TextingPreference field is stale/wrong). _sids =
+        # StudentIDs found opted-in in an export; _courses = course codes an
+        # export covers (so we only trust Mongoose for courses we have data for).
+        self._mongoose_sids: set = set()
+        self._mongoose_optin_cids: set = set()
+        self._mongoose_courses: set = set()
         # Activity-log write batching (see _append_log/_flush_log): collapse a
         # burst of log lines into one redraw so busy runs stay snappy.
         self._log_pending: list = []
@@ -19045,6 +19053,9 @@ class App:
         merged = dict(persisted)
         added = changed = 0
         exports = []
+        mongoose_sids: set = set()
+        mongoose_optin_cids: set = set()
+        mongoose_courses: set = set()
         try:
             exports = mc.find_exports_in_dir(CASELOAD_CSV_PATH.parent)
         except Exception:
@@ -19060,6 +19071,21 @@ class App:
                         error=True)
                 continue
             merged.update(fresh)
+            # Opt-in truth: students joined to an opted-in Mongoose contact, and
+            # the courses this export covers (build_contact_id_map excludes
+            # opted-out contacts, so fresh's keys are genuinely opted-in).
+            mongoose_sids.update(fresh.keys())
+            for c in contacts:
+                dep = self._norm_course(c.get("department") or "")
+                if dep:
+                    mongoose_courses.add(dep)
+                # Opted-in Mongoose contact ids (SF 003… ids), for a robust
+                # blank-mobile-proof join by Contact id (the mobile/name join
+                # above can miss blank-mobile students).
+                if not c.get("opted_out"):
+                    cid = (c.get("contact_id") or "").strip()
+                    if cid:
+                        mongoose_optin_cids.add(cid)
             name_by_sid = {
                 (r.get("StudentID") or "").strip(): (r.get("Name") or "").strip()
                 for r in (rows or [])}
@@ -19098,6 +19124,9 @@ class App:
                 except Exception:
                     pass
         self._contact_ids = merged
+        self._mongoose_sids = mongoose_sids
+        self._mongoose_optin_cids = mongoose_optin_cids
+        self._mongoose_courses = mongoose_courses
         added += grid_added
         changed += grid_changed
         if not silent and (exports or merged or grid_map):
@@ -19266,6 +19295,39 @@ class App:
         who aren't opted in don't exist as textable contacts in Mongoose, so we
         skip them up front (faster + no batch stalls on an un-addable number)."""
         return (row.get("TextingPreference") or "").strip().lower() == "opted in"
+
+    @staticmethod
+    def _norm_course(text: str) -> str:
+        """Normalize a course code to its canonical 'C769' form (extract the
+        letter+3-digit code, uppercase). '' if none — used to match caseload
+        rows to Mongoose export departments consistently."""
+        try:
+            from src.student_lookup import COURSE_CODE_RE
+            m = COURSE_CODE_RE.search((text or "").upper())
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return (text or "").strip().upper()
+
+    def _texting_opted_in_row(self, row: dict) -> bool:
+        """Authoritative texting opt-in for a caseload row. PREFERS Mongoose
+        membership — only genuinely opted-in contacts sync to Mongoose, so the
+        Salesforce TextingPreference field (which can say 'Opted In' for a
+        student whose 'SMS opt-in Academic' box is actually unchecked) is NOT
+        trusted when we have Mongoose data for the student's course. Falls back
+        to TextingPreference only for courses with no Mongoose export loaded, so
+        a missing segment doesn't silently skip everyone."""
+        course = self._norm_course(row.get("CourseCode") or "")
+        if course and course in self._mongoose_courses:
+            sid = (row.get("StudentID") or "").strip()
+            if sid in self._mongoose_sids:
+                return True
+            # Blank-mobile-proof fallback: match by SF Contact id.
+            cid = (self._contact_ids.get(sid) or "").strip()
+            return bool(cid) and cid in self._mongoose_optin_cids
+        # No Mongoose data for this course → fall back to the SF field.
+        return self._texting_opted_in(row)
 
     def _send_text_blocking(self, payload: dict) -> Optional[dict]:
         """Queue a SEND_TEXT and block the main thread until the worker returns
@@ -19516,7 +19578,7 @@ class App:
             variables.update(prompt_vars)
         who = (variables.get("full_name") or variables.get("student_id")
                or "this student")
-        if row is not None and not self._texting_opted_in(row):
+        if row is not None and not self._texting_opted_in_row(row):
             self._append_log(
                 f"Text: {who} is not opted in to texting — skipped.", error=True)
             return False
@@ -19928,7 +19990,7 @@ class App:
         for row in matched:
             rv = self._text_vars_from_row(row)
             name = rv["full_name"] or row.get("Name", "")
-            if not self._texting_opted_in(row):
+            if not self._texting_opted_in_row(row):
                 skipped_names.append(name)
                 continue
             course = rv["course_code"]
