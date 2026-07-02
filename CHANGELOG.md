@@ -3,6 +3,72 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.14.0 — 2026-07-02
+
+The tool now reads the caseload — and files follow-ups — through Salesforce's
+own data feeds, so it no longer depends on how your list view is set up. Plus a
+rebrand, a reworked action editor, smarter texting opt-in, and single-action
+filtering.
+
+### Major features
+- **Whole caseload from the JSON feed (column-independent).** The caseload is
+  now built from the same Aura grid response the page already fetches, not the
+  CSV export — so it's complete **regardless of which columns your Salesforce
+  list view shows**. Removing/rearranging columns no longer breaks find, batch,
+  notes, task pass/fail, or Essential Actions. The CSV export stays an automatic
+  fallback (health-gated), so if the feed ever changes, the tool reverts cleanly.
+- **Essential Actions from its JSON feed.** The EA dashboard is read from its
+  data feed too, fixing the "0 Essential Actions found" cases caused by a view
+  missing the Student ID column. Falls back to the table scrape, and now warns
+  clearly if that fallback can't read the view.
+- **Follow-up date & note write-back via the API.** Setting a student's Follow-up
+  Date or Note now persists through Salesforce's own save action instead of the
+  flaky in-cell edit — fixing the bug where an edit silently didn't stick (it was
+  saving a blank value).
+- **Single-action filtering.** A new action option gates a single fire — or a
+  hand-picked selection — by filter conditions: students who don't match are
+  shown in a popup where you can tick any to **fire on anyway**, and the rest are
+  skipped. Mutually exclusive with batch mode (batch *selects* students; this
+  *gates* the ones you fire on).
+
+### Texting
+- **Opt-in now comes from Mongoose, not Salesforce.** The Salesforce
+  "TextingPreference" field can say *Opted In* for a student whose SMS opt-in is
+  actually off, so texts were attempted and failed. The tool now treats
+  membership in your loaded Mongoose segment as the truth (with the SF field as a
+  fallback only for courses you haven't exported), and lists genuinely
+  not-opted-in students in the text review.
+
+### Rebrand + UI
+- **Renamed to "Caseload Tool."** WGU branding dropped throughout; new animated
+  startup splash and app icon; a **Settings** screen reorganized into navigable
+  tabs with an **About** page (how to report issues, links).
+- **Reworked action editor.** Email, Text, and Notes are now clearly separated
+  parts you **add with a blue button and remove with a gray Delete** (Notes can
+  be emptied too, with a warning) — instead of checkboxes. Option checkboxes
+  within a part are visually subordinate to the part itself.
+- **Quit-while-busy warning** — closing the app mid-action now asks before
+  interrupting a running fire/batch.
+- **Filter presets fixed** — the *is within* operator (this week / this month /
+  next 30 days …) now always lands on a valid preset, so a filter can't silently
+  match nobody; old saved actions self-heal on load.
+- **Momentum calibration chart** — thin-sample bars are drawn faint (not dashed),
+  so "dashed" only ever means the predicted band.
+
+### Project / security
+- **Now source-available under a proprietary license** (previously MIT), and the
+  repository was renamed to drop WGU. Local student data encryption (from 0.13.0)
+  continues to protect the cache, history, and note log at rest.
+
+### Reliability
+- **Survives an offline launch.** If the network/VPN is down when the app starts,
+  the browser no longer crashes the whole app — it stays open with a clear
+  message so you can reconnect and ↻ Caseload.
+- **Download guard** — a caseload export that drops the Student ID column is
+  rejected (the previous good export is kept) rather than quietly corrupting the
+  fallback.
+- Added tests for the caseload guards and the EA/JSON mapping.
+
 ## 0.13.0 — 2026-06-30
 
 A performance leap from reading Salesforce's own data feed instead of scraping
