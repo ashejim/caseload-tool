@@ -9532,6 +9532,26 @@ class PromptRow:
         return out
 
 
+def _option_checkbox(parent, text, variable=None, command=None, **kw):
+    """A SMALL sub-option checkbox — visually subordinate to the bold major-part
+    toggles (Send email / Send text / Notes). Smaller box + font so an option
+    inside a part doesn't compete with 'include this whole part'. Grid/pack it
+    with a left indent to nest it under its part."""
+    return ctk.CTkCheckBox(
+        parent, text=text, variable=variable, command=command,
+        font=ctk.CTkFont(size=11), checkbox_width=16, checkbox_height=16,
+        **kw)
+
+
+# Left indent (px) for a sub-option so it sits under its major part.
+_OPT_INDENT = 30
+
+# Vivid blue for the "+ Add …" affordance buttons in the editor, so the
+# add-a-thing actions stand out from other controls. (light, dark) tuples.
+_ADD_BTN_BLUE = ("#2f6fed", "#2f6fed")
+_ADD_BTN_BLUE_HOVER = ("#2558c8", "#2558c8")
+
+
 class NoteEditor:
     """Widgets for editing a single note. Mirrors the Caseload form:
     Interaction Format, Interaction Type, Academic Activities, Body.
@@ -9640,7 +9660,7 @@ class NoteEditor:
         for i, label in enumerate(ACADEMIC_ACTIVITY_LABELS):
             v = ctk.BooleanVar(value=False)
             self.activity_vars[label] = v
-            cb = ctk.CTkCheckBox(activity_frame, text=label, variable=v)
+            cb = _option_checkbox(activity_frame, label, v)
             cb.grid(row=i, column=0, sticky="w", pady=1)
             self.activity_checkboxes.append(cb)
 
@@ -9682,10 +9702,10 @@ class NoteEditor:
         # / paste before it's submitted (same size cap applies).
         row += 1
         self.enter_additional_text_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            content, text="Edit note at fire time "
-                          "(body, course, academic activities, Essential Action)",
-            variable=self.enter_additional_text_var,
+        _option_checkbox(
+            content, "Edit note at fire time "
+                     "(body, course, academic activities, Essential Action)",
+            self.enter_additional_text_var,
         ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
 
         # Append-clipboard toggle. When on, the clipboard at fire time
@@ -9696,9 +9716,9 @@ class NoteEditor:
         # has it enabled.
         row += 1
         self.append_clipboard_var = ctk.BooleanVar(value=False)
-        self._append_clipboard_checkbox = ctk.CTkCheckBox(
-            content, text="Append clipboard contents after body",
-            variable=self.append_clipboard_var,
+        self._append_clipboard_checkbox = _option_checkbox(
+            content, "Append clipboard contents after body",
+            self.append_clipboard_var,
         )
         self._append_clipboard_checkbox.grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
 
@@ -9712,9 +9732,9 @@ class NoteEditor:
         submit_row = ctk.CTkFrame(content, fg_color="transparent")
         submit_row.grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
         self.submit_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            submit_row, text="Submit and close automatically",
-            variable=self.submit_var,
+        _option_checkbox(
+            submit_row, "Submit and close automatically",
+            self.submit_var,
             command=self._update_submit_warning,
         ).pack(side="left")
         self._submit_warning_label = ctk.CTkLabel(
@@ -9987,10 +10007,10 @@ class ScenarioEditor:
         # below.
         row += 1
         self.use_vars_var = ctk.BooleanVar(value=False)
-        self._use_vars_checkbox = ctk.CTkCheckBox(
+        self._use_vars_checkbox = _option_checkbox(
             self.frame,
-            text="Use action variables (advanced — applies to email + notes below)",
-            variable=self.use_vars_var,
+            "Use action variables (advanced — applies to email + notes below)",
+            self.use_vars_var,
             command=self._on_use_vars_toggled,
         )
         self._use_vars_checkbox_row = row
@@ -10006,10 +10026,10 @@ class ScenarioEditor:
         # exclusive) and the Filters section appears underneath.
         row += 1
         self.batch_mode_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
+        _option_checkbox(
             self.frame,
-            text="Batch mode (apply to all matching students)",
-            variable=self.batch_mode_var,
+            "Batch mode (apply to all matching students)",
+            self.batch_mode_var,
             command=self._on_batch_mode_toggled,
         ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
         row += 1
@@ -10024,10 +10044,10 @@ class ScenarioEditor:
         row += 1
         self._find_first_row = row
         self.find_first_var = ctk.BooleanVar(value=False)
-        self.find_first_checkbox = ctk.CTkCheckBox(
+        self.find_first_checkbox = _option_checkbox(
             self.frame,
-            text="Find student first (prompt at fire time)",
-            variable=self.find_first_var,
+            "Find student first (prompt at fire time)",
+            self.find_first_var,
         )
         self.find_first_checkbox.grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
 
@@ -10037,10 +10057,10 @@ class ScenarioEditor:
         # single action), with a hint shown while batch mode is on.
         row += 1
         self.panel_action_var = ctk.BooleanVar(value=False)
-        self.panel_action_checkbox = ctk.CTkCheckBox(
+        self.panel_action_checkbox = _option_checkbox(
             self.frame,
-            text="Show as a caseload-panel action",
-            variable=self.panel_action_var,
+            "Show as a caseload-panel action",
+            self.panel_action_var,
         )
         self.panel_action_checkbox.grid(
             row=row, column=0, sticky="w", padx=8, pady=(0, 2))
@@ -10122,6 +10142,7 @@ class ScenarioEditor:
         ctk.CTkButton(
             self.frame, text="+ Add note",
             command=self._add_note, width=120, height=32,
+            fg_color=_ADD_BTN_BLUE, hover_color=_ADD_BTN_BLUE_HOVER,
         ).grid(row=row, column=0, sticky="w", padx=8, pady=(4, 8))
 
         self.load(scenario)
@@ -10206,6 +10227,7 @@ class ScenarioEditor:
         ctk.CTkButton(
             action_row, text="+ Add filter",
             width=110, command=self._add_filter_row,
+            fg_color=_ADD_BTN_BLUE, hover_color=_ADD_BTN_BLUE_HOVER,
         ).pack(side="left")
         ctk.CTkButton(
             action_row, text="↻ Refresh columns",
@@ -10302,6 +10324,7 @@ class ScenarioEditor:
         ctk.CTkButton(
             frame, text="+ Add variable", width=130,
             command=self._add_prompt_row,
+            fg_color=_ADD_BTN_BLUE, hover_color=_ADD_BTN_BLUE_HOVER,
         ).grid(row=3, column=0, sticky="w", padx=8, pady=(0, 6))
 
     def _on_use_vars_toggled(self) -> None:
@@ -10469,19 +10492,21 @@ class ScenarioEditor:
 
         # CC Program Mentor
         self.email_cc_pm_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            frame, text="CC Program Mentor",
-            variable=self.email_cc_pm_var,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 4))
+        _option_checkbox(
+            frame, "CC Program Mentor",
+            self.email_cc_pm_var,
+        ).grid(row=6, column=0, columnspan=2, sticky="w",
+               padx=_OPT_INDENT, pady=(6, 4))
 
         # Pick the template (and confirm the subject) at fire time. Lets
         # one scenario serve many templates — the Body template above is
         # used as the default pre-selection in the fire-time picker.
         self.email_pick_template_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            frame, text="Choose email template when fired",
-            variable=self.email_pick_template_var,
-        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+        _option_checkbox(
+            frame, "Choose email template when fired",
+            self.email_pick_template_var,
+        ).grid(row=7, column=0, columnspan=2, sticky="w",
+               padx=_OPT_INDENT, pady=(0, 8))
 
     @staticmethod
     def _available_template_files() -> list[str]:
@@ -10584,10 +10609,10 @@ class ScenarioEditor:
         self.text_inbox_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=(4, 0))
 
         self.text_commit_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
+        _option_checkbox(
             frame,
-            text="Send automatically (otherwise review/edit in the app first)",
-            variable=self.text_commit_var,
+            "Send automatically (otherwise review/edit in the app first)",
+            self.text_commit_var,
         ).grid(row=5, column=1, sticky="w", padx=8, pady=(4, 8))
 
     def _on_send_text_toggled(self) -> None:
