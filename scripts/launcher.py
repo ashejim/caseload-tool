@@ -10126,16 +10126,24 @@ class ScenarioEditor:
         # Visibility set by load() / the add + delete buttons.
 
         # ===== MAJOR PART: NOTES =====
-        # Notes are always-on (a header, not a toggle), styled to match the
-        # email/text part headers so all three read as peer sections.
+        # Notes mirror the email/text parts: when there are NO notes, show a
+        # blue "📝 Add note" button; once a note exists, show the "📝 Notes"
+        # header + a small "+ Add note" (add another). All widgets are created
+        # up front; _refresh_notes_visibility() grids the right ones.
         row += 1
         self._section_divider(row)
         row += 1
-        ctk.CTkLabel(
-            self.frame, text="📝  Notes",
+        self._note_addbtn_row = row
+        self._note_add_btn = ctk.CTkButton(
+            self.frame, text="📝  Add note", width=160, height=34,
             font=self._part_font(),
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(2, 2))
-
+            fg_color=_ADD_BTN_BLUE, hover_color=_ADD_BTN_BLUE_HOVER,
+            command=self._add_note,
+        )
+        row += 1
+        self._notes_header_row = row
+        self._notes_header = ctk.CTkLabel(
+            self.frame, text="📝  Notes", font=self._part_font())
         # Notes live in their own container so add/delete can just
         # pack/destroy children without disturbing the outer grid rows.
         row += 1
@@ -10143,16 +10151,16 @@ class ScenarioEditor:
         self.notes_container.grid(row=row, column=0, sticky="ew", padx=0, pady=0)
         self.notes_container.grid_columnconfigure(0, weight=1)
         self.note_editors: list[NoteEditor] = []
-        for note in scenario.notes:
-            self._add_note_editor(note)
-
-        # + Add note button under the notes container.
         row += 1
-        ctk.CTkButton(
+        self._addnote_btn_row = row
+        self._add_note_btn = ctk.CTkButton(
             self.frame, text="+ Add note",
             command=self._add_note, width=120, height=32,
             fg_color=_ADD_BTN_BLUE, hover_color=_ADD_BTN_BLUE_HOVER,
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(4, 8))
+        )
+        for note in scenario.notes:
+            self._add_note_editor(note)
+        self._refresh_notes_visibility()
 
         self.load(scenario)
 
@@ -10916,6 +10924,22 @@ class ScenarioEditor:
         self.note_editors.append(ne)
         return ne
 
+    def _refresh_notes_visibility(self) -> None:
+        """Show the blue '📝 Add note' button when there are no notes; otherwise
+        show the '📝 Notes' header + the '+ Add note' (add-another) button.
+        Mirrors the email/text add/delete parts."""
+        if self.note_editors:
+            self._note_add_btn.grid_remove()
+            self._notes_header.grid(row=self._notes_header_row, column=0,
+                                    sticky="w", padx=8, pady=(2, 2))
+            self._add_note_btn.grid(row=self._addnote_btn_row, column=0,
+                                    sticky="w", padx=8, pady=(4, 8))
+        else:
+            self._notes_header.grid_remove()
+            self._add_note_btn.grid_remove()
+            self._note_add_btn.grid(row=self._note_addbtn_row, column=0,
+                                    sticky="w", padx=8, pady=(2, 4))
+
     def _add_note(self) -> None:
         """Append a new blank note. Draft until 'Save changes' — same
         model as scenario add/delete."""
@@ -10927,6 +10951,7 @@ class ScenarioEditor:
             submit=True, append_clipboard=False,
         )
         self._add_note_editor(default)
+        self._refresh_notes_visibility()
 
     def _delete_note(self, ne: NoteEditor) -> None:
         # Deleting the LAST note is allowed — an action can be email-only or
@@ -10949,6 +10974,7 @@ class ScenarioEditor:
         ne.frame.destroy()
         for i, e in enumerate(self.note_editors):
             e.set_index(i)
+        self._refresh_notes_visibility()
 
     def load(self, scenario: ScenarioConfig) -> None:
         self.name_entry.delete(0, "end")
@@ -11035,6 +11061,7 @@ class ScenarioEditor:
         self._on_send_email_toggled()
         for ne, note in zip(self.note_editors, scenario.notes):
             ne.load(note)
+        self._refresh_notes_visibility()
 
     def serialize(self) -> dict:
         out: dict = {
