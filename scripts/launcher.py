@@ -9460,7 +9460,17 @@ class FilterRow:
         if isinstance(value, list):
             value = ", ".join(str(v) for v in value)
         if value and long_op not in ("is empty", "is not empty"):
-            self.value_combo.set(str(value))
+            # For 'is within', only restore a value that's still a valid preset.
+            # An OLD saved action (from before a presets change, or with a
+            # non-preset value) would otherwise reinstate a value that resolves
+            # to no range and silently matches NOBODY — keep the 'this month'
+            # default that _on_op_change just set instead.
+            if caseload_filter.normalize_op(long_op) == "within":
+                presets = [p.lower() for p in caseload_filter.WITHIN_PRESETS]
+                if str(value).strip().lower() in presets:
+                    self.value_combo.set(str(value))
+            else:
+                self.value_combo.set(str(value))
 
     def serialize(self) -> dict:
         return {
