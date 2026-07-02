@@ -7851,6 +7851,75 @@ def ask_yes_no_topmost(
     return result["value"]
 
 
+def prompt_override_selection(parent, labels, action_name):
+    """Modal listing students who DON'T meet an action's filter conditions, each
+    with a checkbox to 'fire on anyway'. `labels` is the ordered display list.
+    Returns the list of CHECKED INDICES (into `labels`) to fire anyway, or None
+    if the user cancelled the whole fire. Empty list = fire only the matches."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Some students don't match the filter")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    result = {"value": None}
+
+    ctk.CTkLabel(
+        dialog,
+        text=(f"{len(labels)} selected student(s) don't meet {action_name!r}'s "
+              "filter conditions.\nStudents who DO match will fire regardless. "
+              "Check any below to fire on\nanyway; unchecked ones are skipped."),
+        justify="left", wraplength=440,
+    ).pack(padx=16, pady=(14, 6), anchor="w")
+
+    vars_list: list = []
+    sel_all_var = ctk.BooleanVar(value=False)
+
+    def _toggle_all() -> None:
+        for v in vars_list:
+            v.set(sel_all_var.get())
+
+    ctk.CTkCheckBox(
+        dialog, text="Select all", variable=sel_all_var, command=_toggle_all,
+    ).pack(padx=16, pady=(0, 4), anchor="w")
+
+    scroll = ctk.CTkScrollableFrame(
+        dialog, width=400, height=min(320, 30 * len(labels) + 12))
+    scroll.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+    for lbl in labels:
+        v = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(scroll, text=lbl, variable=v).pack(anchor="w", pady=1)
+        vars_list.append(v)
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(fill="x", padx=16, pady=(4, 14))
+
+    def _close(cancel: bool) -> None:
+        result["value"] = (None if cancel else
+                           [i for i, v in enumerate(vars_list) if v.get()])
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    cont_btn = ctk.CTkButton(
+        btn_row, text="Continue", width=150, command=lambda: _close(False))
+    cont_btn.pack(side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text="Cancel fire", width=110, command=lambda: _close(True),
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=4)
+
+    dialog.bind("<Escape>", lambda _e: _close(True))
+    dialog.protocol("WM_DELETE_WINDOW", lambda: _close(True))
+    dialog.lift()
+    dialog.focus_force()
+    cont_btn.focus_set()
+    dialog.after(100, lambda: (dialog.lift(), dialog.focus_force()))
+
+    parent.wait_window(dialog)
+    return result["value"]
+
+
 def attach_listbox_drag_reorder(listbox, items, refresh, on_change=None):
     """Make a native ``tk.Listbox`` drag-reorderable, backed by the Python
     list ``items``. During a drag a thin accent line marks the drop gap
@@ -18874,7 +18943,8 @@ class App:
     def _fire_per_student(self, scenario: ScenarioConfig, override: str,
                           *, prenav_query: str = "",
                           prenav_label: str = "", course_hint: str = "",
-                          prenav_student_id: str = "") -> None:
+                          prenav_student_id: str = "",
+                          gate_filters: bool = True) -> None:
         """Per-student (non-batch) scenario fire — wraps the original
         in-line `_fire` body so we can sandwich it between _set_busy
         and _set_idle.
@@ -18961,7 +19031,7 @@ class App:
         # _fire_on_selected; this covers the single hotkey / find-first fire.)
         # If we can't find a caseload row to check, fire anyway rather than
         # wrongly block — and say so.
-        if getattr(scenario, "fire_filters", None):
+        if gate_filters and getattr(scenario, "fire_filters", None):
             grow = self._row_for_student(prenav_student_id, chosen_name)
             if grow is None:
                 # Can't identify a caseload row to check → don't silently fire.
@@ -18982,17 +19052,25 @@ class App:
                     "  ↳ single-action filter: no caseload row to check; "
                     "firing at your confirmation.")
             else:
-                keep, gskip, aborted = self._apply_fire_filters(
+                keep, _gskip, aborted = self._apply_fire_filters(
                     scenario, [grow], "fire")
                 if aborted:
                     return
                 if not keep:
-                    who = (chosen_name or (gskip[0] if gskip else "")
+                    who = (chosen_name or self._row_name_and_query(grow)[0]
                            or "This student")
-                    self._append_log(
+                    if not ask_yes_no_topmost(
+                        self.root, "Student doesn't match the filter",
                         f"{who} doesn't meet {scenario.name!r}'s filter "
-                        "conditions — not fired.", error=True)
-                    return
+                        "conditions.\n\nFire anyway?",
+                        yes_label="Fire anyway", no_label="Cancel",
+                    ):
+                        self._append_log(
+                            f"{who} doesn't meet {scenario.name!r}'s filter "
+                            "conditions — not fired.")
+                        return
+                    self._append_log(
+                        f"{who} doesn't match, but firing at your request.")
 
         # Step 2: prompts (scenario-level, feed {{var}} into emails
         # and note bodies). Collect BEFORE per-note custom edits so
@@ -20500,9 +20578,9 @@ class App:
 
     def _apply_fire_filters(self, scenario, rows, source):
         """Single-action filtering: gate `rows` by scenario.fire_filters. Returns
-        (keep, skipped_names, aborted). Mirrors the batch filter pipeline (column
-        resolve + task-facet rewrite + missing-column guard). aborted=True means
-        a filter column is missing from the caseload → don't fire for anyone."""
+        (keep_rows, skipped_rows, aborted). Mirrors the batch filter pipeline
+        (column resolve + task-facet rewrite + missing-column guard).
+        aborted=True means a filter column is missing → don't fire for anyone."""
         raw = getattr(scenario, "fire_filters", None) or []
         rows = list(rows or [])
         if not raw or not rows:
@@ -20523,8 +20601,7 @@ class App:
             if caseload_filter.apply_filters(eval_filters, [r]):
                 keep.append(r)
             else:
-                nm, _ = self._row_name_and_query(r)
-                skipped.append(nm or "?")
+                skipped.append(r)
         return keep, skipped, False
 
     def _collect_note_inputs(
@@ -20811,23 +20888,40 @@ class App:
             return
 
         # Single-action filtering: gate the selection by the action's own
-        # filters BEFORE any review/prompts, so only matching students proceed
-        # and the rest are reported. (Done here so downstream position-indexed
-        # body_overrides stay aligned to the kept rows.)
+        # filters BEFORE any review/prompts, so only matching students proceed.
+        # (Done here so downstream position-indexed body_overrides stay aligned
+        # to the kept rows.) Non-matching students are shown in a popup where the
+        # user can tick any to fire on anyway.
         rows, gate_skipped, aborted = self._apply_fire_filters(
             scenario, rows, "selection")
         if aborted:
             return
         if gate_skipped:
-            self._append_log(
-                f"{len(gate_skipped)} selected student(s) don't meet "
-                f"{scenario.name!r}'s conditions — skipped: "
-                f"{', '.join(gate_skipped[:12])}"
-                f"{' …' if len(gate_skipped) > 12 else ''}.")
+            labels = [self._row_name_and_query(r)[0] or f"student {i + 1}"
+                      for i, r in enumerate(gate_skipped)]
+            picked = prompt_override_selection(self.root, labels, scenario.name)
+            if picked is None:
+                self._append_log(f"{scenario.name!r}: cancelled at the "
+                                 "filter-mismatch review.")
+                return
+            picked_set = set(picked)
+            add_back = [gate_skipped[i] for i in picked_set]
+            rows = rows + add_back
+            if add_back:
+                self._append_log(
+                    f"Including {len(add_back)} student(s) that don't match, at "
+                    f"your request: "
+                    f"{', '.join(labels[i] for i in sorted(picked_set))}.")
+            still = [labels[i] for i in range(len(labels))
+                     if i not in picked_set]
+            if still:
+                self._append_log(
+                    f"{len(still)} student(s) skipped (don't meet "
+                    f"{scenario.name!r}'s conditions): "
+                    f"{', '.join(still[:12])}{' …' if len(still) > 12 else ''}.")
         if not rows:
             self._append_log(
-                f"{scenario.name!r}: no selected students meet the filter "
-                "conditions; nothing fired.")
+                f"{scenario.name!r}: no students to fire; nothing done.")
             return
 
         # Record-only support: no Salesforce, no sends — just log the bound
@@ -20864,7 +20958,7 @@ class App:
                 self._fire_per_student(
                     scenario, override, prenav_query=query,
                     prenav_label=name, course_hint=course_hint,
-                    prenav_student_id=sid)
+                    prenav_student_id=sid, gate_filters=False)
             finally:
                 self._set_idle()
             return
