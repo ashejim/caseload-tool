@@ -10056,35 +10056,56 @@ class ScenarioEditor:
             row=row, column=0, sticky="w", padx=(28, 8), pady=(0, 8))
         self.panel_action_hint.grid_remove()  # shown only in batch mode
 
+        # ===== MAJOR PART: EMAIL =====
         # Send-email toggle + email section (sub-frame visible only
         # when toggle is on). Toggle commands grid_remove/.grid so
-        # the row collapses to nothing when emails aren't used.
+        # the row collapses to nothing when emails aren't used. The
+        # part-level toggle is bold/larger + preceded by a divider so it
+        # reads as a section header, not just another option.
+        row += 1
+        self._section_divider(row)
         row += 1
         self.send_email_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             self.frame,
-            text="Send email (open Outlook draft before filing notes)",
+            text="✉  Send email  (open Outlook draft before filing notes)",
             variable=self.send_email_var,
             command=self._on_send_email_toggled,
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
+            font=self._part_font(),
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(2, 4))
         row += 1
         self._email_section_row = row
         self._build_email_section()
         # Visibility set by load() based on scenario.email != None.
 
+        # ===== MAJOR PART: TEXT =====
         # Send-text toggle + text (Mongoose) section, same collapse pattern.
+        row += 1
+        self._section_divider(row)
         row += 1
         self.send_text_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             self.frame,
-            text="Send text (Mongoose)",
+            text="💬  Send text  (Mongoose)",
             variable=self.send_text_var,
             command=self._on_send_text_toggled,
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
+            font=self._part_font(),
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(2, 4))
         row += 1
         self._text_section_row = row
         self._build_text_section()
         # Visibility set by load() based on scenario.text != None.
+
+        # ===== MAJOR PART: NOTES =====
+        # Notes are always-on (a header, not a toggle), styled to match the
+        # email/text part headers so all three read as peer sections.
+        row += 1
+        self._section_divider(row)
+        row += 1
+        ctk.CTkLabel(
+            self.frame, text="📝  Notes",
+            font=self._part_font(),
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(2, 2))
 
         # Notes live in their own container so add/delete can just
         # pack/destroy children without disturbing the outer grid rows.
@@ -10108,6 +10129,20 @@ class ScenarioEditor:
     @property
     def current_name(self) -> str:
         return self.name_entry.get().strip()
+
+    def _section_divider(self, row: int) -> None:
+        """A thin horizontal rule that visually separates the three MAJOR action
+        parts (email / text / notes) in the editor."""
+        ctk.CTkFrame(
+            self.frame, height=2, fg_color=("#c9c9c9", "#3a3a3a"),
+        ).grid(row=row, column=0, sticky="ew", padx=8, pady=(10, 2))
+
+    @staticmethod
+    def _part_font():
+        """Font for a MAJOR-part toggle (Send email / Send text / Notes) —
+        deliberately larger + bold so 'include this part' stands out from the
+        smaller option checkboxes inside the part."""
+        return ctk.CTkFont(size=14, weight="bold")
 
     def _on_group_menu_change(self, choice: str) -> None:
         """Group dropdown changed — hand the new assignment back to the
