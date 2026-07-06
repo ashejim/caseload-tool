@@ -8072,6 +8072,88 @@ def prompt_override_selection(parent, labels, action_name):
     return result["value"]
 
 
+def prompt_branch_unmatched(parent, labels, branch_titles, action_name):
+    """Branched-fire override: lists students who match NO branch, with a picker
+    to route the CHECKED ones into a chosen branch (or skip them all). Returns
+    (branch_index | None, [checked indices]) — a None index or no checks means
+    skip — or None if the user cancelled the whole fire."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Some students match no branch")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    result = {"value": None}
+
+    ctk.CTkLabel(
+        dialog,
+        text=(f"{len(labels)} selected student(s) don't match any branch of "
+              f"{action_name!r}.\nPick a branch to send the checked ones, or "
+              "leave “Skip” to fire only the matched students."),
+        justify="left", wraplength=460,
+    ).pack(padx=16, pady=(14, 6), anchor="w")
+
+    _SKIP = "— Skip these students —"
+    route_var = ctk.StringVar(value=_SKIP)
+    ctk.CTkLabel(dialog, text="Route checked students to:").pack(
+        padx=16, pady=(2, 0), anchor="w")
+    ctk.CTkOptionMenu(
+        dialog, values=[_SKIP] + list(branch_titles), variable=route_var,
+        width=300).pack(padx=16, pady=(0, 8), anchor="w")
+
+    vars_list: list = []
+    sel_all_var = ctk.BooleanVar(value=False)
+
+    def _toggle_all() -> None:
+        for v in vars_list:
+            v.set(sel_all_var.get())
+
+    ctk.CTkCheckBox(
+        dialog, text="Select all", variable=sel_all_var, command=_toggle_all,
+    ).pack(padx=16, pady=(0, 4), anchor="w")
+
+    scroll = ctk.CTkScrollableFrame(
+        dialog, width=420, height=min(300, 30 * len(labels) + 12))
+    scroll.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+    for lbl in labels:
+        v = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(scroll, text=lbl, variable=v).pack(anchor="w", pady=1)
+        vars_list.append(v)
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(fill="x", padx=16, pady=(4, 14))
+
+    def _close(cancel: bool) -> None:
+        if cancel:
+            result["value"] = None
+        else:
+            sel = route_var.get()
+            idx = branch_titles.index(sel) if sel in branch_titles else None
+            checked = [i for i, v in enumerate(vars_list) if v.get()]
+            result["value"] = (idx, checked)
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    cont_btn = ctk.CTkButton(
+        btn_row, text="Continue", width=150, command=lambda: _close(False))
+    cont_btn.pack(side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text="Cancel fire", width=110, command=lambda: _close(True),
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=4)
+
+    dialog.bind("<Escape>", lambda _e: _close(True))
+    dialog.protocol("WM_DELETE_WINDOW", lambda: _close(True))
+    dialog.lift()
+    dialog.focus_force()
+    cont_btn.focus_set()
+    dialog.after(100, lambda: (dialog.lift(), dialog.focus_force()))
+
+    parent.wait_window(dialog)
+    return result["value"]
+
+
 def attach_listbox_drag_reorder(listbox, items, refresh, on_change=None):
     """Make a native ``tk.Listbox`` drag-reorderable, backed by the Python
     list ``items``. During a drag a thin accent line marks the drop gap
@@ -21587,22 +21669,157 @@ class App:
     # email/text/note. Single-student routing lives in _fire_per_student.
     # ==================================================================
 
-    def _partition_rows_by_branch(self, scenario, rows):
-        """Assign each row to the FIRST branch whose conditions it matches and
-        return [(BranchConfig, [rows]), …] in branch order, dropping empty
-        groups. Rows matching no branch are excluded (like a batch filter that
-        doesn't select them)."""
-        assigned: dict = {}
+    def _branch_coverage(self, scenario, rows):
+        """Per-row branch membership for a branched action over `rows`. Returns
+        (per_row, unmatched, overlaps):
+          per_row   {id(row): [branch indices matched]} in branch order;
+          unmatched [rows] that match NO branch;
+          overlaps  {(i, j): count} for branch-index pairs i<j that co-match at
+                    least one row — i.e. branches that AREN'T mutually exclusive.
+        Each branch's filters are resolved/validated ONCE (a branch with a
+        missing column is logged once, then skipped for everyone)."""
+        branches = list(getattr(scenario, "branches", None) or [])
+        if not rows or not branches:
+            return {}, list(rows or []), {}
+        headers = list(rows[0].keys())
+        compiled = []  # per branch: None=catch-all, False=broken, else filters
+        for b in branches:
+            conds = list(b.conditions or [])
+            if not conds:
+                compiled.append(None)
+                continue
+            filters = [_resolve_filter_columns(f, headers) for f in conds]
+            missing = [f.get("column", "") for f in filters
+                       if f.get("column") and f.get("column") not in headers]
+            if missing:
+                self._append_log(
+                    f"{scenario.name!r} branch {b.title!r}: filter column(s) not "
+                    f"in the caseload export "
+                    f"({', '.join(repr(c) for c in missing)}) — skipping this "
+                    "branch.", error=True)
+                compiled.append(False)
+                continue
+            compiled.append([_rewrite_task_filter(f) for f in filters])
+        per_row: dict = {}
+        overlaps: dict = {}
+        unmatched: list = []
         for r in rows:
-            b, i = self._match_branch(scenario, r)
-            if b is not None:
-                assigned[id(r)] = i
-        groups = []
-        for i, b in enumerate(getattr(scenario, "branches", None) or []):
-            grp = [r for r in rows if assigned.get(id(r)) == i]
-            if grp:
-                groups.append((b, grp))
-        return groups
+            m = []
+            for i, cf in enumerate(compiled):
+                if cf is False:
+                    continue
+                if cf is None or caseload_filter.apply_filters(cf, [r]):
+                    m.append(i)
+            per_row[id(r)] = m
+            if not m:
+                unmatched.append(r)
+            # A catch-all (no conditions) is MEANT to overlap everything — it's
+            # the fall-through. Only flag two CONDITIONED branches co-matching.
+            cond_m = [i for i in m if compiled[i] is not None]
+            for a in range(len(cond_m)):
+                for c in range(a + 1, len(cond_m)):
+                    key = (cond_m[a], cond_m[c])
+                    overlaps[key] = overlaps.get(key, 0) + 1
+        return per_row, unmatched, overlaps
+
+    def _groups_from_matches(self, scenario, rows, per_row, extra=None):
+        """Ordered, non-empty [(BranchConfig, [rows])] from a _branch_coverage
+        per_row map (first match wins). `extra` folds in {branch_index: [rows]}
+        (e.g. user-routed unmatched students)."""
+        branches = list(getattr(scenario, "branches", None) or [])
+        buckets: dict = {i: [] for i in range(len(branches))}
+        for r in rows:
+            m = per_row.get(id(r)) or []
+            if m:
+                buckets[m[0]].append(r)
+        for i, rs in (extra or {}).items():
+            buckets.setdefault(i, []).extend(rs)
+        return [(branches[i], buckets[i])
+                for i in range(len(branches)) if buckets.get(i)]
+
+    def _partition_rows_by_branch(self, scenario, rows):
+        """Plain first-match partition → [(BranchConfig, [rows]), …] in branch
+        order, dropping empty groups; unmatched rows excluded. Coverage +
+        stage-4 safeguards (overlap warning, unmatched override) live in
+        _resolve_branch_groups."""
+        per_row, _unm, _ov = self._branch_coverage(scenario, rows)
+        return self._groups_from_matches(scenario, rows, per_row)
+
+    def _warn_branch_overlap(self, scenario, overlaps) -> bool:
+        """Overlap safeguard: warn when branches aren't mutually exclusive (a
+        student matches >1 branch and silently fires only the FIRST). Returns
+        True to proceed with first-match routing, False to cancel the fire."""
+        branches = list(getattr(scenario, "branches", None) or [])
+
+        def t(i):
+            return (branches[i].title or f"branch {i + 1}"
+                    if i < len(branches) else f"#{i}")
+
+        lines = [f"•  {t(i)}  +  {t(j)}:  {n} student(s)"
+                 for (i, j), n in sorted(overlaps.items())]
+        self._append_log(
+            f"⚠ {scenario.name!r}: branches overlap — "
+            + "; ".join(line.strip("• ") for line in lines), error=True)
+        msg = ("Some students match more than one branch, so branch ORDER "
+               "matters — each of these fires only the FIRST (topmost) branch "
+               "it matches:\n\n" + "\n".join(lines)
+               + "\n\nContinue with first-match routing, or cancel to reorder / "
+                 "tighten the branch conditions?")
+        return ask_yes_no_topmost(
+            self.root, "Branches overlap", msg,
+            yes_label="Continue (first match)", no_label="Cancel fire")
+
+    def _route_unmatched(self, scenario, unmatched):
+        """Unmatched override: let the user route students who match NO branch
+        into a branch (or skip them). Returns {branch_index: [rows]} to fold in,
+        {} to skip all, or None to cancel the whole fire."""
+        branches = list(getattr(scenario, "branches", None) or [])
+        labels = []
+        for r in unmatched:
+            nm = self._row_name_and_query(r)[0]
+            labels.append(nm or (r.get("StudentID") or r.get("Student ID")
+                                 or "?"))
+        titles = [b.title or f"branch {i + 1}" for i, b in enumerate(branches)]
+        res = prompt_branch_unmatched(self.root, labels, titles, scenario.name)
+        if res is None:
+            return None
+        idx, checked = res
+        if idx is None or not checked:
+            return {}
+        return {idx: [unmatched[i] for i in checked]}
+
+    def _resolve_branch_groups(self, scenario, rows):
+        """Coverage + stage-4 safeguards for a branched batch/selection fire.
+        Warns on branch overlap, offers an override for unmatched students, then
+        returns the final ordered [(branch, [rows])] groups — or None to abort
+        the whole fire."""
+        per_row, unmatched, overlaps = self._branch_coverage(scenario, rows)
+        if overlaps and not self._warn_branch_overlap(scenario, overlaps):
+            self._append_log(
+                f"{scenario.name!r}: cancelled at branch-overlap warning.")
+            return None
+        extra = None
+        if unmatched:
+            routed = self._route_unmatched(scenario, unmatched)
+            if routed is None:
+                self._append_log(
+                    f"{scenario.name!r}: cancelled at unmatched-student review.")
+                return None
+            if routed:
+                extra = routed
+                branches = list(getattr(scenario, "branches", None) or [])
+                parts = []
+                for i, v in routed.items():
+                    ttl = (branches[i].title if i < len(branches)
+                           and branches[i].title else f"branch {i + 1}")
+                    parts.append(f"{ttl!r} (+{len(v)})")
+                self._append_log(
+                    f"  ↳ routed {sum(len(v) for v in routed.values())} "
+                    "unmatched student(s) → " + ", ".join(parts))
+            else:
+                self._append_log(
+                    f"  ↳ {len(unmatched)} unmatched student(s) skipped.")
+        return self._groups_from_matches(scenario, rows, per_row, extra)
 
     def _branched_preflight(self, scenario, *, batch: bool) -> bool:
         """Shared up-front checks for a branched batch/selection fire: log into
@@ -21687,8 +21904,6 @@ class App:
     def _fire_branched_batch(self, scenario, override: str) -> None:
         """Main-window fire of a branched action: partition the whole caseload
         by branch and run each branch as its own sub-batch."""
-        if not self._branched_preflight(scenario, batch=True):
-            return
         self._warn_if_caseload_stale("this batch")
         if self._caseload_rows is not None:
             rows = self._caseload_rows
@@ -21704,11 +21919,15 @@ class App:
             if not rows:
                 self._append_log("Batch aborted: couldn't load caseload rows.")
                 return
-        groups = self._partition_rows_by_branch(scenario, rows)
+        groups = self._resolve_branch_groups(scenario, rows)
+        if groups is None:
+            return  # cancelled at an overlap / unmatched safeguard
         if not groups:
             self._append_log(
                 f"{scenario.name!r}: no caseload students match any branch — "
                 "nothing to do.")
+            return
+        if not self._branched_preflight(scenario, batch=True):
             return
         self._append_log(
             "Branched batch — "
@@ -22436,7 +22655,9 @@ class App:
                 finally:
                     self._set_idle()
                 return
-            groups = self._partition_rows_by_branch(scenario, rows)
+            groups = self._resolve_branch_groups(scenario, rows)
+            if groups is None:
+                return  # cancelled at an overlap / unmatched safeguard
             if not groups:
                 self._append_log(
                     f"{scenario.name!r}: none of the {len(rows)} selected "
