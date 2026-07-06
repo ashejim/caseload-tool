@@ -8467,10 +8467,13 @@ def prompt_segment_setup(parent, missing: list) -> bool:
     ).pack(fill="x", padx=16, pady=(14, 2))
     ctk.CTkLabel(
         dialog, anchor="w", justify="left", wraplength=600,
-        text=("These caseload departments have no Mongoose segment yet, so "
-              "their students can't be mapped to a Salesforce Contact id. "
-              "Create one per department (one-time) — then texting can reach "
-              "students even when their caseload mobile is blank."),
+        text=("Optional but recommended. Texting already works without a "
+              "segment — each student is reached by their Salesforce Contact id "
+              "(no mobile needed) and gated by the Salesforce opt-in field. But "
+              "that field can disagree with who's actually opted in inside "
+              "Mongoose. A one-time segment per department gives VERIFIED "
+              "opt-in (and covers any student whose Contact id didn't come "
+              "through from Salesforce)."),
         font=ctk.CTkFont(size=12),
     ).pack(fill="x", padx=16, pady=(0, 8))
 
@@ -20833,6 +20836,29 @@ class App:
                     "skipped when texting until it's refreshed (🔄 Sync "
                     "Contact IDs, or fire a text to be prompted).",
                     error=True)
+            # One-time (per session) setup nudge: if this user texts and a
+            # caseload course has no Mongoose segment yet, mention the OPTIONAL
+            # verified-opt-in setup. Texting already works via the Salesforce
+            # Contact id + opt-in field — this only flags the reliability upgrade
+            # (the SF field can disagree with who's actually opted in in Mongoose).
+            if not getattr(self, "_texting_setup_hinted", False):
+                try:
+                    texts = any(getattr(s, "text", None) is not None
+                                for s in (self.scenarios or {}).values())
+                    ccourses = {self._norm_course(r.get("CourseCode") or "")
+                                for r in (rows or [])}
+                    ccourses.discard("")
+                    uncovered = sorted(ccourses - mongoose_courses)
+                    if texts and uncovered:
+                        self._texting_setup_hinted = True
+                        self._append_log(
+                            "ℹ Texting " + ", ".join(uncovered) + " uses the "
+                            "Salesforce opt-in field (no Mongoose segment yet). "
+                            "That works; for VERIFIED opt-in (the SF field can "
+                            "disagree with Mongoose) set up a segment — 🔄 Sync "
+                            "Contact IDs, or see docs/TEXTING_SETUP.md.")
+                except Exception:
+                    pass
 
     def _distinct_courses(self, rows) -> list:
         """Distinct normalized course codes (e.g. 'C769') across caseload rows,
