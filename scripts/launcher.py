@@ -340,6 +340,10 @@ class BrowserWorker:
         # Aura note-save endpoint when eligible instead of driving the form.
         # The App keeps this in sync at startup + when settings change.
         self.note_api_enabled: bool = True
+        # Opt-in (mirrors Settings.text_send_via_api): send texts via the
+        # Mongoose REST API replay instead of the compose modal. Kept in sync by
+        # the App. Default off; the modal is the fallback when it's off or errors.
+        self.text_api_enabled: bool = False
         # One-shot diagnostic latches for the batch-email scrape path
         # in `_click_match_by_filter`. The first batch of the session
         # logs WHAT the row mailto carried (or didn't), and WHAT the
@@ -2324,6 +2328,9 @@ class BrowserWorker:
             mts = []
         msg_type = next((m.get("id") for m in mts if m.get("isDefault")),
                         (mts[0].get("id") if mts else None))
+        def _digits(s):
+            return "".join(ch for ch in str(s or "") if ch.isdigit())
+
         recips, skipped = [], []
         for cid in contact_ids:
             try:
@@ -2333,16 +2340,27 @@ class BrowserWorker:
                      ).get("body") or "[]")
             except Exception:
                 arr = []
+            cu, cd = cid.upper(), _digits(cid)
             m = next((c for c in arr
-                      if str(c.get("campusStudentId", "")).strip().upper()
-                      == cid.upper()), None)
+                      if str(c.get("campusStudentId", "")).strip().upper() == cu),
+                     None)
+            if m is None and len(cd) >= 10:   # term was a mobile, not a Contact id
+                m = next((c for c in arr
+                          if _digits(c.get("mobileNumber")).endswith(cd[-10:])
+                          or _digits(c.get("formattedMobile")).endswith(cd[-10:])),
+                         None)
             if m and m.get("id") and not m.get("optedOut"):
                 recips.append(m["id"])
             else:
                 skipped.append(cid)
         if not recips:
-            return {"error": f"no recipients resolved (searched "
-                    f"{len(contact_ids)}, matched 0).", "skipped": skipped}
+            # Token/inbox/search all worked — these students just aren't opted-in
+            # Mongoose contacts. Clean skip (0 sent), NOT an error, so the caller
+            # doesn't pointlessly fall back to the modal (which also can't add
+            # them). This is the authoritative optedIn gate.
+            return {"ok": True, "status": None, "sent": 0, "gid": gid,
+                    "skipped": skipped, "resp": "",
+                    "note": "no opted-in Mongoose contacts among recipients"}
         body = {"groupAccountId": gid, "mediaUris": [], "restrictToAssignment": False,
                 "templateId": None, "campaignId": None,
                 "smartMessageWindowInSeconds": 0, "text": text,
@@ -4443,6 +4461,34 @@ class BrowserWorker:
         except Exception:
             return None
 
+    def _dom_payload_to_api(self, payload) -> dict:
+        """Map a compose-modal text payload to the API send payload. Builds the
+        team-local 'YYYY-MM-DDTHH:mm' scheduleDate from the slot dict (date_str
+        is MM/DD/YYYY + hour12/ampm/minute); recipients carry over as the search
+        terms (Contact id or mobile), resolved to Mongoose ids in the API send."""
+        sch = payload.get("schedule") or {}
+        schedule_date = None
+        try:
+            ds = (sch.get("date_str") or "").strip()   # MM/DD/YYYY
+            if ds:
+                mm, dd, yyyy = ds.split("/")
+                h12 = int(sch.get("hour12", 10) or 10)
+                mnt = int(sch.get("minute", 0) or 0)
+                ap = (sch.get("ampm", "AM") or "AM").upper()
+                h24 = (h12 % 12) + (12 if ap == "PM" else 0)
+                schedule_date = (f"{int(yyyy):04d}-{int(mm):02d}-{int(dd):02d}"
+                                 f"T{h24:02d}:{mnt:02d}")
+        except Exception:
+            schedule_date = None
+        return {
+            "course": payload.get("course", ""),
+            "text": payload.get("body", ""),
+            "contact_ids": list(payload.get("recipients") or []),
+            "schedule_date": schedule_date,
+            "schedule_name": (payload.get("schedule_name")
+                              or payload.get("inbox_label") or "API send"),
+        }
+
     def _send_text(self, ctx, payload: dict) -> dict:
         """Drive the Mongoose compose modal from a fired text action. `payload`
         carries the rendered body, recipient mobiles, inbox label, an optional
@@ -4483,6 +4529,25 @@ class BrowserWorker:
             return {"error": "Mongoose isn't logged in (the browser is showing "
                     "the sign-in page). Sign in to Mongoose, then re-fire.",
                     "not_logged_in": True}
+        # API path (opt-in): replay the send endpoint instead of driving the
+        # compose modal — no warm-up / bring-to-front needed. On any hard error
+        # it falls through to the modal below, so texting never breaks. A clean
+        # "nobody opted in" result (ok, 0 sent) is NOT a fallback.
+        if (self.text_api_enabled and payload.get("commit")
+                and (self._mongoose_token or {}).get("token")):
+            api = self._send_text_via_api(ctx, self._dom_payload_to_api(payload))
+            if api.get("ok"):
+                sent = api.get("sent", 0)
+                skipped = api.get("skipped") or []
+                self.on_status(
+                    f"  text: scheduled via API — {sent} recipient(s)"
+                    + (f"; {len(skipped)} skipped (not opted in / not in "
+                       "Mongoose)" if skipped else "") + ".")
+                return {"ok": True, "via": "api", "sent": sent,
+                        "skipped_recipients": skipped}
+            self.on_status(
+                f"  text: API send didn't apply ({api.get('error')}) — falling "
+                "back to the compose modal.")
         # The first compose of a session is flaky (cold renderer); warm it once
         # with a throwaway open/search/close so the first real group goes through.
         if not self._mongoose_warmed:
@@ -17668,6 +17733,8 @@ class App:
         self.worker.stop_event = self._stop_event   # share the STOP signal
         self.worker.note_api_enabled = bool(
             getattr(self.settings, "note_save_via_api", True))
+        self.worker.text_api_enabled = bool(
+            getattr(self.settings, "text_send_via_api", False))
         self.worker.start()
         self._cleanup_sensitive_artifacts()   # purge old captures/probes/shots
 
@@ -25857,6 +25924,25 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        # Send texts via the Mongoose API (opt-in).
+        textapi_var = ctk.BooleanVar(
+            value=getattr(self.settings, "text_send_via_api", False))
+        ctk.CTkCheckBox(
+            dialog,
+            text="Send texts via the Mongoose API (skips the compose modal)",
+            variable=textapi_var, font=ctk.CTkFont(size=13),
+        ).pack(anchor="w", padx=20, pady=(8, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("Schedules texts through Mongoose's own send endpoint instead "
+                  "of driving the compose modal — faster and avoids the cold-tab "
+                  "compose flakiness. Resolves each recipient by Salesforce "
+                  "Contact id and skips anyone not opted in inside Mongoose. The "
+                  "compose modal stays the automatic fallback if it errors."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
         # Advanced: action branching (conditional sub-actions).
         branching_var = ctk.BooleanVar(
             value=getattr(self.settings, "enable_branching", False))
@@ -26079,6 +26165,12 @@ class App:
             self.settings.note_save_via_api = bool(noteapi_var.get())
             try:
                 self.worker.note_api_enabled = self.settings.note_save_via_api
+            except Exception:
+                pass
+            # Send texts via the Mongoose API (opt-in) — keep the worker in sync.
+            self.settings.text_send_via_api = bool(textapi_var.get())
+            try:
+                self.worker.text_api_enabled = self.settings.text_send_via_api
             except Exception:
                 pass
             # Action branching (advanced) — gates the "+ branch" editor UI.

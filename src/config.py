@@ -422,6 +422,11 @@ class Settings:
     # eligible (no Contact id, EA-attached notes, a note left unsubmitted) or
     # if the API call fails. Toggle off to file every note via the form.
     note_save_via_api: bool = True
+    # Send texts through Mongoose's REST API (replaying the harvested bearer
+    # token) instead of driving the compose modal — faster + avoids the cold-tab
+    # compose flakiness. The compose modal stays the automatic fallback if the
+    # API path errors. Default OFF (opt-in) while it beds in. Toggle on to use it.
+    text_send_via_api: bool = False
     # Source the caseload from the live grid JSON (getCaseLoadMainGridData) when
     # that feed is healthy, overlaying any CSV-only columns from the downloaded
     # CSV — so the caseload is complete regardless of how the Salesforce list
