@@ -332,6 +332,10 @@ class BrowserWorker:
         # POSTs — reused to REPLAY the note-save action via fetch (no flaky
         # form). {"token","context","ts"} or None. See _harvest_aura_creds.
         self._aura_creds: Optional[dict] = None
+        # Freshest Mongoose API Bearer token, harvested from any
+        # sms-api.mongooseresearch.com request (rides on every call). Reused to
+        # REPLAY the text-send API. {"token","ts"} or None. ~16h lifetime.
+        self._mongoose_token: Optional[dict] = None
         # Opt-in (mirrors Settings.note_save_via_api): file notes through the
         # Aura note-save endpoint when eligible instead of driving the form.
         # The App keeps this in sync at startup + when settings change.
@@ -349,6 +353,12 @@ class BrowserWorker:
         # (the first compose of a cold/backgrounded tab is flaky). Reset whenever
         # a fresh Mongoose tab is opened.
         self._mongoose_warmed = False
+        # `textapi:` capture: a persistent request/response recorder attached to
+        # the Mongoose tab (captures BOTH tool-driven and MANUAL compose sends),
+        # dumped to text_send_probe.txt for building an API-replay send. `sink`
+        # is the accumulating record list; `stop` detaches it.
+        self._text_capture_sink = None
+        self._text_capture_stop = None
         self.ready_event = threading.Event()
         # Shared STOP signal (set by App._request_stop). Replaced with App's own
         # Event right after construction; the default keeps the worker usable
@@ -532,6 +542,31 @@ class BrowserWorker:
         body, recipients (list of mobiles), inbox_label, schedule (slot dict or
         None), schedule_name, commit."""
         self.q.put(("SEND_TEXT", payload, on_done))
+
+    def submit_arm_text_capture(self, on_done: Callable[[dict], None]) -> None:
+        """Attach a persistent network recorder to the open Mongoose tab (tool
+        AND manual sends) for the text-send API discovery."""
+        self.q.put(("ARM_TEXT_CAPTURE", on_done))
+
+    def submit_dump_text_capture(
+        self, needle: str, on_done: Callable[[dict], None],
+    ) -> None:
+        """Write whatever the armed capture has recorded to text_send_probe.txt,
+        flagging the request whose body carries `needle` (the message you sent)."""
+        self.q.put(("DUMP_TEXT_CAPTURE", needle, on_done))
+
+    def submit_probe_mongoose_api(
+        self, on_done: Callable[[dict], None],
+    ) -> None:
+        """Replay-test the harvested Bearer token + fetch the send API maps
+        (groupaccounts/profile/messageTypes) → mongoose_api_probe.txt."""
+        self.q.put(("PROBE_MONGOOSE_API", on_done))
+
+    def submit_send_text_api(
+        self, payload: dict, on_done: Callable[[dict], None],
+    ) -> None:
+        """Send/schedule a text via the Mongoose REST API replay (not the modal)."""
+        self.q.put(("SEND_TEXT_API", payload, on_done))
 
     def submit_export_segments(
         self, courses: list, on_done: Callable[[dict], None],
@@ -933,6 +968,34 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._send_text(ctx, payload)
+            finally:
+                on_done(res)
+        elif cmd[0] == "ARM_TEXT_CAPTURE":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._arm_text_capture_persistent(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "DUMP_TEXT_CAPTURE":
+            _, needle, on_done = cmd
+            res = {}
+            try:
+                res = self._dump_text_capture_persistent(needle)
+            finally:
+                on_done(res)
+        elif cmd[0] == "PROBE_MONGOOSE_API":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._probe_mongoose_api(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "SEND_TEXT_API":
+            _, payload, on_done = cmd
+            res = {}
+            try:
+                res = self._send_text_via_api(ctx, payload)
             finally:
                 on_done(res)
         elif cmd[0] == "EXPORT_SEGMENTS":
@@ -1914,6 +1977,10 @@ class BrowserWorker:
         # a recent one is valid for replaying saveNoteCmpValues via fetch().
         if method.upper() == "POST" and "/aura" in url:
             self._harvest_aura_creds(request)
+        # Always-on: harvest the Mongoose API Bearer token (rides on every
+        # sms-api.mongooseresearch.com request) — for replaying the text-send API.
+        if "sms-api.mongooseresearch.com" in url:
+            self._harvest_mongoose_token(request)
         if not self._capture_active:
             return
         if method.upper() not in ("POST", "PATCH", "PUT"):
@@ -2083,6 +2150,175 @@ class BrowserWorker:
         ctx = (q.get("aura.context") or [""])[0]
         if tok and ctx:
             self._aura_creds = {"token": tok, "context": ctx, "ts": time.time()}
+
+    def _harvest_mongoose_token(self, request) -> None:
+        """Keep the freshest Mongoose API Bearer token — it rides in the
+        Authorization header of every sms-api.mongooseresearch.com request and is
+        reused (until ~16h expiry) to replay the text-send API. Best-effort."""
+        try:
+            auth = (request.headers or {}).get("authorization", "")
+        except Exception:
+            return
+        if auth[:7].lower() == "bearer " and len(auth) > 40:
+            self._mongoose_token = {"token": auth[7:], "ts": time.time()}
+
+    def _probe_mongoose_api(self, ctx) -> dict:
+        """Replay-test the harvested Bearer token: in-page fetch (from the
+        Mongoose tab, so the API's CORS origin is satisfied) of the read-only
+        maps we need for the send — /api/profile, /api/groupaccounts,
+        /api/messageTypes. Proves the token is replayable AND grabs the
+        course/department -> groupAccountId map. Writes mongoose_api_probe.txt."""
+        from src.config import USER_CONFIG_DIR
+        page = self._mongoose_page(ctx)
+        if page is None:
+            return {"error": "Mongoose isn't open — open the Mongoose tab first."}
+        tok = (self._mongoose_token or {}).get("token")
+        if not tok:
+            return {"error": "No Mongoose bearer token harvested yet — the "
+                    "Mongoose tab fires one on load; reload it and retry."}
+        endpoints = ["/api/profile", "/api/groupaccounts", "/api/messageTypes",
+                     "/api/groupaccounts/mine", "/api/sharedinboxes"]
+        out = {}
+        for ep in endpoints:
+            try:
+                out[ep] = page.evaluate(
+                    """async ([ep, tok]) => {
+                        try {
+                            const r = await fetch(
+                                'https://sms-api.mongooseresearch.com' + ep,
+                                {headers: {'Authorization': 'Bearer ' + tok,
+                                           'Content-Type': 'application/json'}});
+                            const t = await r.text();
+                            return {status: r.status, body: t.slice(0, 9000)};
+                        } catch (e) { return {status: 'fetch-error',
+                                              body: String(e)}; }
+                    }""", [ep, tok])
+            except Exception as e:
+                out[ep] = {"status": "err", "body": str(e)}
+        import re as _re
+        def _redact(s):
+            return _re.sub(
+                r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{6,}",
+                "<JWT redacted>", str(s or ""))
+        lines = ["=== Mongoose API replay probe (harvested Bearer token) ===",
+                 "Bearer JWTs REDACTED. If statuses are 200, the token REPLAYS —",
+                 "the send API is buildable.", ""]
+        ok = False
+        for ep in endpoints:
+            r = out.get(ep) or {}
+            st = r.get("status")
+            if st == 200:
+                ok = True
+            lines += [f"GET {ep}  -> {st}",
+                      "    " + _redact(r.get("body", ""))[:5000], ""]
+        path = USER_CONFIG_DIR / "mongoose_api_probe.txt"
+        try:
+            path.write_text("\n".join(lines), encoding="utf-8")
+        except Exception:
+            path = None
+        return {"path": str(path) if path else None, "replayable": ok,
+                "statuses": {ep: (out.get(ep) or {}).get("status")
+                             for ep in endpoints}}
+
+    def _mongoose_api(self, page, tok, method, ep, body=None):
+        """One authenticated Mongoose API call via in-page fetch on the Mongoose
+        tab (so the API's CORS origin is satisfied + the bearer replays). Returns
+        {status, body(text)}."""
+        return page.evaluate(
+            """async ([method, ep, tok, body]) => {
+                const opts = {method, headers: {
+                    'Authorization': 'Bearer ' + tok,
+                    'Content-Type': 'application/json'}};
+                if (body !== null) opts.body = JSON.stringify(body);
+                try {
+                    const r = await fetch(
+                        'https://sms-api.mongooseresearch.com' + ep, opts);
+                    let t = ''; try { t = await r.text(); } catch (e) {}
+                    return {status: r.status, body: t};
+                } catch (e) { return {status: 'fetch-error', body: String(e)}; }
+            }""", [method, ep, tok, body])
+
+    def _send_text_via_api(self, ctx, payload) -> dict:
+        """Send/schedule a text through Mongoose's REST API (replaying the
+        harvested Bearer token) instead of driving the compose modal. `payload`:
+        {course, text, contact_ids:[SF Contact id…], schedule_date
+        ('YYYY-MM-DDTHH:mm', team-local), schedule_name}. Resolves the group
+        account + default messageType for the course, maps each SF Contact id →
+        Mongoose numeric id (skipping opted-out), then POSTs the send. Returns
+        {ok, status, sent, skipped, gid} or {error}. NOTE: group account +
+        messageType are the CURRENT Mongoose department's — the tab must be on
+        that course's department (cross-department switching is a later add)."""
+        import json as _json
+        page = self._mongoose_page(ctx)
+        if page is None:
+            return {"error": "Mongoose isn't open."}
+        tok = (self._mongoose_token or {}).get("token")
+        if not tok:
+            return {"error": "No Mongoose token harvested yet (reload the tab)."}
+        course = (payload.get("course") or "").strip()
+        text = payload.get("text") or ""
+        contact_ids = [str(c).strip() for c in (payload.get("contact_ids") or [])
+                       if str(c).strip()]
+        if not text or not contact_ids:
+            return {"error": "empty text or no recipients."}
+        try:
+            ga = self._mongoose_api(page, tok, "GET", "/api/groupaccounts")
+            accounts = _json.loads(ga.get("body") or "[]")
+        except Exception as e:
+            return {"error": f"groupaccounts fetch failed: {e}"}
+        gid = next((a.get("id") for a in accounts
+                    if str(a.get("apiCode", "")).strip().upper() == course.upper()),
+                   None)
+        if gid is None and len(accounts) == 1:
+            gid = accounts[0].get("id")   # current dept's single inbox
+        if gid is None:
+            return {"error": f"no Mongoose inbox for course {course!r} in the "
+                    f"current department (have apiCodes "
+                    f"{[a.get('apiCode') for a in accounts]}); switch the "
+                    "Mongoose tab to that department first."}
+        try:
+            mts = _json.loads(
+                (self._mongoose_api(page, tok, "GET", "/api/messageTypes")
+                 ).get("body") or "[]")
+        except Exception:
+            mts = []
+        msg_type = next((m.get("id") for m in mts if m.get("isDefault")),
+                        (mts[0].get("id") if mts else None))
+        recips, skipped = [], []
+        for cid in contact_ids:
+            try:
+                arr = _json.loads(
+                    (self._mongoose_api(page, tok, "POST", "/api/students/search",
+                                        {"includeOptOut": True, "searchText": cid})
+                     ).get("body") or "[]")
+            except Exception:
+                arr = []
+            m = next((c for c in arr
+                      if str(c.get("campusStudentId", "")).strip().upper()
+                      == cid.upper()), None)
+            if m and m.get("id") and not m.get("optedOut"):
+                recips.append(m["id"])
+            else:
+                skipped.append(cid)
+        if not recips:
+            return {"error": f"no recipients resolved (searched "
+                    f"{len(contact_ids)}, matched 0).", "skipped": skipped}
+        body = {"groupAccountId": gid, "mediaUris": [], "restrictToAssignment": False,
+                "templateId": None, "campaignId": None,
+                "smartMessageWindowInSeconds": 0, "text": text,
+                "recipients": recips, "fromCompose": True,
+                "messageTypeId": msg_type}
+        if payload.get("schedule_date"):
+            body["scheduleName"] = payload.get("schedule_name") or "API send"
+            body["scheduleDate"] = payload["schedule_date"]
+        try:
+            r = self._mongoose_api(page, tok, "POST",
+                                   f"/api/groupaccounts/{gid}/send", body)
+        except Exception as e:
+            return {"error": f"send failed: {e}"}
+        st = r.get("status")
+        return {"ok": st in (200, 201, 204), "status": st, "sent": len(recips),
+                "skipped": skipped, "gid": gid, "resp": (r.get("body") or "")[:300]}
 
     # Academic-activity label -> the saveNoteCmpValues boolean field. Positional
     # zip of the selector labels with the payload's note{} flags (confirmed from
@@ -4030,6 +4266,143 @@ class BrowserWorker:
                 pass
         return {"ok": False}
 
+    def _arm_text_send_capture(self, page, sink: list):
+        """Attach temporary request+response listeners to the Mongoose page,
+        recording non-GET / XHR-fetch traffic (method, url, auth-relevant
+        headers, post body, response status) into `sink` — discovery for a
+        send/schedule API replay. Returns a stop() that detaches. Best-effort."""
+        def _interesting(method, rtype):
+            return (method or "GET").upper() != "GET" or rtype in ("xhr", "fetch")
+
+        def _on_req(req):
+            try:
+                if not _interesting(req.method, req.resource_type):
+                    return
+                h = {}
+                for k, v in (req.headers or {}).items():
+                    lk = k.lower()
+                    if lk in ("authorization", "x-csrf-token", "x-xsrf-token",
+                              "x-requested-with", "content-type"):
+                        h[lk] = v
+                    elif lk == "cookie":
+                        h["cookie"] = f"(present, {len(v)} chars)"
+                sink.append({
+                    "kind": "req", "method": (req.method or ""),
+                    "url": (req.url or ""), "rtype": (req.resource_type or ""),
+                    "headers": h, "post_data": (req.post_data or "")[:4000],
+                })
+            except Exception:
+                pass
+
+        def _on_resp(resp):
+            try:
+                rq = resp.request
+                if not _interesting(rq.method, rq.resource_type):
+                    return
+                rec = {"kind": "resp", "status": resp.status,
+                       "url": (resp.url or "")}
+                # KEEP the Response object and read its body at DUMP time — the
+                # sync Playwright API can't read a body inside this event
+                # callback (it returns empty / "unavailable").
+                if "sms-api.mongooseresearch.com/api/" in (resp.url or ""):
+                    rec["_resp"] = resp
+                sink.append(rec)
+            except Exception:
+                pass
+        try:
+            page.on("request", _on_req)
+            page.on("response", _on_resp)
+        except Exception:
+            return lambda: None
+
+        def _stop():
+            try: page.remove_listener("request", _on_req)
+            except Exception: pass
+            try: page.remove_listener("response", _on_resp)
+            except Exception: pass
+        return _stop
+
+    def _dump_text_send_capture(self, sink: list, needle: str):
+        """Write captured Mongoose send traffic to text_send_probe.txt, flagging
+        the request whose body carries the message (the send endpoint) and
+        including the sms-api RESPONSE bodies. Bearer JWTs are REDACTED so the
+        file is safe to share. Returns the path str, or None."""
+        if not sink:
+            return None
+        from src.config import USER_CONFIG_DIR
+        import urllib.parse as _up
+        import re as _re
+
+        def _redact(s):
+            # Any JWT (three base64url segments starting eyJ…) → placeholder.
+            return _re.sub(
+                r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{6,}",
+                "<JWT redacted>", str(s or ""))
+
+        frag = (needle or "").strip().lower()[:24]
+        reqs = [e for e in sink if e.get("kind") == "req"]
+        resps = [e for e in sink if e.get("kind") == "resp"]
+        status_by_url = {e.get("url"): e.get("status") for e in resps}
+        lines = [
+            "=== Mongoose text-send network capture ===",
+            f"message needle: {needle!r}",
+            f"{len(reqs)} request(s), {len(resps)} response(s) captured.",
+            "Bearer JWTs REDACTED — safe to share (student ids/phones may remain).",
+            "", "--- distinct endpoints ---",
+        ]
+        seen = []
+        for e in reqs:
+            try:
+                u = _up.urlparse(e["url"])
+                key = f'{e["method"]:6} {u.netloc}{u.path}'
+            except Exception:
+                key = f'{e.get("method", "")} {e.get("url", "")}'
+            if key not in seen:
+                seen.append(key)
+        lines += [f"  {k}" for k in seen]
+        lines += ["", "--- requests ---"]
+        for e in reqs:
+            body = e.get("post_data", "") or ""
+            flag = ("   <<<<< CARRIES THE MESSAGE — the SEND endpoint"
+                    if frag and frag in body.lower() else "")
+            st = status_by_url.get(e["url"])
+            lines.append(f'{e["method"]} {e["url"]}   [{e.get("rtype", "")}]'
+                         + (f'  -> {st}' if st is not None else '') + flag)
+            for hk, hv in (e.get("headers") or {}).items():
+                lines.append(f'    {hk}: {_redact(hv)}')
+            if body:
+                lines.append(f'    body: {_redact(body)[:1800]}')
+            lines.append("")
+        # sms-api RESPONSE bodies — read NOW (outside the event callback) so the
+        # body is actually available. Dedupe by URL; focus on the endpoints that
+        # carry the maps we need (search → numeric id, inbox + messageType maps).
+        KEY = ("students/search", "groupaccounts", "messagetypes", "profile",
+               "staff", "smartmessages", "customfields", "templates")
+        seen_urls, body_lines = set(), []
+        for e in resps:
+            r = e.get("_resp")
+            url = e.get("url", "")
+            if r is None or url in seen_urls:
+                continue
+            if not any(k in url.lower() for k in KEY):
+                continue
+            seen_urls.add(url)
+            try:
+                body = r.text()
+            except Exception as ex:
+                body = f"(unreadable: {ex})"
+            body_lines += [f'{e.get("status")}  {url}',
+                           f'    {_redact(body)[:3000]}', ""]
+        if body_lines:
+            lines += ["--- sms-api response bodies (key endpoints) ---"]
+            lines += body_lines
+        try:
+            path = USER_CONFIG_DIR / "text_send_probe.txt"
+            path.write_text("\n".join(lines), encoding="utf-8")
+            return str(path)
+        except Exception:
+            return None
+
     def _send_text(self, ctx, payload: dict) -> dict:
         """Drive the Mongoose compose modal from a fired text action. `payload`
         carries the rendered body, recipient mobiles, inbox label, an optional
@@ -4102,7 +4475,7 @@ class BrowserWorker:
             tm.send_text(page, msg, on_status=self.on_status,
                          should_stop=self.stop_event.is_set,
                          emit_timing=bool(payload.get("emit_timing")))
-            return {"ok": True}
+            result = {"ok": True}
         except tm.TextAborted:
             # User hit STOP mid-compose — close the half-built modal so the next
             # action starts clean, and report the abort (NOT a failure).
@@ -4110,9 +4483,52 @@ class BrowserWorker:
                 tm.close_compose(page)
             except Exception:
                 pass
-            return {"aborted": True}
+            result = {"aborted": True}
         except Exception as e:
-            return {"error": str(e)}
+            result = {"error": str(e)}
+        # If a `textapi:` capture is armed, the persistent listener already
+        # recorded this send — auto-dump it (flagged by the message body) so a
+        # tool-driven send needs no separate `textapidump:`. Listener stays
+        # attached for further (e.g. manual) sends.
+        if self._text_capture_sink is not None:
+            try:
+                p = self._dump_text_send_capture(self._text_capture_sink,
+                                                 payload.get("body", ""))
+                if p:
+                    self.on_status(f"  [textapi] send capture → {p}")
+            except Exception:
+                pass
+        return result
+
+    def _arm_text_capture_persistent(self, ctx) -> dict:
+        """Attach the persistent Mongoose network recorder to the open Mongoose
+        tab. Captures every send (tool-driven or manually composed) until
+        dumped. Requires Mongoose already open. Returns {armed, error?}."""
+        if self._text_capture_stop:
+            try:
+                self._text_capture_stop()
+            except Exception:
+                pass
+            self._text_capture_stop = None
+        page = self._mongoose_page(ctx)
+        if page is None:
+            self._text_capture_sink = None
+            return {"armed": False,
+                    "error": "Mongoose isn't open — open it (🐭 Mongoose) first."}
+        sink: list = []
+        self._text_capture_sink = sink
+        self._text_capture_stop = self._arm_text_send_capture(page, sink)
+        return {"armed": True}
+
+    def _dump_text_capture_persistent(self, needle: str) -> dict:
+        """Write the armed capture's recording to text_send_probe.txt, flagging
+        the request carrying `needle` (the message text). Keeps recording."""
+        sink = self._text_capture_sink
+        if not sink:
+            return {"path": None, "count": 0}
+        path = self._dump_text_send_capture(sink, needle or "")
+        n = sum(1 for e in sink if e.get("kind") == "req")
+        return {"path": path, "count": n}
 
     def _export_segments(self, ctx, courses: list) -> dict:
         """Auto-export each course's Mongoose contacts segment to a CSV in the
@@ -14710,6 +15126,30 @@ class CaseloadPanel:
         if q.lower().startswith("apinote"):
             self.app._test_api_note()
             return "break"
+        # DISCOVERY: "textapimap:" replay-tests the harvested Mongoose Bearer
+        # token with authenticated GETs → mongoose_api_probe.txt (proves the
+        # token replays + grabs the groupAccountId map). Before "textapi".
+        if q.lower().startswith("textapimap"):
+            self.app._probe_mongoose_api()
+            return "break"
+        # TEST: "textapisend:" schedules a test text to the highlighted student
+        # via the Mongoose REST API replay (proves the send). Before "textapi".
+        if q.lower().startswith("textapisend"):
+            self.app._test_api_send()
+            return "break"
+        # DISCOVERY: "textapidump:<msg>" writes the armed capture to
+        # text_send_probe.txt, flagging the request carrying <msg>. (Checked
+        # BEFORE "textapi" — it also starts with that prefix.)
+        if q.lower().startswith("textapidump"):
+            needle = q.split(":", 1)[1].strip() if ":" in q else ""
+            self.app._dump_text_capture(needle)
+            return "break"
+        # DISCOVERY: "textapi:" attaches a persistent recorder to the Mongoose
+        # tab (tool + manual sends) — to build an API-replay send like the
+        # note-save one. Then send a text and `textapidump:<msg>`.
+        if q.lower().startswith("textapi"):
+            self.app._arm_text_capture()
+            return "break"
         # DIAGNOSTIC: "griddiff:" compares the intercepted grid JSON against the
         # CSV column by column (writes griddiff_report.txt) — proves whether the
         # JSON can replace the CSV before switching the data path. Read-only.
@@ -19950,6 +20390,158 @@ class App:
                 show()
 
         self.worker.submit_probe_ea_feed(on_done)
+
+    def _arm_text_capture(self) -> None:
+        """DISCOVERY (textapi:): attach a persistent recorder to the open
+        Mongoose tab that captures every text send — tool-driven OR manually
+        composed. Then send/schedule a text and dump with `textapidump:`."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+
+        def on_done(res):
+            def show():
+                if res and res.get("armed"):
+                    self._append_log(
+                        "🎯 Text-send capture ARMED on the Mongoose tab. Now send "
+                        "ONE text — the easiest safe way: compose it MANUALLY in "
+                        "the Mongoose tab (to yourself, or SCHEDULE + delete it). "
+                        "Include a memorable phrase. Then type "
+                        "`textapidump:<that phrase>` here to write "
+                        "text_send_probe.txt (a tool-fired text auto-dumps). "
+                        "⚠ The file may hold a session token — don't share it.",
+                        success=True)
+                else:
+                    self._append_log(
+                        f"Text capture not armed: {(res or {}).get('error')}",
+                        error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_arm_text_capture(on_done)
+
+    def _dump_text_capture(self, needle: str = "") -> None:
+        """DISCOVERY (textapidump:<msg>): write the armed capture to
+        text_send_probe.txt, flagging the request carrying <msg>."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+
+        def on_done(res):
+            def show():
+                p = (res or {}).get("path")
+                if p:
+                    self._append_log(
+                        f"📄 Text-send capture → {p} "
+                        f"({(res or {}).get('count', 0)} request(s)). "
+                        "Open it and look for the “CARRIES THE MESSAGE” flag "
+                        "(the send endpoint). ⚠ Don't share it (session token).",
+                        success=True)
+                else:
+                    self._append_log(
+                        "No capture recorded yet — arm with `textapi:`, send a "
+                        "text, then dump.", error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_dump_text_capture(needle or "", on_done)
+
+    def _probe_mongoose_api(self) -> None:
+        """DISCOVERY (textapimap:): replay-test the harvested Mongoose Bearer
+        token with authenticated GETs (groupaccounts/profile/messageTypes) →
+        mongoose_api_probe.txt. Proves the token replays + grabs the
+        course→groupAccountId map for the send build."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._append_log("Probing the Mongoose API with the harvested token…")
+
+        def on_done(res):
+            def show():
+                p = (res or {}).get("path")
+                if p:
+                    self._append_log(
+                        f"📄 Mongoose API probe → {p}. "
+                        f"REPLAYABLE={(res or {}).get('replayable')}; "
+                        f"statuses={(res or {}).get('statuses')}. "
+                        "200s = the token replays (send API is buildable). "
+                        "Safe to share (JWTs redacted).",
+                        success=bool((res or {}).get("replayable")),
+                        error=not (res or {}).get("replayable"))
+                else:
+                    self._append_log(
+                        f"Mongoose API probe failed: {(res or {}).get('error')}",
+                        error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_probe_mongoose_api(on_done)
+
+    def _test_api_send(self) -> None:
+        """TEST (textapisend:): SCHEDULE a test text (~1h out, team-local) to the
+        highlighted student via the Mongoose REST API replay — proves the full
+        send before wiring it into the fire flow. Delete the scheduled test in
+        Mongoose after. The Mongoose tab must be on the student's department."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        panel = getattr(self, "caseload_panel", None)
+        row = getattr(panel, "_qv_row", None) if panel else None
+        if not row:
+            self._append_log(
+                "textapisend: highlight a student in the viewer first.",
+                error=True)
+            return
+        sid = (row.get("StudentID") or "").strip()
+        cid = (self._contact_ids.get(sid) or "").strip()
+        if not cid:
+            self._append_log(
+                "textapisend: no Salesforce Contact id for that student — can't "
+                "resolve the Mongoose recipient.", error=True)
+            return
+        course = self._norm_course(row.get("CourseCode") or "")
+        from datetime import datetime, timedelta
+        try:
+            from zoneinfo import ZoneInfo
+            dt = datetime.now(ZoneInfo(self.TEAM_IANA)) + timedelta(hours=1)
+        except Exception:
+            dt = datetime.now() + timedelta(hours=1)
+        sched = dt.strftime("%Y-%m-%dT%H:%M")
+        who = (row.get("Name") or sid)
+        payload = {
+            "course": course,
+            "text": "🧪 API send test — please ignore. -Dr. Jim Ashe",
+            "contact_ids": [cid], "schedule_date": sched,
+            "schedule_name": "🧪 API send test",
+        }
+        self._append_log(
+            f"textapisend: scheduling an API test text to {who} ({course}) for "
+            f"{sched} (team-local)…")
+
+        def on_done(res):
+            def show():
+                if res and res.get("ok"):
+                    self._append_log(
+                        f"✓ API SEND WORKED — HTTP {res.get('status')}, "
+                        f"{res.get('sent')} recipient(s), inbox {res.get('gid')}. "
+                        "Check Mongoose → Scheduled and DELETE the test. "
+                        f"(resp: {res.get('resp')})", success=True)
+                else:
+                    self._append_log(
+                        f"API send failed: {(res or {}).get('error') or res}",
+                        error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_send_text_api(payload, on_done)
 
     def _test_api_note(self) -> None:
         """TEST (apinote:): file a harmless Admin Note via the saveNoteCmpValues
