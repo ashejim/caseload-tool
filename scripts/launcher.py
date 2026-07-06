@@ -2261,21 +2261,61 @@ class BrowserWorker:
                        if str(c).strip()]
         if not text or not contact_ids:
             return {"error": "empty text or no recipients."}
-        try:
-            ga = self._mongoose_api(page, tok, "GET", "/api/groupaccounts")
-            accounts = _json.loads(ga.get("body") or "[]")
-        except Exception as e:
-            return {"error": f"groupaccounts fetch failed: {e}"}
-        gid = next((a.get("id") for a in accounts
-                    if str(a.get("apiCode", "")).strip().upper() == course.upper()),
-                   None)
-        if gid is None and len(accounts) == 1:
-            gid = accounts[0].get("id")   # current dept's single inbox
+        def _accounts():
+            try:
+                return _json.loads(
+                    (self._mongoose_api(page, tok, "GET", "/api/groupaccounts")
+                     ).get("body") or "[]")
+            except Exception:
+                return []
+
+        def _find_gid(accts):
+            return next((a.get("id") for a in accts
+                         if str(a.get("apiCode", "")).strip().upper()
+                         == course.upper()), None)
+
+        accounts = _accounts()
+        gid = _find_gid(accounts)
         if gid is None:
-            return {"error": f"no Mongoose inbox for course {course!r} in the "
-                    f"current department (have apiCodes "
-                    f"{[a.get('apiCode') for a in accounts]}); switch the "
-                    "Mongoose tab to that department first."}
+            # Cross-department: /api/groupaccounts + /api/messageTypes are scoped
+            # to the CURRENT department, so switch to the course's department
+            # first (from /api/profile's code→departmentId map), then re-fetch.
+            try:
+                depts = (_json.loads(
+                    (self._mongoose_api(page, tok, "GET", "/api/profile")
+                     ).get("body") or "{}").get("departments")) or []
+            except Exception:
+                depts = []
+            dept_id = next((d.get("id") for d in depts
+                            if str(d.get("code", "")).strip().upper()
+                            == course.upper()), None)
+            if dept_id is not None:
+                self.on_status(
+                    f"  [api] switching Mongoose to the {course} department "
+                    f"(id {dept_id})…")
+                cd = self._mongoose_api(page, tok, "POST",
+                                        "/api/profile/changeDepartment",
+                                        {"departmentId": dept_id})
+                # changeDepartment re-issues a DEPARTMENT-SCOPED token; the search
+                # + groupaccounts are dept-scoped, so we MUST switch to it (else
+                # they keep hitting the old department → 0 matches).
+                m = re.search(
+                    r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{6,}",
+                    cd.get("body") or "")
+                if m:
+                    tok = m.group(0)
+                    self._mongoose_token = {"token": tok, "ts": time.time()}
+                    self.on_status("  [api] switch returned a re-scoped token.")
+                else:
+                    self.on_status(
+                        f"  [api] changeDepartment → {cd.get('status')}; NO token "
+                        f"in the response (body {len(cd.get('body') or '')} "
+                        "chars). If the send fails, the token's elsewhere.")
+                accounts = _accounts()
+                gid = _find_gid(accounts)
+        if gid is None:
+            return {"error": f"no Mongoose inbox matching course {course!r} "
+                    f"(apiCodes {[a.get('apiCode') for a in accounts]})."}
         try:
             mts = _json.loads(
                 (self._mongoose_api(page, tok, "GET", "/api/messageTypes")
