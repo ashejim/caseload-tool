@@ -3,6 +3,53 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.15.0 — 2026-07-06
+
+Texting can now go through Mongoose's own API (faster, no compose-modal
+flakiness), one action can branch into per-condition sub-actions, success-path
+steps are filterable, and the app has a new look.
+
+### Major features
+- **Texting via the Mongoose API (opt-in).** A new Settings toggle — *"Send
+  texts via the Mongoose API"* — schedules texts through Mongoose's own send
+  endpoint instead of driving the compose modal, so it's faster and free of the
+  cold-tab compose flakiness. It resolves each recipient by their Salesforce
+  Contact id, works across any department, and reads opt-in straight from
+  Mongoose (`optedIn`) — cleanly **skipping anyone not actually opted in**
+  instead of the old "no match" failures when Salesforce and Mongoose disagree.
+  The compose modal stays the automatic fallback, and with the toggle on the
+  manual segment / "text IDs" setup isn't needed.
+- **Action branching.** One action can now hold conditional sub-actions
+  ("branches") — e.g. a single *Welcome* that sends each student their own
+  course's email/text/note. Branches are edited in a tab strip
+  (rename / duplicate / color), and firing routes each student to the first
+  branch they match — for single, selection, and batch fires — with fire-time
+  safeguards for overlapping branches and students who match none. (Advanced;
+  enable in Settings.)
+- **Filter by success-path step.** Action and view filters can now target a
+  student's success-path step status (done / due / blocked / skipped) — e.g.
+  *"C769 · Welcome is due"*. The column picker is now a short, searchable,
+  curated dropdown (success-path steps first, then your current columns, then a
+  "search all…") — the same everywhere: action filters, the caseload viewer, and
+  step gate / skip-when conditions.
+
+### Also
+- **Success-path completion backfill + rename-safe actions.** Renaming an action
+  no longer breaks its success-path binding — the old name is kept as an alias
+  and step bindings are repointed automatically. A new *"Backfill success-path
+  completions from history"* (Settings) marks steps done for students who
+  already had the action filed (per the note log), including under former names
+  — fixing success-path filters that showed already-handled students as due.
+- **Mongoose text-ID freshness safeguards.** A stale contact-id / opt-in export
+  is flagged on load, auto-refreshed at startup, and prompts before a texting
+  fire; students opted-in in Salesforce but not yet in the export fall back to
+  the SF field (flagged "unverified" in the review) instead of being silently
+  skipped. (Not used when the API text path above is on.)
+- **New look.** New colored owl app icon, plus an animated splash — the
+  integration logos swirl inward and settle around the owl.
+- **Texting setup doc.** `docs/TEXTING_SETUP.md` explains how texting resolves
+  recipients + opt-in and the optional one-time Mongoose segment setup.
+
 ## 0.14.0 — 2026-07-02
 
 The tool now reads the caseload — and files follow-ups — through Salesforce's
