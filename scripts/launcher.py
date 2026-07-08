@@ -448,6 +448,13 @@ class BrowserWorker:
         on_done({ok, name, contact_id} | {matches} | {error})."""
         self.q.put(("OPEN_CONTACT_GLOBAL", query, on_done))
 
+    def submit_oc_probe(self, query: str,
+                        on_done: Callable[[dict], None]) -> None:
+        """PROBE: global-search a student, open their record, and dump every
+        field label/value + related-list title (to locate ACI/PM/term/task/
+        mobile on an off-caseload record). on_done({ok, fields, related, …})."""
+        self.q.put(("OC_PROBE", query, on_done))
+
     def submit_find_student(self, query: str, new_tab: bool = False,
                             raise_after: Optional[bool] = None) -> None:
         """Navigate to a student record. When `new_tab` is True the
@@ -860,6 +867,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._open_contact_by_global_search(ctx, query)
+            finally:
+                on_done(res)
+        elif cmd[0] == "OC_PROBE":
+            _, query, on_done = cmd
+            res = {}
+            try:
+                res = self._oc_probe(ctx, query)
             finally:
                 on_done(res)
         elif cmd[0] == "FIND":
@@ -1463,6 +1477,72 @@ class BrowserWorker:
             except Exception:
                 pass
         return False
+
+    # Shadow-piercing dump of a record page's field label/value pairs +
+    # related-list titles — to locate ACI (assigned CI) / PM / term / task /
+    # mobile on an off-caseload student's record.
+    _OC_PROBE_JS = r"""
+    () => {
+      const out = {fields: [], related: []};
+      const seen = new Set();
+      const pierce = (root, cb) => {
+        let els; try { els = root.querySelectorAll('*'); } catch(e){ return; }
+        for (const el of els) {
+          try { cb(el); } catch(e){}
+          if (el.shadowRoot) pierce(el.shadowRoot, cb);
+        }
+      };
+      const clean = s => (s||'').replace(/\s+/g,' ').trim();
+      pierce(document, el => {
+        const tag = (el.tagName||'').toLowerCase();
+        const cls = (el.className && el.className.toString)
+                      ? el.className.toString() : '';
+        const sig = tag + ' ' + cls;
+        // Record detail + highlights field wrappers -> label :: value.
+        if (/record-layout-item|highlights-details-item/.test(sig)) {
+          const lab = el.querySelector(
+            '.slds-form-element__label, .slds-text-title, [class*="field-label"]');
+          let label = lab ? clean(lab.innerText || lab.textContent) : '';
+          let value = clean(el.innerText || el.textContent);
+          if (label) value = clean(value.replace(label, ''));
+          if (label && value && label.length < 60 && value.length < 200) {
+            const key = label + '=' + value;
+            if (!seen.has(key)) { seen.add(key); out.fields.push(label + ' :: ' + value); }
+          }
+        }
+        // Related-list card titles (ACI/course may be a child record).
+        if (/related-list|forcerelatedlist|slds-card__header-title/.test(sig)) {
+          const t = el.querySelector('span[title], h2, h3') || el;
+          const txt = clean(t.innerText || t.textContent);
+          if (txt && txt.length < 80) {
+            const key = 'R:' + txt;
+            if (!seen.has(key)) { seen.add(key); out.related.push(txt); }
+          }
+        }
+      });
+      return out;
+    }
+    """
+
+    def _oc_probe(self, ctx, query: str) -> dict:
+        """Open `query`'s record via global search, then dump its field
+        label/value pairs + related-list titles for field-mapping."""
+        res = self._open_contact_by_global_search(ctx, query)
+        if not res.get("ok"):
+            return res  # {matches} (ambiguous) or {error}
+        target = self._active_page(ctx)
+        try:
+            target.wait_for_timeout(1500)  # let the detail panel settle
+            data = target.evaluate(self._OC_PROBE_JS)
+        except Exception as e:
+            return {"error": f"probe scrape failed: {e}",
+                    "contact_id": res.get("contact_id"),
+                    "name": res.get("name")}
+        return {"ok": True, "contact_id": res.get("contact_id"),
+                "name": res.get("name"),
+                "url": (target.url if target else ""),
+                "fields": data.get("fields", []),
+                "related": data.get("related", [])}
 
     def _handle_find(self, ctx, query: str, new_tab: bool = False,
                      raise_after: Optional[bool] = None) -> None:
@@ -15284,6 +15364,12 @@ class CaseloadPanel:
         if q.lower().startswith("gridschema"):
             self.app._grid_schema_dump()
             return "break"
+        # PROBE: "ocprobe: <name/ID>" — open an off-caseload student and dump
+        # their record's fields to oc_probe.txt (to locate ACI/PM/term/task/
+        # mobile for the cold-student-triage feature). Read-only.
+        if q.lower().startswith("ocprobe"):
+            self.app._oc_probe_run(q[len("ocprobe"):].lstrip(": ").strip())
+            return "break"
         # Student ID (digits) or email → if not on the caseload, find anywhere.
         if q and (re.fullmatch(r"\d{5,12}", q) or "@" in q):
             rows = self.app._caseload_rows or []
@@ -21089,6 +21175,63 @@ class App:
                 show()
 
         self.worker.submit_api_note_test(cid, course, on_done)
+
+    def _oc_probe_run(self, query: str) -> None:
+        """PROBE (ocprobe:<name/ID>): open an off-caseload student via global
+        search, then dump their record's field label/value pairs + related-list
+        titles to oc_probe.txt — to locate the assigned faculty (ACI), PM, term
+        end, task status, and mobile for the cold-student-triage feature."""
+        query = (query or "").strip()
+        if not query:
+            self._append_log(
+                "ocprobe: give a name or ID, e.g. 'ocprobe: Liberty Frost'.")
+            return
+        if self._is_busy:
+            self._append_log("Busy — finish the current task first.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._append_log(
+            f"ocprobe: opening {query!r} and dumping record fields…")
+
+        def on_done(res):
+            def show():
+                import os
+                if res and res.get("ok"):
+                    lines = [
+                        f"OC PROBE — {res.get('name')}  ({res.get('contact_id')})",
+                        f"url: {res.get('url')}",
+                        "", "=== FIELDS (label :: value) ===",
+                        *(res.get("fields") or []),
+                        "", "=== RELATED-LIST TITLES ===",
+                        *(res.get("related") or []),
+                    ]
+                    path = os.path.join(os.getcwd(), "oc_probe.txt")
+                    try:
+                        with open(path, "w", encoding="utf-8") as f:
+                            f.write("\n".join(lines))
+                        self._append_log(
+                            f"ocprobe: dumped {len(res.get('fields') or [])} "
+                            f"field(s) + {len(res.get('related') or [])} related "
+                            f"title(s) → {path}", success=True)
+                    except Exception as e:
+                        self._append_log(f"ocprobe: write failed: {e}", error=True)
+                elif res and res.get("matches"):
+                    ms = res["matches"]
+                    self._append_log(
+                        "ocprobe: multiple matches — retry with a unique ID. ("
+                        + ", ".join(m.get("name") or "?" for m in ms[:6]) + ")")
+                else:
+                    self._append_log(
+                        f"ocprobe: {(res or {}).get('error', 'no match')}",
+                        error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_oc_probe(query, on_done)
 
     def _open_student_global(self, query: str) -> None:
         """Find a student ANYWHERE in Salesforce (global search) by Student ID
