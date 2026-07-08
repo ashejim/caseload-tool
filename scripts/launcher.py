@@ -57,6 +57,7 @@ from src.config import (
 from src import crypto_store
 from src.version import __version__
 from src.note_form import NoteData
+from src.action_queue import ActionQueue, QueueItem, QueueStatus
 from src.scenarios import (
     SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
     ScenarioConfig, SuccessPath, load_groups, load_scenarios,
@@ -16452,6 +16453,189 @@ class CaseloadPanel:
         self.freshness_lbl.configure(text=txt, text_color=color)
 
 
+class QueuePanel:
+    """The 'Queue' tab: review multiple BATCH actions up front, then run them
+    in sequence. Review happens when an action is ADDED (its edited payload is
+    stored on the QueueItem); the actual sending/saving happens only on Run.
+
+    Stage 1 builds the shell — the control bar and the row list rendered from
+    ``app.action_queue`` — with the model-only interactions wired (check /
+    uncheck / remove a PENDING row). Add-to-queue (stage 2), Run (stage 3),
+    and Pause/Continue/Cancel (stage 4) fill in the inert controls."""
+
+    # status -> (glyph, (light_color, dark_color))
+    _STATUS_ICON = {
+        QueueStatus.PENDING: ("○", ("gray45", "gray60")),
+        QueueStatus.RUNNING: ("●", ("#1f6feb", "#4a9eff")),
+        QueueStatus.DONE:    ("✓", ("#2e7d32", "#3fb950")),
+        QueueStatus.ERROR:   ("✗", ("#c62828", "#e0524f")),
+    }
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self.tab = None
+        self.ctrls = None
+        self.listbox = None          # scrollable frame holding the rows
+        self._add_btn = None
+        self._start_btn = None
+        self._pause_btn = None
+        self._cancel_btn = None
+
+    # ---- mount -----------------------------------------------------------
+    def attach(self, tab) -> None:
+        self.tab = tab
+        self.mount(tab)
+
+    def mount(self, parent) -> None:
+        for w in parent.winfo_children():
+            w.destroy()
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
+
+        # Control bar: Add-to-queue toggle | Start | Pause | Cancel.
+        self.ctrls = ctk.CTkFrame(parent, fg_color="transparent")
+        self.ctrls.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        self._add_btn = ctk.CTkButton(
+            self.ctrls, text="➕ Add to queue", width=130,
+            command=self._toggle_add_mode,
+        )
+        self._add_btn.pack(side="left")
+        self._start_btn = ctk.CTkButton(
+            self.ctrls, text="▶ Start", width=80,
+            command=self._on_start, state="disabled",
+        )
+        self._start_btn.pack(side="left", padx=(8, 0))
+        self._pause_btn = ctk.CTkButton(
+            self.ctrls, text="⏸ Pause", width=90,
+            command=self._on_pause, state="disabled", **SECONDARY_BTN_KWARGS,
+        )
+        self._pause_btn.pack(side="left", padx=(8, 0))
+        self._cancel_btn = ctk.CTkButton(
+            self.ctrls, text="✕ Cancel", width=90,
+            command=self._on_cancel, state="disabled", **SECONDARY_BTN_KWARGS,
+        )
+        self._cancel_btn.pack(side="left", padx=(8, 0))
+
+        # Scrollable row list.
+        self.listbox = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        self.listbox.grid(row=1, column=0, sticky="nsew", padx=6, pady=(2, 6))
+        self.listbox.grid_columnconfigure(0, weight=1)
+        self.refresh()
+
+    # ---- render ----------------------------------------------------------
+    def refresh(self) -> None:
+        """Rebuild the row list from app.action_queue and sync control state."""
+        if self.listbox is None:
+            return
+        for w in self.listbox.winfo_children():
+            w.destroy()
+
+        items = self.app.action_queue.items
+        if not items:
+            ctk.CTkLabel(
+                self.listbox,
+                text=("No actions queued.\n\nTurn on “➕ Add to queue”, then "
+                      "click the batch actions you want to run in sequence."),
+                justify="left", text_color=("gray40", "gray60"),
+            ).grid(row=0, column=0, sticky="w", padx=8, pady=12)
+        else:
+            for i, it in enumerate(items):
+                self._render_row(i, it)
+
+        self._sync_controls()
+
+    def _render_row(self, row: int, it: QueueItem) -> None:
+        frame = ctk.CTkFrame(self.listbox, fg_color=("gray92", "gray17"))
+        frame.grid(row=row, column=0, sticky="ew", pady=3)
+        frame.grid_columnconfigure(3, weight=1)
+        frozen = it.status.is_frozen
+
+        # checkbox (PENDING rows only; frozen rows show it disabled)
+        var = ctk.BooleanVar(value=it.checked)
+        chk = ctk.CTkCheckBox(
+            frame, text="", width=24, variable=var,
+            command=lambda n=it.action_name, v=var: self._toggle_check(n, v),
+        )
+        if frozen:
+            chk.configure(state="disabled")
+        chk.grid(row=0, column=0, padx=(8, 4), pady=6)
+
+        # color chip
+        chip = ctk.CTkFrame(frame, width=12, height=12, corner_radius=3,
+                            fg_color=it.color or ("gray70", "gray45"))
+        chip.grid(row=0, column=1, padx=(0, 6))
+        chip.grid_propagate(False)
+
+        # status icon
+        glyph, col = self._STATUS_ICON.get(
+            it.status, self._STATUS_ICON[QueueStatus.PENDING])
+        ctk.CTkLabel(frame, text=glyph, width=18, text_color=col,
+                     font=ctk.CTkFont(size=15, weight="bold")).grid(
+            row=0, column=2, padx=(0, 4))
+
+        # name
+        ctk.CTkLabel(frame, text=it.display_name, anchor="w").grid(
+            row=0, column=3, sticky="ew", padx=2)
+
+        # remove (PENDING rows only)
+        rm = ctk.CTkButton(
+            frame, text="✕", width=28, height=24,
+            command=lambda n=it.action_name: self._remove(n),
+            **SECONDARY_BTN_KWARGS,
+        )
+        if frozen:
+            rm.configure(state="disabled")
+        rm.grid(row=0, column=4, padx=(4, 8))
+
+    def _sync_controls(self) -> None:
+        """Enable/disable the control bar. Stage 1: Start is enabled when there
+        is at least one checked item; Pause/Cancel stay disabled until run
+        control lands in stages 3-4."""
+        q = self.app.action_queue
+        can_start = bool(q.checked_items())
+        if self._start_btn is not None:
+            self._start_btn.configure(
+                state="normal" if can_start else "disabled")
+        # add-mode button reflects its toggle state
+        if self._add_btn is not None:
+            on = getattr(self.app, "_queue_add_mode", False)
+            self._add_btn.configure(
+                text="➕ Adding… (click actions)" if on else "➕ Add to queue")
+
+    # ---- interactions (model-only in stage 1) ---------------------------
+    def _toggle_check(self, action_name: str, var) -> None:
+        it = self.app.action_queue.get(action_name)
+        if it is None or it.status.is_frozen:
+            return
+        it.checked = bool(var.get())
+        self._sync_controls()
+
+    def _remove(self, action_name: str) -> None:
+        it = self.app.action_queue.get(action_name)
+        if it is None or it.status.is_frozen:
+            return
+        # (Stage 5 adds the "unsaved review will be discarded" warning.)
+        self.app.action_queue.remove(action_name)
+        self.refresh()
+        self.app._refresh_queue_add_affordance()
+
+    def _toggle_add_mode(self) -> None:
+        # Full button-mode switching arrives in stage 2; stage 1 just flips the
+        # flag + its own label so the control is visibly wired.
+        self.app._queue_add_mode = not getattr(self.app, "_queue_add_mode", False)
+        self._sync_controls()
+        self.app._refresh_queue_add_affordance()
+
+    def _on_start(self) -> None:
+        self.app._append_log("Queue: Run arrives in a later stage.")
+
+    def _on_pause(self) -> None:
+        pass
+
+    def _on_cancel(self) -> None:
+        pass
+
+
 class DataPanel:
     """Analytics/graphs shown as a 'Data' tab in the activity area, with a
     pop-out/dock option (mirrors the caseload panel). A view-selector dropdown
@@ -17952,6 +18136,12 @@ class App:
         )
         self._log_data_popout_btn.pack(side="right", padx=(0, 6))
 
+        # Action queue state (see QueuePanel): batch actions the user has
+        # reviewed but not yet run. `_queue_add_mode` gates the stage-2
+        # "click an action to add it" picking mode.
+        self.action_queue = ActionQueue()
+        self._queue_add_mode = False
+
         # Activity + per-note-type tabs.
         self.log_tabview = ctk.CTkTabview(pane)
         self.log_tabview.grid(row=6, column=0, sticky="nsew", padx=8, pady=(2, 0))
@@ -17987,6 +18177,13 @@ class App:
         self._data_tab.grid_rowconfigure(0, weight=1)
         self.data_panel = DataPanel(self)
         self.data_panel.attach(self._data_tab)
+        # Queue tab: review multiple batch actions up front, then run them in
+        # sequence. See QueuePanel + self.action_queue.
+        self._queue_tab = self.log_tabview.add("Queue")
+        self._queue_tab.grid_columnconfigure(0, weight=1)
+        self._queue_tab.grid_rowconfigure(0, weight=1)
+        self.queue_panel = QueuePanel(self)
+        self.queue_panel.attach(self._queue_tab)
         pane.grid_rowconfigure(6, weight=1)
 
         # Bottom row. Quit is packed first (side=right) so it always
@@ -18138,6 +18335,20 @@ class App:
         apart from send actions at a glance (button + panel menus)."""
         name = getattr(sc, "name", "") or ""
         return f"✎ {name}" if getattr(sc, "record_only", False) else name
+
+    def _color_for_scenario(self, name: str) -> Optional[str]:
+        """The group color (hex) for a scenario, or None if it's ungrouped —
+        used to color its Queue row chip and (later) the 'now running' header."""
+        for g in (self.groups or []):
+            if name in (getattr(g, "scenarios", None) or []):
+                return getattr(g, "color", None)
+        return None
+
+    def _refresh_queue_add_affordance(self) -> None:
+        """Reflect queue state on the main action buttons (add-mode highlight and
+        an 'already queued' mark). Wired in stage 2; a safe no-op until then so
+        the QueuePanel can call it now."""
+        pass
 
     def _rebuild_scenario_buttons(self) -> None:
         """Render the scenario button list. Layout depends on whether
