@@ -16588,19 +16588,24 @@ class QueuePanel:
         rm.grid(row=0, column=4, padx=(4, 8))
 
     def _sync_controls(self) -> None:
-        """Enable/disable the control bar. Stage 1: Start is enabled when there
-        is at least one checked item; Pause/Cancel stay disabled until run
-        control lands in stages 3-4."""
-        q = self.app.action_queue
-        can_start = bool(q.checked_items())
+        """Enable/disable the control bar. Start runs when there's at least one
+        checked, still-PENDING item and no run is in progress. Pause/Cancel come
+        alive in stage 4."""
+        running = getattr(self.app, "_queue_running", False)
+        can_start = bool(self.app._queue_run_set()) and not running
         if self._start_btn is not None:
             self._start_btn.configure(
                 state="normal" if can_start else "disabled")
-        # add-mode button reflects its toggle state
+        # add-mode button reflects its toggle state; disabled during a run
         if self._add_btn is not None:
             on = getattr(self.app, "_queue_add_mode", False)
             self._add_btn.configure(
-                text="➕ Adding… (click actions)" if on else "➕ Add to queue")
+                text="➕ Adding… (click actions)" if on else "➕ Add to queue",
+                state="disabled" if running else "normal")
+
+    def on_run_state_changed(self) -> None:
+        """Called when a run starts/finishes so the control bar reflects it."""
+        self._sync_controls()
 
     # ---- interactions (model-only in stage 1) ---------------------------
     def _toggle_check(self, action_name: str, var) -> None:
@@ -16627,13 +16632,13 @@ class QueuePanel:
         self.app._refresh_queue_add_affordance()
 
     def _on_start(self) -> None:
-        self.app._append_log("Queue: Run arrives in a later stage.")
+        self.app._queue_start()
 
     def _on_pause(self) -> None:
-        pass
+        pass  # stage 4
 
     def _on_cancel(self) -> None:
-        pass
+        pass  # stage 4
 
 
 class DataPanel:
@@ -18142,6 +18147,9 @@ class App:
         self.action_queue = ActionQueue()
         self._queue_add_mode = False
         self._queue_pending_review: list[str] = []   # deferred (added while busy)
+        self._queue_running = False
+        self._queue_paused = False
+        self._queue_cancelled = False
 
         # Activity + per-note-type tabs.
         self.log_tabview = ctk.CTkTabview(pane)
@@ -21161,6 +21169,98 @@ class App:
         if self._queue_pending_review and not self._is_busy:
             self.root.after(300, self._drain_pending_review)
 
+    # ==================================================================
+    # Action queue — run coordinator (a resumable step machine so pause /
+    # continue / cancel — stage 4 — can interleave a manual fire).
+    # ==================================================================
+
+    def _queue_run_set(self) -> list:
+        """Checked, still-PENDING items in queue order — the actions a run will
+        commit (DONE/ERROR rows are skipped, so a re-run only does what's left)."""
+        return [it for it in self.action_queue.items
+                if it.checked and it.status == QueueStatus.PENDING]
+
+    def _queue_start(self) -> None:
+        """Begin running the checked queue items in sequence. Each item's stored
+        payload is committed (its texts/emails/notes actually go out) via
+        _commit_batch; the row is marked done/error from the verdict."""
+        if self._is_busy:
+            self._append_log("Queue: can't start — a task is running.")
+            return
+        if getattr(self, "_queue_running", False):
+            return
+        runnable = self._queue_run_set()
+        if not runnable:
+            self._append_log("Queue: nothing checked to run.")
+            return
+        self._queue_running = True
+        self._queue_paused = False
+        self._queue_cancelled = False
+        self._append_log(f"--- Running queue: {len(runnable)} action(s) ---")
+        self._set_busy("Queue: running…")
+        self.queue_panel.on_run_state_changed()
+        self.root.after(50, self._queue_step)
+
+    def _queue_step(self) -> None:
+        """Advance the run: pick the next checked-PENDING item, mark it RUNNING,
+        then commit it (deferred one tick so the RUNNING row paints first).
+        Checks the cancel/pause flags at each boundary — an in-flight item is
+        never interrupted (pause/cancel take effect before the NEXT item)."""
+        if self._queue_cancelled:
+            self._queue_finish(cancelled=True)
+            return
+        if self._queue_paused:
+            return  # Continue re-enters via _queue_step (stage 4)
+        nxt = next((it for it in self.action_queue.items
+                    if it.checked and it.status == QueueStatus.PENDING), None)
+        if nxt is None:
+            self._queue_finish()
+            return
+        nxt.status = QueueStatus.RUNNING
+        self.queue_panel.refresh()
+        self.root.after(20, lambda it=nxt: self._queue_run_item(it))
+
+    def _queue_run_item(self, it) -> None:
+        """Commit one queue item (blocking) and mark its row from the verdict."""
+        self._append_log(f"--- Queue: running {it.action_name!r} ---")
+        try:
+            result = self._commit_batch(it.payload)
+            it.results = result
+            if result and result.get("ok"):
+                it.status = QueueStatus.DONE
+            else:
+                it.status = QueueStatus.ERROR
+                it.error_detail = ((result or {}).get("detail")
+                                   or "completed with errors")
+        except Exception as e:
+            it.status = QueueStatus.ERROR
+            it.error_detail = str(e)
+            self._append_log(
+                f"Queue: {it.action_name!r} errored — {e}", error=True)
+        self.queue_panel.refresh()
+        self.root.after(50, self._queue_step)
+
+    def _queue_finish(self, cancelled: bool = False) -> None:
+        """End the run: drop busy, restore the control bar, log a summary.
+        Checked PENDING items that never ran stay PENDING (re-runnable)."""
+        self._queue_running = False
+        self._queue_paused = False
+        if cancelled:
+            self._append_log("Queue: cancelled — remaining actions not run.",
+                             error=True)
+        else:
+            done = sum(1 for it in self.action_queue.items
+                       if it.status == QueueStatus.DONE)
+            err = sum(1 for it in self.action_queue.items
+                      if it.status == QueueStatus.ERROR)
+            self._append_log(
+                f"Queue finished: {done} done"
+                + (f", {err} with errors" if err else "") + ".",
+                success=(err == 0), error=(err > 0))
+        self._set_idle()
+        self.queue_panel.refresh()
+        self.queue_panel.on_run_state_changed()
+
     def _collect_prompt_vars(
         self, scenario: ScenarioConfig,
     ) -> Optional[dict[str, str]]:
@@ -22775,11 +22875,13 @@ class App:
             "text_groups": text_groups, "text_selected": text_selected,
         }
 
-    def _commit_batch(self, payload: dict) -> None:
+    def _commit_batch(self, payload: dict) -> dict:
         """COMMIT half: send the reviewed texts (if any), then run the shared
         per-student email→note loop. Consumes a payload from
         _collect_batch_review. A stop/abort at the text send skips the
-        email/note phase (same contract as the old inline flow)."""
+        email/note phase (same contract as the old inline flow). Returns a
+        verdict dict {ok, detail, ...} the Action Queue uses to mark the row
+        done/error; immediate fires ignore it."""
         scenario = payload["scenario"]
         text_groups = payload.get("text_groups")
         if text_groups:
@@ -22788,15 +22890,25 @@ class App:
                 self._append_log(
                     "Action cancelled/stopped at text send; "
                     "notes/email not run.")
-                return
+                return {"ok": False, "detail": "stopped at text send"}
         # The per-student loop — shared with the panel mini-batch. Pass the
         # pre-collected note input so the loop doesn't prompt again.
-        self._execute_scenario_over_rows(
+        outcome = self._execute_scenario_over_rows(
             scenario, payload["override"], payload["confirmed"],
             payload["prompt_vars"], has_email=payload["has_email"],
             source="batch", body_overrides=payload["body_overrides"],
             prefetched_inputs=payload["note_inputs"],
         )
+        outcome = outcome or {}
+        ok = bool(outcome.get("ok"))
+        skipped = outcome.get("skipped") or []
+        detail = ""
+        if not ok:
+            detail = (f"{len(skipped)} skipped" if skipped
+                      else "completed with errors")
+        return {"ok": ok, "detail": detail,
+                "processed": outcome.get("processed"),
+                "total": outcome.get("total"), "skipped": skipped}
 
     # ==================================================================
     # Action branching — batch / multi-select fires. Partition the student
@@ -23535,7 +23647,7 @@ class App:
         has_email: bool, source: str = "batch",
         body_overrides: Optional[dict] = None,
         prefetched_inputs: "Optional[tuple[str, dict]]" = None,
-    ) -> None:
+    ) -> dict:
         """Shared execution core for firing a scenario across many
         students — the full caseload batch AND the panel's hand-picked
         mini-batch. Loops fast-find → auto-send email (if configured) → file
@@ -23555,7 +23667,8 @@ class App:
             collected = self._collect_note_inputs(
                 scenario, len(confirmed), source)
             if collected is None:
-                return
+                return {"ok": False, "cancelled": True, "processed": 0,
+                        "total": len(confirmed), "skipped": []}
             clipboard, custom_bodies = collected
 
         total = len(confirmed)
@@ -23750,6 +23863,10 @@ class App:
         # batch — each keeps its own Lightning DOM alive. Close them back to the
         # Caseload list. Quiet: stay silent when there was nothing to close.
         self._cleanup_record_tabs(quiet=True)
+        # Outcome for callers that need a verdict (the Action Queue marks each
+        # row done/error from this); immediate fires ignore it.
+        return {"ok": ok, "processed": processed, "total": total,
+                "skipped": skipped, "text_failed": text_failed}
 
     def _fire_on_selected(
         self, scenario: ScenarioConfig, rows: list[dict],
