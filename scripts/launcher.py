@@ -12956,6 +12956,15 @@ class CaseloadPanel:
         )
         self.view_menu.pack(side="left", padx=(0, 4))
         self._refresh_view_menu()  # populate with any saved views
+        # Toggle: also search ARCHIVED (past) students, merged into the list
+        # (dimmed). Lets a name search reach former students without leaving the
+        # live caseload. See _toggle_search_archived.
+        self.search_archived_btn = ctk.CTkButton(
+            self.bar_actions, text="🗄 +Archived", width=110,
+            command=self._toggle_search_archived, **SECONDARY_BTN_KWARGS,
+        )
+        self.search_archived_btn.pack(side="left", padx=(0, 4))
+        self._search_archived_fg = self.search_archived_btn.cget("fg_color")
         # Filters toggle — shows/hides the collapsible column-filter section.
         self.filters_toggle_btn = ctk.CTkButton(
             self.bar_actions, text="▸ Filters", width=80,
@@ -13062,6 +13071,8 @@ class CaseloadPanel:
         # Zebra striping for readability.
         self.tree.tag_configure("even", background=self._even_bg)
         self.tree.tag_configure("odd", background=self._odd_bg)
+        # Archived (past) students merged into a search show dimmed/tinted.
+        self.tree.tag_configure("archived", foreground="#9a7a2a")
         # Double-click → open/switch to that student (reuse current tab).
         # Middle-click → quick "open in new console subtab" (background).
         # Right-click → action menu (Open / Open in new tab / Fire ▸).
@@ -15809,11 +15820,9 @@ class CaseloadPanel:
                 keys.add((sid, cc))
         return keys
 
-    def _enter_archived_mode(self, query: Optional[str] = None) -> None:
-        """Switch the grid to past students (from the history snapshots). Opening
-        a row opens their real Salesforce record; notes file via the normal
-        off-caseload path. `query` pre-fills the search (used by the search-box
-        'include archived' button)."""
+    def _load_archived_rows(self) -> None:
+        """(Re)load past students from history into self._archived_rows,
+        excluding whoever's currently on the caseload."""
         try:
             from src import history
             self._archived_rows = history.archived_students(
@@ -15822,6 +15831,31 @@ class CaseloadPanel:
             self.app._append_log(
                 f"Couldn't load archived students: {e}", error=True)
             self._archived_rows = []
+
+    def _toggle_search_archived(self) -> None:
+        """Toggle merging archived (past) students into the current list, so a
+        name search reaches former students. They render dimmed; double-click
+        opens their Salesforce record like any off-caseload student."""
+        on = not getattr(self, "_search_archived", False)
+        self._search_archived = on
+        if on:
+            self._load_archived_rows()
+            self.search_archived_btn.configure(
+                text="🗄 Archived ✓", fg_color=("#8a5a00", "#6b4a00"))
+            self.app._append_log(
+                f"Search now includes {len(self._archived_rows or [])} archived "
+                "student(s) (shown dimmed). Toggle 🗄 off to hide them.")
+        else:
+            self.search_archived_btn.configure(
+                text="🗄 +Archived", fg_color=self._search_archived_fg)
+        self.populate()
+
+    def _enter_archived_mode(self, query: Optional[str] = None) -> None:
+        """Switch the grid to past students (from the history snapshots). Opening
+        a row opens their real Salesforce record; notes file via the normal
+        off-caseload path. `query` pre-fills the search (used by the search-box
+        'include archived' button)."""
+        self._load_archived_rows()
         self._archived_mode = True
         self._show_archived_banner()
         if query is not None:
@@ -16273,10 +16307,13 @@ class CaseloadPanel:
         return f"{glyph} {raw}" if glyph else raw
 
     def _source_rows(self) -> list:
-        """Rows feeding the grid: the live caseload, or — in Archived mode —
-        the past-students rows loaded from history."""
+        """Rows feeding the grid: the live caseload; in Archived mode the past
+        students only; or, with '🗄 +Archived' search on, the live caseload plus
+        matching archived rows (merged, archived shown dimmed)."""
         if getattr(self, "_archived_mode", False):
             return self._archived_rows or []
+        if getattr(self, "_search_archived", False):
+            return (self.app._caseload_rows or []) + (self._archived_rows or [])
         return self.app._caseload_rows or []
 
     def populate(self) -> None:
@@ -16346,11 +16383,14 @@ class CaseloadPanel:
         self._row_by_iid = {}
         for i, r in enumerate(view):
             checked = self._row_key(r) in self._checked_ids
+            tags = ["even" if i % 2 == 0 else "odd"]
+            if r.get("_archived"):
+                tags.append("archived")   # dim past students merged into a search
             iid = self.tree.insert(
                 "", "end", image=self._chk_img(checked),
                 values=[self._task_cell_value(r, h, task_cols)
                         for h in headers],
-                tags=("even" if i % 2 == 0 else "odd",),
+                tags=tuple(tags),
             )
             self._row_by_iid[iid] = r
         self._after_selection_change()
@@ -16399,9 +16439,10 @@ class CaseloadPanel:
         query, _label = self._row_query_label(event)
         if not query:
             return
-        if getattr(self, "_archived_mode", False):
-            # Archived students aren't on the caseload — open via Salesforce
-            # global search (by Student ID).
+        row = self._row_by_iid.get(self.tree.focus())
+        if getattr(self, "_archived_mode", False) or (row and row.get("_archived")):
+            # Off-caseload (archived) students aren't in the caseload row filter
+            # — open via Salesforce global search (by Student ID).
             self.app._open_student_global(query)
         else:
             self.app._find_student_by_query(query, new_tab=new_tab)
@@ -16428,7 +16469,8 @@ class CaseloadPanel:
         iid = self.tree.focus()
         query, label = self._query_label_for_iid(iid)
         if query:
-            if getattr(self, "_archived_mode", False):
+            row = self._row_by_iid.get(iid)
+            if getattr(self, "_archived_mode", False) or (row and row.get("_archived")):
                 # Off-caseload: open the Salesforce record (no caseload-scoped
                 # notes fetch — that relies on the live caseload).
                 self.app._open_student_global(query)
