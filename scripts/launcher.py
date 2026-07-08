@@ -16604,7 +16604,24 @@ class QueuePanel:
                 state="disabled" if running else "normal")
 
     def on_run_state_changed(self) -> None:
-        """Called when a run starts/finishes so the control bar reflects it."""
+        """Reflect the run state on Pause/Cancel (and, via _sync_controls,
+        Start/Add). Pause reads Continue once actually paused, and shows a
+        disabled 'Pausing…' while the in-flight action is still finishing."""
+        running = getattr(self.app, "_queue_running", False)
+        paused = getattr(self.app, "_queue_paused", False)
+        busy = getattr(self.app, "_is_busy", False)
+        if self._pause_btn is not None:
+            if not running:
+                self._pause_btn.configure(state="disabled", text="⏸ Pause")
+            elif paused and busy:
+                self._pause_btn.configure(state="disabled", text="⏸ Pausing…")
+            elif paused:
+                self._pause_btn.configure(state="normal", text="▶ Continue")
+            else:
+                self._pause_btn.configure(state="normal", text="⏸ Pause")
+        if self._cancel_btn is not None:
+            self._cancel_btn.configure(
+                state="normal" if running else "disabled")
         self._sync_controls()
 
     # ---- interactions (model-only in stage 1) ---------------------------
@@ -16635,10 +16652,14 @@ class QueuePanel:
         self.app._queue_start()
 
     def _on_pause(self) -> None:
-        pass  # stage 4
+        # One button toggles Pause <-> Continue.
+        if getattr(self.app, "_queue_paused", False):
+            self.app._queue_continue()
+        else:
+            self.app._queue_pause()
 
     def _on_cancel(self) -> None:
-        pass  # stage 4
+        self.app._queue_cancel()
 
 
 class DataPanel:
@@ -21210,7 +21231,8 @@ class App:
             self._queue_finish(cancelled=True)
             return
         if self._queue_paused:
-            return  # Continue re-enters via _queue_step (stage 4)
+            self._queue_enter_paused()
+            return
         nxt = next((it for it in self.action_queue.items
                     if it.checked and it.status == QueueStatus.PENDING), None)
         if nxt is None:
@@ -21260,6 +21282,58 @@ class App:
         self._set_idle()
         self.queue_panel.refresh()
         self.queue_panel.on_run_state_changed()
+
+    def _queue_pause(self) -> None:
+        """Request a pause. The in-flight action always finishes; stepping stops
+        at the NEXT boundary, where _queue_enter_paused releases the busy state
+        so the user can fire a single action before continuing."""
+        if not self._queue_running or self._queue_paused:
+            return
+        self._queue_paused = True
+        self._append_log(
+            "Queue: pausing — will stop after the current action finishes.")
+        self.queue_panel.on_run_state_changed()
+
+    def _queue_enter_paused(self) -> None:
+        """Settle into the paused state (reached at an item boundary): drop the
+        busy lock so a manual single action can run, and update the controls."""
+        self._set_idle()
+        self._append_log(
+            "Queue paused. Fire a single action if you need to, then Continue.")
+        self.queue_panel.on_run_state_changed()
+        self.queue_panel.refresh()
+
+    def _queue_continue(self) -> None:
+        """Resume a paused run. Guarded so it can't start while a manual action
+        the user fired during the pause is still running."""
+        if not self._queue_running or not self._queue_paused:
+            return
+        if self._is_busy:
+            self._append_log(
+                "Queue: finish the current action before continuing.")
+            return
+        self._queue_paused = False
+        self._append_log("Queue: continuing.")
+        self._set_busy("Queue: running…")
+        self.queue_panel.on_run_state_changed()
+        self.root.after(50, self._queue_step)
+
+    def _queue_cancel(self) -> None:
+        """Cancel the run. If paused (not stepping) finish immediately; if
+        running, flag it and the next item boundary finishes. Either way the
+        in-flight action completes and un-run checked items stay PENDING."""
+        if not self._queue_running:
+            return
+        self._queue_cancelled = True
+        if self._queue_paused and not self._is_busy:
+            # Truly at rest (paused between items, nothing stepping) — finish now.
+            self._queue_finish(cancelled=True)
+        else:
+            # Running, or an in-flight item still finishing (a "Pausing…"
+            # click): the next _queue_step boundary sees the flag and finishes.
+            self._append_log(
+                "Queue: cancelling — will stop after the current action.")
+            self.queue_panel.on_run_state_changed()
 
     def _collect_prompt_vars(
         self, scenario: ScenarioConfig,
