@@ -1422,8 +1422,16 @@ class BrowserWorker:
         if not contacts:
             return {"error": f"no Salesforce Contact found for {query!r}"}
         if len(contacts) > 1:
-            return {"matches": [{"contact_id": c, "name": n}
-                                for c, n in contacts]}
+            # Salesforce matches on surname too (a "Liberty Frost" search also
+            # returns "Jacqualyn Frost"). If exactly ONE result is an exact
+            # name match, open it directly; otherwise hand back the picker.
+            ql = query.strip().lower()
+            exact = [(c, n) for c, n in contacts
+                     if (n or "").strip().lower() == ql]
+            if len(exact) != 1:
+                return {"matches": [{"contact_id": c, "name": n}
+                                    for c, n in contacts]}
+            contacts = exact
         cid, name = contacts[0]
         if self._navigate_to_contact(ctx, cid):
             return {"ok": True, "contact_id": cid, "name": name or query}
