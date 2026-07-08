@@ -1421,17 +1421,24 @@ class BrowserWorker:
                 pass
         if not contacts:
             return {"error": f"no Salesforce Contact found for {query!r}"}
+        ql = query.strip().lower()
+        is_name = (bool(re.search(r"[A-Za-z]", query)) and "@" not in query
+                   and not re.fullmatch(r"\d{5,12}", query.strip()))
+        exact = [(c, n) for c, n in contacts if (n or "").strip().lower() == ql]
+        if is_name:
+            # A name is NOT a unique key (Salesforce also matches on surname, and
+            # two people can share a name), so we can't safely auto-open. ALWAYS
+            # return the full list for the user to pick from.
+            return {"matches": [{"contact_id": c, "name": n}
+                                for c, n in contacts]}
         if len(contacts) > 1:
-            # Salesforce matches on surname too (a "Liberty Frost" search also
-            # returns "Jacqualyn Frost"). If exactly ONE result is an exact
-            # name match, open it directly; otherwise hand back the picker.
-            ql = query.strip().lower()
-            exact = [(c, n) for c, n in contacts
-                     if (n or "").strip().lower() == ql]
-            if len(exact) != 1:
+            # ID/email is unique enough to open; if several came back, prefer an
+            # exact name match, else show the picker.
+            if len(exact) == 1:
+                contacts = exact
+            else:
                 return {"matches": [{"contact_id": c, "name": n}
                                     for c, n in contacts]}
-            contacts = exact
         cid, name = contacts[0]
         if self._navigate_to_contact(ctx, cid):
             return {"ok": True, "contact_id": cid, "name": name or query}
@@ -1501,61 +1508,62 @@ class BrowserWorker:
                 pass
         return False
 
-    # Shadow-piercing dump of a record page's field label/value pairs +
-    # related-list titles — to locate ACI (assigned CI) / PM / term / task /
-    # mobile on an off-caseload student's record.
+    # Shadow-piercing dump of ALL visible text on a record page (in DOM order,
+    # so a field's label is immediately followed by its value) + related-list
+    # titles — a blind first-pass map to locate ACI (assigned CI) / PM / term /
+    # task / mobile on an off-caseload student's record.
     _OC_PROBE_JS = r"""
     () => {
-      const out = {fields: [], related: []};
-      const seen = new Set();
-      const pierce = (root, cb) => {
-        let els; try { els = root.querySelectorAll('*'); } catch(e){ return; }
-        for (const el of els) {
-          try { cb(el); } catch(e){}
-          if (el.shadowRoot) pierce(el.shadowRoot, cb);
+      const snippets = [], related = [], seen = new Set();
+      const clean = s => (s||'').replace(/\s+/g,' ').trim();
+      const walk = (node) => {
+        if (!node) return;
+        if (node.nodeType === 1) {
+          const cls = (node.className && node.className.toString)
+                        ? node.className.toString() : '';
+          const sig = (node.tagName||'').toLowerCase() + ' ' + cls;
+          if (/related-list|forcerelatedlist|slds-card__header-title/.test(sig)) {
+            const t = node.querySelector
+                        ? (node.querySelector('span[title], h2, h3') || node) : node;
+            const txt = clean(t.innerText || t.textContent);
+            if (txt && txt.length < 80) {
+              const k = 'R:' + txt;
+              if (!seen.has(k)) { seen.add(k); related.push(txt); }
+            }
+          }
+          if (node.shadowRoot)
+            for (const c of node.shadowRoot.childNodes) walk(c);
+          for (const c of node.childNodes) walk(c);
+        } else if (node.nodeType === 3) {
+          const t = clean(node.textContent);
+          if (t && t.length < 200 && snippets[snippets.length - 1] !== t)
+            snippets.push(t);
         }
       };
-      const clean = s => (s||'').replace(/\s+/g,' ').trim();
-      pierce(document, el => {
-        const tag = (el.tagName||'').toLowerCase();
-        const cls = (el.className && el.className.toString)
-                      ? el.className.toString() : '';
-        const sig = tag + ' ' + cls;
-        // Record detail + highlights field wrappers -> label :: value.
-        if (/record-layout-item|highlights-details-item/.test(sig)) {
-          const lab = el.querySelector(
-            '.slds-form-element__label, .slds-text-title, [class*="field-label"]');
-          let label = lab ? clean(lab.innerText || lab.textContent) : '';
-          let value = clean(el.innerText || el.textContent);
-          if (label) value = clean(value.replace(label, ''));
-          if (label && value && label.length < 60 && value.length < 200) {
-            const key = label + '=' + value;
-            if (!seen.has(key)) { seen.add(key); out.fields.push(label + ' :: ' + value); }
-          }
-        }
-        // Related-list card titles (ACI/course may be a child record).
-        if (/related-list|forcerelatedlist|slds-card__header-title/.test(sig)) {
-          const t = el.querySelector('span[title], h2, h3') || el;
-          const txt = clean(t.innerText || t.textContent);
-          if (txt && txt.length < 80) {
-            const key = 'R:' + txt;
-            if (!seen.has(key)) { seen.add(key); out.related.push(txt); }
-          }
-        }
-      });
-      return out;
+      try { walk(document.body); } catch(e) {}
+      return {snippets: snippets.slice(0, 1600), related};
     }
     """
 
     def _oc_probe(self, ctx, query: str) -> dict:
-        """Open `query`'s record via global search, then dump its field
-        label/value pairs + related-list titles for field-mapping."""
+        """Open `query`'s record (prefer an exact name match; any off-caseload
+        student's DOM structure is identical, so for mapping the first match is
+        fine) and dump the page's visible text in order + related-list titles."""
         res = self._open_contact_by_global_search(ctx, query)
         if not res.get("ok"):
-            return res  # {matches} (ambiguous) or {error}
+            matches = res.get("matches")
+            if not matches:
+                return res
+            ql = (query or "").strip().lower()
+            pick = next((m for m in matches
+                         if (m.get("name") or "").strip().lower() == ql), matches[0])
+            if not self._navigate_to_contact(ctx, pick.get("contact_id")):
+                return {"error": "couldn't open a search match"}
+            res = {"ok": True, "contact_id": pick.get("contact_id"),
+                   "name": pick.get("name")}
         target = self._active_page(ctx)
         try:
-            target.wait_for_timeout(1500)  # let the detail panel settle
+            target.wait_for_timeout(2000)  # let the record + panels settle
             data = target.evaluate(self._OC_PROBE_JS)
         except Exception as e:
             return {"error": f"probe scrape failed: {e}",
@@ -1564,7 +1572,7 @@ class BrowserWorker:
         return {"ok": True, "contact_id": res.get("contact_id"),
                 "name": res.get("name"),
                 "url": (target.url if target else ""),
-                "fields": data.get("fields", []),
+                "snippets": data.get("snippets", []),
                 "related": data.get("related", [])}
 
     def _handle_find(self, ctx, query: str, new_tab: bool = False,
@@ -21294,11 +21302,12 @@ class App:
             def show():
                 import os
                 if res and res.get("ok"):
+                    snips = res.get("snippets") or []
                     lines = [
                         f"OC PROBE — {res.get('name')}  ({res.get('contact_id')})",
                         f"url: {res.get('url')}",
-                        "", "=== FIELDS (label :: value) ===",
-                        *(res.get("fields") or []),
+                        "", "=== VISIBLE TEXT (DOM order — label then value) ===",
+                        *snips,
                         "", "=== RELATED-LIST TITLES ===",
                         *(res.get("related") or []),
                     ]
@@ -21307,9 +21316,9 @@ class App:
                         with open(path, "w", encoding="utf-8") as f:
                             f.write("\n".join(lines))
                         self._append_log(
-                            f"ocprobe: dumped {len(res.get('fields') or [])} "
-                            f"field(s) + {len(res.get('related') or [])} related "
-                            f"title(s) → {path}", success=True)
+                            f"ocprobe: dumped {len(snips)} text snippet(s) + "
+                            f"{len(res.get('related') or [])} related title(s) "
+                            f"→ {path}", success=True)
                     except Exception as e:
                         self._append_log(f"ocprobe: write failed: {e}", error=True)
                 elif res and res.get("matches"):
