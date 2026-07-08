@@ -1618,15 +1618,19 @@ class BrowserWorker:
     """
 
     def _oc_probe(self, ctx, query: str) -> dict:
-        """Open `query`'s record (prefer an exact name match; any off-caseload
-        student's DOM structure is identical, so for mapping the first match is
-        fine) and dump the page's visible text in order + related-list titles."""
-        res = self._open_contact_by_global_search(ctx, query)
+        """Open `query`'s record and dump the page. `query` may carry a click
+        path after '||' — e.g. 'Liberty || Processes and Interactions || Course
+        Mentor Student Assignments' clicks each tab in order (to reach nested
+        tabs like the Course Mentor / ACI list) before dumping."""
+        parts = [s.strip() for s in (query or "").split("||")]
+        squery = parts[0]
+        click_seq = [p for p in parts[1:] if p]
+        res = self._open_contact_by_global_search(ctx, squery)
         if not res.get("ok"):
             matches = res.get("matches")
             if not matches:
                 return res
-            ql = (query or "").strip().lower()
+            ql = squery.strip().lower()
             pick = next((m for m in matches
                          if (m.get("name") or "").strip().lower() == ql), matches[0])
             if not self._navigate_to_contact(ctx, pick.get("contact_id")):
@@ -1634,15 +1638,24 @@ class BrowserWorker:
             res = {"ok": True, "contact_id": pick.get("contact_id"),
                    "name": pick.get("name")}
         target = self._active_page(ctx)
-        clicked = None
+        clicked = []
         try:
             target.wait_for_timeout(2000)  # let the record + panels settle
             # Reveal the Course Mentor Student Assignments tab (holds the ACI).
-            clicked = target.evaluate(
-                self._OC_CLICK_TAB_JS,
-                ["Course Mentor Student Assignments", "Course Mentor"])
-            if clicked:
-                target.wait_for_timeout(1800)
+            # A click path steers through nested tabs; default best-effort.
+            if click_seq:
+                for label in click_seq:
+                    c = target.evaluate(self._OC_CLICK_TAB_JS, [label])
+                    clicked.append(c)
+                    if c:
+                        target.wait_for_timeout(1600)
+            else:
+                c = target.evaluate(
+                    self._OC_CLICK_TAB_JS,
+                    ["Course Mentor Student Assignments", "Course Mentor"])
+                clicked.append(c)
+                if c:
+                    target.wait_for_timeout(1600)
         except Exception:
             pass
         try:
@@ -1655,7 +1668,7 @@ class BrowserWorker:
         return {"ok": True, "contact_id": res.get("contact_id"),
                 "name": res.get("name"),
                 "url": (target.url if target else ""),
-                "clicked_tab": clicked,
+                "clicked_tab": ", ".join(str(c) for c in clicked) or None,
                 "snippets": data.get("snippets", []),
                 "related": data.get("related", []),
                 "tables": tables}
