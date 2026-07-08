@@ -3,6 +3,38 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.16.0 — 2026-07-08
+
+A new **Action Queue** lets you line up several batch actions and run them in
+sequence, plus the rebranded splash/icon are fixed up.
+
+### Major features
+- **Action Queue.** A new **Queue** tab in the activity panel. Turn on **➕ Add
+  to queue** and click the batch actions you want; each one is **reviewed when
+  you add it** (emails/texts/notes — exactly the usual review), and the reviewed
+  work is stored. Then hit **Start** to run everything in sequence — nothing
+  sends until you run it. While a run is going you can **Pause** (the current
+  action finishes, then it stops so you can fire a one-off action), **Continue**,
+  or **Cancel**. Each row shows its state — reviewed ○, running ●, done ✓, or
+  error ✗ — and a failed action marks its row without stopping the rest. Rows
+  are checkboxes, so you can uncheck one to skip it or re-run what's left later.
+  Clicking an action while something's already running offers to add it to the
+  queue instead of just making you wait.
+  *For now the queue takes standard batch actions; branched and text-only
+  actions still fire directly (queueing them is coming).*
+
+### Fixes & polish
+- **Splash logos restored.** The animated splash again shows all five
+  integration logos swirling in — the **Outlook** logo and the full
+  **Salesforce** wordmark were missing from the 0.15.0 art.
+- **New desktop icon.** The app icon's owl was washed out at small sizes; it's
+  been redrawn with darker, bolder ink on a clean light tile so it reads clearly
+  in the taskbar and on the desktop.
+- **Less clutter with API texting.** The manual **⬇ Texting IDs** button now
+  hides when "Send texts via the Mongoose API" is on — the API resolves
+  recipients and opt-in itself, so the manual segment export isn't needed (it
+  stays available as a fallback when the API path is off).
+
 ## 0.15.0 — 2026-07-06
 
 Texting can now go through Mongoose's own API (faster, no compose-modal
