@@ -15687,6 +15687,8 @@ class CaseloadPanel:
 
     _VIEW_SAVE = "＋ Save current as…"
     _VIEW_MANAGE = "⚙ Manage views…"
+    _VIEW_ARCHIVED = "🗄 Archived (past students)"
+    _VIEW_LIVE = "◀ Live caseload"
 
     def _load_views(self) -> list:
         import json
@@ -15759,15 +15761,31 @@ class CaseloadPanel:
             return
         views = self._load_views()
         names = [v["name"] for v in views]
-        values = names + [self._VIEW_SAVE]
+        archived = getattr(self, "_archived_mode", False)
+        values = []
+        if archived:
+            values.append(self._VIEW_LIVE)          # way back to the live caseload
+        values += names + [self._VIEW_ARCHIVED, self._VIEW_SAVE]
         if names:
             values.append(self._VIEW_MANAGE)
         self.view_menu.configure(values=values)
-        cur = self.app.settings.caseload_current_view or ""
-        self.view_menu.set(cur if cur in names else (names[0] if names
-                                                     else "★ Views"))
+        if archived:
+            self.view_menu.set(self._VIEW_ARCHIVED)
+        else:
+            cur = self.app.settings.caseload_current_view or ""
+            self.view_menu.set(cur if cur in names else (names[0] if names
+                                                         else "★ Views"))
 
     def _on_view_select(self, choice: str) -> None:
+        if choice == self._VIEW_ARCHIVED:
+            self._enter_archived_mode()
+            return
+        if choice == self._VIEW_LIVE:
+            self._exit_archived_mode()
+            return
+        # Any other choice leaves Archived mode (back to the live caseload).
+        if getattr(self, "_archived_mode", False):
+            self._exit_archived_mode(repopulate=False)
         if choice == self._VIEW_SAVE:
             self._save_view_dialog()
         elif choice == self._VIEW_MANAGE:
@@ -15778,6 +15796,69 @@ class CaseloadPanel:
                 self._apply_view(by_name[choice])
                 self.app._append_log(f"Applied view {choice!r}.")
         self._refresh_view_menu()
+
+    # ---- Archived mode (past / off-caseload students) --------------------
+    def _live_caseload_keys(self) -> set:
+        """(student_id, course_code) pairs currently on the caseload — passed to
+        history.archived_students so today's students are excluded."""
+        keys = set()
+        for r in (self.app._caseload_rows or []):
+            sid = str(r.get("StudentID") or r.get("Student ID") or "").strip()
+            cc = str(r.get("CourseCode") or r.get("Course Code") or "").strip()
+            if sid:
+                keys.add((sid, cc))
+        return keys
+
+    def _enter_archived_mode(self, query: Optional[str] = None) -> None:
+        """Switch the grid to past students (from the history snapshots). Opening
+        a row opens their real Salesforce record; notes file via the normal
+        off-caseload path. `query` pre-fills the search (used by the search-box
+        'include archived' button)."""
+        try:
+            from src import history
+            self._archived_rows = history.archived_students(
+                current_keys=self._live_caseload_keys())
+        except Exception as e:
+            self.app._append_log(
+                f"Couldn't load archived students: {e}", error=True)
+            self._archived_rows = []
+        self._archived_mode = True
+        self._show_archived_banner()
+        if query is not None:
+            self.search_var.set(query)   # trace → _on_search sets self._query
+        self.populate()
+        self._refresh_view_menu()
+        self.app._append_log(
+            f"🗄 Archived: showing {len(self._archived_rows or [])} past "
+            "student(s). Double-click one to open their Salesforce record.")
+
+    def _exit_archived_mode(self, repopulate: bool = True) -> None:
+        self._archived_mode = False
+        self._archived_rows = None
+        self._hide_archived_banner()
+        if repopulate:
+            self.populate()
+            self._refresh_view_menu()
+
+    def _show_archived_banner(self) -> None:
+        try:
+            if not hasattr(self, "_caseload_label_fg"):
+                self._caseload_label_fg = self.caseload_label.cget("text_color")
+            self.caseload_label.configure(
+                text="🗄 Archived", text_color=("#8a5a00", "#e0b050"))
+            self.search_entry.configure(placeholder_text="Search archived…")
+        except Exception:
+            pass
+
+    def _hide_archived_banner(self) -> None:
+        try:
+            self.caseload_label.configure(
+                text="Caseload",
+                text_color=getattr(self, "_caseload_label_fg",
+                                   ("gray10", "gray90")))
+            self.search_entry.configure(placeholder_text="Search caseload…")
+        except Exception:
+            pass
 
     def _save_view_dialog(self) -> None:
         from tkinter import simpledialog
@@ -15958,7 +16039,8 @@ class CaseloadPanel:
         # facet helpers (Task1Date/…); otherwise Apply would try to put them
         # in displaycolumns, which the tree doesn't define → ttk error → the
         # whole show/hide silently no-ops.
-        headers = [h for h in rows[0].keys() if not _is_task_facet_col(h)]
+        headers = [h for h in rows[0].keys()
+                   if not _is_task_facet_col(h) and not h.startswith("_")]
         # Capture any drag-resizes done since load so they aren't lost.
         self.persist_column_state()
         prefs = self._load_col_prefs()
@@ -16190,8 +16272,15 @@ class CaseloadPanel:
         glyph = TASK_CELL_GLYPHS.get(state, "")
         return f"{glyph} {raw}" if glyph else raw
 
+    def _source_rows(self) -> list:
+        """Rows feeding the grid: the live caseload, or — in Archived mode —
+        the past-students rows loaded from history."""
+        if getattr(self, "_archived_mode", False):
+            return self._archived_rows or []
+        return self.app._caseload_rows or []
+
     def populate(self) -> None:
-        rows = self.app._caseload_rows or []
+        rows = self._source_rows()
         if not rows:
             self.tree.delete(*self.tree.get_children())
             self.tree["columns"] = ()
@@ -16203,7 +16292,8 @@ class CaseloadPanel:
         # Per-task facet columns (Task1Date/Count/Status, …) are hidden
         # helpers behind the single visible "Task N" column — keep them out
         # of the grid (the Task1/2/3 columns already show date+count+glyph).
-        headers = [h for h in rows[0].keys() if not _is_task_facet_col(h)]
+        headers = [h for h in rows[0].keys()
+                   if not _is_task_facet_col(h) and not h.startswith("_")]
         if tuple(self.tree["columns"]) != tuple(headers):
             # Reset displaycolumns to "#all" BEFORE swapping the column set.
             # ttk validates the existing displaycolumns against the new
@@ -16307,7 +16397,13 @@ class CaseloadPanel:
 
     def _open_row(self, event, new_tab: bool) -> None:
         query, _label = self._row_query_label(event)
-        if query:
+        if not query:
+            return
+        if getattr(self, "_archived_mode", False):
+            # Archived students aren't on the caseload — open via Salesforce
+            # global search (by Student ID).
+            self.app._open_student_global(query)
+        else:
             self.app._find_student_by_query(query, new_tab=new_tab)
 
     def _focus_first_row(self, event=None):
@@ -16332,6 +16428,11 @@ class CaseloadPanel:
         iid = self.tree.focus()
         query, label = self._query_label_for_iid(iid)
         if query:
+            if getattr(self, "_archived_mode", False):
+                # Off-caseload: open the Salesforce record (no caseload-scoped
+                # notes fetch — that relies on the live caseload).
+                self.app._open_student_global(query)
+                return "break"
             self.tree.selection_set(iid)
             # selection_set queues a <<TreeviewSelect>> → show_quick_view →
             # _notes_hint, which would overwrite the "Loading…" message. Defer
