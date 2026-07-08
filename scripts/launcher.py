@@ -1545,6 +1545,78 @@ class BrowserWorker:
     }
     """
 
+    # Click the first tab/link whose text contains one of `labels` (shadow-
+    # pierced) — used to reveal the "Course Mentor Student Assignments" tab.
+    _OC_CLICK_TAB_JS = r"""
+    (labels) => {
+      const clean = s => (s||'').replace(/\s+/g,' ').trim();
+      const cands = [];
+      const walk = (root) => {
+        let els; try { els = root.querySelectorAll('a,button,[role="tab"],li,span'); }
+          catch(e){ return; }
+        for (const el of els) cands.push(el);
+        let all; try { all = root.querySelectorAll('*'); } catch(e){ return; }
+        for (const el of all) if (el.shadowRoot) walk(el.shadowRoot);
+      };
+      walk(document);
+      for (const label of labels) {
+        const ll = label.toLowerCase();
+        for (const el of cands) {
+          const t = clean(el.innerText || el.textContent);
+          if (t && t.length < 70 && t.toLowerCase().includes(ll)) {
+            try { el.scrollIntoView(); el.click(); return t; } catch(e){}
+          }
+        }
+      }
+      return null;
+    }
+    """
+
+    # Dump every table/grid on the page (shadow-pierced): header row + data rows
+    # (cells joined by ' | '), flagging cells that carry a check/success icon
+    # with [✓] — to capture "Course Code | Course Mentor | (active ✓)".
+    _OC_TABLES_JS = r"""
+    () => {
+      const clean = s => (s||'').replace(/\s+/g,' ').trim();
+      const grids = [];
+      const collect = (root) => {
+        let gs; try { gs = root.querySelectorAll('table,[role="grid"],[role="table"]'); }
+          catch(e){ return; }
+        for (const g of gs) grids.push(g);
+        let all; try { all = root.querySelectorAll('*'); } catch(e){ return; }
+        for (const el of all) if (el.shadowRoot) collect(el.shadowRoot);
+      };
+      collect(document);
+      const out = [];
+      for (const g of grids) {
+        const headers = [];
+        g.querySelectorAll('th,[role="columnheader"]').forEach(h => {
+          const t = clean(h.innerText || h.textContent);
+          if (t && t.length < 40) headers.push(t);
+        });
+        const rows = [];
+        g.querySelectorAll('tr,[role="row"]').forEach(tr => {
+          const cells = [];
+          tr.querySelectorAll('td,[role="gridcell"],[role="cell"]').forEach(td => {
+            let t = clean(td.innerText || td.textContent);
+            const icon = td.querySelector('lightning-icon,[icon-name],svg,img[alt]');
+            if (icon) {
+              const meta = (icon.getAttribute && (icon.getAttribute('icon-name')
+                || icon.getAttribute('title') || icon.getAttribute('alt')
+                || icon.getAttribute('aria-label'))) || '';
+              if (/check|success|true|yes|selected/i.test(meta)) t = (t ? t + ' ' : '') + '[✓]';
+            }
+            cells.push(t);
+          });
+          if (cells.some(c => c)) rows.push(cells.join(' | '));
+        });
+        if (rows.length) out.push({headers: headers.join(' | '),
+                                   rows: rows.slice(0, 50)});
+      }
+      return out.slice(0, 12);
+    }
+    """
+
     def _oc_probe(self, ctx, query: str) -> dict:
         """Open `query`'s record (prefer an exact name match; any off-caseload
         student's DOM structure is identical, so for mapping the first match is
@@ -1562,9 +1634,20 @@ class BrowserWorker:
             res = {"ok": True, "contact_id": pick.get("contact_id"),
                    "name": pick.get("name")}
         target = self._active_page(ctx)
+        clicked = None
         try:
             target.wait_for_timeout(2000)  # let the record + panels settle
+            # Reveal the Course Mentor Student Assignments tab (holds the ACI).
+            clicked = target.evaluate(
+                self._OC_CLICK_TAB_JS,
+                ["Course Mentor Student Assignments", "Course Mentor"])
+            if clicked:
+                target.wait_for_timeout(1800)
+        except Exception:
+            pass
+        try:
             data = target.evaluate(self._OC_PROBE_JS)
+            tables = target.evaluate(self._OC_TABLES_JS)
         except Exception as e:
             return {"error": f"probe scrape failed: {e}",
                     "contact_id": res.get("contact_id"),
@@ -1572,8 +1655,10 @@ class BrowserWorker:
         return {"ok": True, "contact_id": res.get("contact_id"),
                 "name": res.get("name"),
                 "url": (target.url if target else ""),
+                "clicked_tab": clicked,
                 "snippets": data.get("snippets", []),
-                "related": data.get("related", [])}
+                "related": data.get("related", []),
+                "tables": tables}
 
     def _handle_find(self, ctx, query: str, new_tab: bool = False,
                      raise_after: Optional[bool] = None) -> None:
@@ -21303,22 +21388,31 @@ class App:
                 import os
                 if res and res.get("ok"):
                     snips = res.get("snippets") or []
+                    tables = res.get("tables") or []
+                    tbl_lines = []
+                    for i, t in enumerate(tables):
+                        tbl_lines.append(f"--- table {i + 1}  [{t.get('headers','')}]")
+                        tbl_lines += (t.get("rows") or [])
                     lines = [
                         f"OC PROBE — {res.get('name')}  ({res.get('contact_id')})",
                         f"url: {res.get('url')}",
-                        "", "=== VISIBLE TEXT (DOM order — label then value) ===",
-                        *snips,
+                        f"clicked tab: {res.get('clicked_tab')}",
+                        "", "=== TABLES (headers + rows; [✓] = check icon) ===",
+                        *tbl_lines,
                         "", "=== RELATED-LIST TITLES ===",
                         *(res.get("related") or []),
+                        "", "=== VISIBLE TEXT (DOM order — label then value) ===",
+                        *snips,
                     ]
                     path = os.path.join(os.getcwd(), "oc_probe.txt")
                     try:
                         with open(path, "w", encoding="utf-8") as f:
                             f.write("\n".join(lines))
                         self._append_log(
-                            f"ocprobe: dumped {len(snips)} text snippet(s) + "
-                            f"{len(res.get('related') or [])} related title(s) "
-                            f"→ {path}", success=True)
+                            f"ocprobe: dumped {len(tables)} table(s) + "
+                            f"{len(snips)} text snippet(s) "
+                            f"(clicked: {res.get('clicked_tab')}) → {path}",
+                            success=True)
                     except Exception as e:
                         self._append_log(f"ocprobe: write failed: {e}", error=True)
                 elif res and res.get("matches"):
