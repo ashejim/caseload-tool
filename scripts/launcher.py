@@ -17889,12 +17889,15 @@ class App:
         self._btn_restart_browser.pack(side="left", padx=(8, 0))
         # Auto-export each caseload department's Mongoose contacts segment and
         # refresh the StudentID -> Contact id map (no manual CSV copying).
+        # The export only feeds the DOM texting fallback; when the API text
+        # path is on it's redundant, so the button is hidden (the export code
+        # stays available as a fallback). Visibility: _update_texting_ids_btn().
         self._btn_sync_ids = ctk.CTkButton(
             toggle_frame, text="⬇ Texting IDs",
             width=120, command=self._sync_contact_ids,
             **SECONDARY_BTN_KWARGS,
         )
-        self._btn_sync_ids.pack(side="left", padx=(8, 0))
+        self._update_texting_ids_btn()
         # Open/focus the Mongoose dashboard in the launcher's own browser so the
         # user can sign in (texting needs an active Mongoose session).
         self._btn_open_mongoose = ctk.CTkButton(
@@ -21579,6 +21582,32 @@ class App:
             if c and c not in seen:
                 seen.append(c)
         return seen
+
+    def _update_texting_ids_btn(self) -> None:
+        """Show the manual '⬇ Texting IDs' export button only when the API text
+        path is OFF. The Mongoose segment export it triggers feeds the DOM
+        texting fallback; with API texting on it's redundant, so hide it (the
+        _sync_contact_ids / export code stays reachable as a fallback). Called
+        at build time and whenever the API-text setting changes."""
+        btn = getattr(self, "_btn_sync_ids", None)
+        if btn is None:
+            return
+        if getattr(self.settings, "text_send_via_api", False):
+            try:
+                btn.pack_forget()
+            except Exception:
+                pass
+            return
+        try:
+            if btn.winfo_ismapped():
+                return
+            mongoose = getattr(self, "_btn_open_mongoose", None)
+            if mongoose is not None and mongoose.winfo_ismapped():
+                btn.pack(side="left", padx=(8, 0), before=mongoose)
+            else:
+                btn.pack(side="left", padx=(8, 0))
+        except Exception:
+            pass
 
     def _sync_contact_ids(self) -> None:
         """Auto-export each caseload department's Mongoose contacts segment, then
@@ -26186,6 +26215,9 @@ class App:
                 self.worker.text_api_enabled = self.settings.text_send_via_api
             except Exception:
                 pass
+            # Hide/show the manual '⬇ Texting IDs' export button to match: the
+            # segment export is only needed for the DOM texting fallback.
+            self._update_texting_ids_btn()
             # Action branching (advanced) — gates the "+ branch" editor UI.
             new_branching = bool(branching_var.get())
             branching_changed = (
