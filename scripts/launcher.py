@@ -1662,24 +1662,31 @@ class BrowserWorker:
             res = {"ok": True, "contact_id": pick.get("contact_id"),
                    "name": pick.get("name")}
         target = self._active_page(ctx)
+        cid = res.get("contact_id")
         clicked = []
+        nav_related = None
         try:
-            target.wait_for_timeout(2000)  # let the record + panels settle
-            # Reveal the Course Mentor Student Assignments tab (holds the ACI).
-            # A click path steers through nested tabs; default best-effort.
+            target.wait_for_timeout(1500)  # let the record settle
             if click_seq:
                 for label in click_seq:
                     c = target.evaluate(self._OC_CLICK_TAB_JS, [label])
                     clicked.append(c)
                     if c:
                         target.wait_for_timeout(1600)
-            else:
-                c = target.evaluate(
-                    self._OC_CLICK_TAB_JS,
-                    ["Course Mentor Student Assignments", "Course Mentor"])
-                clicked.append(c)
-                if c:
-                    target.wait_for_timeout(1600)
+            elif cid:
+                # Deep-link straight to the Course Mentor Student Assignments
+                # related-list FULL view (the complete ACI-by-course list, with
+                # a checkmark on the active mentor). URL pattern from a real
+                # record: /lightning/r/Contact/<id>/related/
+                # CourseMentorStudentAssignments__r/view
+                from urllib.parse import urlsplit
+                p = urlsplit(target.url or CASELOAD_URL
+                             or "https://srm.lightning.force.com")
+                url = (f"{p.scheme}://{p.netloc}/lightning/r/Contact/{cid}/"
+                       "related/CourseMentorStudentAssignments__r/view")
+                target.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                target.wait_for_timeout(3000)
+                nav_related = url
         except Exception:
             pass
         # The Course Mentor Student Assignments is a lazy related-list PANEL
@@ -1707,6 +1714,7 @@ class BrowserWorker:
                 "url": (target.url if target else ""),
                 "clicked_tab": ", ".join(str(c) for c in clicked) or None,
                 "revealed": revealed,
+                "nav_related": nav_related,
                 "snippets": data.get("snippets", []),
                 "related": data.get("related", []),
                 "tables": tables}
@@ -21482,6 +21490,7 @@ class App:
                         f"url: {res.get('url')}",
                         f"clicked tab: {res.get('clicked_tab')}",
                         f"revealed panel: {res.get('revealed')}",
+                        f"related-list nav: {res.get('nav_related')}",
                         "", "=== TABLES (headers + rows; [✓] = check icon) ===",
                         *tbl_lines,
                         "", "=== RELATED-LIST TITLES ===",
