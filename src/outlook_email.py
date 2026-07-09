@@ -84,6 +84,21 @@ def get_user_info() -> dict:
     return info
 
 
+def is_ready() -> bool:
+    """Best-effort check that Outlook is running with a usable profile/account
+    (so auto-send will work). True if the current user's name or SMTP address
+    reads back; retries once for a transient COM warm-up hiccup. False means
+    Outlook isn't available / isn't signed in."""
+    import time as _t
+    for i in range(2):
+        info = get_user_info()
+        if info.get("name") or info.get("email"):
+            return True
+        if i == 0:
+            _t.sleep(1)
+    return False
+
+
 def compose_email(
     to: str,
     cc: str = "",

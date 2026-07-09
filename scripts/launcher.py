@@ -21778,7 +21778,7 @@ class App:
     def _queue_run_item(self, it) -> None:
         """Commit one queue item (blocking) and mark its row from the verdict."""
         self._append_log(f"--- Queue: running {it.action_name!r} ---")
-        login_fail = False
+        service_down = None
         try:
             result = self._commit_batch(it.payload)
             it.results = result
@@ -21788,24 +21788,25 @@ class App:
                 it.status = QueueStatus.ERROR
                 it.error_detail = ((result or {}).get("detail")
                                    or "completed with errors")
-                login_fail = bool((result or {}).get("login_fail"))
+                service_down = (result or {}).get("service_down")
         except Exception as e:
             it.status = QueueStatus.ERROR
             it.error_detail = str(e)
             self._append_log(
                 f"Queue: {it.action_name!r} errored — {e}", error=True)
         self.queue_panel.refresh()
-        # A systemic Mongoose login failure: don't plow through and fail the
-        # rest — PAUSE so the user can sign in and hit Start to retry the failed
-        # action(s). (A per-student "not textable" is NOT this — those are
-        # skipped at review and never reach here.)
-        if login_fail and not self._queue_cancelled:
+        # A systemic service failure (Mongoose not logged in, Outlook not
+        # available): don't plow through and fail the rest — PAUSE so the user
+        # can fix it and press Continue to retry the failed action. The action
+        # is pre-flighted before any send, so retry can't double-send. (A
+        # per-student "not textable / no email" is NOT this — handled inline.)
+        if service_down and not self._queue_cancelled:
             self._queue_paused = True
+            fix = ("sign in (🐭 Mongoose)" if service_down == "Mongoose"
+                   else "open / sign in to Outlook")
             self._append_log(
-                "Queue paused — Mongoose isn't logged in. Sign in "
-                "(🐭 Mongoose), then press ▶ Continue to retry the failed "
-                "action (it re-sends the text, then its email/note).",
-                error=True)
+                f"Queue paused — {service_down} isn't ready. {fix.capitalize()}, "
+                "then press ▶ Continue to retry the failed action.", error=True)
         self.root.after(50, self._queue_step)
 
     def _queue_finish(self, cancelled: bool = False) -> None:
@@ -23504,6 +23505,17 @@ class App:
         done/error; immediate fires ignore it."""
         scenario = payload["scenario"]
         text_groups = payload.get("text_groups")
+        # Pre-flight Outlook BEFORE any send when this action emails: a systemic
+        # Outlook failure then pauses the queue for a CLEAN retry — nothing has
+        # gone out yet, so a retry can't double-send the text.
+        if payload.get("has_email"):
+            from src import outlook_email
+            if not outlook_email.is_ready():
+                self._append_log(
+                    "Outlook isn't available / not signed in — action not run.",
+                    error=True)
+                return {"ok": False, "service_down": "Outlook",
+                        "detail": "Outlook not available — open Outlook + retry"}
         if text_groups:
             if not self._send_reviewed_texts(
                     scenario, text_groups, payload["text_selected"]):
@@ -23511,7 +23523,7 @@ class App:
                 # run pauses for sign-in + retry (rather than dropping the whole
                 # action). A user STOP is just a stop.
                 if getattr(self, "_text_login_fail", False):
-                    return {"ok": False, "login_fail": True,
+                    return {"ok": False, "service_down": "Mongoose",
                             "detail": "Mongoose not logged in — sign in + retry"}
                 self._append_log(
                     "Action cancelled/stopped at text send; "
