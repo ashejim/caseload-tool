@@ -16643,16 +16643,22 @@ class CaseloadPanel:
         all_aci = profile.get("aci") or []
         active = [a for a in all_aci if a.get("active")]
         active_course = active[0]["course"] if active else ""
-        # Back the quick note with ids + the active course so it has context.
+        # Back the quick note + off-caseload actions with the scraped context
+        # (there's no caseload row to look up). _qv_offcaseload_profile keeps the
+        # full profile for the email/note fire path (_offcaseload_open_context).
         self._qv_row = {
             "Name": name,
             "Contact id": contact_id,
             "StudentID": profile.get("student_id", ""),
             "CourseCode": active_course,
             "MobilePhone": profile.get("mobile", ""),
+            "Timezone": profile.get("timezone", ""),
             "WGUEmail": profile.get("wgu_email", ""),
+            "Mentor": profile.get("mentor", ""),
+            "MentorEmail": profile.get("mentor_email", ""),
             "_offcaseload": True,
         }
+        self._qv_offcaseload_profile = dict(profile)
         # This student isn't on the caseload — clear the caseload-only panels.
         for w in self.qv_body.winfo_children():
             w.destroy()
@@ -22916,7 +22922,15 @@ class App:
         # dropdown when opted in), then auto-sent. Rendered from the
         # scraped student context since there's no CSV row here.
         if scenario.email is not None:
-            student_ctx = self._get_student_context_blocking(name_hint=chosen_name)
+            # Off-caseload student open on the record → build the email context
+            # from the scraped profile (lookup_caseload_student finds no row, so
+            # student_email/PM/course would come back blank otherwise).
+            student_ctx = None
+            if not prenav_query:
+                student_ctx = self._offcaseload_open_context()
+            if student_ctx is None:
+                student_ctx = self._get_student_context_blocking(
+                    name_hint=chosen_name)
             if student_ctx is None:
                 self._append_log(
                     "Couldn't read student context for email; action not fired."
@@ -23839,6 +23853,19 @@ class App:
         skip — so a combined fire can collect all user input before sending."""
         from src import text_message as tm
         tcfg = scenario.text
+        # Off-caseload student open on the record: no caseload row / Mongoose
+        # segment mapping, and the per-course shared inbox + opt-in can't be
+        # verified for someone outside our caseload. Texting off-caseload isn't
+        # wired yet — skip it cleanly (any email/note in the same action still
+        # files) rather than send to the wrong inbox/recipient.
+        if not chosen_name:
+            octx = self._offcaseload_open_context()
+            if octx is not None:
+                self._append_log(
+                    "Text: texting off-caseload students isn't supported yet "
+                    f"({octx.get('full_name') or 'this student'}) — email/note "
+                    "still file. (Planned for a later update.)")
+                return False
         # Resolve the student WITHOUT needing the Salesforce record open: prefer
         # the cached caseload CSV row (by name) — texting only needs the mobile,
         # timezone, and course, all of which the CSV has. Fall back to scraping
@@ -26262,6 +26289,40 @@ class App:
             "pm_name": _capitalize_name(_first("MentorName", "Program Mentor")),
             "pm_email": _first_present_value(row, _CSV_PM_EMAIL_COLS),
             "program_name": _first("ProgramName", "Program Name"),
+        }
+
+    def _offcaseload_open_context(self) -> Optional[dict]:
+        """If an off-caseload student is currently open in the viewer, build the
+        email/note/text context from their SCRAPED profile — there's no caseload
+        row for lookup_caseload_student to find, so the normal context read
+        returns blanks. Returns the context dict (with the active ACI carried as
+        aci_name/aci_course for CC), or None when no off-caseload student is
+        open."""
+        panel = getattr(self, "caseload_panel", None)
+        qv = getattr(panel, "_qv_row", None) or {}
+        if not qv.get("_offcaseload"):
+            return None
+        prof = getattr(panel, "_qv_offcaseload_profile", None) or {}
+        name = str(qv.get("Name") or "").strip()
+        first, _, last = name.partition(" ")
+        active = [a for a in (prof.get("aci") or []) if a.get("active")]
+        return {
+            "full_name": name,
+            "first_name": first,
+            "preferred_name": first,
+            "last_name": last,
+            "student_email": prof.get("wgu_email", ""),
+            "student_id": prof.get("student_id", ""),
+            "course_code": active[0]["course"] if active else "",
+            "pm_name": prof.get("mentor", ""),
+            "pm_email": prof.get("mentor_email", ""),
+            # The assigned course instructor (for Stage 5's auto-CC). Only the
+            # name is scraped so far; the email is resolved in Stage 5.
+            "aci_name": active[0]["mentor"] if active else "",
+            "aci_course": active[0]["course"] if active else "",
+            "mobile": prof.get("mobile", ""),
+            "timezone": prof.get("timezone", ""),
+            "_offcaseload": True,
         }
 
     def _get_student_context_blocking(self, name_hint: str = "") -> Optional[dict]:
