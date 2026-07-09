@@ -907,8 +907,17 @@ class BrowserWorker:
             res = {}
             try:
                 ok = self._navigate_to_contact(ctx, cid)
-                res = ({"ok": True, "contact_id": cid, "name": name} if ok
-                       else {"error": f"couldn't open {name or cid}"})
+                if ok:
+                    profile = {"aci": []}
+                    try:
+                        profile = self._scrape_offcaseload_profile(
+                            ctx, cid, name)
+                    except Exception:
+                        profile = {"aci": []}
+                    res = {"ok": True, "contact_id": cid, "name": name,
+                           "profile": profile}
+                else:
+                    res = {"error": f"couldn't open {name or cid}"}
             finally:
                 on_done(res)
         elif cmd[0] == "FIND":
@@ -1738,6 +1747,164 @@ class BrowserWorker:
                 "snippets": data.get("snippets", []),
                 "related": data.get("related", []),
                 "tables": tables}
+
+    # Off-caseload Contact profile: our field key -> label spelling(s) as they
+    # appear on the Contact "Student Profile" page. The page renders each field
+    # as a label snippet immediately followed by its value snippet (DOM order),
+    # so we find the label and take the next non-noise snippet. First spelling
+    # that resolves wins. Calibrated from real Liberty Frost dumps.
+    _OC_FIELD_SPELLINGS = [
+        ("student_id", ["Student ID"]),
+        ("mobile", ["Mobile"]),
+        ("wgu_email", ["WGU Email", "Email"]),
+        ("other_email", ["Other Email"]),
+        ("timezone", ["Timezone"]),
+        ("mentor", ["Mentor"]),            # PM (program mentor) NAME
+        ("mentor_email", ["Mentor Email"]),
+        ("status", ["Status"]),
+        ("college", ["College"]),
+        ("degree_program", ["WGU Degree Program"]),
+        ("program", ["Program Name"]),
+        ("term_number", ["Term Number"]),
+        ("term_end", ["Term End Date"]),
+        ("momentum", ["Momentum"]),
+        ("term_sap", ["Term CUs and SAP"]),
+        ("cum_sap", ["Cumulative SAP %"]),
+        ("last_activity", ["Last Academic Activity Date"]),
+    ]
+
+    # Other labels seen on the page — used to STOP a value scan (a following
+    # label means the field we're on had no value), so we never grab a distant
+    # unrelated snippet.
+    _OC_STOP_LABELS = frozenset({
+        "student id", "mobile", "wgu email", "email", "other email", "timezone",
+        "mentor", "mentor email", "status", "college", "wgu degree program",
+        "program name", "program summary", "term number", "term end date",
+        "momentum", "term cus and sap", "cumulative sap %",
+        "last academic activity date", "previous term completed cus",
+        "first name", "last name", "pidm", "gender", "birthday", "phone",
+        "home phone", "international phone", "other phone", "business phone",
+        "mobile phone", "do not call", "email opt out", "ferpa access",
+        "ferpa indicator", "ferpa designee", "campus code", "affiliation",
+        "affiliation code", "full or part time", "mailing address",
+        "view contact hierarchy", "student preferred name",
+        "sms opt-in academic", "sms opt-in academic", "is nse student",
+        "call recording opt-out", "currently experiencing evb",
+    })
+
+    @staticmethod
+    def _parse_oc_fields(snippets) -> dict:
+        """Parse the Contact page's DOM-order text snippets into a field dict
+        (label -> next non-noise value). See _OC_FIELD_SPELLINGS."""
+        snips = [str(s or "").strip() for s in (snippets or [])]
+        stop = BrowserWorker._OC_STOP_LABELS
+
+        def noise(v: str) -> bool:
+            return (not v or v == "Preview" or v.endswith("Help Info")
+                    or v.startswith("Edit:"))
+
+        out: dict = {}
+        for key, labels in BrowserWorker._OC_FIELD_SPELLINGS:
+            val = ""
+            for label in labels:
+                ll = label.lower()
+                for i, s in enumerate(snips):
+                    if s.lower() != ll:
+                        continue
+                    for j in range(i + 1, min(i + 5, len(snips))):
+                        v = snips[j]
+                        if v.lower() in stop:
+                            break          # hit the next field's label
+                        if noise(v):
+                            continue       # help-text / Preview / edit chrome
+                        val = v
+                        break
+                    if val:
+                        break
+                if val:
+                    break
+            out[key] = val
+        return out
+
+    @staticmethod
+    def _parse_oc_aci(tables) -> list:
+        """Parse the CourseMentorStudentAssignments related-list rows into ACI
+        records: {course, mentor, active}. Row shape (cells joined by ' | '):
+        '… | True IsActive | D502 | Tawnya Lee | <date> | <cos> | …'. The
+        active row (IsActive=True) is the current assigned course instructor."""
+        import re as _re
+        out: list = []
+        seen = set()
+        for t in (tables or []):
+            for rowstr in (t.get("rows") or []):
+                cells = [c.strip() for c in str(rowstr).split("|")]
+                idx = off = None
+                active = False
+                for k, c in enumerate(cells):
+                    if _re.match(r"(True|False)\s+IsActive$", c):
+                        idx, off, active = k, 1, c.startswith("True")
+                        break
+                    if c in ("True", "False") and k + 1 < len(cells) \
+                            and cells[k + 1] == "IsActive":
+                        idx, off, active = k, 2, (c == "True")
+                        break
+                if idx is None:
+                    continue
+                course = cells[idx + off] if idx + off < len(cells) else ""
+                mentor = cells[idx + off + 1] if idx + off + 1 < len(cells) else ""
+                if not course or not mentor:
+                    continue
+                key = (course, mentor, active)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"course": course, "mentor": mentor,
+                            "active": active})
+        return out
+
+    def _scrape_offcaseload_profile(self, ctx, contact_id: str,
+                                    name: str = "") -> dict:
+        """Scrape an off-caseload student's mini-profile: Contact-page fields
+        (student + PM) then the active ACI(s) from the CourseMentorStudent-
+        Assignments related list. Assumes the record is already open on /view.
+        Leaves the browser back on /view (note panel ready) so a quick note can
+        follow. Returns the field dict with an added 'aci' list (possibly []).
+        """
+        target = self._active_page(ctx)
+        if target is None:
+            return {"aci": []}
+        fields: dict = {}
+        try:
+            target.wait_for_timeout(400)  # let the profile paint
+            data = target.evaluate(self._OC_PROBE_JS)
+            fields = self._parse_oc_fields(data.get("snippets", []))
+        except Exception:
+            fields = {}
+        aci: list = []
+        try:
+            from urllib.parse import urlsplit
+            p = urlsplit(target.url or CASELOAD_URL
+                         or "https://srm.lightning.force.com")
+            url = (f"{p.scheme}://{p.netloc}/lightning/r/Contact/{contact_id}/"
+                   "related/CourseMentorStudentAssignments__r/view")
+            self.on_status("  reading the assigned course instructor (ACI)…")
+            target.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            target.wait_for_timeout(2500)
+            for needle in ("Course Mentor Student Assignments", "Course Mentor"):
+                if target.evaluate(self._OC_REVEAL_JS, needle):
+                    target.wait_for_timeout(2000)   # lazy-render the rows
+                    break
+            tables = target.evaluate(self._OC_TABLES_JS)
+            aci = self._parse_oc_aci(tables)
+        except Exception:
+            aci = []
+        # Return to the Contact view so the note panel is ready for a quick note.
+        try:
+            self._navigate_to_contact(ctx, contact_id)
+        except Exception:
+            pass
+        fields["aci"] = aci
+        return fields
 
     def _handle_find(self, ctx, query: str, new_tab: bool = False,
                      raise_after: Optional[bool] = None) -> None:
@@ -16456,6 +16623,127 @@ class CaseloadPanel:
         except Exception:
             pass
 
+    def show_offcaseload_quick_view(self, contact_id: str, name: str,
+                                    profile: dict) -> None:
+        """Render an off-caseload student's scraped mini-profile into the quick
+        view: student contact info + PM (Mentor) + the ACTIVE ACI (prominent).
+        Sets _qv_row so ＋ Note / Ctrl+Shift+N file for them. No Essential
+        Actions / task grid / Success Path — those are caseload-scoped."""
+        profile = profile or {}
+        all_aci = profile.get("aci") or []
+        active = [a for a in all_aci if a.get("active")]
+        active_course = active[0]["course"] if active else ""
+        # Back the quick note with ids + the active course so it has context.
+        self._qv_row = {
+            "Name": name,
+            "Contact id": contact_id,
+            "StudentID": profile.get("student_id", ""),
+            "CourseCode": active_course,
+            "MobilePhone": profile.get("mobile", ""),
+            "WGUEmail": profile.get("wgu_email", ""),
+            "_offcaseload": True,
+        }
+        # This student isn't on the caseload — clear the caseload-only panels.
+        for w in self.qv_body.winfo_children():
+            w.destroy()
+        for w in self.qv_notehead.winfo_children():
+            w.destroy()
+        try:
+            for w in self.qv_ea_frame.winfo_children():
+                w.destroy()
+        except Exception:
+            pass
+        try:
+            self.qv_path_frame.grid_remove()
+        except Exception:
+            pass
+        self.qv_name.configure(text=f"🔎 {name or '(unknown)'}")
+
+        r = 0
+        ctk.CTkLabel(
+            self.qv_body, text="Off-caseload — not on your caseload",
+            anchor="w", font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("#b02020", "#ff6b6b"),
+        ).grid(row=r, column=0, columnspan=2, sticky="w", padx=(0, 6),
+               pady=(0, 4))
+        r += 1
+
+        wrap = 300 if not getattr(self, "_narrow", False) else 180
+
+        def line(rr: int, label: str, value: str, *, copy=False, tel=False):
+            value = str(value or "").strip()
+            if not value:
+                return rr
+            ctk.CTkLabel(
+                self.qv_body, text=f"{label}:", anchor="nw",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=("gray35", "gray70"), width=90,
+            ).grid(row=rr, column=0, sticky="nw", padx=(0, 6), pady=1)
+            vf = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+            vf.grid(row=rr, column=1, sticky="ew", pady=1)
+            vf.grid_columnconfigure(2, weight=1)
+            kw = ({"text_color": ("#1f6feb", "#58a6ff"), "cursor": "hand2"}
+                  if tel else {})
+            v = ctk.CTkLabel(vf, text=value, anchor="w", justify="left",
+                             wraplength=wrap, font=ctk.CTkFont(size=12), **kw)
+            v.grid(row=0, column=0, sticky="w")
+            if tel:
+                v.bind("<Button-1>", lambda e, m=value: self._open_tel(m))
+            if copy:
+                self._copy_icon_btn(vf, value).grid(row=0, column=1, padx=(4, 0))
+            return rr + 1
+
+        r = line(r, "Student ID", profile.get("student_id", ""), copy=True)
+        r = line(r, "Mobile", profile.get("mobile", ""), copy=True, tel=True)
+        r = line(r, "WGU Email", profile.get("wgu_email", ""), copy=True)
+        r = line(r, "Other Email", profile.get("other_email", ""), copy=True)
+        r = line(r, "PM (Mentor)", profile.get("mentor", ""))
+        r = line(r, "PM email", profile.get("mentor_email", ""), copy=True)
+        # ACI — the assigned course instructor(s), prominent.
+        r = self._oc_aci_block(r, active)
+        r = line(r, "Program", profile.get("program", "")
+                 or profile.get("degree_program", ""))
+        r = line(r, "Term #", profile.get("term_number", ""))
+        r = line(r, "Term end", profile.get("term_end", ""))
+        r = line(r, "Momentum", profile.get("momentum", ""))
+        r = line(r, "Term SAP", profile.get("term_sap", ""))
+        r = line(r, "Cum SAP", profile.get("cum_sap", ""))
+        r = line(r, "Last activity", profile.get("last_activity", ""))
+        r = line(r, "Status", profile.get("status", ""))
+        r = line(r, "Timezone", profile.get("timezone", ""))
+        r = line(r, "College", profile.get("college", ""))
+        try:
+            self._ensure_detail_height()
+        except Exception:
+            pass
+
+    def _oc_aci_block(self, r: int, active: list) -> int:
+        """Render the active ACI (assigned course instructor) as a highlighted
+        course→mentor block. If none was found, show '(not found)'."""
+        ctk.CTkLabel(
+            self.qv_body, text="ACI:", anchor="nw",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"), width=90,
+        ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+        if not active:
+            ctk.CTkLabel(
+                self.qv_body, text="(not found)", anchor="w",
+                font=ctk.CTkFont(size=12), text_color=("gray45", "gray60"),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+            return r + 1
+        box = ctk.CTkFrame(self.qv_body, fg_color=("#eaf5ea", "#22331f"),
+                           corner_radius=6)
+        box.grid(row=r, column=1, sticky="ew", pady=1)
+        box.grid_columnconfigure(0, weight=1)
+        for k, a in enumerate(active):
+            ctk.CTkLabel(
+                box, text=f"{a.get('course', '')} → {a.get('mentor', '')}",
+                anchor="w", font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=("#2e7d32", "#7bd88f"),
+            ).grid(row=k, column=0, sticky="ew", padx=8,
+                   pady=(4 if k == 0 else 0, 4))
+        return r + 1
+
     def _save_view_dialog(self) -> None:
         from tkinter import simpledialog
         if not (self.app._caseload_rows or []):
@@ -21707,8 +21995,17 @@ class App:
             def show():
                 if res and res.get("ok"):
                     self._append_log(
-                        f"Opened {res.get('name') or name} (off-caseload) — fire "
-                        "a Find-first-off note action to file a note.", success=True)
+                        f"Opened {res.get('name') or name} (off-caseload) — "
+                        "profile loaded; ＋ Note / Ctrl+Shift+N files a note.",
+                        success=True)
+                    panel = getattr(self, "caseload_panel", None)
+                    if panel is not None:
+                        try:
+                            panel.show_offcaseload_quick_view(
+                                contact_id, res.get("name") or name,
+                                res.get("profile") or {})
+                        except Exception:
+                            pass
                 else:
                     self._append_log(
                         f"Couldn't open the record: "
