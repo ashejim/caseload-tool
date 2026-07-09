@@ -22818,6 +22818,14 @@ class App:
                     course_hint = _ctx["course_code"]
             except Exception:
                 pass
+            if not course_hint:
+                # Off-caseload student: no caseload row and no single course
+                # field on the Contact page — prefill from the active ACI course
+                # captured in the scraped off-caseload profile (_qv_row).
+                panel = getattr(self, "caseload_panel", None)
+                qv = getattr(panel, "_qv_row", None) or {}
+                if qv.get("_offcaseload"):
+                    course_hint = str(qv.get("CourseCode") or "").strip()
         for pos, i in enumerate(edit_idxs):
             n = scenario.notes[i]
             label = f"Note {i + 1}"
@@ -30867,6 +30875,16 @@ class App:
             qv = getattr(panel, "_qv_row", None) or {}
             if qv.get("_offcaseload"):
                 cid = str(qv.get("Contact id") or "").strip()
+        if not cid and query:
+            # On-caseload student not in the (partial Mongoose-segment) map:
+            # use the COMPLETE grid Student→Contact map so pressing Enter
+            # deep-links straight to the record instead of the slow, flaky
+            # caseload row-filter search.
+            try:
+                cid = (self.worker.grid_student_contact_map().get(
+                    str(query).strip(), "") or "").strip()
+            except Exception:
+                cid = ""
         self.worker.submit_fetch_notes(query, on_done, contact_id=cid)
 
     def _reapply_notes_font(self, size=None) -> None:
