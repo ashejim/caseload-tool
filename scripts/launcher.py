@@ -8359,6 +8359,9 @@ def prompt_quick_note(parent, *, default_type: str = "Admin Note",
                   **SECONDARY_BTN_KWARGS).pack(side="left", padx=8)
     dialog.bind("<Escape>", lambda _e: dialog.destroy())
     body_box.bind("<Control-Return>", lambda _e: (_file(), "break"))
+    # Open near the pointer (up-left of it), clamped fully on-screen, so the
+    # popup lands where the ＋ Note button was clicked rather than screen-center.
+    _fit_dialog_to_content(dialog, min_w=520, min_h=600, near_mouse=True)
     parent.wait_window(dialog)
     return result["value"]
 
@@ -15373,6 +15376,7 @@ class CaseloadPanel:
         name = str(row.get("Name") or "").strip() or sid
         course = str(row.get("CourseCode") or row.get("Course Code") or "").strip()
         contact_id = (str(row.get("contactID") or "").strip()
+                      or str(row.get("Contact id") or "").strip()
                       or (self.app._contact_ids.get(sid, "") or "").strip())
         if not contact_id and sid:
             try:
