@@ -22019,6 +22019,14 @@ class App:
         if not runnable:
             self._append_log("Queue: nothing checked to run.")
             return
+        # A fresh Start = retry: reset checked ERROR rows to PENDING so each
+        # runs exactly ONCE this pass. (Without this the step machine, which
+        # advances over runnable items, would re-pick an item the instant it
+        # finished ERROR — an infinite re-send loop.)
+        for it in runnable:
+            if it.status == QueueStatus.ERROR:
+                it.status = QueueStatus.PENDING
+                it.error_detail = ""
         self._queue_running = True
         self._queue_paused = False
         self._queue_cancelled = False
@@ -22038,8 +22046,12 @@ class App:
         if self._queue_paused:
             self._queue_enter_paused()
             return
+        # Only PENDING items run this pass — an item that finishes DONE or ERROR
+        # is terminal for the run and never re-picked (ERROR retries only on a
+        # fresh Start, which resets it to PENDING). This is what stops the
+        # errored-action re-send loop.
         nxt = next((it for it in self.action_queue.items
-                    if it.checked and it.status.is_runnable), None)
+                    if it.checked and it.status == QueueStatus.PENDING), None)
         if nxt is None:
             self._queue_finish()
             return
