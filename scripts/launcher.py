@@ -22204,9 +22204,14 @@ class App:
         # before we read context for the email or file the note.
         if deferred_nav is not None:
             q, sid = deferred_nav
+            # A single-fire EMAIL still scrapes student/PM context from the open
+            # record, which a deep-linked standalone layout doesn't have — so
+            # only NON-email single fires deep-link. (Batch emails read context
+            # from the caseload row, so they deep-link fine.)
             if not self._navigate_for_fire_blocking(
                     q, student_id=sid,
-                    allow_deeplink=self._deeplink_ok(scenario)):
+                    allow_deeplink=(self._deeplink_ok(scenario)
+                                    and scenario.email is None)):
                 self._append_log(
                     f"Could not open {prenav_label or prenav_query!r}; "
                     "scenario not fired.")
@@ -22254,7 +22259,8 @@ class App:
             if nav_query:
                 self._navigate_for_fire_blocking(
                     nav_query, student_id=prenav_student_id,
-                    allow_deeplink=self._deeplink_ok(scenario))
+                    allow_deeplink=(self._deeplink_ok(scenario)
+                                    and scenario.email is None))
 
         # Apply the fire-time course / academic-activity edits onto a copy
         # of the scenario (run_scenario reads note.course_code_override and
@@ -24361,8 +24367,13 @@ class App:
                 # (fast, flake-free), else Fast-find (row filter + click,
                 # which also scrapes mailto/contact-card emails). Either way
                 # the worker harvests the opened record's Contact id.
-                cid = (self._contact_ids.get(sid, "")
-                       if (sid and allow_deeplink) else "")
+                # Prefer the grid's Contact id (complete — every student), then
+                # the Mongoose-segment map. (Was segment-only, so students not
+                # in an exported segment never deep-linked and fell to Fast-find.)
+                cid = ""
+                if allow_deeplink:
+                    cid = (str(row.get("contactID") or "").strip()
+                           or (self._contact_ids.get(sid, "") if sid else ""))
                 click_ok, row_emails = self._click_match_by_filter_blocking(
                     query, expected_name=student_name, contact_id=cid,
                 )
@@ -25190,8 +25201,18 @@ class App:
         it uses the search path. `allow_deeplink` is False when the fire needs
         the on-page Caseload table (e.g. an email step scrapes student/PM
         context) — the deep link opens a standalone record without it."""
-        contact_id = (self._contact_ids.get(student_id, "")
-                      if (student_id and allow_deeplink) else "")
+        # Prefer the complete grid Contact-id map (every student) over the
+        # partial Mongoose-segment map, so a single fire deep-links even for
+        # students not in an exported texting segment.
+        contact_id = ""
+        if allow_deeplink and student_id:
+            try:
+                contact_id = (self.worker.grid_student_contact_map().get(
+                    student_id, "") or "").strip()
+            except Exception:
+                contact_id = ""
+            if not contact_id:
+                contact_id = self._contact_ids.get(student_id, "")
         done_var = tk.BooleanVar(value=False)
         holder: dict = {"ok": False, "contact_id": ""}
 
