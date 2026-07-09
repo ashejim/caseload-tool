@@ -463,6 +463,11 @@ class Settings:
     # Geometry "WxH+X+Y" of the Data panel when popped out into its own window.
     # Empty means "use the default size".
     data_window_geometry: str = ""
+    # Quick "＋ Note" from the caseload viewer: the global hotkey that opens the
+    # quick-note dialog for the selected student, and the note type it defaults
+    # to (updated to the last type you filed, so your common type opens first).
+    quick_note_hotkey: str = "Ctrl+Shift+N"
+    quick_note_last_type: str = "Admin Note"
 
 
 def load_settings() -> Settings:

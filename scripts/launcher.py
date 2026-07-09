@@ -433,6 +433,15 @@ class BrowserWorker:
         (no UI form) for one contact. on_done({ok}|{error})."""
         self.q.put(("API_NOTE_TEST", contact_id, course, on_done))
 
+    def submit_quick_note(self, contact_id: str, note_type: str,
+                          course_code: str, subject: str, body_html: str,
+                          activities: list, on_done: Callable[[dict], None]
+                          ) -> None:
+        """File one ad-hoc "quick note" via the saveNoteCmpValues API replay
+        (no UI form) for a contact. on_done({ok}|{error})."""
+        self.q.put(("QUICK_NOTE", contact_id, note_type, course_code, subject,
+                    body_html, activities, on_done))
+
     def submit_close_record_tabs(
         self, on_done: Callable[[dict], None],
     ) -> None:
@@ -859,6 +868,17 @@ class BrowserWorker:
                     course_code=course, subject="Admin Note",
                     body_html="<p>API replay test — safe to delete.</p>",
                     activities=[])
+            finally:
+                on_done(res)
+        elif cmd[0] == "QUICK_NOTE":
+            (_, contact_id, note_type, course_code, subject, body_html,
+             activities, on_done) = cmd
+            res = {}
+            try:
+                res = self._save_note_via_api(
+                    ctx, contact_id=contact_id, note_type=note_type,
+                    course_code=course_code, subject=subject,
+                    body_html=body_html, activities=activities)
             finally:
                 on_done(res)
         elif cmd[0] == "CLOSE_RECORD_TABS":
@@ -8234,6 +8254,115 @@ def prompt_find_and_pick(
     return result["value"]
 
 
+def prompt_quick_note(parent, *, default_type: str = "Admin Note",
+                      student_name: str = "", course_code: str = ""):
+    """Quick-note dialog — mirrors the 'Note' action's core fields (interaction
+    format, type, academic activities, subject, body) so it feels familiar.
+    Files an ad-hoc note for the selected student. Returns a dict
+    {interaction_format, interaction_type, subject, body, activities} or None."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title(f"Quick note — {student_name}" if student_name else "Quick note")
+    dialog.geometry("520x600")
+    try:
+        dialog.transient(parent)
+        dialog.attributes("-topmost", True)
+        dialog.after(120, lambda: (dialog.lift(), dialog.focus_force()))
+    except Exception:
+        pass
+    result = {"value": None}
+
+    body_frame = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+    body_frame.pack(fill="both", expand=True, padx=12, pady=(10, 4))
+    if course_code:
+        ctk.CTkLabel(body_frame, text=f"Course: {course_code}",
+                     text_color=("gray40", "gray65")).pack(anchor="w", pady=(0, 6))
+
+    fmt_var = ctk.StringVar(value="Single Interaction")
+    fmt_row = ctk.CTkFrame(body_frame, fg_color="transparent")
+    fmt_row.pack(fill="x", pady=(0, 6))
+    ctk.CTkLabel(fmt_row, text="Format:").pack(side="left", padx=(0, 8))
+    for f in INTERACTION_FORMATS:
+        ctk.CTkRadioButton(fmt_row, text=f, variable=fmt_var, value=f,
+                           command=lambda: _refresh()).pack(side="left", padx=6)
+
+    ctk.CTkLabel(body_frame, text="Type:").pack(anchor="w")
+    type_var = ctk.StringVar(value=default_type)
+    type_menu = ctk.CTkComboBox(body_frame, variable=type_var, width=340,
+                                state="readonly",
+                                values=types_for_format(fmt_var.get()),
+                                command=lambda _v=None: _refresh())
+    type_menu.pack(anchor="w", pady=(0, 8))
+
+    ctk.CTkLabel(body_frame, text="Academic activities:").pack(anchor="w")
+    act_frame = ctk.CTkFrame(body_frame, fg_color="transparent")
+    act_frame.pack(fill="x", pady=(0, 8))
+    activity_vars: dict = {}
+    activity_cbs: list = []
+    for lbl in ACADEMIC_ACTIVITY_LABELS:
+        v = ctk.BooleanVar(value=False)
+        cb = ctk.CTkCheckBox(act_frame, text=lbl, variable=v)
+        cb.pack(anchor="w", pady=1)
+        activity_vars[lbl] = v
+        activity_cbs.append(cb)
+
+    ctk.CTkLabel(body_frame, text="Subject (optional):").pack(anchor="w")
+    subject_entry = ctk.CTkEntry(body_frame, width=440,
+                                 placeholder_text="(defaults to the note type)")
+    subject_entry.pack(anchor="w", pady=(0, 8))
+
+    ctk.CTkLabel(body_frame, text="Note:").pack(anchor="w")
+    body_box = ctk.CTkTextbox(body_frame, height=150, wrap="word")
+    body_box.pack(fill="x", pady=(0, 4))
+
+    def _refresh(*_a):
+        types = types_for_format(fmt_var.get())
+        type_menu.configure(values=types)
+        if type_var.get() not in types:
+            type_var.set(types[0])
+        disabled = activities_disabled_for(fmt_var.get(), type_var.get())
+        for cb in activity_cbs:
+            cb.configure(state="disabled" if disabled else "normal")
+        if disabled:
+            for v in activity_vars.values():
+                v.set(False)
+    _refresh()
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(fill="x", padx=12, pady=(0, 12))
+
+    def _file():
+        body = body_box.get("1.0", "end").strip()
+        if not body:
+            from tkinter import messagebox
+            if not messagebox.askyesno(
+                    "Empty note", "The note body is empty. File it anyway?",
+                    parent=dialog):
+                return
+        acts = ([lbl for lbl, v in activity_vars.items() if v.get()]
+                if not activities_disabled_for(fmt_var.get(), type_var.get())
+                else [])
+        result["value"] = {
+            "interaction_format": fmt_var.get(),
+            "interaction_type": type_var.get(),
+            "subject": subject_entry.get().strip(),
+            "body": body, "activities": acts,
+        }
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
+
+    ctk.CTkButton(btn_row, text="File note", command=_file,
+                  fg_color=_ADD_BTN_BLUE,
+                  hover_color=_ADD_BTN_BLUE_HOVER).pack(side="left")
+    ctk.CTkButton(btn_row, text="Cancel", command=dialog.destroy,
+                  **SECONDARY_BTN_KWARGS).pack(side="left", padx=8)
+    dialog.bind("<Escape>", lambda _e: dialog.destroy())
+    body_box.bind("<Control-Return>", lambda _e: (_file(), "break"))
+    parent.wait_window(dialog)
+    return result["value"]
+
+
 def prompt_additional_text(parent, label: str, prefilled: str,
                            enter_submits: bool = True) -> Optional[str]:
     """Blocking modal: multi-line edit of a note body, pre-filled.
@@ -13684,16 +13813,23 @@ class CaseloadPanel:
             font=ctk.CTkFont(size=14, weight="bold"),
         )
         self.qv_name.grid(row=0, column=1, sticky="ew")
+        # Quick note — file an ad-hoc note for the selected student (blue, next
+        # to Review notes). Also on the Ctrl+Shift+N hotkey. On/off caseload.
+        self.quick_note_btn = ctk.CTkButton(
+            hdr, text="＋ Note", width=80, command=self._quick_note,
+            fg_color=_ADD_BTN_BLUE, hover_color=_ADD_BTN_BLUE_HOVER,
+        )
+        self.quick_note_btn.grid(row=0, column=2, padx=(6, 0))
         self.review_btn = ctk.CTkButton(
             hdr, text="Review notes ⏎", width=110,
             command=self._review_focused, **SECONDARY_BTN_KWARGS,
         )
-        self.review_btn.grid(row=0, column=2, padx=(6, 0))
+        self.review_btn.grid(row=0, column=3, padx=(6, 0))
         self.qv_fields_btn = ctk.CTkButton(
             hdr, text="⚙", width=30,
             command=self._open_quickview_dialog, **SECONDARY_BTN_KWARGS,
         )
-        self.qv_fields_btn.grid(row=0, column=3, padx=(6, 0))
+        self.qv_fields_btn.grid(row=0, column=4, padx=(6, 0))
 
         # The info/notes body is (re)built per width mode by
         # _build_detail_body — wide pins the info on the left with a separate
@@ -15219,6 +15355,72 @@ class CaseloadPanel:
         query, label = self._query_label_for_iid(iid)
         if query:
             self.review_notes(query, label)
+
+    def _quick_note(self) -> None:
+        """File a quick ad-hoc note for the selected student (＋ Note button /
+        Ctrl+Shift+N). Uses the quick-view row, else the focused row; files via
+        the saveNoteCmpValues API. Works for on- and off-caseload students."""
+        row = getattr(self, "_qv_row", None) or self._row_by_iid.get(
+            self.tree.focus())
+        if not row:
+            self.app._append_log(
+                "Quick note: select a student in the viewer first.")
+            return
+        if getattr(self.app, "_is_busy", False):
+            self.app._append_log("Busy — finish the current task first.")
+            return
+        sid = str(row.get("StudentID") or row.get("Student ID") or "").strip()
+        name = str(row.get("Name") or "").strip() or sid
+        course = str(row.get("CourseCode") or row.get("Course Code") or "").strip()
+        contact_id = (str(row.get("contactID") or "").strip()
+                      or (self.app._contact_ids.get(sid, "") or "").strip())
+        if not contact_id and sid:
+            try:
+                contact_id = (self.app.worker.grid_student_contact_map().get(
+                    sid, "") or "").strip()
+            except Exception:
+                contact_id = ""
+        if not contact_id:
+            self.app._append_log(
+                f"Quick note: no Contact id known for {name}.")
+            return
+        if not self.app.worker.ready_event.is_set():
+            self.app._append_log("Quick note: browser not ready yet.")
+            return
+        default_type = getattr(
+            self.app.settings, "quick_note_last_type", "Admin Note")
+        data = prompt_quick_note(
+            self.app.root, default_type=default_type,
+            student_name=name, course_code=course)
+        if not data:
+            return
+        # Remember the type used so it opens first next time.
+        try:
+            self.app.settings.quick_note_last_type = data["interaction_type"]
+            save_settings(self.app.settings)
+        except Exception:
+            pass
+        body_html = _note_body_to_html(data["body"])
+        self.app._append_log(
+            f"Filing quick note ({data['interaction_type']}) for {name}…")
+
+        def on_done(res):
+            def show():
+                if res and res.get("ok"):
+                    self.app._append_log(
+                        f"✓ Quick note filed for {name}.", success=True)
+                else:
+                    self.app._append_log(
+                        f"Quick note failed: {(res or {}).get('error')}",
+                        error=True)
+            try:
+                self.app.root.after(0, show)
+            except Exception:
+                show()
+
+        self.app.worker.submit_quick_note(
+            contact_id, data["interaction_type"], course,
+            data["subject"], body_html, data["activities"], on_done)
 
     def review_notes(self, query: str, label: str) -> None:
         """Open the student (navigation) and load their notes into the
@@ -21020,6 +21222,19 @@ class App:
             if vk is not None:
                 self._suppress_vks.add(vk)
 
+        # App-level quick-note hotkey (not tied to a scenario).
+        qn_hk = (getattr(self.settings, "quick_note_hotkey", "") or "").strip()
+        if qn_hk:
+            try:
+                parsed = keyboard.HotKey.parse(to_pynput_hotkey_string(qn_hk))
+                self._hotkeys.append(keyboard.HotKey(
+                    parsed, lambda: self._fire_quick_note_hotkey()))
+                vk = _standalone_fkey_vk(qn_hk)
+                if vk is not None:
+                    self._suppress_vks.add(vk)
+            except Exception as e:
+                self._post_status(f"Skipped quick-note hotkey {qn_hk!r}: {e}")
+
         if not self._hotkeys:
             return
 
@@ -21038,6 +21253,8 @@ class App:
         keys = ", ".join(
             f"{sc.hotkey}->{sc.name}" for sc in self.scenarios.values() if sc.hotkey
         )
+        if qn_hk:
+            keys = (keys + ", " if keys else "") + f"{qn_hk}->quick note"
         suppressed = (
             f"  (claiming {len(self._suppress_vks)} F-keys system-wide)"
             if self._suppress_vks else ""
@@ -21077,6 +21294,13 @@ class App:
 
     def _fire_from_hotkey(self, scenario: ScenarioConfig) -> None:
         self.root.after(0, lambda: self._fire(scenario))
+
+    def _fire_quick_note_hotkey(self) -> None:
+        """Quick-note hotkey → open the quick-note dialog for the selected
+        student in the caseload viewer (marshaled to the UI thread)."""
+        panel = getattr(self, "caseload_panel", None)
+        if panel is not None:
+            self.root.after(0, panel._quick_note)
 
     # ----- Scenario firing -----
 
@@ -27209,6 +27433,28 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        # Quick-note hotkey (the ＋ Note button in the caseload viewer).
+        qn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        qn_row.pack(anchor="w", fill="x", padx=20, pady=(8, 0))
+        ctk.CTkLabel(qn_row, text="Quick-note hotkey (＋ Note):").pack(side="left")
+        quicknote_hk_var = ctk.StringVar(
+            value=getattr(self.settings, "quick_note_hotkey", "Ctrl+Shift+N"))
+        ctk.CTkEntry(qn_row, textvariable=quicknote_hk_var, width=150).pack(
+            side="left", padx=(8, 4))
+        ctk.CTkButton(
+            qn_row, text="Press to set", width=100,
+            command=lambda: open_hotkey_capture(
+                dialog, lambda combo: quicknote_hk_var.set(combo)),
+            **SECONDARY_BTN_KWARGS).pack(side="left")
+        ctk.CTkLabel(
+            dialog,
+            text=("Opens the quick-note dialog for the selected student from "
+                  "anywhere. Clear it to disable the hotkey (the ＋ Note button "
+                  "in the viewer still works)."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
         # Advanced: action branching (conditional sub-actions).
         branching_var = ctk.BooleanVar(
             value=getattr(self.settings, "enable_branching", False))
@@ -27442,6 +27688,11 @@ class App:
             # Hide/show the manual '⬇ Texting IDs' export button to match: the
             # segment export is only needed for the DOM texting fallback.
             self._update_texting_ids_btn()
+            # Quick-note hotkey — re-register the global hotkeys if it changed.
+            new_qn_hk = quicknote_hk_var.get().strip()
+            qn_hk_changed = (new_qn_hk != getattr(
+                self.settings, "quick_note_hotkey", ""))
+            self.settings.quick_note_hotkey = new_qn_hk
             # Action branching (advanced) — gates the "+ branch" editor UI.
             new_branching = bool(branching_var.get())
             branching_changed = (
@@ -27458,6 +27709,8 @@ class App:
                     pass
             # Per-area font sizes already persist live via set_font_size.
             save_settings(self.settings)
+            if qn_hk_changed:
+                self._restart_hotkeys()
             if changed:
                 self._apply_advanced_mode()
             # Toggle the "+ branch" create button on every open editor when the
