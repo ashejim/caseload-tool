@@ -1617,6 +1617,30 @@ class BrowserWorker:
     }
     """
 
+    # Scroll a related-list panel (matched by a title containing `needle`) into
+    # view so Lightning lazy-renders its rows before we dump. Returns the title
+    # text if found. Also nudges any "View All" so more than the default 5 show.
+    _OC_REVEAL_JS = r"""
+    (needle) => {
+      const nl = needle.toLowerCase();
+      const matches = [];
+      const walk = (root) => {
+        let els; try { els = root.querySelectorAll('*'); } catch(e){ return; }
+        for (const el of els) {
+          const t = (el.innerText || el.textContent || '');
+          if (t && t.length < 200 && t.toLowerCase().includes(nl)) matches.push(el);
+          if (el.shadowRoot) walk(el.shadowRoot);
+        }
+      };
+      walk(document);
+      if (!matches.length) return null;
+      matches.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+      const hit = matches[0];
+      try { hit.scrollIntoView({block: 'center'}); } catch(e) {}
+      return (hit.innerText || hit.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    }
+    """
+
     def _oc_probe(self, ctx, query: str) -> dict:
         """Open `query`'s record and dump the page. `query` may carry a click
         path after '||' — e.g. 'Liberty || Processes and Interactions || Course
@@ -1658,6 +1682,19 @@ class BrowserWorker:
                     target.wait_for_timeout(1600)
         except Exception:
             pass
+        # The Course Mentor Student Assignments is a lazy related-list PANEL
+        # (shows 5, "View All"): scroll it into view so its rows render before
+        # we dump (scraping before that is why it kept coming back empty).
+        revealed = None
+        try:
+            for needle in ("Course Mentor Student Assignments", "Course Mentor"):
+                r = target.evaluate(self._OC_REVEAL_JS, needle)
+                if r:
+                    revealed = r
+                    target.wait_for_timeout(2500)  # let the list lazy-render
+                    break
+        except Exception:
+            pass
         try:
             data = target.evaluate(self._OC_PROBE_JS)
             tables = target.evaluate(self._OC_TABLES_JS)
@@ -1669,6 +1706,7 @@ class BrowserWorker:
                 "name": res.get("name"),
                 "url": (target.url if target else ""),
                 "clicked_tab": ", ".join(str(c) for c in clicked) or None,
+                "revealed": revealed,
                 "snippets": data.get("snippets", []),
                 "related": data.get("related", []),
                 "tables": tables}
@@ -21443,6 +21481,7 @@ class App:
                         f"OC PROBE — {res.get('name')}  ({res.get('contact_id')})",
                         f"url: {res.get('url')}",
                         f"clicked tab: {res.get('clicked_tab')}",
+                        f"revealed panel: {res.get('revealed')}",
                         "", "=== TABLES (headers + rows; [✓] = check icon) ===",
                         *tbl_lines,
                         "", "=== RELATED-LIST TITLES ===",
