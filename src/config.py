@@ -472,6 +472,11 @@ class Settings:
     # caseload, auto-CC their assigned course instructor (ACI) and Program Mentor
     # so both are looped in. On by default; the CC is shown in the email review.
     cc_aci_offcaseload: bool = True
+    # Local ACI directory: assigned-course-instructor NAME (normalized: lower-
+    # case, single-spaced) -> their email. Built up as the user confirms each
+    # ACI once (ACIs are colleagues, so a small reused set); editable in
+    # Settings. Preferred over any first.last@wgu.edu guess, which is unreliable.
+    aci_emails: dict = field(default_factory=dict)
 
 
 def load_settings() -> Settings:

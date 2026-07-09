@@ -22942,9 +22942,17 @@ class App:
                    or "this student")
 
             # Off-caseload: loop in the ACI + PM by CC (on by default, settable).
-            # ACI email is derived from the scraped name; the PM email is scraped.
-            # Both appear in the review so the user can correct/remove before it
-            # sends.
+            # The PM email is scraped; the ACI email comes from the local
+            # directory — resolve it, prompting once (pre-filled with the best
+            # guess) for a new ACI. Both appear in the review before it sends.
+            if (student_ctx.get("_offcaseload")
+                    and getattr(self.settings, "cc_aci_offcaseload", True)):
+                aci_name = student_ctx.get("aci_name", "")
+                if aci_name:
+                    aci_email = self._resolve_aci_email(aci_name)
+                    if not aci_email:
+                        aci_email = self._prompt_aci_email(aci_name)
+                    student_ctx["aci_email"] = aci_email
             extra_cc = self._offcaseload_cc(student_ctx)
 
             def _render(scn: ScenarioConfig) -> list[dict]:
@@ -26402,22 +26410,125 @@ class App:
         }
 
     def _offcaseload_cc(self, student_ctx: Optional[dict]) -> str:
-        """CC string (ACI + PM) to loop in on an OFF-caseload student's email,
-        when the setting is on. The ACI email is derived from the scraped name
-        (only the name is captured); the PM email is scraped. Returns "" for
-        on-caseload students or when the setting is off."""
+        """CC string to loop in on an OFF-caseload student's email, when the
+        setting is on. The PM email is SCRAPED (reliable) so it's CC'd. The ACI
+        email is only reliable when SCRAPED (aci_email); we do NOT guess it from
+        the name (first.last@wgu.edu doesn't hold for many faculty) — an auto-
+        sent guess could reach the wrong address. Returns "" for on-caseload
+        students or when the setting is off."""
         if not (student_ctx or {}).get("_offcaseload"):
             return ""
         if not getattr(self.settings, "cc_aci_offcaseload", True):
             return ""
         parts: list = []
-        aci_email = self._derive_wgu_email(student_ctx.get("aci_name", ""))
+        # Only CC the ACI when we have their REAL (scraped) email — never a guess.
+        aci_email = (student_ctx.get("aci_email") or "").strip()
         if aci_email:
             parts.append(aci_email)
         pm_email = (student_ctx.get("pm_email") or "").strip()
         if pm_email:
             parts.append(pm_email)
         return self._merge_cc(*parts) if parts else ""
+
+    # ----- ACI email directory (local, user-maintained) -----
+
+    @staticmethod
+    def _aci_key(name: str) -> str:
+        """Normalize an ACI name to a directory key (lower-case, single-spaced)."""
+        return re.sub(r"\s+", " ", (name or "").strip()).lower()
+
+    def _resolve_aci_email(self, name: str) -> str:
+        """The stored email for an ACI name from the local directory, or "" if we
+        don't have one yet."""
+        key = self._aci_key(name)
+        if not key:
+            return ""
+        d = getattr(self.settings, "aci_emails", None) or {}
+        return str(d.get(key, "") or "").strip()
+
+    def _set_aci_email(self, name: str, email: str) -> None:
+        """Store (or clear, when email is blank) an ACI's email in the local
+        directory and persist it."""
+        key = self._aci_key(name)
+        if not key:
+            return
+        d = dict(getattr(self.settings, "aci_emails", None) or {})
+        email = (email or "").strip()
+        if email:
+            d[key] = email
+        else:
+            d.pop(key, None)
+        self.settings.aci_emails = d
+        save_settings(self.settings)
+
+    def _prompt_aci_email(self, name: str) -> str:
+        """Ask the user to confirm/enter an ACI's email (pre-filled with the best
+        first.last@wgu.edu guess — a starting point, not trusted). Stores the
+        result in the local directory for reuse. Returns the email, or "" if the
+        user cleared it or cancelled."""
+        from tkinter import simpledialog
+        guess = self._derive_wgu_email(name)
+        val = simpledialog.askstring(
+            "Confirm ACI email",
+            f"Email for {name} (assigned course instructor)?\n\n"
+            "Used to CC them on this off-caseload student's email. Saved for "
+            "next time (editable in Settings → Actions → Manage ACI emails).\n"
+            "Leave blank to not CC them.",
+            initialvalue=guess, parent=self.root)
+        if val is None:
+            return ""   # cancelled — don't store, so we ask again next time
+        val = val.strip()
+        self._set_aci_email(name, val)   # blank = remembered "don't CC this ACI"
+        return val
+
+    def _manage_aci_emails_dialog(self) -> None:
+        """Editor for the local ACI email directory (name = email, one per
+        line)."""
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("ACI email directory")
+        dlg.geometry("470x430")
+        try:
+            dlg.transient(self.root)
+            dlg.attributes("-topmost", True)
+            dlg.after(120, lambda: (dlg.lift(), dlg.focus_force()))
+        except Exception:
+            pass
+        ctk.CTkLabel(
+            dlg, text="One per line:   Name = email@wgu.edu",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(12, 2))
+        ctk.CTkLabel(
+            dlg, text=("The assigned course instructor's email, looked up by "
+                       "name when CC'ing off-caseload student emails."),
+            text_color=("gray35", "gray70"), wraplength=440, justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+        box = ctk.CTkTextbox(dlg, wrap="none")
+        box.pack(fill="both", expand=True, padx=12, pady=4)
+        cur = getattr(self.settings, "aci_emails", None) or {}
+        box.insert("1.0", "\n".join(f"{k} = {v}"
+                                    for k, v in sorted(cur.items())))
+
+        def save():
+            d: dict = {}
+            for line in box.get("1.0", "end").splitlines():
+                if "=" not in line:
+                    continue
+                name, _, email = line.partition("=")
+                key = self._aci_key(name)
+                email = email.strip()
+                if key and email:
+                    d[key] = email
+            self.settings.aci_emails = d
+            save_settings(self.settings)
+            self._append_log(f"ACI directory: {len(d)} email(s) saved.")
+            dlg.destroy()
+
+        row = ctk.CTkFrame(dlg, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=(4, 12))
+        ctk.CTkButton(row, text="Save", command=save, fg_color=_ADD_BTN_BLUE,
+                      hover_color=_ADD_BTN_BLUE_HOVER).pack(side="left")
+        ctk.CTkButton(row, text="Cancel", command=dlg.destroy,
+                      **SECONDARY_BTN_KWARGS).pack(side="left", padx=8)
 
     def _get_student_context_blocking(self, name_hint: str = "") -> Optional[dict]:
         """Ask the worker to read the active student's context (email,
@@ -28035,13 +28146,18 @@ class App:
             dialog,
             text=("When you email a student who's on another instructor's "
                   "caseload, automatically CC their assigned course instructor "
-                  "(ACI) and Program Mentor so both are looped in. The ACI "
-                  "address is derived as first.last@wgu.edu from the scraped "
-                  "name and shown in the email review, so you can correct or "
-                  "remove it before it sends."),
+                  "(ACI) and Program Mentor so both are looped in. The PM email "
+                  "is read from Salesforce; the ACI email is looked up in your "
+                  "local ACI directory — you confirm each ACI's email once (it's "
+                  "pre-filled with a first.last@wgu.edu guess) and it's reused "
+                  "after. The CC is shown in the email review before it sends."),
             wraplength=510, justify="left",
             text_color=("gray35", "gray70"), anchor="w",
-        ).pack(fill="x", padx=44, pady=(0, 10))
+        ).pack(fill="x", padx=44, pady=(0, 6))
+        ctk.CTkButton(
+            dialog, text="Manage ACI emails…",
+            command=self._manage_aci_emails_dialog, **SECONDARY_BTN_KWARGS,
+        ).pack(anchor="w", padx=44, pady=(0, 10))
 
         # Quick-note hotkey (the ＋ Note button in the caseload viewer).
         qn_row = ctk.CTkFrame(dialog, fg_color="transparent")
