@@ -22986,7 +22986,9 @@ class App:
                     student_ctx["aci_email"] = aci_email
             extra_cc = self._offcaseload_cc(student_ctx)
             if student_ctx.get("_offcaseload"):
-                self._append_log(f"  ↳ CC (ACI + PM): {extra_cc or '(none)'}")
+                self._append_log(
+                    f"  ↳ ACI CC added: {extra_cc or '(none)'}  "
+                    "(PM CC follows the action's ‘CC Program Mentor’).")
 
             def _render(scn: ScenarioConfig) -> list[dict]:
                 return [self._build_email_preview_data(
@@ -26460,25 +26462,17 @@ class App:
         }
 
     def _offcaseload_cc(self, student_ctx: Optional[dict]) -> str:
-        """CC string to loop in on an OFF-caseload student's email, when the
-        setting is on. The PM email is SCRAPED (reliable) so it's CC'd. The ACI
-        email is only reliable when SCRAPED (aci_email); we do NOT guess it from
-        the name (first.last@wgu.edu doesn't hold for many faculty) — an auto-
-        sent guess could reach the wrong address. Returns "" for on-caseload
-        students or when the setting is off."""
+        """Extra CC (the ACI) to add on an OFF-caseload student's email, when the
+        setting is on. ONLY the ACI is added here — the PM CC follows the
+        action's own "CC Program Mentor" flag (that path already uses the scraped
+        pm_email for off-caseload students), so turning it off on the action
+        drops the PM. The ACI email must be a REAL directory value (never a
+        guess). Returns "" for on-caseload students or when the setting is off."""
         if not (student_ctx or {}).get("_offcaseload"):
             return ""
         if not getattr(self.settings, "cc_aci_offcaseload", True):
             return ""
-        parts: list = []
-        # Only CC the ACI when we have their REAL (scraped) email — never a guess.
-        aci_email = (student_ctx.get("aci_email") or "").strip()
-        if aci_email:
-            parts.append(aci_email)
-        pm_email = (student_ctx.get("pm_email") or "").strip()
-        if pm_email:
-            parts.append(pm_email)
-        return self._merge_cc(*parts) if parts else ""
+        return (student_ctx.get("aci_email") or "").strip()
 
     # ----- ACI email directory (local, user-maintained) -----
 
@@ -28189,18 +28183,18 @@ class App:
             value=getattr(self.settings, "cc_aci_offcaseload", True))
         ctk.CTkCheckBox(
             dialog,
-            text="CC the ACI + PM on off-caseload student emails",
+            text="CC the ACI on off-caseload student emails",
             variable=cc_aci_var, font=ctk.CTkFont(size=13),
         ).pack(anchor="w", padx=20, pady=(8, 0))
         ctk.CTkLabel(
             dialog,
             text=("When you email a student who's on another instructor's "
                   "caseload, automatically CC their assigned course instructor "
-                  "(ACI) and Program Mentor so both are looped in. The PM email "
-                  "is read from Salesforce; the ACI email is looked up in your "
-                  "local ACI directory — you confirm each ACI's email once (it's "
-                  "pre-filled with a first.last@wgu.edu guess) and it's reused "
-                  "after. The CC is shown in the email review before it sends."),
+                  "(ACI). The ACI email is looked up in your local ACI directory "
+                  "— you confirm each ACI's email once (pre-filled with a "
+                  "first.last@wgu.edu guess) and it's reused after. (The Program "
+                  "Mentor is CC'd separately by each action's own ‘CC Program "
+                  "Mentor’ option.) The CC is shown in the email review."),
             wraplength=510, justify="left",
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 6))
