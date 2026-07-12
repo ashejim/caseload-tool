@@ -122,6 +122,17 @@ class ActionQueue:
         gone, self._items = self._items, []
         return gone
 
+    def remove_done(self) -> list[QueueItem]:
+        """Drop the successfully-completed (DONE) rows, returning them. ERROR
+        rows are kept (they may still be retried); RUNNING/PENDING untouched."""
+        gone = [it for it in self._items if it.status == QueueStatus.DONE]
+        self._items = [it for it in self._items
+                       if it.status != QueueStatus.DONE]
+        return gone
+
+    def has_done(self) -> bool:
+        return any(it.status == QueueStatus.DONE for it in self._items)
+
     def checked_items(self) -> list[QueueItem]:
         """Items the user has checked (the run set), in order."""
         return [it for it in self._items if it.checked]

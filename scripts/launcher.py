@@ -17502,6 +17502,7 @@ class QueuePanel:
         self._start_btn = None
         self._pause_btn = None
         self._cancel_btn = None
+        self._clear_done_btn = None
 
     # ---- mount -----------------------------------------------------------
     def attach(self, tab) -> None:
@@ -17537,6 +17538,14 @@ class QueuePanel:
             command=self._on_cancel, state="disabled", **SECONDARY_BTN_KWARGS,
         )
         self._cancel_btn.pack(side="left", padx=(8, 0))
+        # Clear the completed (✓ DONE) rows — tidies the list after a run.
+        # Right-aligned, away from the run controls. Kept-ERROR rows stay.
+        self._clear_done_btn = ctk.CTkButton(
+            self.ctrls, text="🧹 Clear completed", width=140,
+            command=self._on_clear_done, state="disabled",
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._clear_done_btn.pack(side="right")
 
         # Scrollable row list.
         self.listbox = ctk.CTkScrollableFrame(parent, fg_color="transparent")
@@ -17629,6 +17638,11 @@ class QueuePanel:
             self._add_btn.configure(
                 text="➕ Adding… (click actions)" if on else "➕ Add to queue",
                 state="disabled" if running else "normal")
+        # clear-completed: enabled when there's a DONE row and no run in progress
+        if self._clear_done_btn is not None:
+            self._clear_done_btn.configure(
+                state="normal" if (self.app.action_queue.has_done()
+                                   and not running) else "disabled")
 
     def on_run_state_changed(self) -> None:
         """Reflect the run state on Pause/Cancel (and, via _sync_controls,
@@ -17687,6 +17701,18 @@ class QueuePanel:
 
     def _on_cancel(self) -> None:
         self.app._queue_cancel()
+
+    def _on_clear_done(self) -> None:
+        """Remove the completed (✓ DONE) rows from the queue. ERROR rows stay
+        (they may still be retried)."""
+        if getattr(self.app, "_queue_running", False):
+            return
+        gone = self.app.action_queue.remove_done()
+        if gone:
+            self.app._append_log(
+                f"Queue: cleared {len(gone)} completed action(s).")
+        self.refresh()
+        self.app._refresh_queue_add_affordance()
 
 
 class DataPanel:
@@ -22924,10 +22950,11 @@ class App:
         if scenario.email is not None:
             # Off-caseload student open on the record → build the email context
             # from the scraped profile (lookup_caseload_student finds no row, so
-            # student_email/PM/course would come back blank otherwise).
-            student_ctx = None
-            if not prenav_query:
-                student_ctx = self._offcaseload_open_context()
+            # student_email/PM/course would come back blank otherwise). Prefer it
+            # whenever an off-caseload student is open, independent of how the
+            # action was fired (main-window vs. a selected-row fire that carries
+            # a prenav_query) — the CC/ACI logic keys off it.
+            student_ctx = self._offcaseload_open_context()
             if student_ctx is None:
                 student_ctx = self._get_student_context_blocking(
                     name_hint=chosen_name)
@@ -22945,15 +22972,21 @@ class App:
             # The PM email is scraped; the ACI email comes from the local
             # directory — resolve it, prompting once (pre-filled with the best
             # guess) for a new ACI. Both appear in the review before it sends.
-            if (student_ctx.get("_offcaseload")
-                    and getattr(self.settings, "cc_aci_offcaseload", True)):
+            if student_ctx.get("_offcaseload"):
+                cc_on = getattr(self.settings, "cc_aci_offcaseload", True)
                 aci_name = student_ctx.get("aci_name", "")
-                if aci_name:
+                self._append_log(
+                    f"  ↳ Off-caseload email for {who}: ACI = "
+                    f"{aci_name or '(none detected)'}"
+                    f"{'' if cc_on else '  [ACI/PM CC is off in Settings]'}.")
+                if cc_on and aci_name:
                     aci_email = self._resolve_aci_email(aci_name)
                     if not aci_email:
                         aci_email = self._prompt_aci_email(aci_name)
                     student_ctx["aci_email"] = aci_email
             extra_cc = self._offcaseload_cc(student_ctx)
+            if student_ctx.get("_offcaseload"):
+                self._append_log(f"  ↳ CC (ACI + PM): {extra_cc or '(none)'}")
 
             def _render(scn: ScenarioConfig) -> list[dict]:
                 return [self._build_email_preview_data(
@@ -25329,6 +25362,23 @@ class App:
         rows = [r for r in (rows or []) if r]
         if not rows:
             self._append_log("No students selected.")
+            return
+
+        # Off-caseload student (from the off-caseload search view): there's no
+        # caseload row / CSV context and the record is already open — route
+        # through the single-student path (no prenav) so it uses the scraped
+        # profile context and the ACI/PM CC. Only single-select is supported.
+        if any(r.get("_offcaseload") for r in rows):
+            if len(rows) > 1:
+                self._append_log(
+                    "Fire off-caseload students one at a time (their context "
+                    "comes from the open record).")
+                return
+            self._set_busy(f"Running {scenario.name}…")
+            try:
+                self._fire_per_student(scenario, self.course_var.get().strip())
+            finally:
+                self._set_idle()
             return
 
         # Texting actions: offer a Mongoose refresh up front if the export is
