@@ -9995,6 +9995,12 @@ def prompt_batch_email_review(
         selected_vars.append(v)
 
     state = {"current": 0}
+    # Per-student CC / BCC as edited in the review ({idx: str}); the shown value
+    # is captured when leaving a row and at send. `_addr_ready` guards the very
+    # first _show so it doesn't capture the empty initial entries.
+    cc_edits: dict = {}
+    bcc_edits: dict = {}
+    _addr_ready = {"on": False}
 
     # ---- Top banner: filter summary + count. ----
     banner = ctk.CTkFrame(dialog, fg_color=("gray92", "gray18"))
@@ -10192,15 +10198,29 @@ def prompt_batch_email_review(
     to_label.grid(row=0, column=0, sticky="w")
     to_value = ctk.CTkLabel(header_block, text="", anchor="w", justify="left")
     to_value.grid(row=0, column=1, sticky="ew", padx=(2, 0))
+    # Cc / Bcc are EDITABLE (per-student) — the shown value is what sends.
     cc_label = ctk.CTkLabel(header_block, text="Cc:", width=64, anchor="w",
                              font=ctk.CTkFont(size=12, weight="bold"))
-    cc_value = ctk.CTkLabel(header_block, text="", anchor="w", justify="left")
+    cc_label.grid(row=1, column=0, sticky="w")
+    cc_entry = ctk.CTkEntry(header_block, height=26,
+                            placeholder_text="add CC address(es), ; separated")
+    cc_entry.grid(row=1, column=1, sticky="ew", padx=(2, 0), pady=1)
+    bcc_label = ctk.CTkLabel(header_block, text="Bcc:", width=64, anchor="w",
+                             font=ctk.CTkFont(size=12, weight="bold"))
+    bcc_label.grid(row=2, column=0, sticky="w")
+    bcc_entry = ctk.CTkEntry(header_block, height=26,
+                             placeholder_text="add BCC address(es), ; separated")
+    bcc_entry.grid(row=2, column=1, sticky="ew", padx=(2, 0), pady=1)
+    cc_hint = ctk.CTkLabel(header_block, text="", anchor="w",
+                           font=ctk.CTkFont(size=10),
+                           text_color=("gray45", "gray60"))
+    cc_hint.grid(row=3, column=1, sticky="w", padx=(2, 0))
     subj_label = ctk.CTkLabel(header_block, text="Subject:", width=64, anchor="w",
                                font=ctk.CTkFont(size=12, weight="bold"))
-    subj_label.grid(row=2, column=0, sticky="w")
+    subj_label.grid(row=4, column=0, sticky="w")
     subj_value = ctk.CTkLabel(header_block, text="", anchor="w", justify="left",
                                font=ctk.CTkFont(size=12, weight="bold"))
-    subj_value.grid(row=2, column=1, sticky="ew", padx=(2, 0))
+    subj_value.grid(row=4, column=1, sticky="ew", padx=(2, 0))
 
     # Separator + body text.
     sep = ctk.CTkFrame(preview_frame, height=1, fg_color=("gray70", "gray35"))
@@ -10243,9 +10263,19 @@ def prompt_batch_email_review(
         )
         send_btn.configure(state=("normal" if n_checked > 0 else "disabled"))
 
+    def _capture_addrs() -> None:
+        """Save the CC/BCC entry text for the currently-shown row."""
+        if not _addr_ready["on"]:
+            return
+        i = state["current"]
+        if 0 <= i < len(rendered):
+            cc_edits[i] = cc_entry.get().strip()
+            bcc_edits[i] = bcc_entry.get().strip()
+
     def _show(idx: int) -> None:
         if not (0 <= idx < len(rendered)):
             return
+        _capture_addrs()   # remember edits on the row we're leaving
         state["current"] = idx
         entry = rendered[idx]
         # Keep the list selection in sync with the previewed student.
@@ -10266,16 +10296,15 @@ def prompt_batch_email_review(
             text_color=(("gray45", "gray60") if not entry.get("to")
                         else ("gray10", "gray90")),
         )
-        # Cc — hide row if no CC configured for this scenario at all.
-        if entry.get("cc") or entry.get("cc_configured"):
-            cc_label.grid(row=1, column=0, sticky="w")
-            cc_value.grid(row=1, column=1, sticky="ew", padx=(2, 0))
-            cc = entry.get("cc", "") or "(missing — will be looked up at send)"
-            hint = "  (you, auto-CC'd as PM)" if entry.get("cc_is_self") else ""
-            cc_value.configure(text=cc + hint)
-        else:
-            cc_label.grid_remove()
-            cc_value.grid_remove()
+        # Cc / Bcc — editable. Pre-fill CC from the user's edit (if any) else the
+        # computed CC; BCC from the user's edit else blank.
+        cc_entry.delete(0, "end")
+        cc_entry.insert(0, cc_edits.get(idx, entry.get("cc", "") or ""))
+        bcc_entry.delete(0, "end")
+        bcc_entry.insert(0, bcc_edits.get(idx, entry.get("bcc", "") or ""))
+        cc_hint.configure(
+            text="(you, auto-CC'd as PM)" if entry.get("cc_is_self") else "")
+        _addr_ready["on"] = True
         # Subject (+ an edited marker when this body was hand-edited).
         edited_tag = "   ✏ edited" if state["current"] in edits else ""
         subj_value.configure(text=entry.get("subject", "") + edited_tag)
@@ -10424,6 +10453,7 @@ def prompt_batch_email_review(
     result_box = {"value": None}
 
     def _do_send() -> None:
+        _capture_addrs()   # capture the currently-shown row's CC/BCC
         selected = [i for i, v in enumerate(selected_vars) if v.get()]
         if not selected:
             return
@@ -10458,7 +10488,8 @@ def prompt_batch_email_review(
         _show(0)
 
     parent.wait_window(dialog)
-    return result_box["value"], chosen_template_box["value"], edits
+    return (result_box["value"], chosen_template_box["value"], edits,
+            cc_edits, bcc_edits)
 
 
 def _build_checkbox_images():
@@ -22995,15 +23026,18 @@ class App:
                     scn, {}, prompt_vars, user_info, ctx_override=student_ctx,
                     extra_cc=extra_cc)]
 
-            scenario, selected, edits = self._run_email_review(
-                scenario, _render, who)
+            scenario, selected, edits, cc_edits, bcc_edits = \
+                self._run_email_review(scenario, _render, who)
             if not selected:
                 self._append_log("Email review cancelled; note not filed.")
                 return
             ctx_send = {**student_ctx, **prompt_vars}
+            # The reviewer's CC (index 0) is authoritative — pass it as the
+            # override so any ACI/PM the user removed there is honored.
             if not self._send_scenario_email(
                 scenario.email, ctx_send, auto_send=True,
                 body_html_override=edits.get(0), extra_cc=extra_cc,
+                cc_override=cc_edits.get(0), bcc=bcc_edits.get(0, ""),
             ):
                 self._append_log("Email send failed; note not filed.")
                 return
@@ -24240,15 +24274,17 @@ class App:
         # review otherwise.
         has_email = scenario.email is not None
         body_overrides: dict = {}
+        addr_overrides: dict = {}
         if has_email:
             filter_summary = ", ".join(
                 f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
                 for f in scenario.batch.filters
                 if f.get("column")
             )
-            scenario, confirmed, body_overrides = self._review_emails(
-                scenario, matched, prompt_vars, filter_summary,
-            )
+            scenario, confirmed, body_overrides, addr_overrides = \
+                self._review_emails(
+                    scenario, matched, prompt_vars, filter_summary,
+                )
             if confirmed is None:
                 return None  # cancelled / nothing selected (already logged)
         elif scenario.batch.preview:
@@ -24300,6 +24336,7 @@ class App:
             "scenario": scenario, "override": override,
             "confirmed": confirmed, "prompt_vars": prompt_vars,
             "has_email": has_email, "body_overrides": body_overrides,
+            "addr_overrides": addr_overrides,
             "note_inputs": note_inputs,
             "text_groups": text_groups, "text_selected": text_selected,
         }
@@ -24343,6 +24380,7 @@ class App:
             scenario, payload["override"], payload["confirmed"],
             payload["prompt_vars"], has_email=payload["has_email"],
             source="batch", body_overrides=payload["body_overrides"],
+            addr_overrides=payload.get("addr_overrides"),
             prefetched_inputs=payload["note_inputs"],
         )
         outcome = outcome or {}
@@ -24559,10 +24597,11 @@ class App:
 
         has_email = eff.email is not None
         body_overrides: dict = {}
+        addr_overrides: dict = {}
         if has_email:
             summary = f"branch • {len(rows)} student(s)"
-            eff, confirmed, body_overrides = self._review_emails(
-                eff, rows, prompt_vars, summary)
+            eff, confirmed, body_overrides, addr_overrides = \
+                self._review_emails(eff, rows, prompt_vars, summary)
             if confirmed is None:
                 return False
         else:
@@ -24592,7 +24631,7 @@ class App:
         self._execute_scenario_over_rows(
             eff, override, confirmed, prompt_vars,
             has_email=has_email, source=source, body_overrides=body_overrides,
-            prefetched_inputs=note_inputs)
+            addr_overrides=addr_overrides, prefetched_inputs=note_inputs)
         return True
 
     def _fire_branched_batch(self, scenario, override: str) -> None:
@@ -25106,6 +25145,7 @@ class App:
         confirmed: list[dict], prompt_vars: dict, *,
         has_email: bool, source: str = "batch",
         body_overrides: Optional[dict] = None,
+        addr_overrides: Optional[dict] = None,
         prefetched_inputs: "Optional[tuple[str, dict]]" = None,
     ) -> dict:
         """Shared execution core for firing a scenario across many
@@ -25118,6 +25158,7 @@ class App:
         combined action collects ALL user input before the text send); when
         None we gather them here."""
         body_overrides = body_overrides or {}
+        addr_overrides = addr_overrides or {}
         # Step 6: per-note user input — use the caller's if it front-loaded
         # them, else gather now (selection mini-batch has no text step, so
         # there's nothing to front-load ahead of).
@@ -25265,9 +25306,11 @@ class App:
                                 "next attempt's log line."
                             )
                     ctx_info = {**ctx_info, **prompt_vars}
+                    _ov = addr_overrides.get(idx - 1) or {}
                     if not self._send_scenario_email(
                         scenario.email, ctx_info, auto_send=True,
                         body_html_override=body_overrides.get(idx - 1),
+                        cc_override=_ov.get("cc"), bcc=_ov.get("bcc", ""),
                     ):
                         skipped.append((student_name, "auto-send failed"))
                         continue
@@ -25545,15 +25588,17 @@ class App:
         # review modal (same as batch), including the fire-time template
         # dropdown; otherwise a single count/name confirm.
         body_overrides: dict = {}
+        addr_overrides: dict = {}
         if has_email:
             n0 = len(rows)
             summary = (
                 f"{n0} hand-picked from the caseload panel" if n0 != 1
                 else self._row_name_and_query(rows[0])[0]
             )
-            scenario, confirmed, body_overrides = self._review_emails(
-                scenario, rows, prompt_vars, summary,
-            )
+            scenario, confirmed, body_overrides, addr_overrides = \
+                self._review_emails(
+                    scenario, rows, prompt_vars, summary,
+                )
             if confirmed is None:
                 return  # cancelled / nothing selected (already logged)
         else:
@@ -25580,7 +25625,7 @@ class App:
             self._execute_scenario_over_rows(
                 scenario, override, confirmed, prompt_vars,
                 has_email=has_email, source="selection",
-                body_overrides=body_overrides,
+                body_overrides=body_overrides, addr_overrides=addr_overrides,
             )
         finally:
             self._set_idle()
@@ -26187,19 +26232,20 @@ class App:
             return render(_replace(
                 scenario, email=_replace(scenario.email, body_html_file=tpl)))
 
-        selected, chosen_tpl, edits = prompt_batch_email_review(
-            self.root, scenario.name, rendered, summary,
-            templates=templates, current_template=cur_tpl,
-            on_template_change=(_on_tpl if pick else None),
-        )
+        selected, chosen_tpl, edits, cc_edits, bcc_edits = \
+            prompt_batch_email_review(
+                self.root, scenario.name, rendered, summary,
+                templates=templates, current_template=cur_tpl,
+                on_template_change=(_on_tpl if pick else None),
+            )
         if not selected:
-            return scenario, None, {}
+            return scenario, None, {}, {}, {}
         if pick and chosen_tpl and chosen_tpl != scenario.email.body_html_file:
             scenario = _replace(
                 scenario,
                 email=_replace(scenario.email, body_html_file=chosen_tpl))
             self._append_log(f"Using email template {chosen_tpl!r}.")
-        return scenario, selected, edits
+        return scenario, selected, edits, cc_edits, bcc_edits
 
     def _review_emails(
         self, scenario: ScenarioConfig, rows: list[dict],
@@ -26219,25 +26265,32 @@ class App:
                 for row in rows
             ]
 
-        scenario, selected, edits = self._run_email_review(
-            scenario, render, summary)
+        scenario, selected, edits, cc_edits, bcc_edits = \
+            self._run_email_review(scenario, render, summary)
         if selected is None:
             self._append_log(
                 f"{scenario.name!r}: email review cancelled / nobody selected.")
-            return scenario, None, {}
+            return scenario, None, {}, {}
         confirmed = [rows[i] for i in selected]
-        # Re-key any hand-edited bodies from reviewer-index to the position
-        # within `confirmed`, which is what the execution loop iterates.
+        # Re-key any hand-edited bodies / CC / BCC from reviewer-index to the
+        # position within `confirmed`, which is what the execution loop iterates.
         body_overrides = {
             pos: edits[i] for pos, i in enumerate(selected) if i in edits
         }
+        addr_overrides = {}
+        for pos, i in enumerate(selected):
+            if i in cc_edits or i in bcc_edits:
+                addr_overrides[pos] = {
+                    "cc": cc_edits.get(i),
+                    "bcc": bcc_edits.get(i, ""),
+                }
         self._append_log(
             f"Email review confirmed: {len(confirmed)} of {len(rows)} "
             "student(s)."
             + (f" ({len(body_overrides)} hand-edited)" if body_overrides
                else "")
         )
-        return scenario, confirmed, body_overrides
+        return scenario, confirmed, body_overrides, addr_overrides
 
     @staticmethod
     def _derive_wgu_email(name: str) -> str:
@@ -26778,6 +26831,8 @@ class App:
         auto_send: bool = False,
         body_html_override: Optional[str] = None,
         extra_cc: str = "",
+        cc_override: Optional[str] = None,
+        bcc: str = "",
     ) -> bool:
         """Render the template and either Display() the draft for
         review (default) or Send() it programmatically (`auto_send`).
@@ -26894,6 +26949,11 @@ class App:
         cc = student_ctx.get("pm_email", "") if email_cfg.cc_pm else ""
         if extra_cc:
             cc = self._merge_cc(cc, extra_cc)
+        # A CC the user edited in the review is authoritative (replaces the
+        # computed CC entirely); None means "no edit — use the computed CC".
+        if cc_override is not None:
+            cc = self._merge_cc(cc_override)
+        bcc = self._merge_cc(bcc) if bcc else ""
         if not to:
             full_name = student_ctx.get('full_name') or 'this student'
             if auto_send:
@@ -26934,7 +26994,7 @@ class App:
                     outlook_email.compose_email(
                         to=to, cc=cc, subject=subject,
                         html_body=body_html, inline_images=inline_images,
-                        auto_send=True,
+                        bcc=bcc, auto_send=True,
                         signature_name=email_cfg.signature_file,
                     )
                     last_err = None
@@ -26956,7 +27016,7 @@ class App:
         try:
             outlook_email.compose_email(
                 to=to, cc=cc, subject=subject,
-                html_body=body_html, inline_images=inline_images,
+                html_body=body_html, inline_images=inline_images, bcc=bcc,
             )
         except Exception as e:
             self._append_log(f"Outlook compose failed: {e}")

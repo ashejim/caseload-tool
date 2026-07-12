@@ -106,6 +106,7 @@ def compose_email(
     html_body: str = "",
     inline_images: Optional[dict[str, Path]] = None,
     *,
+    bcc: str = "",
     auto_send: bool = False,
     signature_name: str = "",
 ) -> None:
@@ -155,6 +156,8 @@ def compose_email(
     mail.To = to or ""
     if cc:
         mail.CC = cc
+    if bcc:
+        mail.BCC = bcc
     mail.Subject = subject or ""
 
     if auto_send:
