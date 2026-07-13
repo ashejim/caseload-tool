@@ -19276,6 +19276,13 @@ class App:
             command=self._request_stop,
         )
         self._btn_stop.grid(row=0, column=2, sticky="e", padx=(10, 0))
+        try:
+            _attach_tooltip(
+                self._btn_stop,
+                "Stop a running action or batch at the next safe point — use "
+                "if something fired by accident.")
+        except Exception:
+            pass
 
         # Find student — searches the in-DOM Caseload table.
         # HIDDEN from view (2026-05-31): the caseload panel's own search
@@ -19328,7 +19335,7 @@ class App:
         )
         self._btn_add_group.pack(side="left", padx=(8, 0))
         self.caseload_toggle_btn = ctk.CTkButton(
-            toggle_frame, text="Hide viewer", width=120,
+            toggle_frame, text="👁 Hide viewer", width=130,
             command=self._toggle_caseload, **SECONDARY_BTN_KWARGS,
         )
         self.caseload_toggle_btn.pack(side="left", padx=(8, 0))
@@ -19385,6 +19392,42 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self.capture_btn.pack(side="left", padx=(8, 0))
+
+        # Hover help for the toolbar — the emoji-only buttons in particular are
+        # opaque to a new user. (The buttons collapse to emoji when narrow, so
+        # the tooltip is the only label then.)
+        for _btn, _tip in (
+            (self.editor_toggle_btn,
+             "Open the action editor — create, edit, and organize your "
+             "actions, emails, texts, and notes."),
+            (self._btn_add_group,
+             "Add a group to organize your actions (e.g. by course)."),
+            (self.caseload_toggle_btn,
+             "Show or hide the caseload viewer — your searchable student list "
+             "with per-student info and actions."),
+            (self.caseload_refresh_btn,
+             "Reload your caseload from Salesforce."),
+            (self._btn_settings,
+             "Preferences: editor mode (Basic/Advanced), email templates, "
+             "texting, encryption, and setup help."),
+            (self._btn_restart_browser,
+             "Restart the browser if Salesforce or Mongoose gets stuck — your "
+             "login is kept."),
+            (self._btn_sync_ids,
+             "Export Mongoose contact IDs for texting (fallback used when the "
+             "text-send API is off)."),
+            (self._btn_open_mongoose,
+             "Open the Mongoose texting dashboard — sign in here to enable "
+             "texting."),
+            (self.capture_btn,
+             "Advanced: capture Salesforce note-submission traffic for API "
+             "replay (developer tool)."),
+        ):
+            try:
+                _attach_tooltip(_btn, _tip)
+            except Exception:
+                pass
+
         # (Busy/refresh indicator now lives in the top bar — see topbar.)
         # Collapse the rightmost toolbar buttons to emoji-only when the
         # bar gets too narrow (they're the first to clip).
@@ -19418,6 +19461,18 @@ class App:
             command=self._popout_data_panel, **SECONDARY_BTN_KWARGS,
         )
         self._log_data_popout_btn.pack(side="right", padx=(0, 6))
+        for _btn, _tip in (
+            (self._log_collapse_btn,
+             "Show or hide the activity log below."),
+            (self._log_copy_btn,
+             "Copy the activity log to the clipboard."),
+            (self._log_data_popout_btn,
+             "Open the Data panel (analytics) in its own window."),
+        ):
+            try:
+                _attach_tooltip(_btn, _tip)
+            except Exception:
+                pass
 
         # Action queue state (see QueuePanel): batch actions the user has
         # reviewed but not yet run. `_queue_add_mode` gates the stage-2
@@ -19489,6 +19544,15 @@ class App:
             bottom, text="Open log", width=90, command=self._open_log_file,
         )
         self._btn_open_log.pack(side="left", padx=(8, 0))
+        try:
+            _attach_tooltip(
+                self._btn_hide_taskbar,
+                "Hide the window to the taskbar — hotkeys keep working.")
+            _attach_tooltip(
+                self._btn_open_log,
+                "Open the full activity log file in your text editor.")
+        except Exception:
+            pass
         self._bottom_row_frame = bottom
         self._bottom_row_mode = None
         bottom.bind(
@@ -19551,6 +19615,12 @@ class App:
             except Exception:
                 pass
         self._frozen_panes = []
+        # Resize settled — do the deferred toolbar/bottom relabel once now.
+        try:
+            self._relayout_toggle_row()
+            self._relayout_bottom_row()
+        except Exception:
+            pass
 
     def _debounce_configure(self, fn, delay_ms: int = 80):
         """Wrap a <Configure> handler so it runs at most once after resizing
@@ -19570,11 +19640,53 @@ class App:
             state["aid"] = self.root.after(delay_ms, lambda: fn(None))
         return handler
 
+    def _viewer_toggle_text(self, narrow=None) -> str:
+        """Label for the viewer toggle, reflecting its state (visible / hidden /
+        popped-out) and the toolbar density (emoji-only when narrow — the hover
+        tooltip carries the meaning then)."""
+        if narrow is None:
+            narrow = (getattr(self, "_toggle_row_mode", None) == "narrow")
+        if getattr(self, "_caseload_popped", False):
+            return "👁" if narrow else "👁 Caseload popped"
+        if getattr(self, "_caseload_visible", True):
+            return "👁" if narrow else "👁 Hide viewer"
+        return "👁" if narrow else "👁 Show viewer"
+
+    def _editor_toggle_text(self, narrow=None) -> str:
+        """Label for the editor toggle, reflecting open/closed + density."""
+        if narrow is None:
+            narrow = (getattr(self, "_toggle_row_mode", None) == "narrow")
+        if getattr(self, "_editor_visible", False):
+            return "✎" if narrow else "Hide editor"
+        return "✎" if narrow else "✎ Edit actions"
+
+    # Ordered toolbar spec: (button, wide label OR callable(narrow)->text,
+    # wide width, narrow glyph). Dynamic-label buttons (editor/viewer) pass a
+    # callable. Single source of truth for both the collapse decision and the
+    # relabel. Built lazily (buttons must exist first).
+    def _toolbar_specs(self):
+        return [
+            (self.editor_toggle_btn, self._editor_toggle_text, 140, "✎"),
+            (self._btn_add_group, "+ Add group", 110, "➕"),
+            (self.caseload_toggle_btn, self._viewer_toggle_text, 130, "👁"),
+            (self.caseload_refresh_btn, "↻ Caseload", 120, "↻"),
+            (self._btn_settings, "⚙ Settings", 110, "⚙"),
+            (self._btn_restart_browser, "↻ Browser", 90, "🌐"),
+            (self._btn_sync_ids, "⬇ Texting IDs", 120, "⬇"),
+            (self._btn_open_mongoose, "🐭 Mongoose", 120, "🐭"),
+            (self.capture_btn, "🔬 Capture", 100, "🔬"),
+        ]
+
     def _relayout_toggle_row(self, event=None) -> None:
-        """Collapse the rightmost toolbar buttons (Templates/Settings/
-        Capture) to emoji-only when the bar is too narrow, full labels
-        when there's room. Hide-editor and Caseload (leftmost) keep
-        their labels."""
+        """Collapse the toolbar buttons to emoji-only (their hover tooltips
+        carry the meaning) when the row can't hold full labels, restore them
+        when there's room. Threshold is measured from the buttons themselves:
+        collapse once more than HALF of the last (rightmost) button would be
+        clipped, and only counts the buttons currently shown."""
+        # Mid-drag the panes are frozen; don't also churn the toolbar. The
+        # unfreeze runs one final relayout once the resize settles.
+        if getattr(self, "_resize_frozen", False):
+            return
         try:
             w = (event.width if event is not None
                  else self._toggle_row_frame.winfo_width())
@@ -19582,21 +19694,42 @@ class App:
             return
         if w <= 1:
             return
-        mode = "wide" if w >= 540 else "narrow"
+        specs = self._toolbar_specs()
+        PAD = 8   # inter-button padx; plus one lead pad
+        visible = []
+        for spec in specs:
+            try:
+                if spec[0].winfo_ismapped():
+                    visible.append(spec)
+            except Exception:
+                pass
+        if not visible:
+            return
+        wide_total = sum(s[2] for s in visible) + PAD * len(visible)
+        last_wide = visible[-1][2]
+        # "more than half the last button not visible" → collapse.
+        threshold = wide_total - last_wide / 2
+        mode = "wide" if w >= threshold else "narrow"
         if mode == self._toggle_row_mode:
             return
         self._toggle_row_mode = mode
-        if mode == "wide":
-            self._btn_settings.configure(text="⚙ Settings", width=110)
-            self.capture_btn.configure(text="🔬 Capture", width=100)
-        else:
-            self._btn_settings.configure(text="⚙", width=40)
-            self.capture_btn.configure(text="🔬", width=40)
+        narrow = (mode == "narrow")
+        for btn, wide_label, wide_w, glyph in specs:
+            try:
+                if callable(wide_label):
+                    text = wide_label(narrow)
+                else:
+                    text = glyph if narrow else wide_label
+                btn.configure(text=text, width=(40 if narrow else wide_w))
+            except Exception:
+                pass
 
     def _relayout_bottom_row(self, event=None) -> None:
         """Shrink 'Hide to taskbar'/'Open log' to short labels when the
         bottom row is narrow so the (right-pinned) Quit button always
         stays visible."""
+        if getattr(self, "_resize_frozen", False):
+            return
         try:
             w = (event.width if event is not None
                  else self._bottom_row_frame.winfo_width())
@@ -20199,7 +20332,7 @@ class App:
         self._mount_caseload_panel(win, popped=True)
         # The dock toggle is meaningless while popped out.
         self.caseload_toggle_btn.configure(
-            text="Caseload popped", state="disabled")
+            text=self._viewer_toggle_text(), state="disabled")
         win.after(80, win.lift)
         self.root.after(0, self._restore_main_sash)
 
@@ -20229,7 +20362,7 @@ class App:
             except Exception:
                 pass
         self.caseload_toggle_btn.configure(
-            text="Hide viewer", state="normal")
+            text=self._viewer_toggle_text(), state="normal")
         # Bring the main window back to the front — if it was minimized while
         # the viewer was popped out, closing the pop-out should return a
         # visible, quittable main window rather than leaving nothing on screen.
@@ -20256,8 +20389,9 @@ class App:
             except Exception:
                 w = getattr(self, "_caseload_last_w", DEFAULT_W)
             self.main_paned.forget(self.caseload_dock)
-            self.caseload_toggle_btn.configure(text="Show viewer")
             self._caseload_visible = False
+            self.caseload_toggle_btn.configure(
+                text=self._viewer_toggle_text())
             self._grow_window_width(-int(w or DEFAULT_W))
         else:
             w = int(getattr(self, "_caseload_last_w", DEFAULT_W) or DEFAULT_W)
@@ -20269,8 +20403,9 @@ class App:
             self._grow_window_width(+w)
             self.main_paned.add(
                 self.caseload_dock, minsize=300, stretch="always")
-            self.caseload_toggle_btn.configure(text="Hide viewer")
             self._caseload_visible = True
+            self.caseload_toggle_btn.configure(
+                text=self._viewer_toggle_text())
             # Keep the main (or editor) pane at its prior width; the new
             # window width goes to the caseload viewer.
             if main_w > 80:
@@ -20870,7 +21005,7 @@ class App:
                     self._toggle_caseload()  # re-show the viewer
                 except Exception:
                     pass
-            self.editor_toggle_btn.configure(text="✎ Edit actions")
+            self.editor_toggle_btn.configure(text=self._editor_toggle_text())
         else:
             # Enter editor → remember + hide the viewer, hide the main pane,
             # show the editor alone (full-focus).
@@ -20888,7 +21023,7 @@ class App:
             except Exception:
                 pass
             self._editor_visible = True
-            self.editor_toggle_btn.configure(text="Hide editor")
+            self.editor_toggle_btn.configure(text=self._editor_toggle_text())
             # Snapshot the clean state so we can detect unsaved edits on close.
             self._editor_baseline = self._editor_signature()
         # Place the divider synchronously so the panes don't paint at a
@@ -23730,7 +23865,10 @@ class App:
         btn = getattr(self, "_btn_sync_ids", None)
         if btn is None:
             return
-        if getattr(self.settings, "text_send_via_api", False):
+        # Advanced-only + only when the API text path is OFF: it's a rarely-used
+        # fallback export now, so it stays out of a basic user's toolbar.
+        if getattr(self.settings, "text_send_via_api", False) \
+                or not self.settings.advanced_mode:
             try:
                 btn.pack_forget()
             except Exception:
@@ -29216,6 +29354,13 @@ class App:
                 self.capture_btn.pack(side="left", padx=(8, 0))
             else:
                 self.capture_btn.pack_forget()
+        except Exception:
+            pass
+
+        # ⬇ Texting IDs is now advanced-only too (rarely-used fallback export);
+        # its own helper also keeps it hidden when API texting is on.
+        try:
+            self._update_texting_ids_btn()
         except Exception:
             pass
 
