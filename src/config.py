@@ -40,6 +40,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _user_config_dir() -> Path:
+    # Explicit override — used by the fresh-install demo launcher to run a
+    # fully isolated instance (its own scenarios, settings, login, lock) beside
+    # the real one. Honored in both dev and frozen builds.
+    override = os.environ.get("CASELOAD_CONFIG_DIR")
+    if override:
+        return Path(override)
     if _is_frozen():
         appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
         return Path(appdata) / "caseload-notes"

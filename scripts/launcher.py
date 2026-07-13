@@ -3709,15 +3709,21 @@ class BrowserWorker:
             except Exception as e:
                 last_error = str(e)
                 continue
-        self.on_status(f"Caseload table didn't load after retries: {last_error}")
         if target is not None and self._looks_like_login(target):
+            # Not signed in yet (common on a fresh launch) — a friendly nudge,
+            # NOT the raw Playwright timeout dump.
             self.on_status(
-                "⚠ Salesforce is asking you to sign in. Opening the browser "
-                "— please log in, then retry.")
+                "⚠ Not signed in to Salesforce yet — sign in in the browser "
+                "window (opening now), then click ↻ Caseload to load your "
+                "students.")
             try:
                 self._raise_browser_window()
             except Exception:
                 pass
+        else:
+            first_line = (last_error or "").splitlines()[0] if last_error else ""
+            self.on_status(
+                f"Caseload table didn't load after retries: {first_line}")
         return None, None
 
     def _looks_like_login(self, target) -> bool:
@@ -3730,7 +3736,11 @@ class BrowserWorker:
         except Exception:
             url = ""
         if any(s in url for s in (
-                "login.salesforce.com", "/login", "/_ui/login", "secur/login")):
+                "login.salesforce.com", "/login", "/_ui/login", "secur/login",
+                # WGU single-sign-on chain + Salesforce session redirectors the
+                # browser passes through mid-login (SAML → PingID OTP → frontdoor).
+                "access.wgu.edu", "pingfed", "pingone.com", "pingid",
+                "authenticator.ping", "secur/frontdoor", "secur/contentdoor")):
             return True
         try:
             u = target.locator('input[name="username"], input#username')
@@ -5648,7 +5658,10 @@ class BrowserWorker:
                 except Exception:
                     student = None
         if not _panel_ready():
-            self.on_status("No visible note panel. Open one and try again.")
+            self.on_status(
+                "No note panel open. Either select a student in the viewer and "
+                "fire from there, or open a student's New Note panel in "
+                "Salesforce first — then fire again.")
             return False
         # Look up the Caseload row once: gets course code, student ID,
         # and email in a single pass. Tolerates the same kind of
@@ -13704,6 +13717,28 @@ class CaseloadPanel:
             text_color=("gray40", "gray65"),
         )
         self.freshness_lbl.pack(side="left", padx=8)
+        # Hover help — the buttons collapse to emoji-only when narrow, so the
+        # tooltip carries the meaning (mirrors the main toolbar).
+        for _b, _t in (
+            (self.refresh_btn, "Reload the caseload from Salesforce."),
+            (self.search_clear_btn, "Clear the search box."),
+            (self.view_menu, "Saved views — switch column sets + filter bundles."),
+            (self.search_archived_btn,
+             "Also search archived / past students (merged in, dimmed)."),
+            (self.filters_toggle_btn, "Show or hide the column filters."),
+            (self.columns_btn, "Choose which columns show, and their order."),
+            (self.popout_btn,
+             "Pop the viewer into its own window (2nd monitor) / re-dock it."),
+            (self.departures_btn, "Students who left your caseload."),
+            (self.calibration_btn,
+             "Momentum calibration — entry prediction vs. actual outcome."),
+            (self.export_history_btn,
+             "Export the local caseload-history snapshots."),
+        ):
+            try:
+                _attach_tooltip(_b, _t)
+            except Exception:
+                pass
         self._place_bar_actions()  # initial placement (corrected on resize)
 
         # Collapsible filters section (row 1) — hidden until toggled.
@@ -13854,10 +13889,12 @@ class CaseloadPanel:
         return {
             "filters": filt_arrow if n else f"{filt_arrow} Filters",
             "columns": "☰" if n else "☰ Columns",
-            "popout": ("⧉" if popped else "⧉") if n
+            "popout": "⧉" if n
                       else ("⧉ Dock" if popped else "⧉ Pop out"),
             "departures": "⚑" if n else "⚑ Departures",
             "export": "⤓" if n else "⤓ Export history",
+            "archived": "🗄" if n else "🗄 +Archived",
+            "momentum": "📈" if n else "📈 Momentum",
         }
 
     def _place_bar_actions(self) -> None:
@@ -13877,17 +13914,31 @@ class CaseloadPanel:
     def _apply_bar_mode(self) -> None:
         t = self._bar_button_text()
         try:
+            n = self._narrow
             self.filters_toggle_btn.configure(
-                text=t["filters"], width=36 if self._narrow else 80)
+                text=t["filters"], width=36 if n else 80)
             self.columns_btn.configure(
-                text=t["columns"], width=36 if self._narrow else 90)
+                text=t["columns"], width=36 if n else 90)
             self.popout_btn.configure(
-                text=t["popout"], width=36 if self._narrow else 80)
+                text=t["popout"], width=36 if n else 80)
             self.departures_btn.configure(
-                text=t["departures"], width=36 if self._narrow else 100)
+                text=t["departures"], width=36 if n else 100)
             self.export_history_btn.configure(
-                text=t["export"], width=36 if self._narrow else 110)
-            if self._narrow:
+                text=t["export"], width=36 if n else 110)
+            self.search_archived_btn.configure(
+                text=t["archived"], width=36 if n else 110)
+            self.calibration_btn.configure(
+                text=t["momentum"], width=36 if n else 105)
+            self.view_menu.configure(width=48 if n else 120)
+            # The freshness label eats width — hide it when narrow.
+            try:
+                if n:
+                    self.freshness_lbl.pack_forget()
+                else:
+                    self.freshness_lbl.pack(side="left", padx=8)
+            except Exception:
+                pass
+            if n:
                 self.caseload_label.grid_remove()
             else:
                 self.caseload_label.grid()
@@ -13908,11 +13959,12 @@ class CaseloadPanel:
             w = self.frame.winfo_width()
         except Exception:
             return
-        # Two breakpoints: stack the action buttons below the search box once
-        # they can't sit inline with a usable search box, and shrink their
-        # labels to symbols when even the stacked row is tight.
-        narrow = w < 620
-        stacked = w < 900
+        # Protect the search box: it's the highest-priority control, so the
+        # action buttons collapse to emoji EARLY (their tooltips explain them)
+        # and drop to their own row below the search box when the panel is
+        # genuinely narrow — the search box keeps a usable width almost always.
+        narrow = w < 1150   # emoji-only action buttons
+        stacked = w < 760   # buttons move to their own row under the search box
         if narrow != self._narrow or stacked != getattr(self, "_stacked", None):
             self._narrow = narrow
             self._stacked = stacked
@@ -14306,7 +14358,10 @@ class CaseloadPanel:
             h = self.vpane.winfo_height()
             if h <= 1:
                 return
-            max_detail = max(140, h - 150)   # always leave room for the list
+            # Keep the LIST the bigger half: cap the detail at ~half the pane
+            # (and always leave a healthy list). The quick view scrolls, so a
+            # tall profile doesn't need to swallow the list.
+            max_detail = max(160, min(int(h * 0.5), h - 260))
             detail = min(need, max_detail)
             cur_detail = h - self.vpane.sash_coord(0)[1]
             if cur_detail < detail - 4:
@@ -15252,12 +15307,30 @@ class CaseloadPanel:
             vlbl.grid(row=0, column=0, sticky="ew")
         return r + 1
 
+    # Substrings that mark a phone column as STAFF (the assigned CI / mentor /
+    # faculty) rather than the student — its number must NEVER show as the
+    # student's (it's usually the logged-in instructor's own number).
+    _STAFF_PHONE_MARKERS = (
+        "mentor", "instructor", "faculty", "assigned", "advisor", "coach",
+        "cim", "course mentor", "ci phone", "ci mobile", "staff", "employee",
+    )
+
     def _phone_value(self, row: dict) -> str:
-        """Phone isn't a fixed CSV column — find any header containing
-        'phone' (so it works whatever the user names the column they add
-        to their Salesforce caseload view)."""
+        """A STUDENT phone from the row. Phone isn't a fixed CSV column, so we
+        scan for a 'phone' header — but SKIP staff columns (assigned CI /
+        mentor / faculty), whose number would otherwise wrongly show as the
+        student's. Prefer an explicit student mobile, then any student phone."""
+        def _is_staff(name: str) -> bool:
+            n = name.lower()
+            return any(s in n for s in self._STAFF_PHONE_MARKERS)
+
         for k, v in row.items():
-            if "phone" in k.lower() and str(v or "").strip():
+            kl = k.lower()
+            if "mobile" in kl and str(v or "").strip() and not _is_staff(kl):
+                return str(v).strip()
+        for k, v in row.items():
+            kl = k.lower()
+            if "phone" in kl and str(v or "").strip() and not _is_staff(kl):
                 return str(v).strip()
         return ""
 
@@ -17029,14 +17102,28 @@ class CaseloadPanel:
         except Exception:
             return {"visible": [], "hidden": [], "widths": {}}
 
+    # Sensible default visible columns for a user who hasn't customized yet —
+    # the useful-at-a-glance set (student first), by CSV header name. Anything
+    # not listed starts hidden; the user can show more or 'Copy caseload view'.
+    _DEFAULT_VISIBLE_COLUMNS = (
+        "Name", "stuprename", "CourseCode", "TermEndDate", "Momentum",
+        "Task1", "Task2", "Task3",
+    )
+
     def _resolve_display_columns(self, headers: list[str],
                                  prefs: Optional[dict] = None) -> list[str]:
-        """Ordered list of visible CSV headers from saved prefs. Columns
-        never seen before (new CSV exports) default to visible and append
-        after the saved order; explicitly-hidden ones stay hidden."""
+        """Ordered list of visible CSV headers from saved prefs. With NO saved
+        layout (a fresh user), fall back to a curated default set instead of
+        showing every column. Once customized, columns never seen before (new
+        CSV exports) default to visible and append; hidden ones stay hidden."""
         prefs = prefs if prefs is not None else self._load_col_prefs()
         hidden = set(prefs.get("hidden", []))
         visible = [c for c in prefs.get("visible", []) if c in headers]
+        if not visible and not hidden:
+            # Never customized → curated default (only the columns that exist).
+            default = [c for c in self._DEFAULT_VISIBLE_COLUMNS if c in headers]
+            if default:
+                return default
         seen = set(visible) | hidden
         for c in headers:
             if c not in seen:
@@ -17337,10 +17424,18 @@ class CaseloadPanel:
             btns, text="Show all", width=78, command=show_all,
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left")
-        ctk.CTkButton(
-            btns, text="Copy caseload", width=110, command=copy_caseload,
-            **SECONDARY_BTN_KWARGS,
-        ).pack(side="left", padx=(6, 0))
+        _copy_btn = ctk.CTkButton(
+            btns, text="Copy my caseload view", width=160,
+            command=copy_caseload, **SECONDARY_BTN_KWARGS,
+        )
+        _copy_btn.pack(side="left", padx=(6, 0))
+        try:
+            _attach_tooltip(
+                _copy_btn,
+                "Set these columns to match your Salesforce caseload list "
+                "view (reads the columns it currently shows).")
+        except Exception:
+            pass
 
     def _task_cell_value(self, r, header, task_cols):
         """Display value for one grid cell. For Task columns, prefix a colour
@@ -19114,7 +19209,8 @@ class App:
         except Exception:
             pass
         self.root = ctk.CTk()
-        self.root.title(f"Caseload Tool — v{__version__}")
+        _title_suffix = os.environ.get("CASELOAD_TITLE_SUFFIX", "")
+        self.root.title(f"Caseload Tool — v{__version__}{_title_suffix}")
         self.root.minsize(420, 520)
 
         # App / window icon (title bar + taskbar). Set now AND re-apply shortly
@@ -19224,12 +19320,10 @@ class App:
         # (popping before the main window paints makes the dialog
         # look orphaned).
         if not self.settings.first_run_complete:
-            # First-time view is uncluttered: editor already starts hidden;
-            # also collapse the viewer (they set up the caseload first).
-            self.root.after(0, self._hide_viewer_initially)
-            # Size the window to comfortably show the sample groups +
-            # toolbar + a square-ish log (runs after the viewer hides and
-            # advanced-mode trims the toolbar, so the measurement is right).
+            # Size the window comfortably for a first-time user. The viewer
+            # stays SHOWN (it stretches, so the window resizes normally) — the
+            # caseload auto-loads from the API now, so there's no "set up the
+            # caseload first" step that warranted hiding it.
             self.root.after(0, self._apply_first_run_geometry)
             self.root.after(400, self._show_first_run_setup)
 
@@ -19676,6 +19770,23 @@ class App:
             (self._btn_open_mongoose, "🐭 Mongoose", 120, "🐭"),
             (self.capture_btn, "🔬 Capture", 100, "🔬"),
         ]
+
+    def _toolbar_wide_width(self) -> int:
+        """Total width the toolbar needs at FULL (non-collapsed) labels, for the
+        buttons currently shown. Used to size the first-run window so it doesn't
+        get sized to a momentarily-collapsed (emoji-only) toolbar."""
+        total, n, pad = 0, 0, 8
+        for btn, _lbl, wide_w, _glyph in self._toolbar_specs():
+            try:
+                # winfo_manager() is 'pack' for a shown button, '' for a
+                # pack_forget'd one — robust even before the row is drawn
+                # (unlike winfo_ismapped, which is False until mapped).
+                if btn.winfo_manager():
+                    total += wide_w
+                    n += 1
+            except Exception:
+                pass
+        return total + pad * (n + 1)
 
     def _relayout_toggle_row(self, event=None) -> None:
         """Collapse the toolbar buttons to emoji-only (their hover tooltips
@@ -21167,19 +21278,23 @@ class App:
 
     def _apply_first_run_geometry(self) -> None:
         """First-launch default window size (NOT maximized): wide enough to
-        show two action buttons side-by-side with the whole toolbar fully
-        visible, and tall enough to show every group plus a roughly-square
-        activity log. Computed from the laid-out widgets so it adapts to
-        the bundled sample groups / font scale, then centered on screen."""
+        show the main pane (toolbar + 2-column action grid) AND the caseload
+        viewer beside it, and tall enough to show every group plus a
+        roughly-square activity log. Computed from the laid-out widgets so it
+        adapts to the bundled sample groups / font scale, then centered."""
         try:
             self.root.update_idletasks()
-            # Width: the wider of the full toolbar row and the 2-column
-            # action grid drives it (both live in the main pane).
+            # Width: the wider of the full toolbar row and the 2-column action
+            # grid drives the MAIN pane (use the toolbar's WIDE width, not its
+            # live reqwidth — during the busy startup the row may already have
+            # collapsed to emoji-only, which would size the window too narrow).
             content_w = max(
-                self._toggle_row_frame.winfo_reqwidth(),
+                self._toolbar_wide_width(),
                 self.button_frame.winfo_reqwidth(),
             )
-            width = content_w + 32  # pane padx + window padx
+            # Leave room for the caseload viewer, which stays shown on first run.
+            viewer_w = 360 if getattr(self, "_caseload_visible", True) else 0
+            width = content_w + viewer_w + 40  # panes + window padx
 
             # Height: everything in the main pane at its natural height
             # already shows all groups; the log box sits at its minimum,
@@ -21196,6 +21311,9 @@ class App:
             x = max(0, (sw - width) // 2)
             y = max(0, (sh - height) // 2 - 20)
             self.root.geometry(f"{width}x{height}+{x}+{y}")
+            # Place the divider so the main pane gets its full width (buttons
+            # keep their names) — after the new geometry has taken effect.
+            self.root.after(80, self._restore_main_sash)
         except Exception:
             pass
 
@@ -21211,11 +21329,14 @@ class App:
         legacy = int(getattr(self.settings, "main_sash", 0) or 0)
         return [legacy] if legacy > 0 else []
 
-    @staticmethod
-    def _default_sash_positions(n: int, total: int) -> list[int]:
+    def _default_sash_positions(self, n: int, total: int) -> list[int]:
         """Default divider positions for `n` sashes across `total` px."""
-        if n == 1:
-            return [int(total * 0.38)]
+        if n == 1:  # main | caseload
+            # The main pane must be wide enough for the toolbar's FULL button
+            # labels (else they collapse to emoji) — not just 38% of the window.
+            want = self._toolbar_wide_width() + 24
+            x = max(int(total * 0.38), want)
+            return [max(60, min(x, total - 60))]
         if n == 2:  # main | editor | caseload
             return [int(total * 0.30), int(total * 0.64)]
         return [int(total * (i + 1) / (n + 1)) for i in range(n)]
@@ -21762,6 +21883,15 @@ class App:
             return True
         plural = "s" if len(off) > 1 else ""
         notes_label = ", ".join(f"Note {n}" for n in off)
+        if not batch:
+            # Single fire: the note is filled right in front of you to review
+            # and submit — no need for a blocking Proceed/Abort prompt. A gentle
+            # heads-up is enough (the batch case below still confirms, since you
+            # can't eyeball each of N students).
+            self._append_log(
+                f"  ↳ {notes_label} won't auto-submit — the form is filled; "
+                "click Submit in Salesforce when you're ready.")
+            return True
         if batch:
             msg = (
                 f"Heads up — {notes_label} in this action "
@@ -21951,6 +22081,11 @@ class App:
     def _start_hotkeys(self) -> None:
         self._hotkeys = []
         self._suppress_vks = set()
+        # The fresh-install demo runs beside the real instance; it must NOT
+        # grab the global F-keys (they'd fight the real one). Skip registration.
+        if os.environ.get("CASELOAD_NO_HOTKEYS"):
+            self._post_status("Global hotkeys off (fresh-install demo).")
+            return
         for sc in self.scenarios.values():
             if not sc.hotkey:
                 continue
@@ -23800,19 +23935,19 @@ class App:
                         f"  ↳ {len(unmatched)} opted-in student(s) not matched "
                         f"to a Contact id (texts use their caseload phone): "
                         f"{shown}{more}.")
-            # Loud staleness warning: Mongoose opt-in can change any time, so an
-            # export more than a day old may silently skip newly-enrolled
-            # students at text time. (The startup auto-refresh + pre-fire popup
-            # act on the same signal.) Skipped when the API text path is on — it
-            # doesn't use the segment, so its freshness is irrelevant.
-            if (self._mongoose_is_stale()
+            # Staleness heads-up — only for texting users whose EXISTING export
+            # has gone stale (opt-in can change through the day). A brand-new
+            # user with NO export yet gets the ℹ setup hint below instead, not a
+            # scary red warning. Skipped when the API text path is on (it doesn't
+            # use the segment, so its freshness is irrelevant).
+            if (self._mongoose_export_age_hours() is not None
+                    and self._mongoose_is_stale()
                     and not getattr(self.settings, "text_send_via_api", False)):
                 self._append_log(
-                    f"⚠ Mongoose text-ID export is {self._mongoose_age_human()} "
-                    "— it can change several times a day. New students may be "
-                    "skipped when texting until it's refreshed (🔄 Sync "
-                    "Contact IDs, or fire a text to be prompted).",
-                    error=True)
+                    f"Note: your Mongoose text-ID export is "
+                    f"{self._mongoose_age_human()} — opt-in can change through "
+                    "the day, so refresh before texting (🔄 Sync Contact IDs, "
+                    "or fire a text to be prompted).")
             # One-time (per session) setup nudge: if this user texts and a
             # caseload course has no Mongoose segment yet, mention the OPTIONAL
             # verified-opt-in setup. Texting already works via the Salesforce
@@ -24249,6 +24384,11 @@ class App:
                              error=True)
             return False
         self._append_log("Checking Salesforce sign-in…")
+        if not getattr(self, "_first_fire_warmed", False):
+            self._first_fire_warmed = True
+            self._append_log(
+                "  ↳ first action this session — Salesforce is warming up, so "
+                "this one's slower; the rest are quick.")
         done_var = tk.BooleanVar(value=False)
         holder: dict = {"ok": False}
 
@@ -27524,9 +27664,10 @@ class App:
                     self.worker.submit_read_ea_dashboard(on_ea_done)
                 else:
                     self._append_log(
-                        f"Caseload CSV auto-download failed: {message}. "
-                        "You can retry with ↻ Caseload. Until then, "
-                        "batches will fall back to the DOM scrape."
+                        "Caseload not loaded yet — if you're not signed in to "
+                        "Salesforce, sign in in the browser window, then click "
+                        "↻ Caseload. (Until then, batches fall back to a slower "
+                        "per-student scrape.)"
                     )
                     self._set_idle()
             try:
@@ -29088,16 +29229,20 @@ class App:
 
     def _show_first_run_setup(self) -> None:
         """Modal that pops on first launch (settings.first_run_complete
-        is False). Welcome message, mode picker, optional Caseload
-        Tool view setup. On Continue, sets first_run_complete=True
-        and applies the chosen mode. The dialog is mandatory — close
-        via Continue, no Cancel."""
+        is False). Welcome + editor-mode picker. On Continue, sets
+        first_run_complete=True and applies the chosen mode. The dialog is
+        mandatory — close via Continue, no Cancel.
+
+        The Caseload Tool view setup is intentionally NOT here: the caseload
+        now loads from the live grid API, so the view is only needed for fast
+        batch-email addresses. It's surfaced just-in-time (the pre-batch-email
+        prompt) and in ⚙ Settings, rather than front-loaded on a new user."""
         dialog = ctk.CTkToplevel(self.root)
         dialog.title("Welcome to Caseload Notes")
         dialog.transient(self.root)
         dialog.attributes("-topmost", True)
         dialog.grab_set()
-        dialog.geometry("600x600")
+        dialog.geometry("600x400")
         dialog.lift()
         dialog.focus_force()
         # Repeat focus claw-back so the dialog can't get buried
@@ -29112,8 +29257,8 @@ class App:
         ctk.CTkLabel(
             dialog,
             text=(
-                "A couple of choices to get you set up. You can change "
-                "either of these later from the ⚙ Settings dialog."
+                "One quick choice to get you started — you can change it "
+                "later in the ⚙ Settings dialog."
             ),
             font=ctk.CTkFont(size=12),
             text_color=("gray35", "gray70"),
@@ -29127,7 +29272,7 @@ class App:
         mode_frame.pack(fill="x", padx=16, pady=(0, 12))
 
         ctk.CTkLabel(
-            mode_frame, text="1.  Editor mode",
+            mode_frame, text="Editor mode",
             font=ctk.CTkFont(size=13, weight="bold"),
             anchor="w",
         ).pack(fill="x", padx=12, pady=(10, 4))
@@ -29166,37 +29311,11 @@ class App:
             wraplength=480, justify="left",
         ).pack(anchor="w", padx=44, pady=(0, 12))
 
-        # --- Caseload Tool view section.
-        view_frame = ctk.CTkFrame(
-            dialog, fg_color=("gray92", "gray18"), corner_radius=6,
-        )
-        view_frame.pack(fill="x", padx=16, pady=(0, 12))
-
-        ctk.CTkLabel(
-            view_frame, text="2.  Salesforce Caseload Tool view",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            anchor="w",
-        ).pack(fill="x", padx=12, pady=(10, 4))
-        ctk.CTkLabel(
-            view_frame,
-            text=(
-                "A dedicated Salesforce list view with the columns this "
-                "launcher needs (notably Student Email). One-time setup; "
-                "the launcher downloads from it going forward, leaving "
-                "your normal views untouched. Recommended but not "
-                "required — batches still work without it (via slower "
-                "per-student email scraping at send time)."
-            ),
-            font=ctk.CTkFont(size=11),
-            text_color=("gray35", "gray70"),
-            wraplength=540, justify="left", anchor="w",
-        ).pack(fill="x", padx=12, pady=(0, 8))
-
-        ctk.CTkButton(
-            view_frame, text="Show Caseload Tool setup instructions",
-            command=lambda: self._setup_caseload_tool_view_with_help(dialog),
-            width=260,
-        ).pack(anchor="w", padx=12, pady=(0, 12))
+        # The Caseload Tool view setup used to live here as step 2. It's gone
+        # now — the caseload loads from the live grid API, so a new user needs
+        # no Salesforce setup to start. The view (which speeds up batch-email
+        # address lookup) is offered just-in-time the first time they batch an
+        # email without an address column, and any time from ⚙ Settings.
 
         # --- Continue button.
         def _continue() -> None:
@@ -30703,7 +30822,8 @@ class App:
         if not silent:
             age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
             self._append_log(
-                f"Caseload cache: {len(rows)} rows from {source} ({age})"
+                f"✓ Caseload loaded: {len(rows)} students from {source} ({age})",
+                success=True,
             )
             if not self._csv_has_student_email:
                 self._append_log(
@@ -31435,10 +31555,11 @@ class App:
         if not self._distinct_courses(self._caseload_rows or []):
             return
         if not self._mongoose_login_check_blocking():
+            # Only relevant to texting users with an existing (now-stale) export
+            # — a gentle note, not a red error.
             self._append_log(
-                "⚠ Mongoose text IDs are stale, but Mongoose isn't signed in — "
-                "sign in (🐭 Mongoose) then 🔄 Sync Contact IDs to refresh.",
-                error=True)
+                "Note: your Mongoose text IDs are stale. When you next text, "
+                "sign in (🐭 Mongoose) then 🔄 Sync Contact IDs to refresh.")
             return
         self._append_log(
             f"Auto-updating stale Mongoose text IDs "

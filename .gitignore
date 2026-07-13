@@ -119,3 +119,6 @@ flup_save_probe.txt
 text_send_probe.txt
 mongoose_api_probe.txt
 oc_probe*.txt
+
+# Fresh-install demo sandbox (isolated config for onboarding troubleshooting)
+_fresh_demo/
