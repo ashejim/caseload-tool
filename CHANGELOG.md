@@ -3,6 +3,45 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.17.0 — 2026-07-13
+
+A **new-user friendliness** pass — the app is powerful but was overwhelming to
+newcomers. This release makes it approachable out of the box (progressive
+disclosure + guided discovery) without hiding any of the power.
+
+### New-user experience
+- **Clean starter actions.** A fresh install now seeds a small, course-agnostic
+  sample set — a **"Sample single actions"** group (blue: a quick note, a
+  follow-up email) and a **"Sample batch actions"** group (green: a welcome
+  email+text batch, a Task-1-passed batch) — each clearly marked *edit or delete
+  me*, every one filing a note, batches preview-on. The old course-specific
+  seed templates are gone.
+- **Simpler first run.** The welcome screen is just the Simple/Advanced editor
+  choice — the Salesforce "Caseload Tool view" setup is **no longer pushed at
+  startup** (the caseload loads from the live grid API now; the view only speeds
+  up batch-email addresses and is offered just-in-time + in Settings).
+- **Sensible default viewer columns.** New users see a curated set (Name,
+  Preferred Name, Course Code, Term End Date, Momentum, Tasks) instead of every
+  column. **"Copy my caseload view"** in the column chooser matches your
+  Salesforce list view's columns.
+- **Toolbar & viewer tooltips**, and both collapse to emoji-only when narrow
+  (driven by the buttons' own widths) — the **viewer search box stays usable
+  almost always**.
+
+### Fixes & polish
+- **Privacy:** a student's Mobile no longer falls back to a staff/CI phone
+  column (which was showing the instructor's own number).
+- First-run window now opens at a usable width and resizes normally (viewer
+  stays shown); student-info pane no longer crowds out the list.
+- Firing a single note with Submit off no longer blocks with a Proceed/Abort
+  prompt — it fills for review with a gentle note (batches still confirm).
+- Friendlier startup: not-signed-in shows "sign in, then ↻ Caseload" instead of
+  a raw timeout dump; the Mongoose text-ID heads-up is no longer a red scare for
+  users with no export; positive completions log in green.
+- **Fresh-install demo** (`fresh_demo.bat`): run the brand-new-user experience
+  in an isolated sandbox alongside your real instance (own config/login, no
+  global hotkeys) for onboarding troubleshooting.
+
 ## 0.16.0 — 2026-07-08
 
 A new **Action Queue** lets you line up several batch actions and run them in
