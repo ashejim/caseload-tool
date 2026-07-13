@@ -1,220 +1,188 @@
-# Caseload Note Automation
+# CaseloadNotes — Caseload automation for WGU Course Instructors
 
-A Windows desktop launcher that fills repetitive student notes into WGU's
-Caseload (a Salesforce Lightning interface) using Playwright. Press a
-hotkey, and a pre-defined note is filled and submitted on the active
-student's note panel — no typing, no clicking through fields.
+A Windows desktop tool that automates the repetitive Salesforce/Outlook/Mongoose
+work of running a WGU course caseload — filing notes, sending emails and texts,
+and seeing at a glance who needs attention. It runs client-side under your own
+login, so **no Salesforce admin permissions are required**.
 
-Built to replace AutoHotkey / Pulover macros that break on Salesforce
-slowness and UI changes. Runs client-side under your own login, so no
-Salesforce admin permissions are required.
+Press a hotkey (or click a student in the built-in viewer) and a pre-defined
+note is filled and submitted on the active student — no typing through fields,
+no clicking through Lightning. Batch the same action across every student a
+filter matches, and it emails/texts/notes all of them in one reviewed pass.
+
+Built to replace AutoHotkey / Pulover macros that break on Salesforce slowness
+and UI changes.
 
 ## What it does
 
-- Auto-fills the Caseload **Student Note** form (Interaction Format,
-  Interaction Type, Course Code, Subject, Academic Activities, Body)
-- Auto-detects the **Course Code** from the Caseload table — no need
-  to type it per student
-- Submits the note and closes the workspace tab when done
-- Triggered by a **global hotkey** or a button click in the launcher
-- Comes with three predefined workflows you can edit or extend:
-  - **Welcome** (F3) — one welcome note to a newly assigned student
-  - **Approval** (F2) — two notes back-to-back (Email from Student +
-    Email to Student) documenting an approval form round-trip
-  - **Custom** (F4) — a blank slate; edit the body / type in the
-    launcher and use as a third hotkey
+- **Files Student Notes automatically** — Interaction Format, Interaction Type,
+  Course Code, Subject, Academic Activities, Body — with the **course code
+  auto-detected** from the caseload, then submits and closes the tab.
+- **A built-in caseload viewer** — a searchable, filterable list of your
+  students with per-student info, **live task pass/fail** and **Momentum**,
+  Essential Actions, and a quick-view panel. Loads from Salesforce's caseload
+  API (no manual list-view setup needed).
+- **Actions** — reusable single-fire, panel (per-student), and **batch**
+  actions that can send an **Outlook email** (templated, variables, auto-CC the
+  Program Mentor, your signature), a **Mongoose text** (templated, timezone-aware
+  scheduling, opt-in aware), and/or **file notes** — alone or combined.
+- **Batch by filter** — pick students by course, task status, momentum,
+  follow-up date, success-path step, etc., review the recipient list, and fire.
+- **Off-caseload students** — view and file notes/texts for students in your
+  course who are on another instructor's caseload.
+- **Success paths** — per-course step checklists that surface the recommended
+  next action per student.
+- **Extras** — an action queue, conditional action branching, caseload history +
+  departures, Momentum calibration, and at-rest encryption of local student data.
+
+## What it saves you
+
+Every note, email, or text you file by hand is a chain of small, slow,
+repetitive steps — most of the time spent **waiting on Salesforce Lightning to
+load** and **re-entering the same fields** for every student. The app collapses
+each chain to one keypress or click. The estimates below are for a typical
+~227-student caseload; your mileage depends on how much outreach you do.
+
+### Filing one Student Note by hand
+
+| Step | ~Time |
+|---|---|
+| Find the student (search box, wait, click the row) | 10–15s |
+| Open their record + wait for Lightning to render | 5–8s |
+| Open the **New Note** panel + wait | 5s |
+| Set **Interaction Format** + **Interaction Type** dropdowns | 6s |
+| Find + type the **Course Code** (per student) | 8–12s |
+| Type the **Subject** | 5s |
+| Pick the **Academic Activities** (multi-select) | 10–15s |
+| Type / paste the **Body** | 10–30s |
+| **Submit**, wait, then close the tab | 8s |
+| **Total** | **~90–150s (~2 min)** |
+
+With the app: press the hotkey (or fire from the viewer) — every field is filled
+from your template, the **course code is auto-detected**, and it submits and
+closes. You wait ~15s. **Net: ~1.5–2 min saved per note.**
+
+### A follow-up email + note
+
+By hand: open Outlook, compose and personalize the email, send, then file the
+note above → **~4–5 min**. With the app: the templated email renders with the
+student's name, course, and the Program Mentor auto-CC'd; you glance at it, it
+sends and logs the note → **~30–45s. ~3–4 min saved.**
+
+### Batch actions — where the hours go
+
+"Welcome the 25 newly-assigned students" by hand means repeating the email+note
+chain 25 times ≈ **~90 min**. The app filters the caseload, shows you the
+recipient list to confirm, and fires all of them in one pass — a few minutes.
+That's **~3 min saved per student**, so **~60–75 min saved on that one run**.
+
+### Caseload triage
+
+Knowing who's stalled, who passed a task, who's low-momentum normally means
+scrolling Salesforce and clicking into records one by one. The viewer shows it
+all at once, and task pass/fail comes from the caseload API in **~0.0s** instead
+of a ~36s scrape. **~10–20 min/day saved** just knowing where to focus.
+
+### Bottom line
+
+For a ~227-student caseload with a normal mix of individual notes and periodic
+batch outreach:
+
+- ~15 individual notes/emails a day × ~2.5 min → **~37 min**
+- batch outreach averaging ~20 students/day × ~3 min → **~60 min**
+- daily caseload triage → **~15 min**
+
+**≈ 1.5–2 hours per day, or roughly 8–10 hours per 5-day work week.**
+Heavy-outreach days (welcome waves, end-of-term reminders) can save 3+ hours on
+their own; quiet days closer to 45 min. Most of what's saved isn't typing — it's
+the **waiting and clicking** Salesforce makes you repeat for every student.
 
 ## Quick start (end users)
 
 ### 1. Download and extract
 
-Download the `CaseloadNotes` zip from
-[Releases](https://github.com/ashejim/caseload-tool/releases) and
-extract it anywhere — your Desktop, Documents, wherever.
+Download `CaseloadNotes-vX.Y.Z.zip` from
+[Releases](https://github.com/ashejim/caseload-tool/releases) and extract it
+anywhere — Desktop, Documents, wherever. You need Microsoft Edge installed
+(default on Windows 10/11).
 
-### 2. First-run setup — Smart App Control
+### 2. First-run — unblock the app
 
-Windows 11 may block the launcher on first run because the build isn't
-signed with a known publisher certificate. The fix is one of:
+Windows 11 may block the launcher on first run because the build isn't signed
+with a known-publisher certificate:
 
-- **Recommended:** Right-click `CaseloadNotes.exe` → **Properties** →
-  check **Unblock** at the bottom of the General tab → click OK. Done.
-- **If that doesn't work:** Open Windows Security → **App & browser
-  control** → **Smart App Control settings** → switch to **Off**.
-  *Note: this is system-wide, not per-app.*
+- **Recommended:** right-click `CaseloadNotes.exe` → **Properties** → check
+  **Unblock** at the bottom of the General tab → **OK**.
+- **If that doesn't work:** Windows Security → **App & browser control** →
+  **Smart App Control settings** → switch **Off** (system-wide).
 
-We're working on a signed build (via SignPath for open-source projects)
-that will remove this step.
+### 3. First-run — sign in
 
-### 3. First-run setup — Caseload URL (only if needed)
-
-The launcher opens to the standard WGU Caseload page by default. Most
-users won't need to do anything here.
-
-If for some reason the launcher lands on the wrong page (e.g., your
-campus uses a different Salesforce instance), create
-`%APPDATA%\caseload-notes\.env` and add:
-
-```
-CASELOAD_URL=https://your-custom.lightning.force.com/lightning/n/Your_Page
-```
-
-Restart the launcher and it'll use the new URL.
-
-### 4. First-run setup — sign in
-
-Double-click `CaseloadNotes.exe`. A Chromium window opens. Sign in to
-Caseload as you normally would (SSO etc.). The session is saved to
-`%APPDATA%\caseload-notes\browser_data\` and reused on every subsequent
-launch — you won't have to sign in again.
+Double-click `CaseloadNotes.exe`. A browser window opens — sign in to Salesforce
+as you normally would (SSO/MFA). The session is saved and reused on every
+subsequent launch, so you won't have to sign in again. The welcome screen lets
+you pick **Simple** or **Advanced** editor mode; you can change it later in
+**⚙ Settings**. No other setup is required — the caseload loads automatically.
 
 ## Daily use
 
-1. **Launch** CaseloadNotes — the window opens, a Chromium window
-   opens, and after a moment the status changes to "Browser ready" and
-   "Hotkeys active".
-2. **Find a student** in the Chromium window using your normal Caseload
-   workflow (the student list table, search, etc.). Click into the
-   student record.
-3. **Open the New Student Note panel** for that student.
-4. **Press the hotkey** for the scenario you want — anywhere on your
-   system:
-   - **F3** → welcome note
-   - **F2** → approval (two notes filed back-to-back)
-   - **F4** → custom note
-5. The script fills the note, submits, closes the tab.
-6. Move on to the next student.
+1. **Launch** CaseloadNotes — after a moment the status reads "Browser ready"
+   and your caseload appears in the viewer.
+2. **File a quick note:** open a student's **New Note** panel in Salesforce (or
+   select the student in the viewer) and **press the action's hotkey**, anywhere
+   on your system.
+3. **Batch:** click a batch action, review the recipient list, and fire — emails,
+   texts, and notes go out for everyone the filter matched.
 
-If the launcher doesn't have keyboard focus, hotkeys still work — they
-are global.
+Bare F-keys (F2–F12) are claimed system-wide while the launcher runs and return
+to normal when you close it. F1 is reserved by the browser. Modifier combos
+(e.g. `Ctrl+Shift+W`) work too.
 
-### Course code
+## Editing and adding actions
 
-The launcher detects the course code from the Caseload table (the
-*Course Code* column on the row for the active student). You don't need
-to type it. If you want to override it (e.g., the student is in
-multiple courses and you want to file against the other), type the code
-into the **Course code** field before pressing the hotkey.
-
-If the table isn't reachable (you navigated directly to a Salesforce
-contact rather than via Caseload), the launcher will ask you to type a
-code.
-
-## Editing notes
-
-Each scenario lives in `%APPDATA%\caseload-notes\notes.yaml`. You can
-edit it in two ways:
-
-### Via the launcher
-
-The right pane of the window shows one tab per scenario. Edit any
-field — Interaction Format, Interaction Type, Academic Activities,
-Body, Submit toggle, Hotkey — and click **Save changes**. The launcher
-re-registers hotkeys immediately; no restart needed.
-
-Click "Hide editor" to collapse the right pane when you don't need it.
-Each Note section can also be collapsed with the ▼/▶ button.
-
-### Direct YAML edit
-
-If you prefer, open `notes.yaml` in any text editor. The format is
-straightforward:
-
-```yaml
-scenarios:
-  welcome:
-    hotkey: F3
-    close_tab_after: true
-    notes:
-      - interaction_type: Email to Student
-        body: general welcome email sent
-        academic_activities: []
-        submit: true
-```
-
-After editing the file directly, click **Revert** in the launcher to
-reload, or restart the app.
-
-## Adding new scenarios
-
-To add a fourth scenario (e.g., for a different course or a follow-up
-note), copy the `custom` block in `notes.yaml`, rename it, set a unique
-hotkey, and edit the body. The launcher picks it up on next save/revert
-or restart.
-
-## Hotkey notes
-
-- **Bare F-keys (F3, F2, F4...)** are claimed system-wide while the
-  launcher is running. They won't trigger their normal browser/app
-  behavior. When you close the launcher, they return to normal.
-- **F1** is reserved by Chromium for Help and can't be reliably
-  reclaimed by this app — pick F2–F12 or a modifier combo.
-- **Modifier combos** like `Ctrl+Shift+1` or `Ctrl+Alt+W` work too. Set
-  them in the editor's Hotkey field.
+Your actions live in `%APPDATA%\caseload-notes\scenarios.yaml`. Edit them in the
+app via **✎ Edit actions** (one tab per action — set the note fields, email,
+text, batch filters, and hotkey, then **Save**) or directly in the YAML file. A
+fresh install ships a small set of **Sample** actions marked *edit or delete me*
+to start from.
 
 ## Known issues
 
-- **Smart App Control blocks the .exe** on first run — see Quick Start
-  step 2. Will be resolved once the project is signed.
-- **F1 hotkey** is unreliable due to Chromium's built-in help binding.
-- **Comments in notes.yaml are lost** when you save via the launcher.
-  Edit directly in a text editor if you need them.
-- **Multi-tab DOM**: if you have many open Salesforce app tabs, the
-  launcher targets the visible note panel. Don't have a stale note
-  panel open in the background while filling — close those first.
-- **Links stuck at about:blank**: on a fresh launch, clicking a link
-  that opens in a new tab may hang at `about:blank` with a spinning
-  icon and never load. **Workaround:** middle-click the link, or
-  right-click → **Open link in new tab** — both bypass the page's JS
-  handler and use the link's URL directly. Once you've used the
-  launcher's **Find student** once in a session, normal clicks also
-  start working for the rest of that session.
+- **Smart App Control blocks the .exe** on first run — see Quick start step 2.
+  Will be resolved once the project is code-signed.
+- **First action of a session is slower** while Salesforce Lightning warms up;
+  the rest are fast.
+- **Comments in scenarios.yaml are lost** when you save via the app — edit the
+  file directly if you need them.
+- **Links stuck at about:blank** on a fresh launch: middle-click or right-click →
+  **Open link in new tab** to bypass. Clears after the first driven action.
 
 ## Developer setup
-
-Clone the repo, then:
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 playwright install chromium
-```
-
-Run from source:
-
-```powershell
 python -m scripts.launcher
 ```
 
-Or the CLI (one scenario per run):
+**Fresh-install demo** — run the brand-new-user experience in an isolated
+sandbox (its own config/login, no global hotkeys) alongside your real instance:
 
 ```powershell
-python -m scripts.fill_note --scenario approval
+fresh_demo.bat            # or: python -m scripts.fresh_demo
+fresh_demo.bat --reset    # wipe back to a clean first-run
 ```
 
-## Building a distributable .exe
-
-Two paths, both produce a one-folder distribution with bundled Chromium.
-
-**PyInstaller** (fast build, may be blocked by SAC):
+## Building a distributable
 
 ```powershell
-python build.py
+python build.py           # PyInstaller → dist\CaseloadNotes\ + CaseloadNotes-vX.Y.Z.zip
+python build_nuitka.py    # Nuitka (slower build, less SAC-flagged)
 ```
 
-Output at `dist\CaseloadNotes\`.
-
-**Nuitka** (slow build, less likely flagged by SAC):
-
-```powershell
-python build_nuitka.py
-```
-
-Output at `dist-nuitka\CaseloadNotes\`. First run downloads MinGW64 if
-no C compiler is found.
-
-In both cases: zip the output folder and share.
+Zip the output folder (build.py does this for you) and upload it to Releases.
 
 ## License
 

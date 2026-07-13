@@ -1,44 +1,59 @@
-# Caseload Note Automation
+# CaseloadNotes — Project Brief
+
+## What it is
+
+A Windows desktop tool that automates the repetitive Salesforce / Outlook /
+Mongoose work of running a WGU course caseload. It drives the user's own browser
+session with Playwright, so it needs **no Salesforce admin permissions** — it
+does exactly what the instructor could do by hand, just instantly and in bulk.
+
+Originally a hotkey that filled one repetitive note; now a full caseload
+cockpit: a searchable/filterable student viewer with live task pass/fail and
+Momentum, reusable single/panel/batch **actions** that send Outlook emails,
+Mongoose texts, and/or file notes, off-caseload student handling, per-course
+success paths, and more.
 
 ## Goal
-Automate entering repetitive notes into WGU's Caseload (a Salesforce-based
-interface) using Playwright with Python. No admin permissions available in
-Salesforce — automation must run client-side as the user.
 
-## Current scope (Phase 1)
-Script that, given a student identifier, navigates to their record in
-Caseload and enters two standard notes (one "to" and one "from") documenting
-that an approval form was signed and returned via email.
+Give a course instructor back the hours currently lost to Salesforce Lightning's
+slowness and the same fields re-entered for every student — while keeping every
+action reviewable and running safely under the instructor's own login.
 
-## Future scope (Phase 2+)
-Scale up to a full pipeline:
-- Detect approval-form emails in Outlook (via Microsoft Graph or pywin32)
-- Open form for human review
-- Attach signature image if prompted
-- Email signed form back to student
-- Log notes in Caseload (Phase 1 piece)
+## Why it matters — the time it saves
 
-## Technical decisions made
-- **Playwright over Selenium**: better auto-waiting, modern API
-- **Python**: standard ecosystem, good Outlook/PDF libraries for Phase 2
-- **Persistent browser context**: log into Salesforce/SSO once, reuse session
-- **Selector strategy**: prioritize role/label-based selectors
-  (get_by_role, get_by_label), then stable data-* attributes. Avoid
-  auto-generated Lightning IDs and long XPath chains.
-- **Centralized selectors**: all selectors in one file for easy maintenance
-- **Defensive patterns**: assert student identity before writing notes,
-  verify note appears after save, screenshot on failure, explicit timeouts
+The value is not "typing faster." It's removing the **find → click → wait →
+re-enter** loop that Salesforce forces for every single student. Filing one note
+by hand is ~2 minutes: find the student (~10–15s), open the record and wait for
+Lightning (~5–8s), open the note panel (~5s), set two dropdowns (~6s), find and
+type the **course code** (~8–12s), type a subject (~5s), pick academic
+activities (~10–15s), type the body (~10–30s), submit and close (~8s). The app
+does all of it from a template — course code auto-detected — in ~15s of waiting.
 
-## What I still need to provide
-- URL pattern for student pages in Caseload
-- How students are searched/found (search box, ID paste, etc.)
-- Note entry form structure (single textarea? note type dropdown?
-  separate "to"/"from" fields?)
-- Exact text of the two standard notes
-- A signature image file (for Phase 2)
+Multiplied across a normal day on a ~227-student caseload (individual notes and
+emails, periodic batch outreach, daily triage), that is **≈ 1.5–2 hours saved
+per day — roughly 8–10 hours per 5-day work week**. Batch actions dominate: a
+"welcome the 25 new students" run that is ~90 minutes by hand collapses to a few
+reviewed minutes. See the README's *What it saves you* section for the full
+step-by-step justification.
 
-## Background context
-- I'm a Senior Course Faculty at WGU's IT College
-- Currently using Pulover's macro creator, which breaks on Salesforce
-  slowness and minor UI changes
-- Want open-source tooling, runs locally, no admin permissions needed
+## Design decisions
+
+- **Playwright over Selenium** — better auto-waiting, modern API.
+- **Client-side, own login** — a persistent browser context; sign in to
+  Salesforce/SSO once, reuse the session. No admin API access needed.
+- **Caseload from the grid API** — the caseload loads from Salesforce's
+  `getCaseLoadMainGridData` Aura response (pass/fail, contact ids, momentum) with
+  a CSV export as fallback, so no special list-view column setup is required.
+- **Reviewable + safe** — batch actions preview the recipient list before
+  sending; notes can be filled-for-review (Submit off); local student data (note
+  log, history, caseload) is encrypted at rest.
+- **Progressive disclosure** — Simple/Advanced modes, curated default columns,
+  and a small labeled sample action set, so new users aren't overwhelmed while
+  power users keep everything.
+
+## Background
+
+The author is Senior Course Faculty in WGU's IT College. The project replaced
+Pulover's macro creator, which broke on Salesforce slowness and minor UI
+changes. It ships as an open-source, locally-run tool that needs no admin
+permissions — distributed as a zipped Windows build via GitHub Releases.
