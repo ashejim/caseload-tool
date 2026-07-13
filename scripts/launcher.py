@@ -470,6 +470,13 @@ class BrowserWorker:
         off-caseload search picker. on_done({ok, contact_id, name} | {error})."""
         self.q.put(("OPEN_CONTACT_ID", contact_id, name, on_done))
 
+    def submit_enrich_offcaseload(self, contact_id: str, name: str,
+                                  on_done: Callable[[dict], None]) -> None:
+        """On-demand full scrape (fields + active ACI) of an already-open
+        off-caseload record — the deferred 'Get info' step. Slow but reliable
+        (the record is warm). on_done({ok, contact_id, name, profile} | {error})."""
+        self.q.put(("ENRICH_OFFCASELOAD", contact_id, name, on_done))
+
     def submit_find_student(self, query: str, new_tab: bool = False,
                             raise_after: Optional[bool] = None) -> None:
         """Navigate to a student record. When `new_tab` is True the
@@ -903,21 +910,35 @@ class BrowserWorker:
             finally:
                 on_done(res)
         elif cmd[0] == "OPEN_CONTACT_ID":
+            # Open ONLY — navigate to the record (so a quick note can file) but
+            # DON'T scrape the profile/ACI here: that round-trip (fields +
+            # related-list reload) is slow and races the cold record load, so it
+            # came back empty on a first open. The viewer shows minimal info
+            # instantly; the full scrape runs on demand via ENRICH_OFFCASELOAD.
             _, cid, name, on_done = cmd
             res = {}
             try:
                 ok = self._navigate_to_contact(ctx, cid)
                 if ok:
-                    profile = {"aci": []}
-                    try:
-                        profile = self._scrape_offcaseload_profile(
-                            ctx, cid, name)
-                    except Exception:
-                        profile = {"aci": []}
                     res = {"ok": True, "contact_id": cid, "name": name,
-                           "profile": profile}
+                           "profile": {"aci": []}}
                 else:
                     res = {"error": f"couldn't open {name or cid}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "ENRICH_OFFCASELOAD":
+            # On-demand full scrape (fields + active ACI) of an already-open
+            # off-caseload record — the deferred "Get info" step. The record is
+            # warm by now, and we re-navigate first to be sure it's on /view.
+            _, cid, name, on_done = cmd
+            res = {}
+            try:
+                self._navigate_to_contact(ctx, cid)
+                profile = self._scrape_offcaseload_profile(ctx, cid, name)
+                res = {"ok": True, "contact_id": cid, "name": name,
+                       "profile": profile}
+            except Exception as e:
+                res = {"error": f"couldn't read info for {name or cid}: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "FIND":
@@ -1862,6 +1883,59 @@ class BrowserWorker:
                             "active": active})
         return out
 
+    def _read_oc_aci_stable(self, target) -> list:
+        """Reveal the CourseMentorStudentAssignments related list and read its
+        rows, polling until the parsed ACI records are non-empty AND repeat on
+        the next read (or a timeout is hit). Lightning lazy-renders the rows, so
+        a single read can catch a half-rendered (or, right after a record
+        switch, the PREVIOUS student's) grid — requiring a stable non-empty read
+        guards against attributing a stale ACI. Returns [] if the student
+        genuinely has no assignment (never a carry-over)."""
+        prev = None
+        last: list = []
+        for _ in range(12):                    # ~ up to 12 × 700ms
+            for needle in ("Course Mentor Student Assignments", "Course Mentor"):
+                try:
+                    if target.evaluate(self._OC_REVEAL_JS, needle):
+                        break
+                except Exception:
+                    pass
+            try:
+                tables = target.evaluate(self._OC_TABLES_JS)
+            except Exception:
+                tables = []
+            aci = self._parse_oc_aci(tables)
+            if aci:
+                last = aci
+            sig = tuple(sorted((a["course"], a["mentor"], a["active"])
+                               for a in aci))
+            if aci and sig == prev:             # same non-empty read twice
+                return aci
+            prev = sig
+            target.wait_for_timeout(700)
+        return last
+
+    def _read_oc_fields_stable(self, target) -> dict:
+        """Poll the Contact 'Student Profile' fields until they actually paint.
+        The note panel can be ready before the details render, so an early read
+        is empty — accept the first read that yields a real identifying value,
+        else return the best (most-populated) partial read."""
+        best, best_n = {}, -1
+        for _ in range(12):                       # ~ up to 12 × 500ms
+            try:
+                data = target.evaluate(self._OC_PROBE_JS)
+                fields = self._parse_oc_fields(data.get("snippets", []))
+            except Exception:
+                fields = {}
+            if any(fields.get(k) for k in
+                   ("student_id", "wgu_email", "mentor", "mobile")):
+                return fields
+            n = sum(1 for v in fields.values() if v)
+            if n > best_n:
+                best, best_n = fields, n
+            target.wait_for_timeout(500)
+        return best
+
     def _scrape_offcaseload_profile(self, ctx, contact_id: str,
                                     name: str = "") -> dict:
         """Scrape an off-caseload student's mini-profile: Contact-page fields
@@ -1873,13 +1947,10 @@ class BrowserWorker:
         target = self._active_page(ctx)
         if target is None:
             return {"aci": []}
-        fields: dict = {}
-        try:
-            target.wait_for_timeout(400)  # let the profile paint
-            data = target.evaluate(self._OC_PROBE_JS)
-            fields = self._parse_oc_fields(data.get("snippets", []))
-        except Exception:
-            fields = {}
+        # The note panel can be ready a beat BEFORE the 'Student Profile'
+        # details paint (separate Lightning components), so a single early read
+        # comes back empty — poll until the fields actually appear.
+        fields = self._read_oc_fields_stable(target)
         aci: list = []
         try:
             from urllib.parse import urlsplit
@@ -1889,13 +1960,18 @@ class BrowserWorker:
                    "related/CourseMentorStudentAssignments__r/view")
             self.on_status("  reading the assigned course instructor (ACI)…")
             target.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            target.wait_for_timeout(2500)
-            for needle in ("Course Mentor Student Assignments", "Course Mentor"):
-                if target.evaluate(self._OC_REVEAL_JS, needle):
-                    target.wait_for_timeout(2000)   # lazy-render the rows
-                    break
-            tables = target.evaluate(self._OC_TABLES_JS)
-            aci = self._parse_oc_aci(tables)
+            # Lightning is a client-side SPA: navigating between records keeps
+            # the PREVIOUS record's related-list rows in the DOM until the new
+            # ones render, so a raced scrape can read the prior student's ACI
+            # (or an empty list on a cold open). Force a hard reload so the only
+            # rows that can render belong to THIS contact, then wait for a stable
+            # non-empty read before trusting it.
+            try:
+                target.reload(wait_until="domcontentloaded", timeout=30_000)
+            except Exception:
+                pass
+            target.wait_for_timeout(1500)
+            aci = self._read_oc_aci_stable(target)
         except Exception:
             aci = []
         # Return to the Contact view so the note panel is ready for a quick note.
@@ -14659,6 +14735,20 @@ class CaseloadPanel:
     def show_quick_view(self, row: dict) -> None:
         """Fill the quick-view box from a cached CSV row — instant, no
         Salesforce. Rebuilds the body each highlight (simple + correct)."""
+        # Off-caseload match rows carry only Name + Contact id — render them in
+        # the dedicated off-caseload view so SELECTING one (not just opening it)
+        # is consistent: show the full profile from the session cache if we
+        # scraped it earlier, else the minimal view + the ‘Get info’ button.
+        # This is what makes moving away and back NOT need a re-scrape.
+        if row and row.get("_offcaseload"):
+            cid = str(row.get("Contact id") or "").strip()
+            nm = str(row.get("Name") or "").strip()
+            cached = (self.app._oc_profile_cache.get(cid) if cid else None)
+            if cached is not None:
+                self.show_offcaseload_quick_view(cid, nm, cached, enriched=True)
+            else:
+                self.show_offcaseload_quick_view(cid, nm, {}, enriched=False)
+            return
         self._qv_row = row   # remembered for the notes course-code filter
         for w in self.qv_body.winfo_children():
             w.destroy()
@@ -16640,6 +16730,14 @@ class CaseloadPanel:
         self._show_offcaseload_banner()
         self.populate()
         self._refresh_view_menu()
+        if len(rows) == 1:
+            # Exactly one hit → open it straight away so the profile + ‘Get
+            # info’ button (or cached info) appear without a second click.
+            self.app._append_log(
+                "🔎 Off-caseload: 1 match"
+                + (f" for {query!r}" if query else "") + " — opening…")
+            self.app._open_contact_id(rows[0]["Contact id"], rows[0]["Name"])
+            return
         self.app._append_log(
             f"🔎 Off-caseload: {len(rows)} match(es)"
             + (f" for {query!r}" if query else "")
@@ -16665,11 +16763,15 @@ class CaseloadPanel:
             pass
 
     def show_offcaseload_quick_view(self, contact_id: str, name: str,
-                                    profile: dict) -> None:
+                                    profile: dict, enriched: bool = True) -> None:
         """Render an off-caseload student's scraped mini-profile into the quick
         view: student contact info + PM (Mentor) + the ACTIVE ACI (prominent).
         Sets _qv_row so ＋ Note / Ctrl+Shift+N file for them. No Essential
-        Actions / task grid / Success Path — those are caseload-scoped."""
+        Actions / task grid / Success Path — those are caseload-scoped.
+
+        `enriched` False means only the id/name are known (the fast open path);
+        the profile + ACI are fetched on demand via the ‘Get info’ button, and
+        firing an email meanwhile warns that the ACI won't be CC'd."""
         profile = profile or {}
         all_aci = profile.get("aci") or []
         active = [a for a in all_aci if a.get("active")]
@@ -16688,8 +16790,10 @@ class CaseloadPanel:
             "Mentor": profile.get("mentor", ""),
             "MentorEmail": profile.get("mentor_email", ""),
             "_offcaseload": True,
+            "_oc_enriched": bool(enriched),
         }
         self._qv_offcaseload_profile = dict(profile)
+        self._qv_offcaseload_enriched = bool(enriched)
         # This student isn't on the caseload — clear the caseload-only panels.
         for w in self.qv_body.winfo_children():
             w.destroy()
@@ -16714,6 +16818,37 @@ class CaseloadPanel:
         ).grid(row=r, column=0, columnspan=2, sticky="w", padx=(0, 6),
                pady=(0, 4))
         r += 1
+
+        # Deferred-fetch state: until the user clicks ‘Get info’, only the
+        # id/name are known. Offer the button + flag the missing profile so it's
+        # obvious nothing (incl. the ACI CC) is loaded yet.
+        self._qv_getinfo_btn = None
+        if not enriched:
+            btnrow = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+            btnrow.grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 6))
+            self._qv_getinfo_btn = ctk.CTkButton(
+                btnrow, text="⤓ Get info + ACI", height=28, width=140,
+                command=self.app._enrich_offcaseload_open)
+            self._qv_getinfo_btn.grid(row=0, column=0, sticky="w")
+            ctk.CTkLabel(
+                btnrow, text="  info not fetched yet",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=("#b06a00", "#e0a030"),
+            ).grid(row=0, column=1, sticky="w")
+            r += 1
+        else:
+            # Enriched (fresh scrape or session cache) — a small refresh in case
+            # the ACI/PM changed mid-session.
+            refrow = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+            refrow.grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            self._qv_getinfo_btn = ctk.CTkButton(
+                refrow, text="↻ Refresh", height=24, width=90,
+                font=ctk.CTkFont(size=11),
+                fg_color=("gray70", "gray30"),
+                hover_color=("gray60", "gray40"),
+                command=self.app._enrich_offcaseload_open)
+            self._qv_getinfo_btn.grid(row=0, column=0, sticky="w")
+            r += 1
 
         wrap = 300 if not getattr(self, "_narrow", False) else 180
 
@@ -16747,7 +16882,7 @@ class CaseloadPanel:
         r = line(r, "PM (Mentor)", profile.get("mentor", ""))
         r = line(r, "PM email", profile.get("mentor_email", ""), copy=True)
         # ACI — the assigned course instructor(s), prominent.
-        r = self._oc_aci_block(r, active)
+        r = self._oc_aci_block(r, active, enriched)
         r = line(r, "Program", profile.get("program", "")
                  or profile.get("degree_program", ""))
         r = line(r, "Term #", profile.get("term_number", ""))
@@ -16764,17 +16899,20 @@ class CaseloadPanel:
         except Exception:
             pass
 
-    def _oc_aci_block(self, r: int, active: list) -> int:
+    def _oc_aci_block(self, r: int, active: list, enriched: bool = True) -> int:
         """Render the active ACI (assigned course instructor) as a highlighted
-        course→mentor block. If none was found, show '(not found)'."""
+        course→mentor block. If none was found, show '(not found)' — or, when
+        the profile hasn't been fetched yet, a 'not fetched' hint."""
         ctk.CTkLabel(
             self.qv_body, text="ACI:", anchor="nw",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=("gray35", "gray70"), width=90,
         ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
         if not active:
+            msg = ("(not found)" if enriched
+                   else "⤓ not fetched — click ‘Get info’")
             ctk.CTkLabel(
-                self.qv_body, text="(not found)", anchor="w",
+                self.qv_body, text=msg, anchor="w",
                 font=ctk.CTkFont(size=12), text_color=("gray45", "gray60"),
             ).grid(row=r, column=1, sticky="w", pady=1)
             return r + 1
@@ -16790,6 +16928,24 @@ class CaseloadPanel:
             ).grid(row=k, column=0, sticky="ew", padx=8,
                    pady=(4 if k == 0 else 0, 4))
         return r + 1
+
+    def set_offcaseload_enriching(self, on: bool) -> None:
+        """Reflect the in-flight 'Get info' fetch on its button (disabled +
+        spinner text while the scrape runs)."""
+        btn = getattr(self, "_qv_getinfo_btn", None)
+        if btn is None:
+            return
+        try:
+            if on:
+                self._qv_getinfo_btn_label = btn.cget("text")
+                btn.configure(text="⏳ Loading…", state="disabled")
+            else:
+                btn.configure(
+                    text=getattr(self, "_qv_getinfo_btn_label",
+                                 "⤓ Get info + ACI"),
+                    state="normal")
+        except Exception:
+            pass
 
     def _save_view_dialog(self) -> None:
         from tkinter import simpledialog
@@ -17377,7 +17533,17 @@ class CaseloadPanel:
         if row and row.get("_offcaseload"):
             cid = str(row.get("Contact id") or "").strip()
             if cid:
-                self.app._open_contact_id(cid, str(row.get("Name") or ""))
+                # Enter on the student who's ALREADY open (but not yet enriched)
+                # runs the deferred 'Get info' fetch — so Enter both opens and,
+                # pressed again, loads the profile + ACI. Otherwise open it
+                # (fast, minimal).
+                cur = getattr(self, "_qv_row", None) or {}
+                if (cur.get("_offcaseload")
+                        and str(cur.get("Contact id") or "") == cid
+                        and not cur.get("_oc_enriched")):
+                    self.app._enrich_offcaseload_open()
+                else:
+                    self.app._open_contact_id(cid, str(row.get("Name") or ""))
             return "break"
         if query:
             if getattr(self, "_archived_mode", False) or (row and row.get("_archived")):
@@ -18874,6 +19040,13 @@ class App:
         # searches Mongoose by this (unique, works for blank-mobile students);
         # loaded from SQLite at startup and refreshed when an export is found.
         self._contact_ids: dict[str, str] = {}
+        # Session cache of ENRICHED off-caseload profiles, keyed by Contact id.
+        # Filled when 'Get info' scrapes a student; lets a re-open (or switching
+        # back after moving off) show the full profile + ACI instantly, with no
+        # re-scrape. In-memory only (never written to disk) so no extra student
+        # PII at rest and no cross-day staleness — cleared on app restart. A ↻
+        # Refresh button re-scrapes when something changed mid-session.
+        self._oc_profile_cache: dict[str, dict] = {}
         # Texting opt-in truth, from the Mongoose segment export(s): only truly
         # opted-in contacts sync to Mongoose, so membership here is the reliable
         # signal (Salesforce's TextingPreference field is stale/wrong). _sids =
@@ -22067,18 +22240,34 @@ class App:
         def on_done(res):
             def show():
                 if res and res.get("ok"):
-                    self._append_log(
-                        f"Opened {res.get('name') or name} (off-caseload) — "
-                        "profile loaded; ＋ Note / Ctrl+Shift+N files a note.",
-                        success=True)
                     panel = getattr(self, "caseload_panel", None)
-                    if panel is not None:
-                        try:
-                            panel.show_offcaseload_quick_view(
-                                contact_id, res.get("name") or name,
-                                res.get("profile") or {})
-                        except Exception:
-                            pass
+                    cached = self._oc_profile_cache.get(contact_id)
+                    if cached is not None:
+                        # Enriched earlier this session → show it all instantly.
+                        self._append_log(
+                            f"Opened {res.get('name') or name} (off-caseload) — "
+                            "info from this session (↻ Refresh to re-read).",
+                            success=True)
+                        if panel is not None:
+                            try:
+                                panel.show_offcaseload_quick_view(
+                                    contact_id, res.get("name") or name,
+                                    cached, enriched=True)
+                            except Exception:
+                                pass
+                    else:
+                        self._append_log(
+                            f"Opened {res.get('name') or name} (off-caseload) — "
+                            "click ‘⤓ Get info + ACI’ (or press Enter on the "
+                            "student) to load the profile + ACI; ＋ Note files "
+                            "a note.", success=True)
+                        if panel is not None:
+                            try:
+                                panel.show_offcaseload_quick_view(
+                                    contact_id, res.get("name") or name,
+                                    res.get("profile") or {}, enriched=False)
+                            except Exception:
+                                pass
                 else:
                     self._append_log(
                         f"Couldn't open the record: "
@@ -22089,6 +22278,62 @@ class App:
                 show()
 
         self.worker.submit_open_contact_id(contact_id, name, on_done)
+
+    def _enrich_offcaseload_open(self) -> None:
+        """Fetch the full profile + active ACI for the off-caseload student
+        currently open in the viewer — the deferred 'Get info' step (the scrape
+        is slow + races a cold open, so it's on demand). Updates the viewer in
+        place when done."""
+        if self._is_busy:
+            self._append_log("Busy — finish the current task first.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        panel = getattr(self, "caseload_panel", None)
+        qv = getattr(panel, "_qv_row", None) or {}
+        if not qv.get("_offcaseload"):
+            self._append_log("Get info: open an off-caseload student first.")
+            return
+        cid = str(qv.get("Contact id") or "").strip()
+        name = str(qv.get("Name") or "").strip()
+        if not cid:
+            self._append_log("Get info: no Contact id for this student.")
+            return
+        self._append_log(f"Fetching info + ACI for {name or cid}… (a few sec)")
+        try:
+            panel.set_offcaseload_enriching(True)
+        except Exception:
+            pass
+
+        def on_done(res):
+            def show():
+                try:
+                    panel.set_offcaseload_enriching(False)
+                except Exception:
+                    pass
+                if res and res.get("ok"):
+                    prof = res.get("profile") or {}
+                    self._oc_profile_cache[cid] = prof   # session cache
+                    try:
+                        panel.show_offcaseload_quick_view(
+                            cid, res.get("name") or name, prof, enriched=True)
+                    except Exception:
+                        pass
+                    self._append_log(
+                        f"✓ Info + ACI loaded for {res.get('name') or name}.",
+                        success=True)
+                else:
+                    self._append_log(
+                        f"Couldn't load info: "
+                        f"{(res or {}).get('error', 'unknown error')}",
+                        error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_enrich_offcaseload(cid, name, on_done)
 
     def _pick_offcaseload_match(self, query: str, matches: list) -> None:
         """A name can match several people in Salesforce — show a picker so the
@@ -22218,9 +22463,32 @@ class App:
         def on_done(res):
             def show():
                 if res and res.get("ok"):
-                    self._append_log(
-                        f"Opened {res.get('name') or query} (off-caseload) — "
-                        "fire a Find-first-off note action to file a note.")
+                    panel = getattr(self, "caseload_panel", None)
+                    cid = str(res.get("contact_id") or "").strip()
+                    cached = self._oc_profile_cache.get(cid) if cid else None
+                    if cached is not None:
+                        self._append_log(
+                            f"Opened {res.get('name') or query} (off-caseload) "
+                            "— info from this session (↻ Refresh to re-read).")
+                        if panel is not None:
+                            try:
+                                panel.show_offcaseload_quick_view(
+                                    cid, res.get("name") or query, cached,
+                                    enriched=True)
+                            except Exception:
+                                pass
+                    else:
+                        self._append_log(
+                            f"Opened {res.get('name') or query} (off-caseload) "
+                            "— click ‘⤓ Get info + ACI’ (or press Enter on the "
+                            "student) to load the profile + ACI; then fire.")
+                        if panel is not None and cid:
+                            try:
+                                panel.show_offcaseload_quick_view(
+                                    cid, res.get("name") or query, {},
+                                    enriched=False)
+                            except Exception:
+                                pass
                 elif res and res.get("matches"):
                     ms = res["matches"]
                     # Show the matches IN the caseload viewer (an "Off-caseload"
@@ -22998,6 +23266,26 @@ class App:
             user_info = outlook_email.get_user_info()
             who = (chosen_name or student_ctx.get("full_name", "")
                    or "this student")
+
+            # Off-caseload without the deferred 'Get info' fetch → we have no
+            # ACI (or PM/course) to attach. Warn LOUDLY rather than silently
+            # sending an email with no ACI CC'd.
+            if (student_ctx.get("_offcaseload")
+                    and not student_ctx.get("_enriched")
+                    and getattr(self.settings, "cc_aci_offcaseload", True)):
+                if not ask_yes_no_topmost(
+                    self.root, "No ACI fetched",
+                    f"You haven't fetched {who}'s info yet, so the ACI (assigned "
+                    "course instructor) will NOT be CC'd on this email.\n\n"
+                    "To CC the ACI: Cancel, click ‘⤓ Get info + ACI’ in the "
+                    "viewer, wait for it to load, then fire again.\n\n"
+                    "Send now without the ACI?",
+                    yes_label="Send without ACI", no_label="Cancel",
+                ):
+                    self._append_log(
+                        "Fire cancelled — click ‘⤓ Get info + ACI’ in the "
+                        "viewer, then fire again to CC the ACI.")
+                    return
 
             # Off-caseload: loop in the ACI + PM by CC (on by default, settable).
             # The PM email is scraped; the ACI email comes from the local
@@ -26512,6 +26800,7 @@ class App:
             "mobile": prof.get("mobile", ""),
             "timezone": prof.get("timezone", ""),
             "_offcaseload": True,
+            "_enriched": bool(qv.get("_oc_enriched")),
         }
 
     def _offcaseload_cc(self, student_ctx: Optional[dict]) -> str:
