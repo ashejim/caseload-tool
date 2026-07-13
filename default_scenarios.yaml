@@ -1,160 +1,127 @@
+# Starter actions for a new install. These are SAMPLES — edit them to make
+# them yours, or delete the ones you don't need. Each one files a Salesforce
+# note (what the caseload is all about); some also send an email or a text.
+# Batch samples ship with preview ON, so nothing sends until you review it.
 scenarios:
-  approval:
-    hotkey: F2
-    close_tab_after: true
+
+  # SINGLE-FIRE: press F3 with a student's note panel open in Salesforce to
+  # fill a note. submit is OFF, so it fills the form for you to review and
+  # submit — a safe way to try it (Salesforce notes can't be deleted).
+  Sample - quick note:
+    hotkey: F3
+    close_tab_after: false
     find_first: false
+    panel_action: true
     notes:
-    - interaction_format: Single Interaction
-      interaction_type: Email from Student
-      body: Task 1 approval sent for review
-      academic_activities:
-      - Course/Program Information Discussed
-      - Course/Program Information Requested
-      submit: true
-      append_clipboard: false
-      enter_additional_text: false
     - interaction_format: Single Interaction
       interaction_type: Email to Student
-      body: Task 1 approval form approved and emailed. Task 2 info sent.
+      body: Reached out to the student about their progress.
       academic_activities: []
-      submit: true
-      append_clipboard: false
-      enter_additional_text: false
-  flup email:
-    hotkey: Ctrl+Shift+S
-    close_tab_after: true
-    find_first: false
-    notes:
-    - interaction_format: Single Interaction
-      interaction_type: Email from Student
-      body: 'em exchange with st: '
-      academic_activities:
-      - Course/Program Information Discussed
-      - Course/Program Information Requested
-      submit: true
-      append_clipboard: true
-      enter_additional_text: true
-    - interaction_format: Single Interaction
-      interaction_type: Email to Student
-      body: 'em exchange with st: '
-      academic_activities: []
-      submit: true
-      append_clipboard: false
-      enter_additional_text: false
-  followup to call:
-    hotkey: F5
-    close_tab_after: true
-    find_first: true
-    notes:
-    - interaction_format: Single Interaction
-      interaction_type: Live Call
-      body: Followup call completed.
-      academic_activities:
-      - Course/Program Information Discussed
-      - Course/Program Information Requested
       submit: false
       append_clipboard: false
       enter_additional_text: false
+
+  # CASELOAD-PANEL: pick a student in the viewer, then fire this to send a
+  # follow-up email AND log a note in one step.
+  Sample - follow-up email:
+    hotkey: ''
+    close_tab_after: false
+    find_first: false
+    panel_action: true
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: Sent a follow-up email to the student.
+      academic_activities: []
+      submit: true
+      append_clipboard: false
+      enter_additional_text: false
     email:
-      subject: Following up on our call, {{first_name}}
+      subject: Following up, {{first_name}}
       body_html_file: sample_followup.html
       to: ''
       signature_file: ''
       inline_images: []
       cc_pm: false
-  welcome-C769:
+
+  # BATCH (note + email + text): emails AND texts every student the filter
+  # matches, and logs a note for each. Edit YOUR_COURSE to your course code.
+  # Preview is ON — you review the recipient list before anything sends.
+  Sample - welcome (batch):
     hotkey: ''
-    close_tab_after: true
+    close_tab_after: false
     find_first: false
     notes:
     - interaction_format: Single Interaction
       interaction_type: Email to Student
-      body: 'welcome em with Task 1 guidance sent. '
+      body: Sent a welcome email and text to the newly assigned student.
       academic_activities: []
       submit: true
       append_clipboard: false
       enter_additional_text: false
     email:
-      subject: Welcome C769 email from your course faculty
-      body_html_file: C769-welcome.html
+      subject: Welcome to {{course_code}}, {{first_name}}!
+      body_html_file: sample_welcome.html
       to: ''
-      signature_file: WGU (your.email@wgu.edu)
-      inline_images:
-      - image001.png
-      cc_pm: true
-    batch:
-      filters:
-      - column: Last Assigned CI Contact
-        op: is empty
-        value: ''
-      - column: Course Code
-        op: is
-        value: C769
-      preview: true
-  outreach-C769:
-    hotkey: ''
-    close_tab_after: true
-    find_first: false
-    notes:
-    - interaction_format: Single Interaction
-      interaction_type: Email from Student
-      body: testing outreach batch. Ill bet out
-      academic_activities: []
-      submit: false
-      append_clipboard: false
-      enter_additional_text: false
-    email:
-      subject: ''
-      body_html_file: welcome-C769-2.html
-      to: your.email@wgu.edu
       signature_file: ''
       inline_images: []
       cc_pm: false
-      font_size: 12
+    text:
+      body: Hi {{first_name}}! This is {{user_name}}, your {{course_code}} instructor.
+        Welcome aboard — reply any time if you have questions.
+      body_file: ''
+      schedule: true
+      window_start_hour: 10
+      window_end_hour: 16
+      inbox_label: ''
+      commit: false
     batch:
       filters:
       - column: Course Code
         op: is
-        value: C769
+        value: YOUR_COURSE
+      - column: Last Assigned CI Contact
+        op: is empty
+        value: ''
       preview: true
-  new_task1_policy-batch:
+
+  # BATCH (note + email, no text): congratulate students who passed Task 1.
+  # Edit YOUR_COURSE and the filter to match how your course marks Task 1.
+  # Preview is ON.
+  Sample - Task 1 passed (batch):
     hotkey: ''
-    close_tab_after: true
+    close_tab_after: false
     find_first: false
     notes:
     - interaction_format: Single Interaction
       interaction_type: Email to Student
-      body: outreach email. with new Task 1 policy
+      body: Congratulated the student on passing Task 1.
       academic_activities: []
       submit: true
       append_clipboard: false
       enter_additional_text: false
     email:
-      subject: New D502 Task 1 approval form policy
-      body_html_file: task 1 D502 policy.html
+      subject: Nice work on Task 1, {{first_name}}!
+      body_html_file: sample_task1_passed.html
       to: ''
-      signature_file: WGU (your.email@wgu.edu)
+      signature_file: ''
       inline_images: []
-      cc_pm: true
+      cc_pm: false
     batch:
       filters:
       - column: Course Code
         op: is
-        value: D502
-      - column: Task1
-        op: is empty
-        value: ''
+        value: YOUR_COURSE
       preview: true
+
 groups:
-- name: basic
-  color: '#239a8e'
+- name: Sample single actions (edit or delete me)
+  color: '#2f75c9'
   scenarios:
-  - approval
-  - flup email
-  - followup to call
-- name: C769 Batch Actions
-  color: '#c08a25'
+  - Sample - quick note
+  - Sample - follow-up email
+- name: Sample batch actions (edit or delete me)
+  color: '#2f9e44'
   scenarios:
-  - welcome-C769
-  - outreach-C769
-  - new_task1_policy-batch
+  - Sample - welcome (batch)
+  - Sample - Task 1 passed (batch)
