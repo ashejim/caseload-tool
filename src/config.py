@@ -430,9 +430,12 @@ class Settings:
     note_save_via_api: bool = True
     # Send texts through Mongoose's REST API (replaying the harvested bearer
     # token) instead of driving the compose modal — faster + avoids the cold-tab
-    # compose flakiness. The compose modal stays the automatic fallback if the
-    # API path errors. Default OFF (opt-in) while it beds in. Toggle on to use it.
-    text_send_via_api: bool = False
+    # compose flakiness, and auto-skips students who haven't opted in (Mongoose
+    # is the opt-out source of truth). The compose modal stays the automatic
+    # fallback if the API path errors. Default ON for new installs so texting
+    # "just works" without a segment export; existing users keep whatever they
+    # saved (save_settings serializes every field). Toggle off to drive the modal.
+    text_send_via_api: bool = True
     # Source the caseload from the live grid JSON (getCaseLoadMainGridData) when
     # that feed is healthy, overlaying any CSV-only columns from the downloaded
     # CSV — so the caseload is complete regardless of how the Salesforce list
