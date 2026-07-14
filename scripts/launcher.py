@@ -13601,6 +13601,19 @@ class CaseloadPanel:
         # rebuild (pop-out / re-dock).
         self._active_filters: list[dict] = []
         self._filters_open = False
+        # Batch-scope: when a batch runs (or a queued item is previewed), the
+        # viewer temporarily shows ONLY that batch's target students. None = not
+        # scoped. The user's live search is stashed here and restored on exit.
+        self._batch_scope_ids: Optional[set] = None
+        self._batch_scope_label = ""
+        self._search_saved_for_scope: Optional[str] = None
+        # Two-step batch fire: viewer "selection mode" — the matched students
+        # shown alone + pre-checked with a Start/Cancel bar. The prior checkbox
+        # set is stashed and restored on exit.
+        self._selection_mode = False
+        self._selection_on_start = None
+        self._selection_on_cancel = None
+        self._selection_prev_checks: set = set()
         # Column drag-reorder state (header click-drag).
         self._coldrag: Optional[dict] = None
         self._suppress_next_sort = False
@@ -13666,15 +13679,6 @@ class CaseloadPanel:
         )
         self.view_menu.pack(side="left", padx=(0, 4))
         self._refresh_view_menu()  # populate with any saved views
-        # Toggle: also search ARCHIVED (past) students, merged into the list
-        # (dimmed). Lets a name search reach former students without leaving the
-        # live caseload. See _toggle_search_archived.
-        self.search_archived_btn = ctk.CTkButton(
-            self.bar_actions, text="🗄 +Archived", width=110,
-            command=self._toggle_search_archived, **SECONDARY_BTN_KWARGS,
-        )
-        self.search_archived_btn.pack(side="left", padx=(0, 4))
-        self._search_archived_fg = self.search_archived_btn.cget("fg_color")
         # Filters toggle — shows/hides the collapsible column-filter section.
         self.filters_toggle_btn = ctk.CTkButton(
             self.bar_actions, text="▸ Filters", width=80,
@@ -13694,24 +13698,20 @@ class CaseloadPanel:
             **SECONDARY_BTN_KWARGS,
         )
         self.popout_btn.pack(side="left", padx=(0, 4))
-        # Local history: review departures + export the snapshot DB.
-        self.departures_btn = ctk.CTkButton(
-            self.bar_actions, text="⚑ Departures", width=100,
-            command=self._open_departures_dialog, **SECONDARY_BTN_KWARGS,
+        # Overflow menu for the secondary viewer actions — keeps the header
+        # short beside the search box. Holds: search archived students (a
+        # checkable toggle — its ✓ reflects the state), Departures, Momentum
+        # calibration, and Export history. Native popup that FLOATS over the
+        # list (nothing reflows/resizes); rebuilt on each open by
+        # _show_caseload_more_menu(). Views/Filters/Columns/Pop out stay inline.
+        # The moved buttons' command methods (_toggle_search_archived /
+        # _open_departures_dialog / _open_momentum_calibration_dialog /
+        # _export_history) are unchanged and invoked straight from the menu.
+        self._caseload_more_btn = ctk.CTkButton(
+            self.bar_actions, text="⋯ More", width=80,
+            command=self._show_caseload_more_menu, **SECONDARY_BTN_KWARGS,
         )
-        self.departures_btn.pack(side="left", padx=(0, 4))
-        # Momentum calibration: entry-time prediction vs. actual outcome.
-        self.calibration_btn = ctk.CTkButton(
-            self.bar_actions, text="📈 Momentum", width=105,
-            command=self._open_momentum_calibration_dialog,
-            **SECONDARY_BTN_KWARGS,
-        )
-        self.calibration_btn.pack(side="left", padx=(0, 4))
-        self.export_history_btn = ctk.CTkButton(
-            self.bar_actions, text="⤓ Export history", width=110,
-            command=self._export_history, **SECONDARY_BTN_KWARGS,
-        )
-        self.export_history_btn.pack(side="left", padx=(0, 4))
+        self._caseload_more_btn.pack(side="left", padx=(0, 4))
         self.freshness_lbl = ctk.CTkLabel(
             self.bar_actions, text="", font=ctk.CTkFont(size=11),
             text_color=("gray40", "gray65"),
@@ -13723,17 +13723,13 @@ class CaseloadPanel:
             (self.refresh_btn, "Reload the caseload from Salesforce."),
             (self.search_clear_btn, "Clear the search box."),
             (self.view_menu, "Saved views — switch column sets + filter bundles."),
-            (self.search_archived_btn,
-             "Also search archived / past students (merged in, dimmed)."),
             (self.filters_toggle_btn, "Show or hide the column filters."),
             (self.columns_btn, "Choose which columns show, and their order."),
             (self.popout_btn,
              "Pop the viewer into its own window (2nd monitor) / re-dock it."),
-            (self.departures_btn, "Students who left your caseload."),
-            (self.calibration_btn,
-             "Momentum calibration — entry prediction vs. actual outcome."),
-            (self.export_history_btn,
-             "Export the local caseload-history snapshots."),
+            (self._caseload_more_btn,
+             "More — search archived students, departures, momentum "
+             "calibration, and export history."),
         ):
             try:
                 _attach_tooltip(_b, _t)
@@ -13783,7 +13779,48 @@ class CaseloadPanel:
         self.vpane.grid(row=2, column=0, sticky="nsew", padx=4, pady=(0, 4))
         table_wrap = ctk.CTkFrame(self.vpane)
         table_wrap.grid_columnconfigure(0, weight=1)
-        table_wrap.grid_rowconfigure(0, weight=1)
+        table_wrap.grid_rowconfigure(1, weight=1)   # the tree row stretches
+        # Batch-scope banner (row 0): shown only while the viewer is scoped to a
+        # running/previewed batch's target students; hidden otherwise. Gives the
+        # "why did my list shrink" cue + a one-click way back to the full list.
+        self._scope_banner = ctk.CTkFrame(
+            table_wrap, fg_color=("#dbe8ff", "#22304a"))
+        self._scope_banner.grid(row=0, column=0, columnspan=2, sticky="ew",
+                                pady=(0, 2))
+        # Action buttons sit on the LEFT — near the row checkboxes, and they
+        # don't shift position when the window resizes. The label fills the
+        # remaining width to their right. Only one button set shows at a time
+        # (✓ Start + Cancel in selection mode, else the read-only Show all),
+        # so the hidden columns collapse and the visible button stays flush left.
+        self._scope_start_btn = ctk.CTkButton(
+            self._scope_banner, text="✓ Start", width=110,
+            command=self._on_selection_start,
+        )
+        self._scope_start_btn.grid(row=0, column=0, sticky="w", padx=(8, 6),
+                                   pady=4)
+        self._scope_start_btn.grid_remove()
+        self._scope_cancel_btn = ctk.CTkButton(
+            self._scope_banner, text="Cancel", width=80,
+            command=self._on_selection_cancel, **SECONDARY_BTN_KWARGS,
+        )
+        self._scope_cancel_btn.grid(row=0, column=1, sticky="w", padx=(0, 6),
+                                    pady=4)
+        self._scope_cancel_btn.grid_remove()
+        self._scope_show_all_btn = ctk.CTkButton(
+            self._scope_banner, text="Show all", width=90,
+            command=self._exit_batch_scope, **SECONDARY_BTN_KWARGS,
+        )
+        self._scope_show_all_btn.grid(row=0, column=2, sticky="w",
+                                      padx=(8, 6), pady=4)
+        self._scope_banner_lbl = ctk.CTkLabel(
+            self._scope_banner, text="", anchor="w",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("#1f4e8f", "#cfe0ff"),
+        )
+        self._scope_banner_lbl.grid(row=0, column=3, sticky="w",
+                                    padx=(8, 8), pady=4)
+        self._scope_banner.grid_columnconfigure(3, weight=1)
+        self._scope_banner.grid_remove()   # hidden until a batch scopes the view
         self._style_tree()
         self._make_check_images()
         # "tree headings" keeps the implicit #0 column visible — we use it
@@ -13792,13 +13829,13 @@ class CaseloadPanel:
             table_wrap, show="tree headings", selectmode="browse",
             style="Caseload.Treeview",
         )
-        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.grid(row=1, column=0, sticky="nsew")
         vsb = ttk.Scrollbar(table_wrap, orient="vertical",
                             command=self.tree.yview)
-        vsb.grid(row=0, column=1, sticky="ns")
+        vsb.grid(row=1, column=1, sticky="ns")
         hsb = ttk.Scrollbar(table_wrap, orient="horizontal",
                             command=self.tree.xview)
-        hsb.grid(row=1, column=0, sticky="ew")
+        hsb.grid(row=2, column=0, sticky="ew")
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         # Zebra striping for readability.
         self.tree.tag_configure("even", background=self._even_bg)
@@ -13880,6 +13917,33 @@ class CaseloadPanel:
         self._stacked = True
         self.frame.bind("<Configure>", self._on_panel_resize)
 
+    def _show_caseload_more_menu(self) -> None:
+        """Overflow menu for the ⋯ More viewer button — the secondary actions
+        that used to crowd the header. Built fresh on each open so the archived
+        checkmark reflects the current state. Floats over the list as a native
+        popup (nothing reflows/resizes); tk_popup clamps it to the screen and
+        opens it upward if the button is near the bottom edge."""
+        menu = tk.Menu(self._caseload_more_btn, tearoff=0)
+        archived_on = getattr(self, "_search_archived", False)
+        menu.add_command(
+            label=("✓  🗄  Search archived students" if archived_on
+                   else "🗄  Search archived students"),
+            command=self._toggle_search_archived)
+        menu.add_separator()
+        menu.add_command(label="⚑  Departures",
+                         command=self._open_departures_dialog)
+        menu.add_command(label="📈  Momentum calibration",
+                         command=self._open_momentum_calibration_dialog)
+        menu.add_command(label="⤓  Export history",
+                         command=self._export_history)
+        try:
+            x = self._caseload_more_btn.winfo_rootx()
+            y = (self._caseload_more_btn.winfo_rooty()
+                 + self._caseload_more_btn.winfo_height())
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
     def _bar_button_text(self) -> dict:
         """Button/label text for the current narrow/wide + toggle state. When
         narrow, labels collapse to symbols so the action row fits."""
@@ -13891,10 +13955,7 @@ class CaseloadPanel:
             "columns": "☰" if n else "☰ Columns",
             "popout": "⧉" if n
                       else ("⧉ Dock" if popped else "⧉ Pop out"),
-            "departures": "⚑" if n else "⚑ Departures",
-            "export": "⤓" if n else "⤓ Export history",
-            "archived": "🗄" if n else "🗄 +Archived",
-            "momentum": "📈" if n else "📈 Momentum",
+            "more": "⋯" if n else "⋯ More",
         }
 
     def _place_bar_actions(self) -> None:
@@ -13921,14 +13982,8 @@ class CaseloadPanel:
                 text=t["columns"], width=36 if n else 90)
             self.popout_btn.configure(
                 text=t["popout"], width=36 if n else 80)
-            self.departures_btn.configure(
-                text=t["departures"], width=36 if n else 100)
-            self.export_history_btn.configure(
-                text=t["export"], width=36 if n else 110)
-            self.search_archived_btn.configure(
-                text=t["archived"], width=36 if n else 110)
-            self.calibration_btn.configure(
-                text=t["momentum"], width=36 if n else 105)
+            self._caseload_more_btn.configure(
+                text=t["more"], width=36 if n else 80)
             self.view_menu.configure(width=48 if n else 120)
             # The freshness label eats width — hide it when narrow.
             try:
@@ -13953,6 +14008,153 @@ class CaseloadPanel:
             self.search_entry.focus_set()
         except Exception:
             pass
+
+    def set_batch_scope(self, rows, label: str) -> None:
+        """Scope the viewer to just these students (a batch's targets), blanking
+        the live search so exactly that set shows (the search is stashed and
+        restored on exit). Called at the start of a batch commit (immediate AND
+        queued) and for queue-row previews. Safe to re-call — e.g. the queue
+        advancing to the next item — without losing the user's saved search."""
+        ids = {str(r.get("StudentID", "")).strip()
+               for r in (rows or [])
+               if str(r.get("StudentID", "")).strip()}
+        if not ids:
+            return
+        # Stash the live search only on FIRST entry, so an item→item re-scope
+        # doesn't overwrite the saved value with the (already-blanked) "".
+        if self._batch_scope_ids is None:
+            self._search_saved_for_scope = self.search_var.get()
+        self._batch_scope_ids = ids
+        self._batch_scope_label = (label or "batch").strip()
+        try:
+            self._scope_banner_lbl.configure(
+                text=f"🎯 Showing {len(ids)} student(s) in "
+                     f"“{self._batch_scope_label}” — batch targets")
+            self._scope_banner.grid()
+        except Exception:
+            pass
+        # Blanking the search triggers its trace → repopulate (already scoped);
+        # if it's already blank, repopulate directly.
+        if self.search_var.get():
+            self.search_var.set("")
+        else:
+            self.populate()
+
+    def clear_batch_scope(self) -> None:
+        """Leave batch scoping and restore the user's prior search. No-op when
+        not scoped."""
+        if self._batch_scope_ids is None:
+            return
+        self._batch_scope_ids = None
+        self._batch_scope_label = ""
+        try:
+            self._scope_banner.grid_remove()
+        except Exception:
+            pass
+        saved = self._search_saved_for_scope
+        self._search_saved_for_scope = None
+        if saved:
+            self.search_var.set(saved)   # trace → _on_search → populate
+        else:
+            self.populate()
+
+    def _exit_batch_scope(self) -> None:
+        """Banner 'Show all' button — user manually returns to the full list."""
+        self.clear_batch_scope()
+
+    def enter_batch_selection(self, rows, label, on_start, on_cancel) -> None:
+        """Two-step batch fire (step 1): show ONLY these matched students, pre-
+        check them all, and swap the banner to a ✓ Start / Cancel bar so the user
+        can inspect + deselect before the review/run. The general 'fire on
+        selected' bar is suppressed while armed. on_start(selected_rows) /
+        on_cancel() are the app callbacks."""
+        keys = {self._row_key(r) for r in (rows or []) if self._row_key(r)}
+        ids = {str(r.get("StudentID", "") or r.get("Student ID", "")).strip()
+               for r in (rows or [])
+               if str(r.get("StudentID", "") or r.get("Student ID", "")).strip()}
+        if not ids:
+            if on_start:
+                on_start(list(rows or []))   # nothing to select — just proceed
+            return
+        self._selection_mode = True
+        self._selection_on_start = on_start
+        self._selection_on_cancel = on_cancel
+        self._selection_prev_checks = set(self._checked_ids)
+        # Scope to the matched set (reuses the scope filter) + stash search.
+        if self._batch_scope_ids is None:
+            self._search_saved_for_scope = self.search_var.get()
+        self._batch_scope_ids = ids
+        self._batch_scope_label = (label or "batch").strip()
+        # Pre-check all matched.
+        self._checked_ids.clear()
+        self._checked_ids.update(keys)
+        # Banner → selection mode.
+        try:
+            self._scope_show_all_btn.grid_remove()
+            self._scope_start_btn.grid()
+            self._scope_cancel_btn.grid()
+            self._scope_banner.grid()
+        except Exception:
+            pass
+        self._update_selection_banner()
+        if self.search_var.get():
+            self.search_var.set("")   # trace → _on_search → repopulate (scoped)
+        else:
+            self.populate()
+
+    def _update_selection_banner(self) -> None:
+        """Refresh the selection banner text + the ✓ Start count (called on every
+        check/uncheck via _after_selection_change)."""
+        n = len(self._checked_rows())
+        try:
+            self._scope_banner_lbl.configure(
+                text=f"🎯 “{self._batch_scope_label}” — pick students, then Start")
+            self._scope_start_btn.configure(
+                text=f"✓ Start ({n})",
+                state=("normal" if n else "disabled"))
+        except Exception:
+            pass
+
+    def _on_selection_start(self) -> None:
+        """✓ Start: capture the kept subset, leave selection mode, hand off to
+        the app to run the review + commit on it."""
+        if not self._selection_mode:
+            return
+        selected = list(self._checked_rows())
+        on_start = self._selection_on_start
+        self._exit_batch_selection(restore_checks=True)
+        if on_start:
+            on_start(selected)
+
+    def _on_selection_cancel(self) -> None:
+        """Cancel: leave selection mode (restoring the viewer) and tell the app
+        the batch was cancelled."""
+        if not self._selection_mode:
+            return
+        on_cancel = self._selection_on_cancel
+        self._exit_batch_selection(restore_checks=True)
+        if on_cancel:
+            on_cancel()
+
+    def _exit_batch_selection(self, restore_checks: bool = True) -> None:
+        """Leave selection mode: restore the prior checkbox set + the normal
+        banner state, and clear the scope (which restores the search + list)."""
+        if not self._selection_mode:
+            return
+        self._selection_mode = False
+        self._selection_on_start = None
+        self._selection_on_cancel = None
+        if restore_checks:
+            self._checked_ids.clear()
+            self._checked_ids.update(self._selection_prev_checks)
+        self._selection_prev_checks = set()
+        try:
+            self._scope_start_btn.grid_remove()
+            self._scope_cancel_btn.grid_remove()
+            self._scope_show_all_btn.grid()   # restore the normal banner button
+        except Exception:
+            pass
+        self.clear_batch_scope()   # hides banner, restores search, repopulates
 
     def _on_panel_resize(self, event=None) -> None:
         try:
@@ -16401,6 +16603,12 @@ class CaseloadPanel:
         except Exception:
             pass
         n = len(self._checked_rows())
+        if getattr(self, "_selection_mode", False):
+            # Armed batch: the ✓ Start button carries the count; keep the general
+            # 'fire on selected' bar out of the way.
+            self._update_selection_banner()
+            self.action_bar.grid_remove()
+            return
         if n > 0:
             self.sel_count_lbl.configure(text=f"{n} selected")
             self.action_bar.grid()
@@ -16721,19 +16929,15 @@ class CaseloadPanel:
     def _toggle_search_archived(self) -> None:
         """Toggle merging archived (past) students into the current list, so a
         name search reaches former students. They render dimmed; double-click
-        opens their Salesforce record like any off-caseload student."""
+        opens their Salesforce record like any off-caseload student. Invoked
+        from the ⋯ More menu, whose ✓ reflects the on/off state."""
         on = not getattr(self, "_search_archived", False)
         self._search_archived = on
         if on:
             self._load_archived_rows()
-            self.search_archived_btn.configure(
-                text="🗄 Archived ✓", fg_color=("#8a5a00", "#6b4a00"))
             self.app._append_log(
                 f"Search now includes {len(self._archived_rows or [])} archived "
                 "student(s) (shown dimmed). Toggle 🗄 off to hide them.")
-        else:
-            self.search_archived_btn.configure(
-                text="🗄 +Archived", fg_color=self._search_archived_fg)
         self.populate()
 
     def _enter_archived_mode(self, query: Optional[str] = None) -> None:
@@ -17514,6 +17718,11 @@ class CaseloadPanel:
         # task pass/fail via the synthetic "Task Status" column), then the
         # search box (substring) on top.
         base = self._apply_active_filters(rows)
+        # Batch scope: restrict to the running/previewed batch's target students.
+        if self._batch_scope_ids is not None:
+            sid = self._batch_scope_ids
+            base = [r for r in base
+                    if str(r.get("StudentID", "")).strip() in sid]
         if getattr(self, "_ea_only_var", None) is not None and \
                 self._ea_only_var.get():
             base = [r for r in base if (r.get("EssentialAction") or "").strip()]
@@ -17905,6 +18114,26 @@ class QueuePanel:
             name_lbl.configure(text_color=("#c0392b", "#e0524f"))
         name_lbl.grid(row=0, column=3, sticky="ew", padx=2)
 
+        # preview 👁 — scope the caseload viewer to this action's target students
+        # (resolved + stored at add time), so the user can inspect exactly who
+        # it'll act on before running. Only shown when targets were captured.
+        targets = (it.payload or {}).get("confirmed") \
+            if isinstance(it.payload, dict) else None
+        if targets:
+            prev = ctk.CTkButton(
+                frame, text="👁", width=28, height=24,
+                command=lambda t=targets, n=it.display_name:
+                    self.app._preview_queue_item_targets(t, n),
+                **SECONDARY_BTN_KWARGS,
+            )
+            try:
+                _attach_tooltip(
+                    prev, f"Show these {len(targets)} student(s) in the "
+                          "caseload viewer.")
+            except Exception:
+                pass
+            prev.grid(row=0, column=4, padx=(0, 2))
+
         # remove — allowed for anything except the currently-running row.
         rm = ctk.CTkButton(
             frame, text="✕", width=28, height=24,
@@ -17913,7 +18142,7 @@ class QueuePanel:
         )
         if not it.status.can_remove:
             rm.configure(state="disabled")
-        rm.grid(row=0, column=4, padx=(4, 8))
+        rm.grid(row=0, column=5, padx=(4, 8))
 
     def _sync_controls(self) -> None:
         """Enable/disable the control bar. Start runs when there's at least one
@@ -19265,6 +19494,9 @@ class App:
         self.note_log_entries: list[NoteLogEntry] = []
         self.note_tabs: dict[str, dict] = {}  # tab_key -> {frame, list_frame}
         self.caseload_panel: Optional[CaseloadPanel] = None
+        # Two-step batch fire: the armed action awaiting viewer Start/Cancel
+        # ({scenario, override}), or None. Guards _fire against overlap.
+        self._armed_batch = None
         self._build_main_pane()
         self._build_editor_pane()
         self._build_caseload_pane()
@@ -19441,11 +19673,6 @@ class App:
             command=self._toggle_editor, **SECONDARY_BTN_KWARGS,
         )
         self.editor_toggle_btn.pack(side="left")
-        self._btn_add_group = ctk.CTkButton(
-            toggle_frame, text="+ Add group", width=110,
-            command=self._add_group, **SECONDARY_BTN_KWARGS,
-        )
-        self._btn_add_group.pack(side="left", padx=(8, 0))
         self.caseload_toggle_btn = ctk.CTkButton(
             toggle_frame, text="👁 Hide viewer", width=130,
             command=self._toggle_caseload, **SECONDARY_BTN_KWARGS,
@@ -19465,38 +19692,28 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self._btn_settings.pack(side="left", padx=(8, 0))
-        # Recover from a stuck browser (Salesforce or Mongoose hang) without
-        # restarting the whole app — closes + reopens the browser; login is kept.
-        self._btn_restart_browser = ctk.CTkButton(
-            toggle_frame, text="↻ Browser",
-            width=90, command=self._restart_browser,
-            **SECONDARY_BTN_KWARGS,
+        # Overflow menu for secondary/rarely-used actions — keeps the main row
+        # short so a new user isn't faced with a wall of buttons. Holds Add
+        # group, Mongoose (texting), Restart browser, and the advanced Texting-
+        # IDs export. Opens as a native popup that FLOATS over the content —
+        # nothing below it reflows or resizes, and tk_popup clamps it to the
+        # screen (opens upward if near the bottom edge). Rebuilt fresh on each
+        # open by _show_more_menu(), so advanced-only items appear/disappear
+        # with the mode automatically. The command methods for the moved
+        # buttons (_add_group / _restart_browser / _open_mongoose_clicked /
+        # _sync_contact_ids) are unchanged and invoked straight from the menu.
+        self._btn_more = ctk.CTkButton(
+            toggle_frame, text="⋯ More", width=90,
+            command=self._show_more_menu, **SECONDARY_BTN_KWARGS,
         )
-        self._btn_restart_browser.pack(side="left", padx=(8, 0))
-        # Auto-export each caseload department's Mongoose contacts segment and
-        # refresh the StudentID -> Contact id map (no manual CSV copying).
-        # The export only feeds the DOM texting fallback; when the API text
-        # path is on it's redundant, so the button is hidden (the export code
-        # stays available as a fallback). Visibility: _update_texting_ids_btn().
-        self._btn_sync_ids = ctk.CTkButton(
-            toggle_frame, text="⬇ Texting IDs",
-            width=120, command=self._sync_contact_ids,
-            **SECONDARY_BTN_KWARGS,
-        )
-        self._update_texting_ids_btn()
-        # Open/focus the Mongoose dashboard in the launcher's own browser so the
-        # user can sign in (texting needs an active Mongoose session).
-        self._btn_open_mongoose = ctk.CTkButton(
-            toggle_frame, text="🐭 Mongoose",
-            width=120, command=self._open_mongoose_clicked,
-            **SECONDARY_BTN_KWARGS,
-        )
-        self._btn_open_mongoose.pack(side="left", padx=(8, 0))
-        # Discovery: capture Salesforce's note-submission network
-        # traffic so we can later replay it via REST API instead of
-        # driving the UI. One-click toggle; on stop, writes the
-        # captured requests to a JSON file in the user config dir.
-        # Advanced-only: hidden in basic mode via _apply_advanced_mode.
+        self._btn_more.pack(side="left", padx=(8, 0))
+        # Discovery: capture Salesforce's note-submission network traffic so we
+        # can later replay it via REST API instead of driving the UI. One-click
+        # toggle; on stop, writes the captured requests to a JSON file in the
+        # user config dir. Stays INLINE (not in the More menu) because it flips
+        # its own label to "⏹ Stop capture" while active — a rebuilt-on-open
+        # menu can't show that live state. Advanced-only: hidden in basic mode
+        # via _apply_advanced_mode.
         self._capture_active = False
         self.capture_btn = ctk.CTkButton(
             toggle_frame, text="🔬 Capture",
@@ -19512,8 +19729,6 @@ class App:
             (self.editor_toggle_btn,
              "Open the action editor — create, edit, and organize your "
              "actions, emails, texts, and notes."),
-            (self._btn_add_group,
-             "Add a group to organize your actions (e.g. by course)."),
             (self.caseload_toggle_btn,
              "Show or hide the caseload viewer — your searchable student list "
              "with per-student info and actions."),
@@ -19522,15 +19737,9 @@ class App:
             (self._btn_settings,
              "Preferences: editor mode (Basic/Advanced), email templates, "
              "texting, encryption, and setup help."),
-            (self._btn_restart_browser,
-             "Restart the browser if Salesforce or Mongoose gets stuck — your "
-             "login is kept."),
-            (self._btn_sync_ids,
-             "Export Mongoose contact IDs for texting (fallback used when the "
-             "text-send API is off)."),
-            (self._btn_open_mongoose,
-             "Open the Mongoose texting dashboard — sign in here to enable "
-             "texting."),
+            (self._btn_more,
+             "More actions — add a group, open Mongoose texting, restart the "
+             "browser, and other tools."),
             (self.capture_btn,
              "Advanced: capture Salesforce note-submission traffic for API "
              "replay (developer tool)."),
@@ -19802,6 +20011,33 @@ class App:
             return "✎" if narrow else "Hide editor"
         return "✎" if narrow else "✎ Edit actions"
 
+    def _show_more_menu(self) -> None:
+        """Overflow menu for the ⋯ More toolbar button — the secondary actions
+        that used to crowd the toolbar. Built fresh on each open so advanced-
+        only items track the current mode. Pops up as a native menu that floats
+        over the content below (nothing reflows/resizes); tk_popup clamps it to
+        the screen and opens it upward if the button is near the bottom edge."""
+        menu = tk.Menu(self._btn_more, tearoff=0)
+        menu.add_command(label="➕  Add group",
+                         command=self._add_group)
+        menu.add_command(label="🐭  Mongoose (texting)",
+                         command=self._open_mongoose_clicked)
+        # Advanced + API-text-off only: the manual Mongoose ID export feeds the
+        # DOM texting fallback and is redundant when the send-API path is on.
+        if getattr(self.settings, "advanced_mode", False) \
+                and not getattr(self.settings, "text_send_via_api", False):
+            menu.add_command(label="⬇  Export texting IDs",
+                             command=self._sync_contact_ids)
+        menu.add_separator()
+        menu.add_command(label="↻  Restart browser",
+                         command=self._restart_browser)
+        try:
+            x = self._btn_more.winfo_rootx()
+            y = self._btn_more.winfo_rooty() + self._btn_more.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
     # Ordered toolbar spec: (button, wide label OR callable(narrow)->text,
     # wide width, narrow glyph). Dynamic-label buttons (editor/viewer) pass a
     # callable. Single source of truth for both the collapse decision and the
@@ -19809,13 +20045,10 @@ class App:
     def _toolbar_specs(self):
         return [
             (self.editor_toggle_btn, self._editor_toggle_text, 140, "✎"),
-            (self._btn_add_group, "+ Add group", 110, "➕"),
             (self.caseload_toggle_btn, self._viewer_toggle_text, 130, "👁"),
             (self.caseload_refresh_btn, "↻ Caseload", 120, "↻"),
             (self._btn_settings, "⚙ Settings", 110, "⚙"),
-            (self._btn_restart_browser, "↻ Browser", 90, "🌐"),
-            (self._btn_sync_ids, "⬇ Texting IDs", 120, "⬇"),
-            (self._btn_open_mongoose, "🐭 Mongoose", 120, "🐭"),
+            (self._btn_more, "⋯ More", 90, "⋯"),
             (self.capture_btn, "🔬 Capture", 100, "🔬"),
         ]
 
@@ -22865,6 +23098,13 @@ class App:
         )
 
     def _fire(self, scenario: ScenarioConfig) -> None:
+        # A batch selection is armed (the viewer is showing a batch's matched
+        # students with a Start/Cancel bar) — finish that before anything else.
+        if getattr(self, "_armed_batch", None) is not None:
+            self._append_log(
+                "Finish the current batch selection first — click ✓ Start or "
+                "Cancel in the caseload viewer.")
+            return
         # "Add to queue" mode: clicking an action ADDS it (review now, run
         # later) instead of firing it.
         if getattr(self, "_queue_add_mode", False):
@@ -22906,11 +23146,19 @@ class App:
         # Batch scenarios have their own driver — load the caseload,
         # apply filters, show a review/confirm dialog, then loop.
         if scenario.batch is not None:
-            self._set_busy(f"Batch: {scenario.name}")
-            try:
-                self._fire_batch(scenario, override)
-            finally:
-                self._set_idle()
+            # Text-only batches keep their own driver (no note/email review and
+            # no per-student selection step — texting has its own opt-in flow).
+            if self._is_text_only(scenario):
+                self._set_busy(f"Batch: {scenario.name}")
+                try:
+                    self._fire_batch_text(scenario)
+                finally:
+                    self._set_idle()
+                return
+            # Standard batch → two-step: arm the viewer with the matched students
+            # shown alone + pre-checked (✓ Start / Cancel); Start then runs the
+            # review + commit on whatever the user kept.
+            self._begin_batch_selection(scenario, override)
             return
 
         # Branched action fired from the MAIN WINDOW (no Find-first) → treat as a
@@ -22990,6 +23238,10 @@ class App:
         if payload is None:
             self._append_log(f"{name!r}: not added to queue (review cancelled).")
             return
+        # Review confirmed; nothing runs now (queued for later), so drop the
+        # viewer scope that _collect_batch_review set for the review. The 👁 on
+        # the queued row re-previews these students on demand.
+        self._clear_viewer_batch_scope()
         self.action_queue.add(QueueItem(
             action_name=name,
             display_name=self._action_display_name(scenario),
@@ -24040,33 +24292,13 @@ class App:
         return seen
 
     def _update_texting_ids_btn(self) -> None:
-        """Show the manual '⬇ Texting IDs' export button only when the API text
-        path is OFF. The Mongoose segment export it triggers feeds the DOM
-        texting fallback; with API texting on it's redundant, so hide it (the
-        _sync_contact_ids / export code stays reachable as a fallback). Called
-        at build time and whenever the API-text setting changes."""
-        btn = getattr(self, "_btn_sync_ids", None)
-        if btn is None:
-            return
-        # Advanced-only + only when the API text path is OFF: it's a rarely-used
-        # fallback export now, so it stays out of a basic user's toolbar.
-        if getattr(self.settings, "text_send_via_api", False) \
-                or not self.settings.advanced_mode:
-            try:
-                btn.pack_forget()
-            except Exception:
-                pass
-            return
-        try:
-            if btn.winfo_ismapped():
-                return
-            mongoose = getattr(self, "_btn_open_mongoose", None)
-            if mongoose is not None and mongoose.winfo_ismapped():
-                btn.pack(side="left", padx=(8, 0), before=mongoose)
-            else:
-                btn.pack(side="left", padx=(8, 0))
-        except Exception:
-            pass
+        """No-op retained for its callers (build, settings change, advanced-mode
+        toggle). The manual '⬇ Export texting IDs' export used to be its own
+        toolbar button whose visibility this method managed; it now lives inside
+        the ⋯ More menu, which is rebuilt on each open and decides its own
+        visibility there (advanced mode + API-text path OFF). See
+        _show_more_menu()."""
+        return
 
     def _sync_contact_ids(self) -> None:
         """Auto-export each caseload department's Mongoose contacts segment, then
@@ -24731,11 +24963,9 @@ class App:
         return self._send_text_payload(payload)
 
     def _fire_batch(self, scenario: ScenarioConfig, override: str) -> None:
-        """Drive a batch scenario end-to-end (immediate fire): collect the
-        review, then commit it. Split into _collect_batch_review (all pre-flight
-        + user review/input, no sending) and _commit_batch (text send +
-        per-student email→note loop) so the Action Queue can collect at ADD time
-        and commit at RUN time. The activity log is the progress display."""
+        """Classic one-shot batch fire (kept as the no-viewer fallback): collect
+        the review, then commit it. The normal main-window path now goes through
+        the two-step _begin_batch_selection (viewer selection → Start)."""
         # Text-only batch: no Salesforce notes/navigation — its own driver.
         if self._is_text_only(scenario):
             self._fire_batch_text(scenario)
@@ -24745,14 +24975,76 @@ class App:
             return  # aborted / cancelled during review (already logged)
         self._commit_batch(payload)
 
-    def _collect_batch_review(self, scenario: ScenarioConfig, override: str):
-        """COLLECT half of a standard (non-text-only, non-branched) batch: run
-        every pre-flight and ALL user review/input — filters, prompts, email
-        review, note inputs, and text REVIEW — and return a payload dict for
-        _commit_batch to run later, WITHOUT sending anything. Returns None if the
-        action was aborted or cancelled at any step (already logged). The Action
-        Queue stores this payload at add time; the immediate-fire path commits
-        it right away."""
+    def _begin_batch_selection(self, scenario: ScenarioConfig,
+                               override: str) -> None:
+        """Two-step batch fire, step 1: run pre-flights + filter, then arm the
+        caseload viewer — the matched students shown alone + pre-checked, with a
+        ✓ Start / Cancel bar — so the user can inspect and deselect BEFORE any
+        review or send. Start → _start_batch_selection (review + commit on the
+        kept subset); Cancel → _cancel_batch_selection. Falls back to the classic
+        one-shot review popup when the viewer isn't available."""
+        panel = getattr(self, "caseload_panel", None)
+        if panel is None:
+            # No viewer to select in — run the classic flow (review popup only).
+            self._set_busy(f"Batch: {scenario.name}")
+            try:
+                payload = self._collect_batch_review(scenario, override)
+                if payload is not None:
+                    self._commit_batch(payload)
+            finally:
+                self._set_idle()
+            return
+        self._set_busy(f"Batch: finding students for {scenario.name}…")
+        try:
+            matched = self._collect_batch_matched(scenario, override)
+        finally:
+            self._set_idle()
+        if not matched:
+            return  # aborted / no match (already logged)
+        self._armed_batch = {"scenario": scenario, "override": override}
+        self._append_log(
+            f"Review the {len(matched)} matched student(s) in the viewer — "
+            "deselect any you want to skip — then click ✓ Start (or Cancel).")
+        panel.enter_batch_selection(
+            matched, self._action_display_name(scenario),
+            on_start=self._start_batch_selection,
+            on_cancel=self._cancel_batch_selection)
+
+    def _start_batch_selection(self, selected_rows) -> None:
+        """Viewer ✓ Start: run the review + commit on the user's kept subset."""
+        armed = getattr(self, "_armed_batch", None)
+        self._armed_batch = None
+        if armed is None:
+            return
+        scenario, override = armed["scenario"], armed["override"]
+        selected_rows = [r for r in (selected_rows or []) if r]
+        if not selected_rows:
+            self._append_log(
+                f"{scenario.name!r}: no students selected — cancelled.")
+            return
+        self._set_busy(f"Batch: {scenario.name}")
+        try:
+            payload = self._collect_batch_review(
+                scenario, override, selected=selected_rows)
+            if payload is not None:
+                self._commit_batch(payload)
+        finally:
+            self._set_idle()
+
+    def _cancel_batch_selection(self) -> None:
+        """Viewer Cancel: drop the armed batch (the viewer restores itself)."""
+        armed = getattr(self, "_armed_batch", None)
+        self._armed_batch = None
+        if armed is not None:
+            self._append_log(f"{armed['scenario'].name!r}: batch cancelled.")
+
+    def _collect_batch_matched(self, scenario: ScenarioConfig, override: str):
+        """Two-step batch fire, step 1: run every pre-flight (Mongoose /
+        Salesforce sign-in, submit-unchecked + CSV-email warnings, staleness),
+        load the caseload, and apply the action's filters — returning the MATCHED
+        rows. No review, no sending. Returns None if aborted/cancelled or nothing
+        matched (already logged). Both the viewer-selection arming and the review
+        half (_collect_batch_review) build on this."""
         from tkinter import messagebox
 
         # A combined action will send texts — confirm Mongoose is signed in
@@ -24864,96 +25156,176 @@ class App:
             self._append_log("Batch: no matches; nothing to do.")
             return None
         self._append_log(f"Filters matched {len(matched)} students.")
+        return matched
 
-        # Step 3: pick the display columns for the review dialog —
-        # Name + Student ID (so the user can verify identity at a
-        # glance) + every column referenced in the filters (in
-        # filter order, deduped).
-        display_columns = ["Name", "Student ID"]
-        for f in filters:
-            col = f.get("column", "")
-            if col and col not in display_columns:
-                display_columns.append(col)
+    def _collect_batch_review(self, scenario: ScenarioConfig, override: str,
+                              selected: "Optional[list]" = None):
+        """COLLECT half of a standard (non-text-only, non-branched) batch: run
+        the prompts + email/text/note REVIEW and return a payload dict for
+        _commit_batch to run later, WITHOUT sending anything. When `selected` is
+        given — the two-step viewer selection — the review runs over exactly
+        those rows; when None it computes the full matched set first (queue-add /
+        legacy path). Returns None if aborted/cancelled at any step (logged)."""
+        from tkinter import messagebox
 
-        # Step 4: prompts FIRST (the new email review modal renders
-        # each student's email with these substitutions in place, so
-        # they must be collected before review).
-        prompt_vars = self._collect_prompt_vars(scenario)
-        if prompt_vars is None:
-            return None  # user cancelled a prompt
-
-        # Step 5: review-and-confirm — combined per-student email
-        # preview when the scenario has an email step (FERPA-quality
-        # review of every outgoing message); column-based filter
-        # review otherwise.
-        has_email = scenario.email is not None
-        body_overrides: dict = {}
-        addr_overrides: dict = {}
-        if has_email:
-            filter_summary = ", ".join(
-                f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
-                for f in scenario.batch.filters
-                if f.get("column")
-            )
-            scenario, confirmed, body_overrides, addr_overrides = \
-                self._review_emails(
-                    scenario, matched, prompt_vars, filter_summary,
-                )
-            if confirmed is None:
-                return None  # cancelled / nothing selected (already logged)
-        elif scenario.batch.preview:
-            confirmed = prompt_batch_review(
-                self.root, scenario.name, matched, display_columns,
-            )
-            if confirmed is None:
-                self._append_log("Batch cancelled.")
-                return None
-            if not confirmed and scenario.text is None:
-                self._append_log("Batch: 0 students confirmed; nothing to do.")
+        if selected is None:
+            matched = self._collect_batch_matched(scenario, override)
+            if not matched:
                 return None
         else:
-            confirmed = matched
-
-        # Collect ALL remaining user input UP FRONT — the per-note "additional
-        # text" edits — BEFORE the text send + the per-student loop run. That
-        # way the user finishes every prompt at the start and the tool then
-        # works unattended (texts schedule, emails send, notes file). Otherwise
-        # the additional-text prompt landed AFTER the ~30s text send, forcing
-        # the user to come back mid-run.
-        note_inputs: "Optional[tuple[str, dict]]" = None
-        if scenario.notes:
-            note_inputs = self._collect_note_inputs(
-                scenario, len(confirmed), "batch")
-            if note_inputs is None:
-                return None  # cancelled at an additional-text prompt
-
-        # Text channel (combined action): REVIEW only (the last interactive
-        # step) — timezone-grouped + scheduled. The reviewed selection is
-        # stored and SENT at commit time (so a queued action reviews at add
-        # time, sends at run time). Cancelling aborts the action.
-        text_groups = None
-        text_selected = None
-        if scenario.text is not None:
-            text_groups, tskipped = self._build_text_review_groups(
-                scenario, matched, prompt_vars)
-            if text_groups is None:
+            matched = [r for r in selected if r]
+            if not matched:
+                self._append_log("Batch: no students selected; nothing to do.")
                 return None
-            if text_groups:
-                text_selected = self._review_texts(
-                    scenario, text_groups, tskipped)
-                if text_selected is None:
-                    self._append_log(
-                        "Action cancelled at text review; nothing sent.")
-                    return None
 
-        return {
-            "scenario": scenario, "override": override,
-            "confirmed": confirmed, "prompt_vars": prompt_vars,
-            "has_email": has_email, "body_overrides": body_overrides,
-            "addr_overrides": addr_overrides,
-            "note_inputs": note_inputs,
-            "text_groups": text_groups, "text_selected": text_selected,
-        }
+        # Resolved filters (for the review dialog's display columns).
+        csv_headers = list(matched[0].keys()) if matched else []
+        filters = [
+            _resolve_filter_columns(f, csv_headers)
+            for f in scenario.batch.filters
+        ]
+        # Scope the caseload viewer to the review set — the two-step arm already
+        # scoped it to the matched students; here we (re)affirm to whatever's
+        # being reviewed. Kept on a confirmed review: immediate fire →
+        # _commit_batch clears it at run end; queue-add → _queue_add_action
+        # clears it after storing. Cleared here (finally) if review is cancelled.
+        self._set_viewer_batch_scope(
+            matched, self._action_display_name(scenario))
+        review_ok = False
+        try:
+            # Step 3: pick the display columns for the review dialog —
+            # Name + Student ID (so the user can verify identity at a
+            # glance) + every column referenced in the filters (in
+            # filter order, deduped).
+            display_columns = ["Name", "Student ID"]
+            for f in filters:
+                col = f.get("column", "")
+                if col and col not in display_columns:
+                    display_columns.append(col)
+
+            # Step 4: prompts FIRST (the new email review modal renders
+            # each student's email with these substitutions in place, so
+            # they must be collected before review).
+            prompt_vars = self._collect_prompt_vars(scenario)
+            if prompt_vars is None:
+                return None  # user cancelled a prompt
+
+            # Step 5: review-and-confirm — combined per-student email
+            # preview when the scenario has an email step (FERPA-quality
+            # review of every outgoing message); column-based filter
+            # review otherwise.
+            has_email = scenario.email is not None
+            body_overrides: dict = {}
+            addr_overrides: dict = {}
+            if has_email:
+                filter_summary = ", ".join(
+                    f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
+                    for f in scenario.batch.filters
+                    if f.get("column")
+                )
+                scenario, confirmed, body_overrides, addr_overrides = \
+                    self._review_emails(
+                        scenario, matched, prompt_vars, filter_summary,
+                    )
+                if confirmed is None:
+                    return None  # cancelled / nothing selected (already logged)
+            elif scenario.batch.preview and selected is None:
+                # Legacy / queue-add path: the column-based student-selection
+                # modal. Skipped in the two-step flow (`selected` given) — the
+                # viewer selection already chose the students.
+                confirmed = prompt_batch_review(
+                    self.root, scenario.name, matched, display_columns,
+                )
+                if confirmed is None:
+                    self._append_log("Batch cancelled.")
+                    return None
+                if not confirmed and scenario.text is None:
+                    self._append_log(
+                        "Batch: 0 students confirmed; nothing to do.")
+                    return None
+            else:
+                confirmed = matched
+
+            # Collect ALL remaining user input UP FRONT — the per-note
+            # "additional text" edits — BEFORE the text send + the per-student
+            # loop run. That way the user finishes every prompt at the start and
+            # the tool then works unattended (texts schedule, emails send, notes
+            # file). Otherwise the additional-text prompt landed AFTER the ~30s
+            # text send, forcing the user to come back mid-run.
+            note_inputs: "Optional[tuple[str, dict]]" = None
+            if scenario.notes:
+                note_inputs = self._collect_note_inputs(
+                    scenario, len(confirmed), "batch")
+                if note_inputs is None:
+                    return None  # cancelled at an additional-text prompt
+
+            # Text channel (combined action): REVIEW only (the last interactive
+            # step) — timezone-grouped + scheduled. The reviewed selection is
+            # stored and SENT at commit time (so a queued action reviews at add
+            # time, sends at run time). Cancelling aborts the action.
+            text_groups = None
+            text_selected = None
+            if scenario.text is not None:
+                text_groups, tskipped = self._build_text_review_groups(
+                    scenario, matched, prompt_vars)
+                if text_groups is None:
+                    return None
+                if text_groups:
+                    text_selected = self._review_texts(
+                        scenario, text_groups, tskipped)
+                    if text_selected is None:
+                        self._append_log(
+                            "Action cancelled at text review; nothing sent.")
+                        return None
+
+            review_ok = True
+            return {
+                "scenario": scenario, "override": override,
+                "confirmed": confirmed, "prompt_vars": prompt_vars,
+                "has_email": has_email, "body_overrides": body_overrides,
+                "addr_overrides": addr_overrides,
+                "note_inputs": note_inputs,
+                "text_groups": text_groups, "text_selected": text_selected,
+            }
+        finally:
+            # Review cancelled → drop the scope (no run will clear it). A
+            # confirmed review keeps it for the run / queue-add caller.
+            if not review_ok:
+                self._clear_viewer_batch_scope()
+
+    def _set_viewer_batch_scope(self, rows, label: str) -> None:
+        """Scope the caseload viewer to a batch's target students, if the viewer
+        exists. No-op when it's hidden / not built."""
+        p = getattr(self, "caseload_panel", None)
+        if p is not None:
+            try:
+                p.set_batch_scope(rows, label)
+            except Exception:
+                pass
+
+    def _clear_viewer_batch_scope(self) -> None:
+        """Remove any batch scoping from the caseload viewer (if it exists)."""
+        p = getattr(self, "caseload_panel", None)
+        if p is not None:
+            try:
+                p.clear_batch_scope()
+            except Exception:
+                pass
+
+    def _preview_queue_item_targets(self, rows, label: str) -> None:
+        """Queue-row 👁: scope the caseload viewer to a queued action's target
+        students (resolved at add time) so the user can inspect them BEFORE the
+        action runs — the browser's free here, so they can even open a record.
+        Cleared via the viewer banner's 'Show all'."""
+        if getattr(self, "caseload_panel", None) is None:
+            self._append_log(
+                "Open the caseload viewer (👁) to preview a queued action's "
+                "target students.")
+            return
+        self._set_viewer_batch_scope(rows, label)
+        self._append_log(
+            f"Previewing {len(rows or [])} target student(s) for {label!r} in "
+            "the viewer — click 'Show all' there to exit.")
 
     def _commit_batch(self, payload: dict) -> dict:
         """COMMIT half: send the reviewed texts (if any), then run the shared
@@ -24963,50 +25335,61 @@ class App:
         verdict dict {ok, detail, ...} the Action Queue uses to mark the row
         done/error; immediate fires ignore it."""
         scenario = payload["scenario"]
-        text_groups = payload.get("text_groups")
-        # Pre-flight Outlook BEFORE any send when this action emails: a systemic
-        # Outlook failure then pauses the queue for a CLEAN retry — nothing has
-        # gone out yet, so a retry can't double-send the text.
-        if payload.get("has_email"):
-            from src import outlook_email
-            if not outlook_email.is_ready():
-                self._append_log(
-                    "Outlook isn't available / not signed in — action not run.",
-                    error=True)
-                return {"ok": False, "service_down": "Outlook",
-                        "detail": "Outlook not available — open Outlook + retry"}
-        if text_groups:
-            if not self._send_reviewed_texts(
-                    scenario, text_groups, payload["text_selected"]):
-                # A Mongoose login failure is recoverable — flag it so a queue
-                # run pauses for sign-in + retry (rather than dropping the whole
-                # action). A user STOP is just a stop.
-                if getattr(self, "_text_login_fail", False):
-                    return {"ok": False, "service_down": "Mongoose",
-                            "detail": "Mongoose not logged in — sign in + retry"}
-                self._append_log(
-                    "Action cancelled/stopped at text send; "
-                    "notes/email not run.")
-                return {"ok": False, "detail": "stopped at text send"}
-        # The per-student loop — shared with the panel mini-batch. Pass the
-        # pre-collected note input so the loop doesn't prompt again.
-        outcome = self._execute_scenario_over_rows(
-            scenario, payload["override"], payload["confirmed"],
-            payload["prompt_vars"], has_email=payload["has_email"],
-            source="batch", body_overrides=payload["body_overrides"],
-            addr_overrides=payload.get("addr_overrides"),
-            prefetched_inputs=payload["note_inputs"],
-        )
-        outcome = outcome or {}
-        ok = bool(outcome.get("ok"))
-        skipped = outcome.get("skipped") or []
-        detail = ""
-        if not ok:
-            detail = (f"{len(skipped)} skipped" if skipped
-                      else "completed with errors")
-        return {"ok": ok, "detail": detail,
-                "processed": outcome.get("processed"),
-                "total": outcome.get("total"), "skipped": skipped}
+        # Scope the caseload viewer to just this batch's target students while it
+        # runs — immediate fire AND queue run both land here — so the user can
+        # review exactly who's being acted on. Cleared in `finally`, however the
+        # commit exits (early return, stop, or error).
+        self._set_viewer_batch_scope(
+            payload.get("confirmed"), self._action_display_name(scenario))
+        try:
+            text_groups = payload.get("text_groups")
+            # Pre-flight Outlook BEFORE any send when this action emails: a
+            # systemic Outlook failure then pauses the queue for a CLEAN retry —
+            # nothing has gone out yet, so a retry can't double-send the text.
+            if payload.get("has_email"):
+                from src import outlook_email
+                if not outlook_email.is_ready():
+                    self._append_log(
+                        "Outlook isn't available / not signed in — action not "
+                        "run.", error=True)
+                    return {"ok": False, "service_down": "Outlook",
+                            "detail": "Outlook not available — open Outlook + "
+                                      "retry"}
+            if text_groups:
+                if not self._send_reviewed_texts(
+                        scenario, text_groups, payload["text_selected"]):
+                    # A Mongoose login failure is recoverable — flag it so a
+                    # queue run pauses for sign-in + retry (rather than dropping
+                    # the whole action). A user STOP is just a stop.
+                    if getattr(self, "_text_login_fail", False):
+                        return {"ok": False, "service_down": "Mongoose",
+                                "detail": "Mongoose not logged in — sign in + "
+                                          "retry"}
+                    self._append_log(
+                        "Action cancelled/stopped at text send; "
+                        "notes/email not run.")
+                    return {"ok": False, "detail": "stopped at text send"}
+            # The per-student loop — shared with the panel mini-batch. Pass the
+            # pre-collected note input so the loop doesn't prompt again.
+            outcome = self._execute_scenario_over_rows(
+                scenario, payload["override"], payload["confirmed"],
+                payload["prompt_vars"], has_email=payload["has_email"],
+                source="batch", body_overrides=payload["body_overrides"],
+                addr_overrides=payload.get("addr_overrides"),
+                prefetched_inputs=payload["note_inputs"],
+            )
+            outcome = outcome or {}
+            ok = bool(outcome.get("ok"))
+            skipped = outcome.get("skipped") or []
+            detail = ""
+            if not ok:
+                detail = (f"{len(skipped)} skipped" if skipped
+                          else "completed with errors")
+            return {"ok": ok, "detail": detail,
+                    "processed": outcome.get("processed"),
+                    "total": outcome.get("total"), "skipped": skipped}
+        finally:
+            self._clear_viewer_batch_scope()
 
     # ==================================================================
     # Action branching — batch / multi-select fires. Partition the student
@@ -25279,16 +25662,25 @@ class App:
         self._append_log(
             "Branched batch — "
             + "; ".join(f"{b.title!r}: {len(rs)}" for b, rs in groups))
-        for b, rs in groups:
-            self._append_log(f"— Branch {b.title!r}: {len(rs)} student(s) —")
-            eff = self._effective_branch_scenario(scenario, b)
-            if not self._run_branch_group(eff, rs, "batch"):
+        # Scope the viewer to the union of all branches' students for the run.
+        # Branched batches don't go through _commit_batch, so set/clear here.
+        scope_rows = [r for _b, rs in groups for r in rs]
+        self._set_viewer_batch_scope(
+            scope_rows, self._action_display_name(scenario))
+        try:
+            for b, rs in groups:
                 self._append_log(
-                    f"{scenario.name!r}: branched batch stopped at branch "
-                    f"{b.title!r}.")
-                return
-        self._append_log(
-            f"{scenario.name!r}: branched batch complete.", success=True)
+                    f"— Branch {b.title!r}: {len(rs)} student(s) —")
+                eff = self._effective_branch_scenario(scenario, b)
+                if not self._run_branch_group(eff, rs, "batch"):
+                    self._append_log(
+                        f"{scenario.name!r}: branched batch stopped at branch "
+                        f"{b.title!r}.")
+                    return
+            self._append_log(
+                f"{scenario.name!r}: branched batch complete.", success=True)
+        finally:
+            self._clear_viewer_batch_scope()
 
     def _fire_batch_text(self, scenario: ScenarioConfig) -> None:
         """Batch texting: filter the caseload, render each student's text with
@@ -25346,21 +25738,28 @@ class App:
             self._append_log("Batch: no matches; nothing to do.")
             return
         self._append_log(f"Filters matched {len(matched)} students.")
+        # Scope the viewer to this text batch's students for the review/send.
+        # Text-only actions don't go through _commit_batch, so set/clear here.
+        # Cleared in `finally`, however we exit.
+        self._set_viewer_batch_scope(
+            matched, self._action_display_name(scenario))
+        try:
+            # Prompts first, so each per-student render includes them.
+            prompt_vars = self._collect_prompt_vars(scenario)
+            if prompt_vars is None:
+                return
 
-        # Prompts first, so each per-student render includes them.
-        prompt_vars = self._collect_prompt_vars(scenario)
-        if prompt_vars is None:
-            return
-
-        groups, skipped = self._build_text_review_groups(
-            scenario, matched, prompt_vars)
-        if groups is None:
-            return  # template load failed (already logged)
-        if not groups:
-            self._append_log(
-                "Batch text: no opted-in students to text after filtering.")
-            return
-        self._review_and_send_texts(scenario, groups, skipped)
+            groups, skipped = self._build_text_review_groups(
+                scenario, matched, prompt_vars)
+            if groups is None:
+                return  # template load failed (already logged)
+            if not groups:
+                self._append_log(
+                    "Batch text: no opted-in students to text after filtering.")
+                return
+            self._review_and_send_texts(scenario, groups, skipped)
+        finally:
+            self._clear_viewer_batch_scope()
 
     def _build_text_review_groups(self, scenario, matched, prompt_vars):
         """Group matched students for batch texting and render the shared
@@ -25998,6 +26397,11 @@ class App:
         rows (the panel's checkbox selection) — a mini-batch. Reuses the
         batch execution core, including the FERPA per-student email-review
         modal when the scenario has an email step."""
+        if getattr(self, "_armed_batch", None) is not None:
+            self._append_log(
+                "Finish the current batch selection first — click ✓ Start or "
+                "Cancel in the caseload viewer.")
+            return
         if self._is_busy:
             self._append_log(
                 f"Busy — wait for the current task to finish before "
