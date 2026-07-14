@@ -442,6 +442,10 @@ class Settings:
     # view is configured (no manual column setup). Falls back to the CSV
     # automatically when the feed is degraded. Toggle off to always use the CSV.
     caseload_source_json: bool = True
+    # Remembered text zoom for the ❔ Help dialog (its A− / A+ buttons). Lets a
+    # user on a very high-DPI display bump the reading size once and keep it.
+    # 1.0 = default; clamped to [0.8, 2.0] when applied.
+    help_font_scale: float = 1.0
     # Advanced: enable ACTION BRANCHING — conditional sub-actions inside one
     # action (e.g. a single "welcome" that sends the right email/text per
     # course). When off, the "+ branch" button is hidden and branched actions

@@ -19377,6 +19377,24 @@ class App:
                 "if something fired by accident.")
         except Exception:
             pass
+        # ❔ Help / Getting started — pinned top-right next to STOP so it's the
+        # first thing a new user reaches for: what to do first + a tour of the
+        # app's fuller capabilities. Accent blue so it stands out; always
+        # visible (not gated by Basic/Advanced mode).
+        self._btn_help = ctk.CTkButton(
+            topbar, text="❔ Help", width=84, height=32,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=("#3b8ed0", "#1f6aa5"), hover_color=("#337ab7", "#185a8c"),
+            text_color="white", command=self._show_help,
+        )
+        self._btn_help.grid(row=0, column=3, sticky="e", padx=(8, 0))
+        try:
+            _attach_tooltip(
+                self._btn_help,
+                "Getting started — what to do first and a tour of everything "
+                "the app can do.")
+        except Exception:
+            pass
 
         # Find student — searches the in-DOM Caseload table.
         # HIDDEN from view (2026-05-31): the caseload panel's own search
@@ -29257,6 +29275,193 @@ class App:
 
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
 
+    def _show_help(self) -> None:
+        """Getting-started / What-can-this-do dialog (❔ Help button). A calm
+        landing point for new users: the first three steps to a first action,
+        then a tour of the fuller capabilities that are otherwise invisible in
+        the toolbar. Openable any time; purely informational (no state change).
+
+        Text size is user-adjustable (A− / A+ in the header) and remembered in
+        settings.help_font_scale, so a high-DPI display can be dialed in once."""
+        scale = max(0.8, min(2.0, float(
+            getattr(self.settings, "help_font_scale", 1.0) or 1.0)))
+        # Every text label registers here as (widget, base_size, weight) so the
+        # A−/A+ buttons can rescale the whole dialog in one sweep.
+        regs: list[tuple] = []
+
+        def _mk(parent, text, base, weight="normal", **kw):
+            lbl = ctk.CTkLabel(
+                parent, text=text,
+                font=ctk.CTkFont(size=int(round(base * scale)), weight=weight),
+                **kw)
+            regs.append((lbl, base, weight))
+            return lbl
+
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Getting started — Caseload Notes")
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.geometry("700x620")
+        dialog.lift()
+        dialog.focus_force()
+        dialog.after(150, lambda: (dialog.lift(), dialog.focus_force()))
+
+        # Header row: title on the left, text-size controls on the right.
+        header = ctk.CTkFrame(dialog, fg_color="transparent")
+        header.pack(fill="x", padx=20, pady=(18, 2))
+        header.grid_columnconfigure(0, weight=1)
+        _mk(header, "Getting started", 22, "bold", anchor="w").grid(
+            row=0, column=0, sticky="w")
+        zoom = ctk.CTkFrame(header, fg_color="transparent")
+        zoom.grid(row=0, column=1, sticky="e")
+        ctk.CTkLabel(
+            zoom, text="Text size", font=ctk.CTkFont(size=11),
+            text_color=("gray40", "gray65"),
+        ).pack(side="left", padx=(0, 6))
+        _btn_smaller = ctk.CTkButton(
+            zoom, text="A−", width=36, height=28, **SECONDARY_BTN_KWARGS)
+        _btn_smaller.pack(side="left")
+        _btn_bigger = ctk.CTkButton(
+            zoom, text="A+", width=36, height=28, **SECONDARY_BTN_KWARGS)
+        _btn_bigger.pack(side="left", padx=(4, 0))
+
+        _mk(dialog,
+            ("Caseload Notes files your Salesforce notes, emails, and "
+             "texts for you — one student at a time or a whole group at "
+             "once. Here's how to start, and everything it can do."),
+            14, text_color=("gray35", "gray70"),
+            wraplength=620, justify="left", anchor="w",
+            ).pack(fill="x", padx=20, pady=(0, 10))
+
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+        body.grid_columnconfigure(0, weight=1)
+
+        def _card(title: str, rows: list[tuple[str, str]]) -> None:
+            card = ctk.CTkFrame(
+                body, fg_color=("gray92", "gray18"), corner_radius=6)
+            card.pack(fill="x", padx=4, pady=(0, 10))
+            card.grid_columnconfigure(1, weight=1)
+            _mk(card, title, 16, "bold", anchor="w").grid(
+                row=0, column=0, columnspan=2, sticky="ew",
+                padx=12, pady=(10, 6))
+            for i, (lead, text) in enumerate(rows, start=1):
+                _mk(card, lead, 15, "bold", width=44, anchor="n",
+                    justify="center").grid(
+                    row=i, column=0, sticky="nw", padx=(12, 4), pady=(0, 8))
+                _mk(card, text, 14, wraplength=520, justify="left",
+                    anchor="w").grid(
+                    row=i, column=1, sticky="ew", padx=(0, 12), pady=(0, 8))
+
+        _card("Your first action — three steps", [
+            ("1",
+             "Open the caseload viewer (👁) — it's your searchable student "
+             "list. Type a name, email, or Student ID to find someone, then "
+             "click their row to see their info."),
+            ("2",
+             "Pick an action from the buttons on the left. The app ships with "
+             "colored sample actions (blue = single-student, green = batch) — "
+             "click ✎ Edit actions to see how they're built or make your own."),
+            ("3",
+             "Fire it. For a single student, their record opens and the note / "
+             "email / text is prepared (and filed, if the action submits). For "
+             "a batch, it runs across everyone matching the action's filters — "
+             "results collect in the Action log tab."),
+        ])
+
+        _card("What else it can do", [
+            ("📋",
+             "Caseload viewer — sortable, filterable student list with tasks, "
+             "pass/fail, momentum, follow-up dates, and per-student actions."),
+            ("⚡",
+             "Batch actions — file notes and send emails + texts to a whole "
+             "filtered group in one click, with an optional preview first."),
+            ("💬",
+             "Texting — send Mongoose texts with saved templates and time-zone "
+             "aware scheduling; opted-out students are skipped automatically."),
+            ("🧭",
+             "Success Paths — per-course step checklists that recommend each "
+             "student's next best action."),
+            ("📈",
+             "Momentum & Data — see momentum predictions against real outcomes "
+             "and other analytics in the Data tab."),
+            ("🗂",
+             "Action queue — line up several batch actions, review them, then "
+             "run them together."),
+            ("👤",
+             "Off-caseload students — look up and file notes for students in "
+             "your course who are assigned to another instructor."),
+        ])
+
+        _card("Tips", [
+            ("•",
+             "Hover any toolbar button to see what it does."),
+            ("•",
+             "⚙ Settings has editor mode (Simple / Advanced), email "
+             "templates, texting, and encryption."),
+            ("•",
+             "Nothing is sent without your action — batches can preview first, "
+             "and ■ STOP (top-right) halts a run at the next safe point."),
+        ])
+
+        # --- Text-size rescale (A− / A+), remembered in settings.
+        def _apply_scale() -> None:
+            for w, base, weight in regs:
+                try:
+                    w.configure(font=ctk.CTkFont(
+                        size=int(round(base * scale)), weight=weight))
+                except Exception:
+                    pass
+
+        def _bump(delta: float) -> None:
+            nonlocal scale
+            new = max(0.8, min(2.0, round(scale + delta, 2)))
+            if new == scale:
+                return
+            scale = new
+            self.settings.help_font_scale = scale
+            try:
+                save_settings(self.settings)
+            except Exception:
+                pass
+            _apply_scale()
+
+        _btn_smaller.configure(command=lambda: _bump(-0.1))
+        _btn_bigger.configure(command=lambda: _bump(0.1))
+
+        # --- Footer: links + close.
+        def _open_github() -> None:
+            try:
+                import webbrowser
+                webbrowser.open(_GITHUB_URL, new=2)
+            except Exception:
+                pass
+
+        def _close() -> None:
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(4, 16), side="bottom")
+        ctk.CTkButton(
+            btn_row, text="⚙ Open Settings", width=140,
+            command=lambda: (_close(), self._open_settings()),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left")
+        ctk.CTkButton(
+            btn_row, text="Updates on GitHub ↗", width=160,
+            command=_open_github, **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            btn_row, text="Got it", width=120, command=_close,
+        ).pack(side="right")
+
+        dialog.protocol("WM_DELETE_WINDOW", _close)
+        dialog.bind("<Escape>", lambda _e: _close())
+
     def _show_first_run_setup(self) -> None:
         """Modal that pops on first launch (settings.first_run_complete
         is False). Welcome + editor-mode picker. On Continue, sets
@@ -29288,7 +29493,8 @@ class App:
             dialog,
             text=(
                 "One quick choice to get you started — you can change it "
-                "later in the ⚙ Settings dialog."
+                "later in the ⚙ Settings dialog. New here? Click ❔ Help on "
+                "the toolbar any time for the first steps and a quick tour."
             ),
             font=ctk.CTkFont(size=12),
             text_color=("gray35", "gray70"),
