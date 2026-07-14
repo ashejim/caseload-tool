@@ -3,6 +3,43 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.18.0 — 2026-07-14
+
+Batch actions are now **reviewed right in the caseload viewer**, plus a
+declutter pass and a few onboarding follow-ups.
+
+### Two-step batch fire
+- **Pick the students in the viewer, then Start.** Pressing a batch action no
+  longer opens straight into a modal. Instead the caseload viewer **filters to
+  just the students that match the batch**, with them all **pre-checked** and a
+  **✓ Start / Cancel** bar. The browser is free here, so you can sort, inspect a
+  student, even open their record — then deselect anyone you want to skip.
+- **Start** then runs the usual **email / text / note review** over exactly the
+  students you kept (you can still deselect further there); **Cancel** puts the
+  viewer back the way it was. A plain note batch with nothing to review files
+  straight from Start.
+- **The viewer stays scoped to that batch** while it runs — the busy scrim only
+  covers the browser, so you watch it work through exactly that set — and
+  restores your full list (and prior search) when it finishes.
+
+### Batch students in the viewer
+- The same scoping applies to **queued** runs, and each **pending queue row gets
+  a 👁 button** that previews its target students in the viewer before it runs.
+
+### Declutter
+- **`⋯ More` overflow menus.** The main toolbar and the caseload-viewer header
+  each keep the everyday buttons inline and tuck the rest (Add group, Mongoose,
+  Restart browser; Departures, Momentum, Export history, Search archived) into a
+  single **`⋯ More`** popup that floats over the list without reshuffling it.
+
+### Onboarding follow-ups
+- **One "Action log" tab.** Per-batch result tabs are consolidated into a single
+  collapsible **Action log** (per action + course, with ✕ and *Clear all*).
+- **❔ Help** getting-started dialog (a 3-step walkthrough + feature tour) with
+  **A− / A+** text sizing, pinned top-right next to ■ STOP.
+- **Texting via API by default** for new installs — no Mongoose segment export
+  needed to start texting (existing users keep their setting).
+
 ## 0.17.0 — 2026-07-13
 
 A **new-user friendliness** pass — the app is powerful but was overwhelming to
