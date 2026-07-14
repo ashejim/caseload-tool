@@ -19620,6 +19620,36 @@ class App:
         self._queue_tab.grid_rowconfigure(0, weight=1)
         self.queue_panel = QueuePanel(self)
         self.queue_panel.attach(self._queue_tab)
+        # Action log tab: ONE permanent home for every fired action's results
+        # (single fires + batches). Each action+course is a collapsible section
+        # (newest on top) with its own ✕, plus a Clear all — so completed runs
+        # no longer spawn separate top-level tabs that bury Activity/Data/Queue.
+        self._action_log_tab = self.log_tabview.add("Action log")
+        self._action_log_tab.grid_columnconfigure(0, weight=1)
+        self._action_log_tab.grid_rowconfigure(1, weight=1)
+        _alhdr = ctk.CTkFrame(self._action_log_tab, fg_color="transparent")
+        _alhdr.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+        _alhdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            _alhdr, text="Fired actions (this session)",
+            font=ctk.CTkFont(size=12, weight="bold"), anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        self._action_log_clear_btn = ctk.CTkButton(
+            _alhdr, text="✕ Clear all", width=90,
+            command=self._clear_action_log, **SECONDARY_BTN_KWARGS,
+        )
+        self._action_log_clear_btn.grid(row=0, column=1, sticky="e")
+        self._action_log_scroll = ctk.CTkScrollableFrame(self._action_log_tab)
+        self._action_log_scroll.grid(
+            row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        self._action_log_scroll.grid_columnconfigure(0, weight=1)
+        self._action_log_empty = ctk.CTkLabel(
+            self._action_log_scroll,
+            text="No actions fired yet this session.",
+            text_color=("gray45", "gray60"),
+        )
+        self._action_log_empty.pack(pady=12)
+        self._action_order: list[str] = []   # tab_keys, newest first
         pane.grid_rowconfigure(6, weight=1)
 
         # Bottom row. Quit is packed first (side=right) so it always
@@ -32005,8 +32035,8 @@ class App:
     def _record_note(self, entry: NoteLogEntry) -> None:
         self.note_log_entries.append(entry)
         self._append_to_csv(entry)
-        self._ensure_note_tab(entry.tab_key)
-        self._append_to_note_tab(entry)
+        self._ensure_action_section(entry)
+        self._append_to_action_section(entry)
         # Success Path: if this action fulfils a step on the student's course
         # path, mark it done. Only when the note actually FILED (submitted) — a
         # form left for manual review hasn't completed the step yet.
@@ -32139,39 +32169,127 @@ class App:
         except Exception as e:
             self._append_log(f"(could not migrate log file: {e})")
 
-    def _ensure_note_tab(self, tab_key: str) -> None:
+    def _ensure_action_section(self, entry: NoteLogEntry) -> None:
+        """Create a collapsible section in the Action log for this action+course
+        (keyed by tab_key) if it doesn't exist yet. New sections go on top and
+        auto-expand; the others collapse so the freshest run is what you see."""
+        tab_key = entry.tab_key
         if tab_key in self.note_tabs:
             return
-        tab = self.log_tabview.add(tab_key)
-        tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(0, weight=1)
-        list_frame = ctk.CTkScrollableFrame(tab)
-        list_frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-        list_frame.grid_columnconfigure(0, weight=1)
+        try:
+            self._action_log_empty.pack_forget()
+        except Exception:
+            pass
+        # Collapse existing sections so the new run is the focus.
+        for m in self.note_tabs.values():
+            if not m.get("collapsed"):
+                self._set_section_collapsed(m, True)
+        accent = self._color_for_scenario(entry.scenario) or "#3b8ed0"
+        title = tab_key.strip()
+        section = ctk.CTkFrame(self._action_log_scroll,
+                               fg_color=("gray90", "gray17"), corner_radius=6)
+        header = ctk.CTkFrame(section, fg_color="transparent")
+        header.pack(fill="x", padx=2, pady=(2, 0))
+        header.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(header, text="●", text_color=accent, width=14,
+                     font=ctk.CTkFont(size=13)).grid(row=0, column=0, padx=(4, 2))
+        toggle = ctk.CTkButton(
+            header, text=f"▼  {title}   (0)", anchor="w", height=24,
+            fg_color="transparent", hover=False,
+            text_color=("gray10", "gray90"),
+            command=lambda k=tab_key: self._toggle_action_section(k),
+        )
+        toggle.grid(row=0, column=1, sticky="ew")
         ctk.CTkButton(
-            tab, text="Remove this tab",
-            command=lambda k=tab_key: self._remove_note_tab(k),
-            **SECONDARY_BTN_KWARGS, width=140,
-        ).grid(row=1, column=0, padx=4, pady=(0, 4), sticky="e")
-        self.note_tabs[tab_key] = {"frame": tab, "list": list_frame, "row": 0}
-        self.log_tabview.set(tab_key)  # auto-focus the new tab
+            header, text="✕", width=28, height=24,
+            command=lambda k=tab_key: self._remove_action_section(k),
+            **SECONDARY_BTN_KWARGS,
+        ).grid(row=0, column=2, padx=(4, 4))
+        body = ctk.CTkFrame(section, fg_color="transparent")
+        body.pack(fill="x", padx=(20, 6), pady=(0, 4))
+        body.grid_columnconfigure(0, weight=1)
+        self.note_tabs[tab_key] = {
+            "section": section, "body": body, "toggle": toggle,
+            "row": 0, "count": 0, "collapsed": False, "title": title,
+        }
+        self._action_order.insert(0, tab_key)  # newest first
+        self._reflow_action_sections()
+        try:
+            self.log_tabview.set("Action log")   # show the results
+        except Exception:
+            pass
 
-    def _append_to_note_tab(self, entry: NoteLogEntry) -> None:
+    def _append_to_action_section(self, entry: NoteLogEntry) -> None:
         meta = self.note_tabs.get(entry.tab_key)
         if not meta:
             return
         ctk.CTkLabel(
-            meta["list"], text=entry.display, anchor="w",
+            meta["body"], text=entry.display, anchor="w",
             font=ctk.CTkFont(size=12),
-        ).grid(row=meta["row"], column=0, sticky="ew", padx=4, pady=1)
+        ).grid(row=meta["row"], column=0, sticky="ew", padx=2, pady=1)
         meta["row"] += 1
+        meta["count"] += 1
+        self._refresh_section_title(meta)
 
-    def _remove_note_tab(self, tab_key: str) -> None:
+    def _refresh_section_title(self, meta: dict) -> None:
+        arrow = "▶" if meta.get("collapsed") else "▼"
         try:
-            self.log_tabview.delete(tab_key)
+            meta["toggle"].configure(
+                text=f"{arrow}  {meta['title']}   ({meta['count']})")
         except Exception:
             pass
-        self.note_tabs.pop(tab_key, None)
+
+    def _set_section_collapsed(self, meta: dict, collapsed: bool) -> None:
+        meta["collapsed"] = collapsed
+        try:
+            if collapsed:
+                meta["body"].pack_forget()
+            else:
+                meta["body"].pack(fill="x", padx=(20, 6), pady=(0, 4))
+        except Exception:
+            pass
+        self._refresh_section_title(meta)
+
+    def _toggle_action_section(self, tab_key: str) -> None:
+        meta = self.note_tabs.get(tab_key)
+        if meta:
+            self._set_section_collapsed(meta, not meta.get("collapsed"))
+
+    def _remove_action_section(self, tab_key: str) -> None:
+        meta = self.note_tabs.pop(tab_key, None)
+        if meta:
+            try:
+                meta["section"].destroy()
+            except Exception:
+                pass
+        if tab_key in self._action_order:
+            self._action_order.remove(tab_key)
+        if not self.note_tabs:
+            try:
+                self._action_log_empty.pack(pady=12)
+            except Exception:
+                pass
+
+    def _clear_action_log(self) -> None:
+        for k in list(self.note_tabs.keys()):
+            self._remove_action_section(k)
+
+    def _reflow_action_sections(self) -> None:
+        """Re-pack the sections newest-first (topmost = most recent)."""
+        for k in self._action_order:
+            m = self.note_tabs.get(k)
+            if m:
+                try:
+                    m["section"].pack_forget()
+                except Exception:
+                    pass
+        for k in self._action_order:   # newest first → packed top-down
+            m = self.note_tabs.get(k)
+            if m:
+                try:
+                    m["section"].pack(fill="x", padx=2, pady=(4, 0))
+                except Exception:
+                    pass
 
     # ----- Multi-match picker -----
 
