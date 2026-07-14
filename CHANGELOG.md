@@ -25,6 +25,8 @@ declutter pass and a few onboarding follow-ups.
 ### Batch students in the viewer
 - The same scoping applies to **queued** runs, and each **pending queue row gets
   a 👁 button** that previews its target students in the viewer before it runs.
+- The selection / scope banner is **tinted to the action's group color** (a light
+  wash) so you can tell at a glance which batch you're reviewing.
 
 ### Declutter
 - **`⋯ More` overflow menus.** The main toolbar and the caseload-viewer header

@@ -6001,6 +6001,40 @@ def _text_color_for_bg(hex_color: str) -> str:
     return "#000000" if yiq >= 128 else "#ffffff"
 
 
+def _tint_hex(hex_color: str, toward: str, t: float) -> str:
+    """Blend `hex_color` toward `toward` by fraction t (0→hex_color, 1→toward).
+    Returns the input unchanged if it can't be parsed."""
+    try:
+        a = (hex_color or "").lstrip("#")
+        b = (toward or "").lstrip("#")
+        if len(a) == 3:
+            a = "".join(c + c for c in a)
+        if len(b) == 3:
+            b = "".join(c + c for c in b)
+        ch = [round(int(a[i:i + 2], 16) * (1 - t) + int(b[i:i + 2], 16) * t)
+              for i in (0, 2, 4)]
+        return "#%02x%02x%02x" % tuple(ch)
+    except Exception:
+        return hex_color
+
+
+# Default (ungrouped) batch-banner palette — the original light blue.
+_SCOPE_BANNER_DEFAULT = (("#dbe8ff", "#22304a"), ("#1f4e8f", "#cfe0ff"))
+
+
+def _scope_banner_theme(base_hex: Optional[str]):
+    """(fg_color, text_color) CTk (light, dark) tuples for the batch banner,
+    tinted from a group's base color: a pale wash in light mode / a muted dark
+    wash in dark mode, with a legible same-hue label. Falls back to the default
+    light-blue when the action is ungrouped (base_hex falsy / unparseable)."""
+    base = (base_hex or "").strip()
+    if len(base.lstrip("#")) not in (3, 6):
+        return _SCOPE_BANNER_DEFAULT
+    fg = (_tint_hex(base, "#ffffff", 0.82), _tint_hex(base, "#1b1b1b", 0.72))
+    text = (_tint_hex(base, "#000000", 0.45), _tint_hex(base, "#ffffff", 0.60))
+    return (fg, text)
+
+
 def _hover_color_for(hex_color: str) -> str:
     """Slightly darker version of `hex_color` for hover state.
     Returns the input unchanged if it can't be parsed."""
@@ -14009,12 +14043,23 @@ class CaseloadPanel:
         except Exception:
             pass
 
-    def set_batch_scope(self, rows, label: str) -> None:
+    def _apply_scope_banner_color(self, base_hex) -> None:
+        """Tint the scope/selection banner from the batch's group color (a light
+        wash + a legible label), or the default light-blue when ungrouped."""
+        fg, text = _scope_banner_theme(base_hex)
+        try:
+            self._scope_banner.configure(fg_color=fg)
+            self._scope_banner_lbl.configure(text_color=text)
+        except Exception:
+            pass
+
+    def set_batch_scope(self, rows, label: str, color=None) -> None:
         """Scope the viewer to just these students (a batch's targets), blanking
         the live search so exactly that set shows (the search is stashed and
         restored on exit). Called at the start of a batch commit (immediate AND
-        queued) and for queue-row previews. Safe to re-call — e.g. the queue
-        advancing to the next item — without losing the user's saved search."""
+        queued) and for queue-row previews. `color` = the batch's group color
+        hex (banner tint), or None for the default. Safe to re-call — e.g. the
+        queue advancing to the next item — without losing the user's search."""
         ids = {str(r.get("StudentID", "")).strip()
                for r in (rows or [])
                if str(r.get("StudentID", "")).strip()}
@@ -14026,6 +14071,7 @@ class CaseloadPanel:
             self._search_saved_for_scope = self.search_var.get()
         self._batch_scope_ids = ids
         self._batch_scope_label = (label or "batch").strip()
+        self._apply_scope_banner_color(color)
         try:
             self._scope_banner_lbl.configure(
                 text=f"🎯 Showing {len(ids)} student(s) in "
@@ -14062,12 +14108,14 @@ class CaseloadPanel:
         """Banner 'Show all' button — user manually returns to the full list."""
         self.clear_batch_scope()
 
-    def enter_batch_selection(self, rows, label, on_start, on_cancel) -> None:
+    def enter_batch_selection(self, rows, label, on_start, on_cancel,
+                              color=None) -> None:
         """Two-step batch fire (step 1): show ONLY these matched students, pre-
         check them all, and swap the banner to a ✓ Start / Cancel bar so the user
         can inspect + deselect before the review/run. The general 'fire on
-        selected' bar is suppressed while armed. on_start(selected_rows) /
-        on_cancel() are the app callbacks."""
+        selected' bar is suppressed while armed. `color` = the batch's group
+        color hex (banner tint), or None for the default. on_start(selected_rows)
+        / on_cancel() are the app callbacks."""
         keys = {self._row_key(r) for r in (rows or []) if self._row_key(r)}
         ids = {str(r.get("StudentID", "") or r.get("Student ID", "")).strip()
                for r in (rows or [])
@@ -14088,7 +14136,8 @@ class CaseloadPanel:
         # Pre-check all matched.
         self._checked_ids.clear()
         self._checked_ids.update(keys)
-        # Banner → selection mode.
+        # Banner → selection mode, tinted from the batch's group color.
+        self._apply_scope_banner_color(color)
         try:
             self._scope_show_all_btn.grid_remove()
             self._scope_start_btn.grid()
@@ -18122,8 +18171,8 @@ class QueuePanel:
         if targets:
             prev = ctk.CTkButton(
                 frame, text="👁", width=28, height=24,
-                command=lambda t=targets, n=it.display_name:
-                    self.app._preview_queue_item_targets(t, n),
+                command=lambda t=targets, n=it.display_name, c=it.color:
+                    self.app._preview_queue_item_targets(t, n, c),
                 **SECONDARY_BTN_KWARGS,
             )
             try:
@@ -25008,7 +25057,8 @@ class App:
         panel.enter_batch_selection(
             matched, self._action_display_name(scenario),
             on_start=self._start_batch_selection,
-            on_cancel=self._cancel_batch_selection)
+            on_cancel=self._cancel_batch_selection,
+            color=self._color_for_scenario(scenario.name))
 
     def _start_batch_selection(self, selected_rows) -> None:
         """Viewer ✓ Start: run the review + commit on the user's kept subset."""
@@ -25190,7 +25240,8 @@ class App:
         # _commit_batch clears it at run end; queue-add → _queue_add_action
         # clears it after storing. Cleared here (finally) if review is cancelled.
         self._set_viewer_batch_scope(
-            matched, self._action_display_name(scenario))
+            matched, self._action_display_name(scenario),
+            self._color_for_scenario(scenario.name))
         review_ok = False
         try:
             # Step 3: pick the display columns for the review dialog —
@@ -25293,13 +25344,14 @@ class App:
             if not review_ok:
                 self._clear_viewer_batch_scope()
 
-    def _set_viewer_batch_scope(self, rows, label: str) -> None:
+    def _set_viewer_batch_scope(self, rows, label: str, color=None) -> None:
         """Scope the caseload viewer to a batch's target students, if the viewer
-        exists. No-op when it's hidden / not built."""
+        exists (banner tinted from the batch's group `color`). No-op when the
+        viewer is hidden / not built."""
         p = getattr(self, "caseload_panel", None)
         if p is not None:
             try:
-                p.set_batch_scope(rows, label)
+                p.set_batch_scope(rows, label, color)
             except Exception:
                 pass
 
@@ -25312,17 +25364,18 @@ class App:
             except Exception:
                 pass
 
-    def _preview_queue_item_targets(self, rows, label: str) -> None:
+    def _preview_queue_item_targets(self, rows, label: str, color=None) -> None:
         """Queue-row 👁: scope the caseload viewer to a queued action's target
         students (resolved at add time) so the user can inspect them BEFORE the
         action runs — the browser's free here, so they can even open a record.
-        Cleared via the viewer banner's 'Show all'."""
+        `color` = the action's group color (banner tint). Cleared via the viewer
+        banner's 'Show all'."""
         if getattr(self, "caseload_panel", None) is None:
             self._append_log(
                 "Open the caseload viewer (👁) to preview a queued action's "
                 "target students.")
             return
-        self._set_viewer_batch_scope(rows, label)
+        self._set_viewer_batch_scope(rows, label, color)
         self._append_log(
             f"Previewing {len(rows or [])} target student(s) for {label!r} in "
             "the viewer — click 'Show all' there to exit.")
@@ -25340,7 +25393,8 @@ class App:
         # review exactly who's being acted on. Cleared in `finally`, however the
         # commit exits (early return, stop, or error).
         self._set_viewer_batch_scope(
-            payload.get("confirmed"), self._action_display_name(scenario))
+            payload.get("confirmed"), self._action_display_name(scenario),
+            self._color_for_scenario(scenario.name))
         try:
             text_groups = payload.get("text_groups")
             # Pre-flight Outlook BEFORE any send when this action emails: a
@@ -25666,7 +25720,8 @@ class App:
         # Branched batches don't go through _commit_batch, so set/clear here.
         scope_rows = [r for _b, rs in groups for r in rs]
         self._set_viewer_batch_scope(
-            scope_rows, self._action_display_name(scenario))
+            scope_rows, self._action_display_name(scenario),
+            self._color_for_scenario(scenario.name))
         try:
             for b, rs in groups:
                 self._append_log(
@@ -25742,7 +25797,8 @@ class App:
         # Text-only actions don't go through _commit_batch, so set/clear here.
         # Cleared in `finally`, however we exit.
         self._set_viewer_batch_scope(
-            matched, self._action_display_name(scenario))
+            matched, self._action_display_name(scenario),
+            self._color_for_scenario(scenario.name))
         try:
             # Prompts first, so each per-student render includes them.
             prompt_vars = self._collect_prompt_vars(scenario)
