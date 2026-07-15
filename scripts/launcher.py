@@ -60,8 +60,10 @@ from src.note_form import NoteData
 from src.action_queue import ActionQueue, QueueItem, QueueStatus
 from src.scenarios import (
     SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
-    ScenarioConfig, SuccessPath, load_groups, load_scenarios,
-    load_success_paths, run_scenario, success_path_to_dict, _note_from_dict,
+    ScenarioConfig, SuccessPath, NoteTemplate, NoteTemplateField,
+    NOTE_FIELD_KINDS, load_groups, load_scenarios, load_note_templates,
+    load_success_paths, note_template_to_dict, parse_note_template_text,
+    render_note_template, run_scenario, success_path_to_dict, _note_from_dict,
 )
 from src.student_lookup import (
     click_caseload_row,
@@ -252,10 +254,14 @@ def _note_body_to_html(text: str) -> str:
     """Convert a plain-text note body into the simple paragraph HTML the
     Salesforce note-save endpoint stores (each line a <p>; blank lines a
     <p><br></p>) so an API-filed note reads the same as a form-typed one.
-    HTML-special characters are escaped."""
+    HTML-special characters are escaped; **bold** markers become <b>…</b>
+    (applied AFTER escaping so the tags survive) — mirrored by strip_md_bold on
+    the DOM form path."""
+    from src.note_form import md_bold_to_html
     lines = (text or "").split("\n")
     parts = [
-        ("<p>" + html.escape(ln) + "</p>") if ln.strip() else "<p><br></p>"
+        ("<p>" + md_bold_to_html(html.escape(ln)) + "</p>")
+        if ln.strip() else "<p><br></p>"
         for ln in lines
     ]
     return "".join(parts) or "<p><br></p>"
@@ -8545,11 +8551,16 @@ def prompt_find_and_pick(
 
 
 def prompt_quick_note(parent, *, default_type: str = "Admin Note",
-                      student_name: str = "", course_code: str = ""):
+                      student_name: str = "", course_code: str = "",
+                      note_templates=None, on_manage_templates=None):
     """Quick-note dialog — mirrors the 'Note' action's core fields (interaction
     format, type, academic activities, subject, body) so it feels familiar.
     Files an ad-hoc note for the selected student. Returns a dict
-    {interaction_format, interaction_type, subject, body, activities} or None."""
+    {interaction_format, interaction_type, subject, body, activities} or None.
+
+    When `note_templates` is given, a 'Choose template ▾' button lets the user
+    fill a saved template into the body — the easy 'file a templated note now'
+    entry for the silent-fire paths (no configured edit-at-fire note needed)."""
     dialog = ctk.CTkToplevel(parent)
     dialog.title(f"Quick note — {student_name}" if student_name else "Quick note")
     dialog.geometry("520x600")
@@ -8573,6 +8584,34 @@ def prompt_quick_note(parent, *, default_type: str = "Admin Note",
     course_entry.pack(side="left")
     if course_code:
         course_entry.insert(0, course_code)
+
+    # Optional: fill this note from a saved template (picks + fills, drops the
+    # rendered text into the body and presets the note type if the template
+    # names one). Only shown when templates exist.
+    if note_templates:
+        tpl_row = ctk.CTkFrame(body_frame, fg_color="transparent")
+        tpl_row.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(tpl_row, text="Template:").pack(side="left", padx=(0, 8))
+
+        def _choose_template():
+            tmpl = pick_note_template(dialog, note_templates,
+                                      course_entry.get().strip(),
+                                      manage=on_manage_templates)
+            if not tmpl:
+                return
+            filled = prompt_fill_note_template(dialog, tmpl)
+            if filled is None:
+                return
+            body_box.delete("1.0", "end")
+            body_box.insert("1.0", filled)
+            if (tmpl.note_type
+                    and tmpl.note_type in types_for_format(fmt_var.get())):
+                type_var.set(tmpl.note_type)
+                _refresh()
+
+        ctk.CTkButton(tpl_row, text="Choose template ▾",
+                      command=_choose_template, width=170,
+                      **SECONDARY_BTN_KWARGS).pack(side="left")
 
     fmt_var = ctk.StringVar(value="Single Interaction")
     fmt_row = ctk.CTkFrame(body_frame, fg_color="transparent")
@@ -8665,12 +8704,20 @@ def prompt_quick_note(parent, *, default_type: str = "Admin Note",
 
 
 def prompt_additional_text(parent, label: str, prefilled: str,
-                           enter_submits: bool = True) -> Optional[str]:
+                           enter_submits: bool = True,
+                           note_templates=None, course: str = "",
+                           on_manage_templates=None,
+                           default_template=None) -> Optional[str]:
     """Blocking modal: multi-line edit of a note body, pre-filled.
     Returns the new body (no strip), or None if cancelled. When
     `enter_submits` (the default), Enter submits and Shift+Enter inserts a
     newline; when False, Enter inserts a newline and only the button submits.
     Esc always cancels.
+
+    When `note_templates` is given, a 'Choose template ▾' button appears above
+    the body — picking one opens the fill form and drops the rendered text into
+    the body (used for the batch 'fill once, apply to all' path). `course` seeds
+    the picker's course auto-suggest.
 
     Pre-fill rule: if the body doesn't already end in whitespace, a
     single trailing space is added so the user can start typing
@@ -8703,6 +8750,30 @@ def prompt_additional_text(parent, label: str, prefilled: str,
     text_box.focus_force()
     dialog.after(50, text_box.focus_force)
     text_box.mark_set("insert", "end-1c")
+
+    if note_templates or default_template is not None:
+        def _apply_template_fill(tmpl):
+            filled = prompt_fill_note_template(dialog, tmpl)
+            if filled is None:
+                return
+            text_box.delete("1.0", "end")
+            text_box.insert("1.0", filled)
+            text_box.mark_set("insert", "end-1c")
+
+    if note_templates:
+        tpl_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        tpl_row.pack(fill="x", padx=12, pady=(0, 2), before=text_box)
+        ctk.CTkLabel(tpl_row, text="Template:", anchor="w").pack(side="left")
+
+        def _choose_template():
+            tmpl = pick_note_template(dialog, note_templates, course,
+                                      manage=on_manage_templates)
+            if tmpl:
+                _apply_template_fill(tmpl)
+
+        ctk.CTkButton(
+            tpl_row, text="Choose template ▾", command=_choose_template,
+            width=170, **SECONDARY_BTN_KWARGS).pack(side="left", padx=(6, 0))
 
     def submit(_event=None):
         result["value"] = text_box.get("1.0", "end-1c")
@@ -8739,15 +8810,261 @@ def prompt_additional_text(parent, label: str, prefilled: str,
         **SECONDARY_BTN_KWARGS,
     ).pack(side="left", padx=4)
 
+    # A bound default template pre-opens its fill form (Cancel it to free-type).
+    if default_template is not None:
+        dialog.after(60, lambda: _apply_template_fill(default_template))
     parent.wait_window(dialog)
     return result["value"]
+
+
+def pick_note_template(parent, templates, course="", manage=None):
+    """Small popup: choose a NoteTemplate to fill. Templates whose `courses` is
+    empty (apply to any course) or include `course` are SUGGESTED at the top; a
+    'Show all…' reveals the rest. Returns the chosen NoteTemplate or None.
+
+    When `manage` is given (a callable `manage(start_new: bool, parent) -> list`
+    that opens the template editor and returns the refreshed list), '＋ New' and
+    '✎ Edit…' buttons appear and the picker updates in place after editing.
+    Opens near the mouse and restores the parent's grab on close."""
+    templates = list(templates or [])
+    if not templates and manage is None:
+        return None
+    cu = (course or "").strip().upper()
+
+    def _matches(t):
+        return (not t.courses) or (cu and cu in [c.upper() for c in t.courses])
+
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Choose a note template")
+    try:
+        _px, _py = dialog.winfo_pointerxy()
+        dialog.geometry(f"+{max(_px - 30, 0)}+{max(_py - 30, 0)}")
+    except Exception:
+        pass
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.lift()
+    dialog.after(50, lambda: (dialog.lift(), dialog.focus_force()))
+    res = {"value": None}
+    state = {"show_all": False}
+
+    def _close():
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+        try: parent.grab_set()
+        except Exception: pass
+
+    def _choose(t):
+        res["value"] = t
+        _close()
+
+    header = ctk.CTkLabel(
+        dialog, text="Templates:", anchor="w",
+        font=ctk.CTkFont(size=12, weight="bold"))
+    header.pack(fill="x", padx=12, pady=(10, 2))
+
+    listframe = ctk.CTkScrollableFrame(dialog, width=360, height=260)
+    listframe.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+    def _button(t):
+        sub = f"   ·  {t.interaction_type}" if t.interaction_type else ""
+        crs = f"   [{', '.join(t.courses)}]" if t.courses else ""
+        ctk.CTkButton(
+            listframe, text=f"{t.name}{sub}{crs}", anchor="w",
+            command=lambda tt=t: _choose(tt), **SECONDARY_BTN_KWARGS,
+        ).pack(fill="x", padx=4, pady=2)
+
+    def redraw():
+        for w in listframe.winfo_children():
+            w.destroy()
+        suggested = [t for t in templates if _matches(t)]
+        sug_ids = {id(t) for t in suggested}
+        others = [t for t in templates if id(t) not in sug_ids]
+        header.configure(text=(f"Suggested for {cu}:" if (cu and suggested)
+                               else "Templates:"))
+        if not templates:
+            ctk.CTkLabel(
+                listframe, text="No templates yet — click ＋ New below.",
+                text_color=("gray40", "gray65"),
+            ).pack(fill="x", padx=6, pady=20)
+            return
+        for t in suggested:
+            _button(t)
+        show_all = state["show_all"] or not suggested
+        if others and show_all:
+            if suggested:
+                ctk.CTkLabel(
+                    listframe, text="Other templates:", anchor="w",
+                    text_color=("gray40", "gray65"),
+                ).pack(fill="x", padx=6, pady=(6, 0))
+            for t in others:
+                _button(t)
+        elif others:
+            ctk.CTkButton(
+                listframe, text=f"Show all ({len(others)} more)…", anchor="w",
+                command=lambda: (state.update(show_all=True), redraw()),
+                **SECONDARY_BTN_KWARGS,
+            ).pack(fill="x", padx=4, pady=(6, 2))
+
+    def _manage(start_new):
+        nonlocal templates
+        try:
+            fresh = manage(bool(start_new), dialog)
+        except Exception:
+            fresh = templates
+        templates = list(fresh or [])
+        redraw()
+
+    redraw()
+
+    ctrl = ctk.CTkFrame(dialog, fg_color="transparent")
+    ctrl.pack(fill="x", padx=10, pady=(2, 10))
+    if manage is not None:
+        ctk.CTkButton(ctrl, text="＋ New", width=80,
+                      command=lambda: _manage(True),
+                      **SECONDARY_BTN_KWARGS).pack(side="left")
+        ctk.CTkButton(ctrl, text="✎ Edit…", width=80,
+                      command=lambda: _manage(False),
+                      **SECONDARY_BTN_KWARGS).pack(side="left", padx=(6, 0))
+    ctk.CTkButton(ctrl, text="Cancel", command=_close, width=90,
+                  **SECONDARY_BTN_KWARGS).pack(side="right")
+    dialog.bind("<Escape>", lambda _e: _close())
+    dialog.protocol("WM_DELETE_WINDOW", _close)
+    _fit_dialog_to_content(dialog, min_w=380, near_mouse=True)
+    parent.wait_window(dialog)
+    return res["value"]
+
+
+def prompt_fill_note_template(parent, template, prefill=None):
+    """Tab-through fill form for a NoteTemplate: each field renders as its widget
+    (text = entry, multiline = box, dropdown = editable combobox seeded with the
+    field's choices), pre-filled with its default (or `prefill[label]` when
+    given). Tab / Shift-Tab move between fields. Returns the rendered note body,
+    or None if cancelled. Restores the parent's grab on close."""
+    prefill = prefill or {}
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title(f"Fill note — {template.name}")
+    try:
+        _px, _py = dialog.winfo_pointerxy()
+        dialog.geometry(f"+{max(_px - 30, 0)}+{max(_py - 30, 0)}")
+    except Exception:
+        pass
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.lift()
+    dialog.after(50, lambda: (dialog.lift(), dialog.focus_force()))
+    res = {"value": None}
+
+    ctk.CTkLabel(
+        dialog, text="Tab between fields · Ctrl+Enter or Continue to finish · "
+        "Esc = cancel", anchor="w", text_color=("gray35", "gray70"),
+    ).pack(fill="x", padx=12, pady=(10, 2))
+
+    form = ctk.CTkScrollableFrame(dialog, width=480, height=340)
+    form.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+    rows = []  # (field, widget, kind)
+    for f in template.fields:
+        seed = prefill.get(f.label, f.default)
+        ctk.CTkLabel(
+            form, text=f"{f.label}:", anchor="w",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(fill="x", padx=6, pady=(6, 0))
+        if f.kind == "multiline":
+            w = ctk.CTkTextbox(form, wrap="word", height=70)
+            w.pack(fill="x", padx=6, pady=(0, 2))
+            if seed:
+                w.insert("1.0", seed)
+        elif f.kind == "dropdown":
+            w = ctk.CTkComboBox(form, values=list(f.choices))
+            w.pack(fill="x", padx=6, pady=(0, 2))
+            w.set(seed or "")
+        elif f.kind == "date":
+            # Editable combobox (choices = relative quick-picks like "1 week")
+            # PLUS a 📅 button that drops in a concrete MM/DD/YYYY date.
+            drow = ctk.CTkFrame(form, fg_color="transparent")
+            drow.pack(fill="x", padx=6, pady=(0, 2))
+            w = ctk.CTkComboBox(drow, values=list(f.choices))
+            w.pack(side="left", fill="x", expand=True)
+            w.set(seed or "")
+
+            def _pick_date(cb=w):
+                d = prompt_calendar_pick(dialog)
+                if d:
+                    cb.set(d.strftime("%m/%d/%Y"))
+
+            ctk.CTkButton(drow, text="📅", width=40, command=_pick_date,
+                          **SECONDARY_BTN_KWARGS).pack(side="left", padx=(4, 0))
+        else:
+            w = ctk.CTkEntry(form)
+            w.pack(fill="x", padx=6, pady=(0, 2))
+            if seed:
+                w.insert(0, seed)
+        rows.append((f, w, f.kind))
+
+    widgets = [w for (_f, w, _k) in rows]
+
+    def _focus(delta, ix):
+        if not widgets:
+            return "break"
+        j = (ix + delta) % len(widgets)
+        try:
+            widgets[j].focus_set()
+        except Exception:
+            pass
+        return "break"
+
+    for ix, w in enumerate(widgets):
+        w.bind("<Tab>", lambda _e, i=ix: _focus(1, i))
+        w.bind("<Shift-Tab>", lambda _e, i=ix: _focus(-1, i))
+
+    def _val(w, kind):
+        if kind == "multiline":
+            return w.get("1.0", "end-1c")
+        return w.get()
+
+    def _close():
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+        try: parent.grab_set()
+        except Exception: pass
+
+    def _ok(_e=None):
+        values = {f.label: _val(w, kind) for (f, w, kind) in rows}
+        res["value"] = render_note_template(template, values)
+        _close()
+
+    def _cancel(_e=None):
+        _close()
+
+    btns = ctk.CTkFrame(dialog, fg_color="transparent")
+    btns.pack(pady=(2, 10))
+    ctk.CTkButton(btns, text="Continue", command=_ok, width=110).pack(
+        side="left", padx=4)
+    ctk.CTkButton(btns, text="Cancel", command=_cancel, width=90,
+                  **SECONDARY_BTN_KWARGS).pack(side="left", padx=4)
+    dialog.bind("<Escape>", _cancel)
+    dialog.bind("<Control-Return>", _ok)
+    dialog.protocol("WM_DELETE_WINDOW", _cancel)
+    if widgets:
+        dialog.after(60, lambda: widgets[0].focus_set())
+    _fit_dialog_to_content(dialog, min_w=500, near_mouse=True)
+    parent.wait_window(dialog)
+    return res["value"]
 
 
 def prompt_edit_note(parent, label, body_prefill, course_default,
                      activities_on, eas, enter_submits: bool = True,
                      interaction_type: str = "",
                      interaction_format: str = "Single Interaction",
-                     subject_default: str = ""):
+                     subject_default: str = "", note_templates=None,
+                     on_manage_templates=None, default_template=None):
     """Unified fire-time note dialog: edit the body, subject, course code,
     note type, and academic activities, and — when the student has open
     Essential Actions — attach/close one. Returns
@@ -8812,6 +9129,42 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
     subject_entry.pack(side="left", fill="x", expand=True)
     if subject_default:
         subject_entry.insert(0, subject_default)
+
+    # Optional: fill the body from a saved note template. Only shown when the
+    # user has templates; picking one opens a tab-through fill form and drops
+    # the rendered text into the body (and presets the note type if the template
+    # names one). Normal free-typing is unaffected.
+    if note_templates or default_template is not None:
+        def _apply_template_fill(tmpl):
+            filled = prompt_fill_note_template(dialog, tmpl)
+            if filled is None:
+                return
+            text_box.delete("1.0", "end")
+            text_box.insert("1.0", filled)
+            text_box.mark_set("insert", "end-1c")
+            if tmpl.note_type and tmpl.note_type in type_choices:
+                type_var.set(tmpl.note_type)
+                _sync_activities()
+
+    if note_templates:
+        tmpl_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        tmpl_row.pack(fill="x", padx=12, pady=(2, 2))
+        ctk.CTkLabel(tmpl_row, text="Template:", width=90, anchor="w").pack(
+            side="left")
+
+        def _choose_template(_e=None):
+            tmpl = pick_note_template(
+                dialog, note_templates, course_entry.get().strip(),
+                manage=on_manage_templates)
+            if tmpl:
+                _apply_template_fill(tmpl)
+
+        ctk.CTkButton(
+            tmpl_row, text="Choose template ▾", command=_choose_template,
+            width=170, **SECONDARY_BTN_KWARGS).pack(side="left")
+        ctk.CTkLabel(
+            tmpl_row, text="  fills the note body below",
+            text_color=("gray40", "gray65")).pack(side="left")
 
     ctk.CTkLabel(dialog, text="Note body:", anchor="w").pack(
         fill="x", padx=12, pady=(6, 0))
@@ -8939,6 +9292,10 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
     # blocks and the buttons sit at the bottom and were getting clipped), and
     # place it near the mouse.
     _fit_dialog_to_content(dialog, min_w=480, near_mouse=True)
+    # A note with a bound default template pre-opens its fill form so the user
+    # fills it straight away (they can Cancel that to free-type instead).
+    if default_template is not None:
+        dialog.after(60, lambda: _apply_template_fill(default_template))
     parent.wait_window(dialog)
     return res["value"]
 
@@ -10057,6 +10414,62 @@ def prompt_batch_text_review(
     return result["value"]
 
 
+def prompt_email_deselect_choice(parent, n_unchecked, n_total, other_desc):
+    """3-way modal shown when the user leaves some students UNCHECKED in the
+    email review AND the action also does something else (a note/text) for them.
+    Returns:
+      'email_only' — skip only the email for the unchecked; still do the rest.
+      'entirely'   — drop the unchecked from the action entirely.
+      'back'       — return to the email review.
+    Defaults to 'back' (Esc / window close) so no student is silently dropped."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Some students unchecked for email")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.lift()
+    dialog.after(50, lambda: (dialog.lift(), dialog.focus_force()))
+    res = {"value": "back"}
+
+    ctk.CTkLabel(
+        dialog, justify="left", anchor="w", wraplength=430,
+        text=(f"{n_unchecked} of {n_total} student(s) are unchecked for "
+              f"email.\nThis action also does {other_desc} for them.\n\n"
+              f"For the unchecked student(s):"),
+    ).pack(fill="x", padx=16, pady=(16, 10))
+
+    def choose(v):
+        res["value"] = v
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+        try:
+            if parent is not None:
+                parent.grab_set()
+        except Exception: pass
+
+    btns = ctk.CTkFrame(dialog, fg_color="transparent")
+    btns.pack(fill="x", padx=16, pady=(0, 14))
+    ctk.CTkButton(
+        btns, text="Skip only the email\n(do the rest for them)",
+        command=lambda: choose("email_only"), width=210, height=46,
+    ).pack(side="left", padx=(0, 6))
+    ctk.CTkButton(
+        btns, text="Skip them\nentirely", command=lambda: choose("entirely"),
+        width=120, height=46, **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=6)
+    ctk.CTkButton(
+        btns, text="◀ Back", command=lambda: choose("back"), width=80,
+        height=46, **SECONDARY_BTN_KWARGS,
+    ).pack(side="right")
+    dialog.bind("<Escape>", lambda _e: choose("back"))
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("back"))
+    _fit_dialog_to_content(dialog, min_w=470, near_mouse=True)
+    parent.wait_window(dialog)
+    return res["value"]
+
+
 def prompt_batch_email_review(
     parent,
     scenario_name: str,
@@ -10066,12 +10479,18 @@ def prompt_batch_email_review(
     templates: Optional[list[str]] = None,
     current_template: str = "",
     on_template_change: Optional[Callable[[str], list[dict]]] = None,
+    allow_empty: bool = False,
 ) -> tuple:
     """Modal reviewer for batch emails. Returns
     `(selected_indices_or_None, chosen_template)` — the indices (into
     `rendered`) the user wants to send to (None on cancel), and the
     template they had selected (the unchanged default unless a
     `templates` dropdown was shown).
+
+    `allow_empty` lets the user proceed with NOBODY checked (returns `[]`
+    instead of forcing a non-empty selection). The caller passes True when the
+    action has other channels (a note/text) so "email no one" is a valid way to
+    skip just the email step; when False, proceeding needs ≥1 recipient.
 
     When `templates` is given (the scenario opted into 'choose template
     when fired'), a Template dropdown appears above the preview; changing
@@ -10380,11 +10799,17 @@ def prompt_batch_email_review(
             text=f"{n_checked} of {len(rendered)} selected · "
                  f"showing {state['current'] + 1} of {len(rendered)}"
         )
-        send_btn.configure(
-            text=f"Send to {n_checked} students"
-            if n_checked != 1 else "Send to 1 student"
-        )
-        send_btn.configure(state=("normal" if n_checked > 0 else "disabled"))
+        if n_checked > 0:
+            send_btn.configure(
+                text=(f"Send to {n_checked} students" if n_checked != 1
+                      else "Send to 1 student"),
+                state="normal")
+        else:
+            # Zero checked: only proceed-able when the action has other channels
+            # (email no one, still do the note/text). Otherwise stay disabled.
+            send_btn.configure(
+                text="Continue — email no one",
+                state=("normal" if allow_empty else "disabled"))
 
     def _capture_addrs() -> None:
         """Save the CC/BCC entry text for the currently-shown row."""
@@ -10578,9 +11003,12 @@ def prompt_batch_email_review(
     def _do_send() -> None:
         _capture_addrs()   # capture the currently-shown row's CC/BCC
         selected = [i for i, v in enumerate(selected_vars) if v.get()]
-        if not selected:
+        # An empty selection is only reachable when allow_empty (the button is
+        # disabled otherwise); it's a valid "email no one" signal — the caller
+        # decides what that means for the action's other channels.
+        if not selected and not allow_empty:
             return
-        result_box["value"] = selected
+        result_box["value"] = selected   # may be [] when allow_empty
         try: dialog.grab_release()
         except Exception: pass
         try: dialog.destroy()
@@ -11334,9 +11762,14 @@ class NoteEditor:
         self, parent, index: int,
         on_delete: Optional[Callable] = None,
         get_scenario_vars: Optional[Callable[[], list[str]]] = None,
+        pick_template: Optional[Callable] = None,
     ):
         self.index = index
         self._collapsed = False
+        # Callback (parent, course) -> chosen NoteTemplate | None, opening the
+        # same fire-time picker so a note can bind a DEFAULT template.
+        self._pick_template = pick_template
+        self._default_template = ""   # bound template name; "" = none
         # Callable returning the live list of `var` names from the
         # ScenarioEditor's variable rows — refreshed each time the
         # body field gets focus so freshly-added variables show up.
@@ -11447,6 +11880,27 @@ class NoteEditor:
         self.subject_entry = ctk.CTkEntry(
             content, placeholder_text="(optional; {{vars}} allowed)")
         self.subject_entry.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 2))
+
+        # Default note template — same picker + layout as fire time. Binds a
+        # template that's pre-loaded into the fill form when this note fires
+        # (for "Edit note at fire time" notes). Only shown when templates are
+        # wired in (pick_template given).
+        if self._pick_template is not None:
+            row += 1
+            tpl_row = ctk.CTkFrame(content, fg_color="transparent")
+            tpl_row.grid(row=row, column=0, sticky="ew", padx=8, pady=(8, 0))
+            ctk.CTkLabel(tpl_row, text="Default template:").pack(side="left")
+            ctk.CTkButton(
+                tpl_row, text="Choose template ▾",
+                command=self._choose_default_template, width=170,
+                **SECONDARY_BTN_KWARGS).pack(side="left", padx=(6, 0))
+            self._tpl_label = ctk.CTkLabel(
+                tpl_row, text="(none)", text_color=("gray40", "gray65"))
+            self._tpl_label.pack(side="left", padx=(8, 0))
+            self._tpl_clear_btn = ctk.CTkButton(
+                tpl_row, text="✕", width=28,
+                command=self._clear_default_template, **SECONDARY_BTN_KWARGS)
+            # Packed only when a template is bound (see _set_default_template).
 
         # Body
         row += 1
@@ -11617,12 +12071,38 @@ class NoteEditor:
         self._update_submit_warning()
         self.append_clipboard_var.set(note.append_clipboard)
         self.enter_additional_text_var.set(note.enter_additional_text)
+        self._set_default_template(getattr(note, "note_template", ""))
         # Course code override (per-note, replaces the old main-window
         # global field). Empty = auto-detect at fire time.
         self.course_code_override_entry.delete(0, "end")
         if note.course_code_override:
             self.course_code_override_entry.insert(0, note.course_code_override)
         self._update_activity_state()
+
+    def _choose_default_template(self) -> None:
+        if not self._pick_template:
+            return
+        course = self.course_code_override_entry.get().strip()
+        tmpl = self._pick_template(self.frame.winfo_toplevel(), course)
+        if tmpl:
+            self._set_default_template(tmpl.name)
+
+    def _clear_default_template(self) -> None:
+        self._set_default_template("")
+
+    def _set_default_template(self, name: str) -> None:
+        """Update the bound default-template name + its label/clear affordance."""
+        self._default_template = (name or "").strip()
+        if not hasattr(self, "_tpl_label"):
+            return   # templates not wired into this editor
+        if self._default_template:
+            self._tpl_label.configure(
+                text=self._default_template, text_color=("gray10", "gray90"))
+            self._tpl_clear_btn.pack(side="left", padx=(6, 0))
+        else:
+            self._tpl_label.configure(
+                text="(none)", text_color=("gray40", "gray65"))
+            self._tpl_clear_btn.pack_forget()
 
     def _update_submit_warning(self) -> None:
         """Show / hide the yellow warning chip next to the Submit
@@ -11673,6 +12153,9 @@ class NoteEditor:
             "append_clipboard": self.append_clipboard_var.get(),
             "enter_additional_text": self.enter_additional_text_var.get(),
         }
+        # Only emit the bound-template key when set (keeps scenarios.yaml clean).
+        if self._default_template:
+            out["note_template"] = self._default_template
         # Only emit the override key when non-empty so scenarios.yaml
         # stays clean for the (common) auto-detect case.
         cc_override = self.course_code_override_entry.get().strip()
@@ -11761,7 +12244,11 @@ class ScenarioEditor:
         branching_enabled: bool = False,
         get_view_columns: Optional[Callable[[], list[str]]] = None,
         get_sp_options: Optional[Callable[[], list]] = None,
+        pick_template: Optional[Callable] = None,
     ):
+        # (parent, course) -> chosen NoteTemplate | None; forwarded to each
+        # NoteEditor so a note can bind a default template.
+        self._pick_template = pick_template
         self.scenario_name = scenario.name
         self.close_tab_after = scenario.close_tab_after
         # Action branching. `branches` holds one dict per branch (same shape as
@@ -12878,6 +13365,7 @@ class ScenarioEditor:
             index=len(self.note_editors),
             on_delete=self._delete_note,
             get_scenario_vars=self._current_prompt_var_names,
+            pick_template=self._pick_template,
         )
         ne.frame.pack(fill="x", padx=4, pady=4)
         ne.load(note_data)
@@ -14712,18 +15200,36 @@ class CaseloadPanel:
                 text_color=("gray40", "gray65"),
             ).grid(row=0, column=0, columnspan=2, padx=8, pady=20)
         else:
+            # Click a student → close this dialog and open them in the 🗄
+            # Archived view (pre-filtered to their ID) so their saved data can
+            # be reviewed + updated. They're off the live caseload now, so the
+            # archived path is where they live.
+            def open_departed(sid):
+                dlg.destroy()
+                try:
+                    self._enter_archived_mode(query=str(sid))
+                except Exception as e:
+                    self.app._append_log(
+                        f"Couldn't open {sid} in the archived view: {e}",
+                        error=True)
+
+            ctk.CTkLabel(
+                hdr, text="Click a student to open them in the viewer.",
+                text_color=("gray40", "gray65"), font=ctk.CTkFont(size=11),
+            ).pack(anchor="w")
             # Follow-ups first, then completed; each block alphabetical-ish by
             # the order find_departures returned (prior-collection order).
             ordered = ([d for d in deps if d["classification"] == "followup"]
                        + [d for d in deps if d["classification"] != "followup"])
             for i, d in enumerate(ordered):
                 followup = d["classification"] == "followup"
+                sid = d["student_id"]
                 tag = ctk.CTkLabel(
                     scroll,
                     text=("FOLLOW UP" if followup else "completed"),
                     width=84, corner_radius=6,
                     fg_color=("#b3261e" if followup else "#3a3a3a"),
-                    text_color="white",
+                    text_color="white", cursor="hand2",
                     font=ctk.CTkFont(size=10, weight="bold"),
                 )
                 tag.grid(row=i, column=0, padx=(4, 8), pady=2, sticky="w")
@@ -14732,9 +15238,14 @@ class CaseloadPanel:
                 detail = (f"{d.get('name') or d['student_id']}  "
                           f"[{d['student_id']}]  ·  {d['course_code']}  ·  "
                           f"last: {last}  ·  seen {seen}")
-                ctk.CTkLabel(
+                det = ctk.CTkLabel(
                     scroll, text=detail, anchor="w", justify="left",
-                ).grid(row=i, column=1, padx=4, pady=2, sticky="w")
+                    cursor="hand2",
+                )
+                det.grid(row=i, column=1, padx=4, pady=2, sticky="w")
+                for wdg in (tag, det):
+                    wdg.bind("<Button-1>",
+                             lambda _e, s=sid: open_departed(s))
 
         # Action buttons on their OWN row (so they can't get clipped by the
         # dialog width / widget scaling), with Close on a separate row.
@@ -15688,12 +16199,15 @@ class CaseloadPanel:
             note += f"  ({date})"
         if attempts:
             note += f"  ·  {attempts} attempt" + ("s" if attempts != 1 else "")
-        if state != "none":
-            note += "\nclick to open the EMA Score Report"
-            badge.configure(cursor="hand2")
-            badge.bind(
-                "<Button-1>",
-                lambda e, t=i, rw=row: self._open_task_report_for(rw, t))
+        # Always clickable — even a task with no recorded status. Caseload data
+        # can lag the real result (a just-passed/submitted task may still show
+        # blank here), and the EMA Score Report is the authoritative source, so
+        # let the user open it regardless of what our snapshot says.
+        note += "\nclick to open the EMA Score Report"
+        badge.configure(cursor="hand2")
+        badge.bind(
+            "<Button-1>",
+            lambda e, t=i, rw=row: self._open_task_report_for(rw, t))
         _attach_tooltip(badge, note)
 
     def _schedule_task_status_fetch(self, sid, badges, row) -> None:
@@ -16015,7 +16529,9 @@ class CaseloadPanel:
             self.app.settings, "quick_note_last_type", "Admin Note")
         data = prompt_quick_note(
             self.app.root, default_type=default_type,
-            student_name=name, course_code=course)
+            student_name=name, course_code=course,
+            note_templates=self.app.note_templates,
+            on_manage_templates=self.app._manage_templates_from_picker)
         if not data:
             return
         # Remember the type used so it opens first next time.
@@ -19371,6 +19887,9 @@ class App:
         # Per-course success paths (ordered step checklists) — see
         # SuccessPath. Keyed by course code; empty until the user defines one.
         self.success_paths: dict[str, SuccessPath] = load_success_paths()
+        # Reusable structured note bodies (see NoteTemplate). Chosen + filled at
+        # fire time; empty until the user defines one.
+        self.note_templates: list[NoteTemplate] = load_note_templates()
         # Preferences were loaded above (before the data-unlock step). Share
         # the name-casing pref with the template builders.
         self._sync_name_cap_mode()
@@ -21122,6 +21641,7 @@ class App:
                 getattr(getattr(self, "settings", None), "enable_branching", False)),
             get_view_columns=self._viewer_shown_columns,
             get_sp_options=self._success_path_filter_options,
+            pick_template=self._pick_default_template_cb,
         )
         editor.frame.grid(row=0, column=0, sticky="nsew")
         editor.frame.grid_remove()
@@ -22056,6 +22576,7 @@ class App:
             self.scenarios = load_scenarios()
             self.groups = load_groups()
             self.success_paths = load_success_paths()
+            self.note_templates = load_note_templates()
             self._refresh_scenario_raw()
         except Exception as e:
             self._append_log(f"Loaded but reload failed: {e}", error=True)
@@ -22181,6 +22702,7 @@ class App:
             self.scenarios = load_scenarios()
             self.groups = load_groups()
             self.success_paths = load_success_paths()
+            self.note_templates = load_note_templates()
             self._refresh_scenario_raw()
         except Exception as e:
             self._append_log(f"Revert failed: {e}")
@@ -22370,6 +22892,14 @@ class App:
                 for course, p in self.success_paths.items()
             }
 
+        # Persist reusable note templates (see NoteTemplate). _save_yaml rebuilds
+        # new_doc from scratch, so an omitted block is dropped from disk — always
+        # re-serialize from the in-memory list.
+        if getattr(self, "note_templates", None):
+            new_doc["note_templates"] = [
+                note_template_to_dict(t) for t in self.note_templates
+            ]
+
         try:
             SCENARIOS_YAML.write_text(
                 yaml.safe_dump(new_doc, sort_keys=False, allow_unicode=True),
@@ -22382,6 +22912,7 @@ class App:
             self.scenarios = load_scenarios()
             self.groups = load_groups()
             self.success_paths = load_success_paths()
+            self.note_templates = load_note_templates()
             # The just-saved doc IS the new on-disk state — use it directly so
             # un-opened actions serialize from current data next save.
             self._scenario_raw = dict(new_doc.get("scenarios", {}))
@@ -23753,22 +24284,28 @@ class App:
         eas_read = False
         eas_navigated = False  # did we actually nav to the EA tab (needs re-nav)?
         eas: list = []
+        # A bound default template also needs the fire-time dialog (that's where
+        # its fill form pops), so include those notes even without edit-at-fire.
         edit_idxs = [i for i, n in enumerate(scenario.notes)
-                     if n.enter_additional_text]
-        # A main-window fire has no caseload row, so there's no course_hint
-        # and the fire-time note dialog's Course field would be blank (the
-        # right-click path gets the code from the row). Detect the active
-        # student's course code up front — same lookup the worker uses at
-        # submit — but only when a dialog will actually show and we don't
-        # already have a code.
-        if edit_idxs and not course_hint and not override:
+                     if n.enter_additional_text or getattr(n, "note_template", "")]
+        # A main-window / hotkey fire has no caseload row, so there's no
+        # course_hint and no known student id. Read the active record's context
+        # ONCE up front — it's a NON-navigating read of the current page (cheap),
+        # and it yields BOTH the course code AND the student_id. The student_id
+        # then lets the EA offer come from the fast dashboard CACHE instead of a
+        # slow live nav-read to the EA tab (which was the 2-3s stall). Runs only
+        # when a dialog will actually show and no student is pre-selected.
+        ctx_sid = ""
+        if edit_idxs and deferred_nav is None and not prenav_student_id:
             try:
                 _ctx = self._get_student_context_blocking(name_hint=chosen_name)
-                if _ctx and _ctx.get("course_code"):
-                    course_hint = _ctx["course_code"]
             except Exception:
-                pass
-            if not course_hint:
+                _ctx = None
+            if _ctx:
+                ctx_sid = str(_ctx.get("student_id", "") or "").strip()
+                if not course_hint and not override and _ctx.get("course_code"):
+                    course_hint = _ctx["course_code"]
+            if not course_hint and not override:
                 # Off-caseload student: no caseload row and no single course
                 # field on the Contact page — prefill from the active ACI course
                 # captured in the scraped off-caseload profile (_qv_row).
@@ -23792,16 +24329,20 @@ class App:
                 # Only fall back to a live read when we have no dashboard data
                 # AND no background nav is in flight (e.g. a hotkey fire against
                 # the already-open record) — there a blocking read is harmless.
-                sid = prenav_student_id or (
-                    (self._caseload_row_by_name(chosen_name) or {}).get(
-                        "StudentID", "") if chosen_name else "")
+                # Prefer the student id we already know — pre-nav row, the
+                # up-front context read (ctx_sid), or a name→row lookup — so the
+                # EA offer resolves from the dashboard cache (no navigation).
+                sid = (prenav_student_id or ctx_sid
+                       or ((self._caseload_row_by_name(chosen_name) or {}).get(
+                           "StudentID", "") if chosen_name else ""))
                 ea_by_sid = getattr(self, "_ea_by_sid", {}) or {}
                 if sid and ea_by_sid:
                     ea_dash = ea_by_sid.get(sid)
                     eas = [ea_dash] if ea_dash else []
                 elif deferred_nav is None:
-                    # No dashboard data AND no deferred navigation (e.g. a
-                    # hotkey fire against the already-open record) → read live.
+                    # No usable dashboard cache (never scraped) AND no deferred
+                    # navigation (e.g. a hotkey fire against the already-open
+                    # record) → fall back to the live (navigating) EA read.
                     self._append_log(
                         "Checking this student's Essential Actions…")
                     eas = self._read_eas_blocking()
@@ -23812,13 +24353,21 @@ class App:
             course_default = (n.course_code_override or course_hint
                               or override or "")
             offer_ea = (pos == 0)  # attach at most one EA per fire
+            default_tmpl = None
+            if getattr(n, "note_template", ""):
+                default_tmpl = next(
+                    (t for t in self.note_templates
+                     if t.name == n.note_template), None)
             res = prompt_edit_note(
                 self.root, label, prefill, course_default,
                 list(n.academic_activities), eas if offer_ea else [],
                 enter_submits=self.settings.enter_submits_note,
                 interaction_type=n.interaction_type,
                 interaction_format=n.interaction_format,
-                subject_default=n.subject)
+                subject_default=n.subject,
+                note_templates=self.note_templates,
+                on_manage_templates=self._manage_templates_from_picker,
+                default_template=default_tmpl)
             if res is None:
                 self._append_log(f"{label} edit cancelled; action not fired.")
                 return
@@ -23933,21 +24482,28 @@ class App:
                     scn, {}, prompt_vars, user_info, ctx_override=student_ctx,
                     extra_cc=extra_cc)]
 
+            # Allow "email no one" only when there's a note to still file —
+            # then deselecting the email skips just the send, not the note.
             scenario, selected, edits, cc_edits, bcc_edits = \
-                self._run_email_review(scenario, _render, who)
-            if not selected:
+                self._run_email_review(scenario, _render, who,
+                                       allow_empty=bool(scenario.notes))
+            if selected is None:
                 self._append_log("Email review cancelled; note not filed.")
                 return
-            ctx_send = {**student_ctx, **prompt_vars}
-            # The reviewer's CC (index 0) is authoritative — pass it as the
-            # override so any ACI/PM the user removed there is honored.
-            if not self._send_scenario_email(
-                scenario.email, ctx_send, auto_send=True,
-                body_html_override=edits.get(0), extra_cc=extra_cc,
-                cc_override=cc_edits.get(0), bcc=bcc_edits.get(0, ""),
-            ):
-                self._append_log("Email send failed; note not filed.")
-                return
+            if selected:
+                ctx_send = {**student_ctx, **prompt_vars}
+                # The reviewer's CC (index 0) is authoritative — pass it as the
+                # override so any ACI/PM the user removed there is honored.
+                if not self._send_scenario_email(
+                    scenario.email, ctx_send, auto_send=True,
+                    body_html_override=edits.get(0), extra_cc=extra_cc,
+                    cc_override=cc_edits.get(0), bcc=bcc_edits.get(0, ""),
+                ):
+                    self._append_log("Email send failed; note not filed.")
+                    return
+            else:
+                self._append_log(
+                    "Email skipped (deselected); filing note only.")
 
         # Reading EAs switched the record to the EA tab; if we're NOT
         # attaching, re-open the record so the normal note panel is back. Only
@@ -24628,7 +25184,8 @@ class App:
         payload["emit_timing"] = bool(
             getattr(self.settings, "advanced_mode", False))
         self.worker.submit_send_text(payload, on_done)
-        self.root.wait_variable(done_var)
+        with self._waiting("Mongoose", "sending the text"):
+            self.root.wait_variable(done_var)
         return holder["res"]
 
     def _close_record_tabs_blocking(self) -> int:
@@ -24692,7 +25249,8 @@ class App:
                 set_main()
 
         self.worker.submit_mongoose_login_check(on_done)
-        self.root.wait_variable(done_var)
+        with self._waiting("Mongoose", "checking sign-in"):
+            self.root.wait_variable(done_var)
         if not holder["ok"]:
             self._append_log(
                 "Mongoose isn't signed in — opened it for you. Sign in to "
@@ -24731,7 +25289,8 @@ class App:
                 set_main()
 
         self.worker.submit_salesforce_login_check(on_done)
-        self.root.wait_variable(done_var)
+        with self._waiting("Salesforce", "checking sign-in"):
+            self.root.wait_variable(done_var)
         if not holder["ok"]:
             self._append_log(
                 "Salesforce isn't signed in (SSO likely timed out) — brought "
@@ -25268,14 +25827,15 @@ class App:
             has_email = scenario.email is not None
             body_overrides: dict = {}
             addr_overrides: dict = {}
+            email_skip: set = set()
             if has_email:
                 filter_summary = ", ".join(
                     f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
                     for f in scenario.batch.filters
                     if f.get("column")
                 )
-                scenario, confirmed, body_overrides, addr_overrides = \
-                    self._review_emails(
+                scenario, confirmed, body_overrides, addr_overrides, \
+                    email_skip = self._review_emails(
                         scenario, matched, prompt_vars, filter_summary,
                     )
                 if confirmed is None:
@@ -25334,7 +25894,7 @@ class App:
                 "scenario": scenario, "override": override,
                 "confirmed": confirmed, "prompt_vars": prompt_vars,
                 "has_email": has_email, "body_overrides": body_overrides,
-                "addr_overrides": addr_overrides,
+                "addr_overrides": addr_overrides, "email_skip": email_skip,
                 "note_inputs": note_inputs,
                 "text_groups": text_groups, "text_selected": text_selected,
             }
@@ -25397,10 +25957,17 @@ class App:
             self._color_for_scenario(scenario.name))
         try:
             text_groups = payload.get("text_groups")
+            email_skip = set(payload.get("email_skip") or ())
+            confirmed_n = len(payload.get("confirmed") or [])
+            # At least one email actually sends only if the action emails AND not
+            # every processed student was deselected from the email step.
+            will_email = (payload.get("has_email")
+                          and len(email_skip) < confirmed_n)
             # Pre-flight Outlook BEFORE any send when this action emails: a
             # systemic Outlook failure then pauses the queue for a CLEAN retry —
             # nothing has gone out yet, so a retry can't double-send the text.
-            if payload.get("has_email"):
+            # Skipped when the user chose to email no one (nothing to pre-flight).
+            if will_email:
                 from src import outlook_email
                 if not outlook_email.is_ready():
                     self._append_log(
@@ -25430,6 +25997,7 @@ class App:
                 payload["prompt_vars"], has_email=payload["has_email"],
                 source="batch", body_overrides=payload["body_overrides"],
                 addr_overrides=payload.get("addr_overrides"),
+                email_skip=email_skip,
                 prefetched_inputs=payload["note_inputs"],
             )
             outcome = outcome or {}
@@ -25649,9 +26217,10 @@ class App:
         has_email = eff.email is not None
         body_overrides: dict = {}
         addr_overrides: dict = {}
+        email_skip: set = set()
         if has_email:
             summary = f"branch • {len(rows)} student(s)"
-            eff, confirmed, body_overrides, addr_overrides = \
+            eff, confirmed, body_overrides, addr_overrides, email_skip = \
                 self._review_emails(eff, rows, prompt_vars, summary)
             if confirmed is None:
                 return False
@@ -25682,7 +26251,8 @@ class App:
         self._execute_scenario_over_rows(
             eff, override, confirmed, prompt_vars,
             has_email=has_email, source=source, body_overrides=body_overrides,
-            addr_overrides=addr_overrides, prefetched_inputs=note_inputs)
+            addr_overrides=addr_overrides, email_skip=email_skip,
+            prefetched_inputs=note_inputs)
         return True
 
     def _fire_branched_batch(self, scenario, override: str) -> None:
@@ -26193,16 +26763,27 @@ class App:
             clipboard = self._read_clipboard_content()
         custom_bodies: dict[int, str] = {}
         for i, n in enumerate(scenario.notes):
-            if not n.enter_additional_text:
+            # A bound default template also needs this dialog (its fill form
+            # pops here), so include those notes even without edit-at-fire.
+            if not n.enter_additional_text and not getattr(n, "note_template", ""):
                 continue
             label = f"Note {i + 1} (applies to all {total} students)"
             prefill = n.body
             if n.append_clipboard and clipboard:
                 sep = "\n" if prefill and not prefill.endswith("\n") else ""
                 prefill = f"{prefill}{sep}{clipboard}"
+            default_tmpl = None
+            if getattr(n, "note_template", ""):
+                default_tmpl = next(
+                    (t for t in self.note_templates
+                     if t.name == n.note_template), None)
             edited = prompt_additional_text(
                 self.root, label, prefill,
-                enter_submits=self.settings.enter_submits_note)
+                enter_submits=self.settings.enter_submits_note,
+                note_templates=self.note_templates,
+                course=(n.course_code_override or ""),
+                on_manage_templates=self._manage_templates_from_picker,
+                default_template=default_tmpl)
             if edited is None:
                 self._append_log(f"{label}: cancelled; {source} not started.")
                 return None
@@ -26215,6 +26796,7 @@ class App:
         has_email: bool, source: str = "batch",
         body_overrides: Optional[dict] = None,
         addr_overrides: Optional[dict] = None,
+        email_skip: Optional[set] = None,
         prefetched_inputs: "Optional[tuple[str, dict]]" = None,
     ) -> dict:
         """Shared execution core for firing a scenario across many
@@ -26222,12 +26804,15 @@ class App:
         mini-batch. Loops fast-find → auto-send email (if configured) → file
         note. The activity log is the progress display. `source` is the noun
         used in log lines ('batch' / 'selection'). `body_overrides` maps a row's
-        position in `confirmed` to a hand-edited email body. `prefetched_inputs`
+        position in `confirmed` to a hand-edited email body. `email_skip` is the
+        set of positions in `confirmed` the user deselected from the email review
+        — they skip ONLY the email (still get the note/text). `prefetched_inputs`
         = (clipboard, custom_bodies) already gathered by the caller (so a
         combined action collects ALL user input before the text send); when
         None we gather them here."""
         body_overrides = body_overrides or {}
         addr_overrides = addr_overrides or {}
+        email_skip = email_skip or set()
         # Step 6: per-note user input — use the caller's if it front-loaded
         # them, else gather now (selection mini-batch has no text step, so
         # there's nothing to front-load ahead of).
@@ -26338,7 +26923,9 @@ class App:
                 # Prompt vars merge into student_ctx so {{summary}}-
                 # style placeholders in the email body / subject / to
                 # resolve against the run-wide prompt input.
-                if has_email:
+                # A student deselected in the email review (email_skip) skips
+                # ONLY the email here — their note/text still runs below.
+                if has_email and (idx - 1) not in email_skip:
                     # Build context from the CSV row, then fill any gaps
                     # from the row-level mailto + contact-card scrape we
                     # did during fast-find. The two sources together
@@ -26383,6 +26970,12 @@ class App:
                     ):
                         skipped.append((student_name, "auto-send failed"))
                         continue
+                elif has_email:
+                    # In email_skip — deselected from the email step; still file
+                    # the note/text below.
+                    self._append_log(
+                        f"  (email skipped for {student_name} — deselected; "
+                        "filing note/text)")
 
                 # 7c. Notes — block until the worker finishes this RUN.
                 # Worker returns True iff the run completed without
@@ -26663,13 +27256,14 @@ class App:
         # dropdown; otherwise a single count/name confirm.
         body_overrides: dict = {}
         addr_overrides: dict = {}
+        email_skip: set = set()
         if has_email:
             n0 = len(rows)
             summary = (
                 f"{n0} hand-picked from the caseload panel" if n0 != 1
                 else self._row_name_and_query(rows[0])[0]
             )
-            scenario, confirmed, body_overrides, addr_overrides = \
+            scenario, confirmed, body_overrides, addr_overrides, email_skip = \
                 self._review_emails(
                     scenario, rows, prompt_vars, summary,
                 )
@@ -26700,6 +27294,7 @@ class App:
                 scenario, override, confirmed, prompt_vars,
                 has_email=has_email, source="selection",
                 body_overrides=body_overrides, addr_overrides=addr_overrides,
+                email_skip=email_skip,
             )
         finally:
             self._set_idle()
@@ -26746,7 +27341,8 @@ class App:
                 done_var.set(True)
 
         self.worker.submit_read_essential_actions(on_done)
-        self.root.wait_variable(done_var)
+        with self._waiting("Salesforce", "Essential Actions"):
+            self.root.wait_variable(done_var)
         return holder["eas"]
 
     def _read_ea_dashboard_blocking(self) -> list:
@@ -27176,7 +27772,8 @@ class App:
         self.worker.submit_find_and_settle(query, contact_id, on_done)
 
         def join() -> bool:
-            self.root.wait_variable(done_var)
+            with self._waiting("Salesforce", "opening the record"):
+                self.root.wait_variable(done_var)
             # Collect-as-you-go: persist a freshly-harvested id for this student.
             harvested = holder["contact_id"]
             if (student_id and harvested
@@ -27222,7 +27819,8 @@ class App:
                 done_var.set(True)
 
         self.worker.submit_click_match(name, on_done)
-        self.root.wait_variable(done_var)
+        with self._waiting("Salesforce", "opening the record"):
+            self.root.wait_variable(done_var)
         return holder["success"]
 
     def _download_caseload_csv_blocking(self) -> tuple[bool, str]:
@@ -27279,7 +27877,8 @@ class App:
         self.worker.submit_click_match_by_filter(
             query, on_done, expected_name=expected_name, contact_id=contact_id,
         )
-        self.root.wait_variable(done_var)
+        with self._waiting("Salesforce", "opening the record"):
+            self.root.wait_variable(done_var)
         return holder["success"], holder["info"]
 
     @staticmethod
@@ -27290,12 +27889,13 @@ class App:
         except Exception:
             return []
 
-    def _run_email_review(self, scenario: ScenarioConfig, render, summary: str):
+    def _run_email_review(self, scenario: ScenarioConfig, render, summary: str,
+                          allow_empty: bool = False):
         """Core FERPA email-preview review. `render(scenario)` returns the
         list of preview dicts (re-invoked when the fire-time template
-        dropdown changes). Returns (scenario, selected_indices):
-        selected_indices is None on cancel / empty selection; `scenario`
-        carries any template the user chose in the dropdown."""
+        dropdown changes). Returns (scenario, selected_indices): selected_indices
+        is None on cancel, else the (possibly EMPTY when `allow_empty`) list of
+        checked indices. `scenario` carries any template the user chose."""
         from dataclasses import replace as _replace
         rendered = render(scenario)
         pick = bool(scenario.email and scenario.email.pick_template)
@@ -27311,8 +27911,9 @@ class App:
                 self.root, scenario.name, rendered, summary,
                 templates=templates, current_template=cur_tpl,
                 on_template_change=(_on_tpl if pick else None),
+                allow_empty=allow_empty,
             )
-        if not selected:
+        if selected is None:   # cancelled (empty list is a valid "email no one")
             return scenario, None, {}, {}, {}
         if pick and chosen_tpl and chosen_tpl != scenario.email.body_html_file:
             scenario = _replace(
@@ -27321,13 +27922,35 @@ class App:
             self._append_log(f"Using email template {chosen_tpl!r}.")
         return scenario, selected, edits, cc_edits, bcc_edits
 
+    @staticmethod
+    def _describe_other_channels(scenario: ScenarioConfig) -> str:
+        """Human phrase for the action's non-email channels (for the deselect
+        prompt): 'a note', 'a text', 'a note and a text', or 'branch actions'."""
+        parts = []
+        if scenario.notes:
+            parts.append("a note")
+        if scenario.text is not None:
+            parts.append("a text")
+        if not parts and scenario.branches:
+            parts.append("branch actions")
+        return " and ".join(parts) or "other steps"
+
     def _review_emails(
         self, scenario: ScenarioConfig, rows: list[dict],
         prompt_vars: dict, summary: str,
     ) -> tuple:
-        """Show the email previewer for a list of CSV rows (batch /
-        selection). Returns (scenario, confirmed_rows); confirmed_rows is
-        None when the user cancelled or selected nobody."""
+        """Show the email previewer for a list of CSV rows (batch / selection).
+
+        Returns (scenario, confirmed, body_overrides, addr_overrides,
+        email_skip). `confirmed` is the students to PROCESS (drives the
+        note/text loop); `email_skip` is the set of positions WITHIN `confirmed`
+        that should NOT be emailed — students the user deselected in the review
+        but kept for the action's other channels. `confirmed` is None when the
+        user cancelled or there's nothing left to do.
+
+        Deselecting a student now only removes them from the EMAIL, not the whole
+        action: when some are unchecked and the action also files a note/text,
+        the user is asked whether to skip just the email or drop them entirely."""
         from src import outlook_email
         user_info = outlook_email.get_user_info()
         self._append_log(
@@ -27339,32 +27962,65 @@ class App:
                 for row in rows
             ]
 
+        # Other channels present iff the action also files a note / sends a text
+        # (or is branched). Only then can "email no one" / a partial deselection
+        # keep students in the run for those channels.
+        has_other = (bool(scenario.notes) or scenario.text is not None
+                     or bool(scenario.branches))
+
         scenario, selected, edits, cc_edits, bcc_edits = \
-            self._run_email_review(scenario, render, summary)
+            self._run_email_review(scenario, render, summary,
+                                   allow_empty=has_other)
         if selected is None:
+            self._append_log(f"{scenario.name!r}: email review cancelled.")
+            return scenario, None, {}, {}, set()
+
+        selected_set = set(selected)
+        unchecked = [i for i in range(len(rows)) if i not in selected_set]
+
+        if not unchecked:
+            process_all = True            # everyone emailed AND processed
+        elif not has_other:
+            # Email-only action: an unchecked student simply isn't acted on.
+            if not selected:
+                self._append_log(
+                    f"{scenario.name!r}: nobody selected; nothing to do.")
+                return scenario, None, {}, {}, set()
+            process_all = False
+        else:
+            choice = prompt_email_deselect_choice(
+                self.root, len(unchecked), len(rows),
+                self._describe_other_channels(scenario))
+            if choice == "back":
+                return self._review_emails(scenario, rows, prompt_vars, summary)
+            process_all = (choice == "email_only")
+
+        # index_map[pos_in_confirmed] = reviewer index. process_all keeps
+        # everyone (deselected → email-skipped); else only the checked go on.
+        index_map = list(range(len(rows))) if process_all else list(selected)
+        confirmed = [rows[ri] for ri in index_map]
+        if not confirmed:
             self._append_log(
-                f"{scenario.name!r}: email review cancelled / nobody selected.")
-            return scenario, None, {}, {}
-        confirmed = [rows[i] for i in selected]
-        # Re-key any hand-edited bodies / CC / BCC from reviewer-index to the
-        # position within `confirmed`, which is what the execution loop iterates.
-        body_overrides = {
-            pos: edits[i] for pos, i in enumerate(selected) if i in edits
-        }
+                f"{scenario.name!r}: no students left to process.")
+            return scenario, None, {}, {}, set()
+        email_skip = {pos for pos, ri in enumerate(index_map)
+                      if ri not in selected_set}
+        # Re-key hand-edited bodies / CC / BCC from reviewer index to position
+        # within `confirmed` (what the execution loop iterates).
+        body_overrides = {pos: edits[ri] for pos, ri in enumerate(index_map)
+                          if ri in edits}
         addr_overrides = {}
-        for pos, i in enumerate(selected):
-            if i in cc_edits or i in bcc_edits:
-                addr_overrides[pos] = {
-                    "cc": cc_edits.get(i),
-                    "bcc": bcc_edits.get(i, ""),
-                }
+        for pos, ri in enumerate(index_map):
+            if ri in cc_edits or ri in bcc_edits:
+                addr_overrides[pos] = {"cc": cc_edits.get(ri),
+                                       "bcc": bcc_edits.get(ri, "")}
+        n_email = len(confirmed) - len(email_skip)
         self._append_log(
-            f"Email review confirmed: {len(confirmed)} of {len(rows)} "
-            "student(s)."
-            + (f" ({len(body_overrides)} hand-edited)" if body_overrides
-               else "")
-        )
-        return scenario, confirmed, body_overrides, addr_overrides
+            f"Email review: {n_email} to email of {len(confirmed)} processed"
+            + (f" ({len(email_skip)} note/text-only)" if email_skip else "")
+            + (f", {len(body_overrides)} hand-edited" if body_overrides else "")
+            + ".")
+        return scenario, confirmed, body_overrides, addr_overrides, email_skip
 
     @staticmethod
     def _derive_wgu_email(name: str) -> str:
@@ -27721,7 +28377,8 @@ class App:
                 done_var.set(True)
 
         self.worker.submit_get_student_context(on_done, name_hint=name_hint)
-        self.root.wait_variable(done_var)
+        with self._waiting("Salesforce", "reading the student"):
+            self.root.wait_variable(done_var)
         return holder["info"]
 
     def _read_all_caseload_rows_blocking(self) -> list[dict]:
@@ -27794,7 +28451,8 @@ class App:
             prompt_vars=prompt_vars,
             on_done=on_done,
         )
-        self.root.wait_variable(done_var)
+        with self._waiting("Salesforce", "filing the note"):
+            self.root.wait_variable(done_var)
         return holder["success"]
 
     def _show_template_preview(
@@ -28797,6 +29455,458 @@ class App:
         else:
             redraw()
 
+    def _open_note_templates_dialog(self, parent=None, start_new: bool = False) -> None:
+        """Editor for reusable note templates (see NoteTemplate). Pick/create a
+        template, give it course tags + an interaction-type tag (drives the
+        fire-time picker's auto-suggest), then build its fill-in fields — each a
+        label + default + widget kind (text / multiline / dropdown + choices).
+        A 'Paste form text' shortcut turns a pasted 'Label: default' block into
+        fields. Persists into scenarios.yaml via _save_yaml."""
+        parent = parent or self.root
+        # Working copy: list of plain dicts mirroring self.note_templates so the
+        # user can cancel without touching live state. `var` is carried through
+        # untouched (future auto-fill hook; no UI yet).
+        work: list[dict] = [
+            {
+                "name": t.name,
+                "courses": list(t.courses),
+                "interaction_type": t.interaction_type,
+                "note_type": t.note_type,
+                "fields": [dict(label=f.label, default=f.default, kind=f.kind,
+                                choices=list(f.choices), var=f.var)
+                           for f in t.fields],
+            }
+            for t in (self.note_templates or [])
+        ]
+        # Normalized snapshot of what's on disk now — compared on close to warn
+        # about unsaved edits (see is_dirty / build_templates).
+        original = [note_template_to_dict(t) for t in (self.note_templates or [])]
+
+        dlg = ctk.CTkToplevel(parent)
+        dlg.title("Note templates")
+        dlg.geometry("820x680")
+        try:
+            dlg.transient(parent)
+        except Exception:
+            pass
+        dlg.attributes("-topmost", True)
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        dlg.grid_columnconfigure(0, weight=1)
+        dlg.grid_rowconfigure(1, weight=1)
+
+        state = {"idx": None, "prev": None}  # open-template index + preview box
+        hdr: dict = {}            # header widgets for the open template
+        field_widgets: list = []  # (field_dict, label_e, kind_c, default_e, choices_e)
+
+        def display_names():
+            return [f"{i + 1}. {t['name'] or '(unnamed)'}"
+                    for i, t in enumerate(work)]
+
+        def cur() -> "Optional[dict]":
+            i = state["idx"]
+            if i is None or not (0 <= i < len(work)):
+                return None
+            return work[i]
+
+        def sync_from_widgets():
+            t = cur()
+            if not t:
+                return
+            if hdr:
+                t["name"] = hdr["name"].get().strip()
+                t["courses"] = [c.strip().upper()
+                                for c in hdr["courses"].get().split(",")
+                                if c.strip()]
+                t["interaction_type"] = hdr["itype"].get().strip()
+                t["note_type"] = hdr["ntype"].get().strip()
+            for fd, le, kc, de, ce in field_widgets:
+                fd["label"] = le.get().strip()
+                fd["kind"] = (kc.get().strip() or "text")
+                fd["default"] = de.get()
+                fd["choices"] = [c.strip() for c in ce.get().split(",")
+                                 if c.strip()]
+
+        def refresh_preview():
+            """Re-render the preview from current widget values WITHOUT a full
+            redraw (which would destroy the field the user is editing). Bound to
+            each field's focus-out + type change so the preview tracks edits —
+            including the last field before another is added."""
+            prev = state.get("prev")
+            if prev is None:
+                return
+            sync_from_widgets()
+            t = cur()
+            if t is None:
+                return
+            tmp = NoteTemplate(name=t["name"], fields=[
+                NoteTemplateField(
+                    label=(fd.get("label") or "").strip(),
+                    default=fd.get("default", ""),
+                    kind=fd.get("kind", "text"),
+                    choices=list(fd.get("choices") or []))
+                for fd in t["fields"] if (fd.get("label") or "").strip()])
+            try:
+                prev.configure(state="normal")
+                prev.delete("1.0", "end")
+                prev.insert("1.0",
+                            render_note_template(tmp, {}) or "(no fields yet)")
+                prev.configure(state="disabled")
+            except Exception:
+                pass
+
+        # ---- top bar: template selector + New / Delete ----
+        top = ctk.CTkFrame(dlg, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
+        ctk.CTkLabel(top, text="Template:").pack(side="left")
+        tmpl_var = ctk.StringVar(value="")
+        tmpl_combo = ctk.CTkComboBox(
+            top, width=240, variable=tmpl_var, values=display_names(),
+            state="readonly", command=lambda _v=None: on_select())
+        tmpl_combo.pack(side="left", padx=(6, 6))
+
+        def refresh_combo():
+            vals = display_names()
+            tmpl_combo.configure(values=vals)
+            i = state["idx"]
+            tmpl_var.set(vals[i] if (i is not None and 0 <= i < len(vals))
+                         else "")
+
+        def select_idx(i):
+            sync_from_widgets()
+            state["idx"] = i if (i is not None and 0 <= i < len(work)) else None
+            refresh_combo()
+            redraw()
+
+        def on_select():
+            vals = display_names()
+            sel = tmpl_var.get()
+            if sel in vals:
+                select_idx(vals.index(sel))
+
+        def new_template():
+            sync_from_widgets()
+            work.append({"name": "New template", "courses": [],
+                         "interaction_type": "", "note_type": "", "fields": []})
+            select_idx(len(work) - 1)
+
+        ctk.CTkButton(top, text="+ New", width=80, command=new_template,
+                      **SECONDARY_BTN_KWARGS).pack(side="left")
+
+        def delete_template():
+            t = cur()
+            if not t:
+                return
+            if not ask_yes_no_topmost(
+                    dlg, "Delete template",
+                    f"Delete note template {t['name'] or '(unnamed)'}?"):
+                return
+            i = state["idx"]
+            work.pop(i)
+            state["idx"] = (i - 1 if i > 0 else (0 if work else None))
+            refresh_combo()
+            redraw()
+
+        ctk.CTkButton(top, text="Delete", width=90, command=delete_template,
+                      **SECONDARY_BTN_KWARGS).pack(side="right")
+
+        body = ctk.CTkScrollableFrame(dlg)
+        body.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        body.grid_columnconfigure(0, weight=1)
+
+        def move_field(i, delta):
+            sync_from_widgets()
+            fields = cur()["fields"]
+            j = i + delta
+            if 0 <= j < len(fields):
+                fields[i], fields[j] = fields[j], fields[i]
+                redraw()
+
+        def del_field(i):
+            sync_from_widgets()
+            fields = cur()["fields"]
+            if 0 <= i < len(fields):
+                fields.pop(i)
+                redraw()
+
+        def add_field():
+            sync_from_widgets()
+            cur()["fields"].append(
+                dict(label="", default="", kind="text", choices=[], var=""))
+            redraw()
+
+        def paste_form():
+            sync_from_widgets()
+            txt = prompt_additional_text(
+                dlg, "Paste the form — one 'Label: default' per line "
+                "(e.g. 'Attempt: N/A')", "", enter_submits=False)
+            if not txt:
+                return
+            parsed = parse_note_template_text(txt)
+            if not parsed:
+                return
+            t = cur()
+            if t["fields"] and ask_yes_no_topmost(
+                    dlg, "Replace fields?",
+                    "Replace the current fields with the pasted form? "
+                    "(No = append them.)"):
+                t["fields"] = []
+            for f in parsed:
+                t["fields"].append(dict(label=f.label, default=f.default,
+                                        kind=f.kind, choices=[], var=""))
+            redraw()
+
+        def redraw():
+            state["prev"] = None  # old preview box is about to be destroyed
+            for w in body.winfo_children():
+                w.destroy()
+            field_widgets.clear()
+            hdr.clear()
+            t = cur()
+            if t is None:
+                ctk.CTkLabel(
+                    body, text="Create a template with + New above.",
+                    text_color=("gray40", "gray65"),
+                ).grid(row=0, column=0, padx=8, pady=20)
+                return
+            r = 0
+            # ---- template header ----
+            def _labeled(row, label, key, placeholder):
+                ctk.CTkLabel(body, text=label, anchor="w").grid(
+                    row=row, column=0, sticky="w", padx=8, pady=(6, 0))
+                e = ctk.CTkEntry(body, placeholder_text=placeholder)
+                e.grid(row=row + 1, column=0, sticky="ew", padx=8, pady=(0, 2))
+                return e
+            hdr["name"] = _labeled(r, "Name", "name",
+                                   "e.g. Cloud Session Note")
+            if t["name"]:
+                hdr["name"].insert(0, t["name"])
+            r += 2
+            hdr["courses"] = _labeled(
+                r, "Courses  (comma-separated; blank = any course)", "courses",
+                "e.g. C769, D197")
+            if t["courses"]:
+                hdr["courses"].insert(0, ", ".join(t["courses"]))
+            r += 2
+            hdr["itype"] = _labeled(
+                r, "Interaction type tag  (what was done/discussed)", "itype",
+                "e.g. Session Note, Coaching Call")
+            if t["interaction_type"]:
+                hdr["itype"].insert(0, t["interaction_type"])
+            r += 2
+            ctk.CTkLabel(
+                body, text="Salesforce note type to preset  (optional)",
+                anchor="w").grid(row=r, column=0, sticky="w", padx=8, pady=(6, 0))
+            r += 1
+            ntype_choices = [""] + sorted(set(
+                types_for_format("Single Interaction")
+                + types_for_format("Multiple Interactions")))
+            cur_nt = t["note_type"]
+            if cur_nt and cur_nt not in ntype_choices:
+                ntype_choices.append(cur_nt)   # preserve an unknown saved value
+            hdr["ntype"] = ctk.CTkComboBox(
+                body, values=ntype_choices, state="readonly")
+            hdr["ntype"].grid(row=r, column=0, sticky="ew", padx=8, pady=(0, 2))
+            hdr["ntype"].set(cur_nt if cur_nt in ntype_choices else "")
+            r += 1
+            # ---- fields ----
+            ctk.CTkLabel(
+                body, text="Fields  (tabbed through at fire time; top = first)",
+                font=ctk.CTkFont(size=13, weight="bold"),
+            ).grid(row=r, column=0, sticky="w", padx=6, pady=(10, 0))
+            r += 1
+            ctk.CTkLabel(
+                body, anchor="w", justify="left",
+                text=("Type:  text = one line  ·  multiline = paragraph box "
+                      "(label on its own line, text beneath)  ·  dropdown = "
+                      "pick-list of Choices  ·  date = type / pick a date, with "
+                      "Choices as quick-picks (e.g. 1 week)"),
+                wraplength=760, text_color=("gray35", "gray70"),
+            ).grid(row=r, column=0, sticky="w", padx=6, pady=(0, 2))
+            r += 1
+            for i, fd in enumerate(t["fields"]):
+                fr = ctk.CTkFrame(body)
+                fr.grid(row=r, column=0, sticky="ew", padx=4, pady=3)
+                fr.grid_columnconfigure(1, weight=1)
+                r += 1
+                ctk.CTkButton(fr, text="▲", width=26,
+                              command=lambda ix=i: move_field(ix, -1),
+                              **SECONDARY_BTN_KWARGS).grid(
+                                  row=0, column=0, padx=(4, 0), pady=4)
+                label_e = ctk.CTkEntry(
+                    fr, placeholder_text="field label (e.g. Summary)")
+                if fd.get("label"):
+                    label_e.insert(0, fd["label"])
+                label_e.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+                label_e.bind("<FocusOut>", lambda _e: refresh_preview())
+                ctk.CTkButton(fr, text="✕", width=26,
+                              command=lambda ix=i: del_field(ix),
+                              **SECONDARY_BTN_KWARGS).grid(
+                                  row=0, column=2, padx=(0, 4), pady=4)
+                bar = ctk.CTkFrame(fr, fg_color="transparent")
+                bar.grid(row=1, column=0, columnspan=3, sticky="ew",
+                         padx=6, pady=(0, 4))
+                ctk.CTkButton(bar, text="▼", width=26,
+                              command=lambda ix=i: move_field(ix, 1),
+                              **SECONDARY_BTN_KWARGS).pack(side="left",
+                                                          padx=(0, 8))
+                ctk.CTkLabel(bar, text="Type:").pack(side="left")
+                kind_c = ctk.CTkComboBox(bar, width=110,
+                                         values=list(NOTE_FIELD_KINDS),
+                                         state="readonly",
+                                         command=lambda _v=None: refresh_preview())
+                kind_c.set(fd.get("kind", "text") if fd.get("kind", "text")
+                           in NOTE_FIELD_KINDS else "text")
+                kind_c.pack(side="left", padx=(4, 10))
+                ctk.CTkLabel(bar, text="Default:").pack(side="left")
+                default_e = ctk.CTkEntry(bar, width=90)
+                if fd.get("default"):
+                    default_e.insert(0, fd["default"])
+                default_e.pack(side="left", padx=(4, 10))
+                default_e.bind("<FocusOut>", lambda _e: refresh_preview())
+                ctk.CTkLabel(bar, text="Choices:").pack(side="left")
+                choices_e = ctk.CTkEntry(
+                    bar, width=180,
+                    placeholder_text="comma-sep (dropdown only)")
+                if fd.get("choices"):
+                    choices_e.insert(0, ", ".join(fd["choices"]))
+                choices_e.pack(side="left", padx=(4, 0))
+                choices_e.bind("<FocusOut>", lambda _e: refresh_preview())
+                field_widgets.append(
+                    (fd, label_e, kind_c, default_e, choices_e))
+            btns = ctk.CTkFrame(body, fg_color="transparent")
+            btns.grid(row=r, column=0, sticky="w", padx=6, pady=(2, 10))
+            r += 1
+            ctk.CTkButton(btns, text="+ Add field", width=110,
+                          command=add_field,
+                          **SECONDARY_BTN_KWARGS).pack(side="left")
+            ctk.CTkButton(btns, text="Paste form text…", width=140,
+                          command=paste_form,
+                          **SECONDARY_BTN_KWARGS).pack(side="left", padx=(8, 0))
+            # ---- preview (defaults shown; refreshes on edit focus-out) ----
+            ctk.CTkLabel(
+                body, text="Preview  (defaults shown)", anchor="w",
+                text_color=("gray35", "gray70"),
+            ).grid(row=r, column=0, sticky="w", padx=6, pady=(4, 0))
+            r += 1
+            prev = ctk.CTkTextbox(body, height=110)
+            prev.grid(row=r, column=0, sticky="ew", padx=6, pady=(0, 8))
+            state["prev"] = prev
+            refresh_preview()
+
+        def build_templates() -> "list[NoteTemplate]":
+            """Normalize the working copy into NoteTemplates: drop fields with no
+            label and templates with no name or no fields, and de-duplicate
+            names. Shared by save + the unsaved-changes check."""
+            out: list[NoteTemplate] = []
+            seen: set[str] = set()
+            for t in work:
+                fields: list[NoteTemplateField] = []
+                for fd in t["fields"]:
+                    label = (fd.get("label") or "").strip()
+                    if not label:
+                        continue
+                    kind = (fd.get("kind") if fd.get("kind") in NOTE_FIELD_KINDS
+                            else "text")
+                    fields.append(NoteTemplateField(
+                        label=label, default=fd.get("default", ""), kind=kind,
+                        choices=list(fd.get("choices") or []),
+                        var=(fd.get("var") or "").strip()))
+                name = (t.get("name") or "").strip()
+                # A template needs a name AND at least one field to be useful —
+                # drop empty/half-built rows silently.
+                if not name or not fields:
+                    continue
+                base, n = name, 2
+                while name in seen:
+                    name, n = f"{base} ({n})", n + 1
+                seen.add(name)
+                out.append(NoteTemplate(
+                    name=name, fields=fields,
+                    courses=[c.strip().upper() for c in (t.get("courses") or [])
+                             if c.strip()],
+                    interaction_type=(t.get("interaction_type") or "").strip(),
+                    note_type=(t.get("note_type") or "").strip()))
+            return out
+
+        def is_dirty() -> bool:
+            sync_from_widgets()
+            current = [note_template_to_dict(t) for t in build_templates()]
+            return current != original
+
+        def _destroy():
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            dlg.destroy()
+            try:
+                if parent is not None and parent is not self.root:
+                    parent.grab_set()
+            except Exception:
+                pass
+
+        def do_save():
+            sync_from_widgets()
+            new_list = build_templates()
+            self.note_templates = new_list
+            self._save_yaml()
+            self._append_log(f"Saved {len(new_list)} note template(s).")
+            _destroy()
+
+        def close_dlg():
+            if is_dirty() and not ask_yes_no_topmost(
+                    dlg, "Discard changes?",
+                    "You have unsaved note-template changes. Discard them?"):
+                return
+            _destroy()
+
+        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row.grid(row=2, column=0, sticky="ew", padx=12, pady=(2, 12))
+        ctk.CTkButton(btn_row, text="Cancel", width=100, command=close_dlg,
+                      **SECONDARY_BTN_KWARGS).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn_row, text="Save", width=100,
+                      command=do_save).pack(side="right")
+        dlg.protocol("WM_DELETE_WINDOW", close_dlg)
+
+        # Open on the first template, else the empty-state hint. When invoked to
+        # create one (start_new, e.g. the fire-time picker's New button), begin
+        # with a fresh blank template selected.
+        if start_new:
+            new_template()
+        elif work:
+            select_idx(0)
+        else:
+            redraw()
+
+        # Block until closed so callers (the fire-time picker's New/Edit) can
+        # read the refreshed self.note_templates right after this returns.
+        try:
+            parent.wait_window(dlg)
+        except Exception:
+            pass
+
+    def _manage_templates_from_picker(self, start_new, parent):
+        """Open the note-template editor from a fire-time picker's New/Edit
+        button and return the refreshed template list so the picker updates in
+        place. `parent` is the picker dialog (keeps modal grabs nesting)."""
+        self._open_note_templates_dialog(parent=parent, start_new=bool(start_new))
+        return self.note_templates
+
+    def _pick_default_template_cb(self, parent, course=""):
+        """Open the note-template picker from the action editor (to bind a note's
+        default template). Returns the chosen NoteTemplate or None. Releases any
+        grab the picker left on the main window (the editor isn't modal)."""
+        tmpl = pick_note_template(parent, self.note_templates, course,
+                                  manage=self._manage_templates_from_picker)
+        try:
+            self.root.grab_release()
+        except Exception:
+            pass
+        return tmpl
+
     def _open_settings(self) -> None:
         """Modal for user preferences. Currently the advanced /
         developer-mode toggle + Caseload Tool view status. Designed
@@ -29466,6 +30576,26 @@ class App:
             dialog,
             text=("Per-course step checklists (description, bound action, gate, "
                   "skip-when) that drive each student's recommended next action."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
+        # Note templates: reusable structured note bodies chosen + filled at
+        # fire time (see NoteTemplate).
+        nt_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        nt_row.pack(fill="x", padx=20, pady=(0, 2))
+        ctk.CTkLabel(nt_row, text="Note templates:").pack(side="left")
+        ctk.CTkButton(
+            nt_row, text="Configure…", width=120,
+            command=lambda: self._open_note_templates_dialog(parent=win),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("Reusable fill-in note forms (label + default + dropdown/"
+                  "typing) you tab through at fire time. Tag by course/type so "
+                  "the right one is suggested. Paste a 'Label: default' block to "
+                  "build one fast."),
             wraplength=510, justify="left",
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
@@ -30401,6 +31531,24 @@ class App:
     # spinner in any monospaced font and renders cleanly in CTkLabel.
     _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
+    def _lock_overlay_text(self) -> str:
+        """Scrim text — the base 'automation running' line, plus the current
+        Salesforce/Mongoose wait (if any) so the user watching the browser sees
+        what's happening, not just a static banner."""
+        base = ("🔒  Automation running\n\n"
+                "Please don't click in the browser until this finishes.")
+        if getattr(self, "_waiting_active", False) and self._busy_message:
+            base += f"\n\n{self._busy_message}"
+        return base
+
+    def _refresh_lock_overlay_text(self) -> None:
+        lbl = getattr(self, "_lock_overlay_label", None)
+        if lbl is not None:
+            try:
+                lbl.configure(text=self._lock_overlay_text())
+            except Exception:
+                pass
+
     def _show_browser_lock(self) -> None:
         """Cover the launcher's browser window with a topmost, semi-opaque
         scrim that swallows clicks/keys, so the user can't change the
@@ -30425,13 +31573,13 @@ class App:
                 pass
             ov.geometry(f"{w}x{h}+{x}+{y}")
             ov.configure(bg="#0d1117", cursor="watch")
-            tk.Label(
+            self._lock_overlay_label = tk.Label(
                 ov,
-                text="🔒  Automation running\n\n"
-                     "Please don't click in the browser until this finishes.",
+                text=self._lock_overlay_text(),
                 bg="#0d1117", fg="#ffffff",
                 font=("Segoe UI", 16, "bold"), justify="center",
-            ).place(relx=0.5, rely=0.5, anchor="center")
+            )
+            self._lock_overlay_label.place(relx=0.5, rely=0.5, anchor="center")
             # Swallow any interaction that reaches the scrim.
             for seq in ("<Button-1>", "<Button-2>", "<Button-3>",
                         "<Key>", "<MouseWheel>"):
@@ -30461,6 +31609,7 @@ class App:
     def _hide_browser_lock(self) -> None:
         ov = getattr(self, "_lock_overlay", None)
         self._lock_overlay = None
+        self._lock_overlay_label = None
         if ov is not None:
             try:
                 ov.destroy()
@@ -30616,12 +31765,20 @@ class App:
             frame = self._SPINNER_FRAMES[
                 self._busy_spinner_index % len(self._SPINNER_FRAMES)
             ]
-            # Yellow pill — pad with non-breaking spaces so the
-            # background tag is wide enough to stand out visually.
-            self.busy_label.configure(
-                text=f"  {frame}  WORKING — {self._busy_message}  ",
-                fg_color=("#ffefc1", "#5a4500"),
-            )
+            # Yellow pill — pad with spaces so the background tag is wide enough
+            # to stand out. While blocked on Salesforce/Mongoose, switch to a
+            # LOUDER amber and drop the "WORKING —" prefix (the message already
+            # says "⏳ waiting on …").
+            if getattr(self, "_waiting_active", False):
+                self.busy_label.configure(
+                    text=f"  {frame}  {self._busy_message}  ",
+                    fg_color=("#ffd166", "#6a4a00"),
+                )
+            else:
+                self.busy_label.configure(
+                    text=f"  {frame}  WORKING — {self._busy_message}  ",
+                    fg_color=("#ffefc1", "#5a4500"),
+                )
         except Exception:
             return
         self._busy_spinner_index += 1
@@ -30629,6 +31786,49 @@ class App:
             self.root.after(90, self._tick_spinner)
         except Exception:
             pass
+
+    @contextmanager
+    def _waiting(self, service: str, detail: str = ""):
+        """Loudly announce a blocking wait on Salesforce / Mongoose in the status
+        pill for the duration, then restore. `service` is 'Salesforce' or
+        'Mongoose'; `detail` an optional short phrase. Works whether or not a run
+        is already busy — during a run the animated spinner keeps ticking over
+        the louder message; standalone it shows a static pill just for the wait.
+        Best-effort: any widget error is swallowed so it never blocks the wait."""
+        label = (f"⏳ waiting on {service}"
+                 + (f" — {detail}" if detail else "") + "…")
+        prev_msg = self._busy_message
+        prev_waiting = getattr(self, "_waiting_active", False)
+        was_busy = self._is_busy
+        self._busy_message = label
+        self._waiting_active = True
+        try:
+            frame = self._SPINNER_FRAMES[
+                self._busy_spinner_index % len(self._SPINNER_FRAMES)]
+            self.busy_label.configure(
+                text=f"  {frame}  {label}  ", fg_color=("#ffd166", "#6a4a00"))
+            self.busy_label.update_idletasks()
+        except Exception:
+            pass
+        self._refresh_lock_overlay_text()   # echo on the browser scrim, if up
+        try:
+            yield
+        finally:
+            self._busy_message = prev_msg
+            self._waiting_active = prev_waiting
+            self._refresh_lock_overlay_text()
+            try:
+                if was_busy:
+                    # The run's spinner tick repaints the prior WORKING message.
+                    frame = self._SPINNER_FRAMES[
+                        self._busy_spinner_index % len(self._SPINNER_FRAMES)]
+                    self.busy_label.configure(
+                        text=f"  {frame}  WORKING — {prev_msg}  ",
+                        fg_color=("#ffefc1", "#5a4500"))
+                else:
+                    self.busy_label.configure(text="", fg_color="transparent")
+            except Exception:
+                pass
 
     def _get_caseload_columns(self) -> list[str]:
         """Current caseload columns presented as user-facing display
