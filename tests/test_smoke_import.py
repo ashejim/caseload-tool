@@ -27,6 +27,7 @@ SRC_MODULES = [
     "src.version",
     "src.config",
     "src.dates",
+    "src.ema_links",
     "src.scenarios",
     "src.note_form",
     "src.caseload_filter",

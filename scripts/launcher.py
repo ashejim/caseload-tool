@@ -62,6 +62,7 @@ from src.dates import (
     TZ_ABBR_TO_IANA, effective_tz, student_local_time,
     days_until, days_since, to_iso_date,
 )
+from src.ema_links import parse_ema_url, build_ema_url
 from src.scenarios import (
     SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
     ScenarioConfig, SuccessPath, NoteTemplate, NoteTemplateField,
@@ -6437,27 +6438,6 @@ def fmt_note_date(iso: str) -> str:
         return d.strftime("%m/%d %I:%M %p").lstrip("0")
     except Exception:
         return s[:16].replace("T", " ")
-
-
-_EMA_URL_RE = re.compile(
-    r"tasks\.wgu\.edu/student/(\d+)/course/(\d+)/task/(\d+)/score-report",
-    re.I)
-
-
-def parse_ema_url(url: str) -> Optional[dict]:
-    """Pull the ids out of an EMA Score Report URL, e.g.
-    https://tasks.wgu.edu/student/009930908/course/33860018/task/4521/score-report
-    -> {student_id, course_id, task_id}. None if it doesn't match."""
-    m = _EMA_URL_RE.search(url or "")
-    if not m:
-        return None
-    return {"student_id": m.group(1), "course_id": m.group(2),
-            "task_id": m.group(3)}
-
-
-def build_ema_url(student_id: str, course_id: str, task_id: str) -> str:
-    return (f"https://tasks.wgu.edu/student/{student_id}"
-            f"/course/{course_id}/task/{task_id}/score-report")
 
 
 def _attach_tooltip(widget, text: str) -> None:
