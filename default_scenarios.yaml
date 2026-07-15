@@ -5,8 +5,11 @@
 scenarios:
 
   # SINGLE-FIRE: press F3 with a student's note panel open in Salesforce to
-  # fill a note. submit is OFF, so it fills the form for you to review and
-  # submit — a safe way to try it (Salesforce notes can't be deleted).
+  # fill a note. It uses the "Student note" TEMPLATE below (note_template) — a
+  # fill-in form you tab through at fire time; the result becomes the note body.
+  # submit is OFF, so it fills the form for you to review and submit — a safe way
+  # to try it (Salesforce notes can't be deleted). To type a plain note instead,
+  # clear "Default template" on this note in the editor.
   Sample - quick note:
     hotkey: F3
     close_tab_after: false
@@ -20,6 +23,7 @@ scenarios:
       submit: false
       append_clipboard: false
       enter_additional_text: false
+      note_template: Student note
 
   # CASELOAD-PANEL: pick a student in the viewer, then fire this to send a
   # follow-up email AND log a note in one step.
@@ -125,3 +129,33 @@ groups:
   scenarios:
   - Sample - welcome (batch)
   - Sample - Task 1 passed (batch)
+
+# Reusable note templates — fill-in forms you tab through at fire time. Manage
+# them in Settings -> Note templates, or bind one to a note as its default
+# (note_template:, as "Sample - quick note" does above). Field kinds: text (one
+# line), multiline (a box), dropdown (pick-list of choices), date (type / pick a
+# date, with choices as quick-picks). Tag with courses: [C123] to have it
+# suggested only for those courses (blank = any).
+note_templates:
+- name: Student note
+  interaction_type: Outreach
+  fields:
+  - label: Purpose
+    kind: multiline
+  - label: Outcome
+    kind: dropdown
+    choices:
+    - On track
+    - Needs follow-up
+    - At risk
+  - label: Student action items
+    kind: multiline
+  - label: Next follow-up
+    kind: date
+    default: N/A
+    choices:
+    - N/A
+    - 1 week
+    - 2 weeks
+  - label: Summary
+    kind: multiline
