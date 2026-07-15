@@ -58,6 +58,10 @@ from src import crypto_store
 from src.version import __version__
 from src.note_form import NoteData
 from src.action_queue import ActionQueue, QueueItem, QueueStatus
+from src.dates import (
+    TZ_ABBR_TO_IANA, effective_tz, student_local_time,
+    days_until, days_since, to_iso_date,
+)
 from src.scenarios import (
     SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
     ScenarioConfig, SuccessPath, NoteTemplate, NoteTemplateField,
@@ -265,24 +269,6 @@ def _note_body_to_html(text: str) -> str:
         for ln in lines
     ]
     return "".join(parts) or "<p><br></p>"
-
-
-def _to_iso_date(s: str) -> str:
-    """Normalize a follow-up date string to ISO 'YYYY-MM-DD' for the Aura save
-    (the UI passes MM/DD/YYYY; already-ISO passes through). Unknown formats are
-    returned unchanged."""
-    s = (s or "").strip()
-    if not s:
-        return ""
-    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
-    if m:
-        y, mo, d = m.groups()
-        return f"{y}-{int(mo):02d}-{int(d):02d}"
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)   # MM/DD/YYYY
-    if m:
-        mo, d, y = m.groups()
-        return f"{y}-{int(mo):02d}-{int(d):02d}"
-    return s
 
 
 class BrowserWorker:
@@ -3116,7 +3102,7 @@ class BrowserWorker:
             # The Apex method wants the date as a JSON-QUOTED ISO string, e.g.
             # the literal characters "2026-07-31" (quotes included) — observed
             # in the capture. The UI passes MM/DD/YYYY, so normalize to ISO.
-            iso = _to_iso_date(date)
+            iso = to_iso_date(date)
             params = {"theStudentAcaCourseId": acac,
                       "theCourseFollowupDate": f'"{iso}"'}
         else:
@@ -6195,52 +6181,8 @@ def apply_caseload_tree_font(size: int) -> None:
 # WGU caseload exports a bare timezone abbreviation (EST/CST/...). Map
 # to IANA zones so we can show the correct *current* local time with DST
 # handled (e.g. EST in June is really EDT).
-_TZ_ABBR_TO_IANA = {
-    "EST": "America/New_York", "EDT": "America/New_York",
-    "CST": "America/Chicago", "CDT": "America/Chicago",
-    "MST": "America/Denver", "MDT": "America/Denver",
-    "PST": "America/Los_Angeles", "PDT": "America/Los_Angeles",
-    "AKST": "America/Anchorage", "AKDT": "America/Anchorage",
-    "HST": "Pacific/Honolulu",       # Hawaii — no DST
-    "ChS": "Pacific/Guam", "ChST": "Pacific/Guam",  # Chamorro — no DST
-}
-
-
-def student_local_time(tz_abbr: str) -> str:
-    """Current local time for a student given their CSV timezone
-    abbreviation, e.g. 'EST' -> '2:14 PM'. Empty string if unknown."""
-    tz_abbr = (tz_abbr or "").strip()
-    iana = _TZ_ABBR_TO_IANA.get(tz_abbr)
-    if not iana:
-        return ""
-    try:
-        from zoneinfo import ZoneInfo
-        now = datetime.now(ZoneInfo(iana))
-        return now.strftime("%I:%M %p").lstrip("0")
-    except Exception:
-        return ""
-
-
-def days_until(date_str: str) -> Optional[int]:
-    """Whole days from today until an ISO 'YYYY-MM-DD' date (negative if
-    past). None if unparseable."""
-    s = (date_str or "").strip()[:10]
-    if not s:
-        return None
-    try:
-        d = datetime.strptime(s, "%Y-%m-%d").date()
-        return (d - datetime.now().date()).days
-    except Exception:
-        return None
-
-
-def days_since(date_str: str) -> Optional[int]:
-    """Whole days from an ISO date/timestamp until today (negative if the
-    date is in the future). None if unparseable. The inverse of days_until —
-    used for 'days since last contact / course start / last action'. Accepts a
-    full timestamp too (only the leading YYYY-MM-DD is read)."""
-    du = days_until(date_str)
-    return None if du is None else -du
+# Date/timezone helpers (student_local_time, days_until, days_since, effective_tz,
+# TZ_ABBR_TO_IANA, to_iso_date) now live in src/dates.py — imported at the top.
 
 
 def parse_task_status(val: str) -> tuple[str, str, int]:

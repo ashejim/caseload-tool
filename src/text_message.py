@@ -34,32 +34,10 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from src import email_template
-
-# WGU caseload exports a bare timezone abbreviation (EST/CST/...). Map to IANA
-# zones so DST is handled correctly. NOTE: scripts/launcher.py has its own copy
-# (`_TZ_ABBR_TO_IANA`) used by `student_local_time`; consolidate to this one
-# when convenient.
-TZ_ABBR_TO_IANA = {
-    "EST": "America/New_York", "EDT": "America/New_York",
-    "CST": "America/Chicago", "CDT": "America/Chicago",
-    "MST": "America/Denver", "MDT": "America/Denver",
-    "PST": "America/Los_Angeles", "PDT": "America/Los_Angeles",
-    "AKST": "America/Anchorage", "AKDT": "America/Anchorage",
-    "HST": "Pacific/Honolulu",                      # Hawaii — no DST
-    "ChS": "Pacific/Guam", "ChST": "Pacific/Guam",  # Chamorro — no DST
-}
-
-# Fallback timezone for students with a blank/unrecognized Timezone — schedule
-# them as Mountain rather than skipping (user's call: MT is the safe default).
-DEFAULT_TZ_ABBR = "MST"
-
-
-def effective_tz(tz_abbr: str) -> str:
-    """The student's tz abbreviation if recognized, else the MT default — so a
-    student with no/unknown Timezone still gets scheduled (treated as Mountain)."""
-    tz = (tz_abbr or "").strip()
-    return tz if tz in TZ_ABBR_TO_IANA else DEFAULT_TZ_ABBR
-
+# Timezone map + fallback now live in src/dates.py (single source of truth).
+# Re-imported here so existing `text_message.TZ_ABBR_TO_IANA` / `.effective_tz`
+# references keep working.
+from src.dates import TZ_ABBR_TO_IANA, DEFAULT_TZ_ABBR, effective_tz
 
 # The Mongoose compose textarea caps the body (maxlength="306" in the DOM).
 MAX_SMS_LEN = 306
