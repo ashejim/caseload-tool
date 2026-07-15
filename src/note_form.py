@@ -5,6 +5,7 @@ opened the note panel. This module finds the *visible* note form and fills
 the supplied fields. It does NOT click Submit by default — the user
 reviews and submits manually until we're confident in the selectors.
 """
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,6 +18,24 @@ from src import selectors
 from src.config import SCREENSHOTS_DIR
 
 InteractionFormat = Literal["Single Interaction", "Multiple Interactions"]
+
+# Minimal markdown bold: **text** → bold. Used so a note template can bold a
+# label (e.g. **Purpose**). The API note path stores HTML, so it renders real
+# bold; the DOM form path types plain text, so it strips the markers instead of
+# showing literal asterisks. Non-greedy, must wrap ≥1 char, single-line.
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def strip_md_bold(text: str) -> str:
+    """Drop **bold** markers, keeping the inner text — for the plain-text DOM
+    note path (can't render bold, so literal asterisks would look wrong)."""
+    return _MD_BOLD_RE.sub(r"\1", text or "")
+
+
+def md_bold_to_html(escaped: str) -> str:
+    """Convert **bold** to <b>…</b> in ALREADY-HTML-ESCAPED text — for the API
+    note path, whose body is stored as HTML."""
+    return _MD_BOLD_RE.sub(r"<b>\1</b>", escaped or "")
 
 
 @dataclass
@@ -31,6 +50,7 @@ class NoteData:
     submit: bool = False                   # leave False while we dial in selectors
     append_clipboard: bool = False         # paste clipboard text after body at fire time
     enter_additional_text: bool = False    # "edit note at fire time": body/course/activities/EA dialog
+    note_template: str = ""                # default NoteTemplate name to pre-load at fire time (by name; "" = none)
 
 
 def _screenshot_failure(page: Page, tag: str) -> Path:
@@ -340,7 +360,11 @@ def fill_note(page: Page, data: NoteData, *, timeout_ms: int = 10_000) -> None:
             # still real Enter presses so the Quill editor splits paragraphs
             # correctly. insert_text dispatches a proper input event, so
             # Quill registers the text just like a paste.
-            for i, line in enumerate(data.body.splitlines() or [data.body]):
+            # Strip **bold** markers — the DOM editor is plain-text here, so we
+            # drop the markers rather than type literal asterisks (the API path
+            # renders them as real bold instead).
+            body_text = strip_md_bold(data.body)
+            for i, line in enumerate(body_text.splitlines() or [body_text]):
                 if i > 0:
                     page.keyboard.press("Enter")
                 if line:

@@ -223,6 +223,7 @@ def _note_from_dict(d: dict) -> NoteData:
         submit=bool(d.get("submit", True)),
         append_clipboard=bool(d.get("append_clipboard", False)),
         enter_additional_text=bool(d.get("enter_additional_text", False)),
+        note_template=str(d.get("note_template", "") or "").strip(),
     )
 
 
@@ -453,6 +454,176 @@ def success_path_to_dict(p: SuccessPath) -> dict:
             for s in p.steps
         ],
     }
+
+
+# ----------------------------------------------------------------------
+# Note templates — reusable structured note bodies. A template is an ordered
+# list of fill-in FIELDS (label + default + widget kind) the user tabs through
+# at fire time; the result renders into the note body. `courses` +
+# `interaction_type` drive the fire-time picker's auto-suggest (which templates
+# float to the top for the student's course). Definitions are CONFIG, stored in
+# scenarios.yaml under a top-level `note_templates:` list (parallel to `groups`
+# / `success_paths`). See launcher's note-template editor + fire dialog.
+# ----------------------------------------------------------------------
+NOTE_FIELD_KINDS = ("text", "multiline", "dropdown", "date")
+
+
+@dataclass
+class NoteTemplateField:
+    """One fill-in field of a NoteTemplate.
+
+    Renders as ``Label: value`` — except a ``multiline`` field, which puts its
+    label on its own line with the (possibly multi-line) value beneath. ``kind``
+    drives the fire-time widget: ``text`` = single-line entry, ``multiline`` =
+    text box, ``dropdown`` = editable combobox seeded with ``choices`` (still
+    free-typeable), ``date`` = an editable combobox (``choices`` act as relative
+    quick-picks like "1 week") plus a 📅 calendar button for a concrete date.
+    ``default`` pre-fills the field (e.g. ``"N/A"``). ``var`` is a reserved hook
+    for FUTURE auto-fill — the name of a student/caseload variable whose value
+    seeds the field; unused for now, just persisted."""
+    label: str
+    default: str = ""
+    kind: str = "text"          # one of NOTE_FIELD_KINDS
+    choices: list[str] = field(default_factory=list)
+    var: str = ""
+
+
+@dataclass
+class NoteTemplate:
+    """A reusable structured note body. ``fields`` are filled at fire time and
+    rendered into the note text. ``courses`` (course codes) and
+    ``interaction_type`` (a free "what was done / discussed" tag) drive the
+    picker's auto-suggest — an empty ``courses`` means the template applies to
+    any course. ``note_type`` optionally presets the Salesforce interaction type
+    (the note-form dropdown) when the template is chosen."""
+    name: str
+    fields: list[NoteTemplateField] = field(default_factory=list)
+    courses: list[str] = field(default_factory=list)
+    interaction_type: str = ""
+    note_type: str = ""
+
+
+def _note_field_from_dict(d) -> Optional[NoteTemplateField]:
+    if not isinstance(d, dict):
+        return None
+    label = str(d.get("label", "") or "").strip()
+    if not label:
+        return None
+    kind = str(d.get("kind", "text") or "text").strip().lower()
+    if kind not in NOTE_FIELD_KINDS:
+        kind = "text"
+    return NoteTemplateField(
+        label=label,
+        default=str(d.get("default", "") or ""),
+        kind=kind,
+        choices=[str(c).strip() for c in (d.get("choices") or [])
+                 if str(c).strip()],
+        var=str(d.get("var", "") or "").strip(),
+    )
+
+
+def _note_template_from_dict(d) -> Optional[NoteTemplate]:
+    if not isinstance(d, dict):
+        return None
+    name = str(d.get("name", "") or "").strip()
+    if not name:
+        return None
+    fields = [f for f in (_note_field_from_dict(x)
+                          for x in (d.get("fields") or [])) if f]
+    return NoteTemplate(
+        name=name,
+        fields=fields,
+        courses=[str(c).strip() for c in (d.get("courses") or [])
+                 if str(c).strip()],
+        interaction_type=str(d.get("interaction_type", "") or "").strip(),
+        note_type=str(d.get("note_type", "") or "").strip(),
+    )
+
+
+def _note_field_to_dict(f: NoteTemplateField) -> dict:
+    """Serialize a field, omitting empty/default keys to keep the YAML tidy."""
+    d: dict = {"label": f.label}
+    if f.default:
+        d["default"] = f.default
+    if f.kind and f.kind != "text":
+        d["kind"] = f.kind
+    if f.choices:
+        d["choices"] = list(f.choices)
+    if f.var:
+        d["var"] = f.var
+    return d
+
+
+def note_template_to_dict(t: NoteTemplate) -> dict:
+    """Serialize a NoteTemplate for the scenarios.yaml `note_templates:` list."""
+    d: dict = {"name": t.name}
+    if t.courses:
+        d["courses"] = list(t.courses)
+    if t.interaction_type:
+        d["interaction_type"] = t.interaction_type
+    if t.note_type:
+        d["note_type"] = t.note_type
+    d["fields"] = [_note_field_to_dict(f) for f in t.fields]
+    return d
+
+
+def load_note_templates(path: Path = SCENARIOS_YAML) -> list[NoteTemplate]:
+    """Read the top-level ``note_templates:`` list from scenarios.yaml. Optional
+    feature block — missing / empty / parse-error returns ``[]`` (never blocks
+    startup). Templates without a name or with no valid fields are dropped;
+    order is preserved."""
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+    if not isinstance(raw, dict):
+        return []
+    items = raw.get("note_templates")
+    if not isinstance(items, list):
+        return []
+    return [t for t in (_note_template_from_dict(x) for x in items) if t]
+
+
+def render_note_template(template: NoteTemplate, values: dict) -> str:
+    """Render a filled template into note-body text.
+
+    ``values`` maps field label -> the user's entered string; a label missing
+    from ``values`` falls back to that field's ``default``. Each field becomes a
+    ``Label: value`` line, except a ``multiline`` field, which puts its label on
+    its own line with the value beneath. An empty value keeps the bare
+    ``Label:`` so the form skeleton survives (matching how these session-note
+    forms are filed)."""
+    lines: list[str] = []
+    for f in template.fields:
+        val = values.get(f.label, f.default)
+        val = "" if val is None else str(val)
+        if f.kind == "multiline":
+            lines.append(f"{f.label}:")
+            if val:
+                lines.append(val)
+        else:
+            lines.append(f"{f.label}: {val}".rstrip())
+    return "\n".join(lines)
+
+
+def parse_note_template_text(text: str) -> list[NoteTemplateField]:
+    """Turn a pasted ``Label: default`` block into fields — the fast way to
+    author a template (paste the cloud-team form and go). Each non-blank line
+    splits on its FIRST colon: left = label, right (trimmed) = default (e.g.
+    ``N/A``). A line with no colon becomes a label-only field. Blank lines are
+    skipped. Widget kinds default to ``text``; upgrade to multiline/dropdown in
+    the editor afterward."""
+    out: list[NoteTemplateField] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        label, _sep, default = line.partition(":")
+        label = label.strip()
+        if not label:
+            continue
+        out.append(NoteTemplateField(label=label, default=default.strip()))
+    return out
 
 
 def _prompts_from_list(items: Optional[list]) -> list[Prompt]:
