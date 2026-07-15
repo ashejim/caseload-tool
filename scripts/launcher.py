@@ -64,6 +64,13 @@ from src.dates import (
 )
 from src.ema_links import parse_ema_url, build_ema_url
 from src.note_text import note_body_to_html, note_html_to_text, fmt_note_date
+# Public helpers imported under their existing private aliases so the many
+# in-file call sites stay unchanged.
+from src.names import (
+    capitalize_name as _capitalize_name,
+    names_loosely_match as _names_loosely_match,
+    set_cap_mode as _set_name_cap_mode,
+)
 from src.scenarios import (
     SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
     ScenarioConfig, SuccessPath, NoteTemplate, NoteTemplateField,
@@ -6170,42 +6177,6 @@ def apply_caseload_tree_font(size: int) -> None:
 # TZ_ABBR_TO_IANA, to_iso_date) now live in src/dates.py — imported at the top.
 
 
-# Active name-capitalization mode (kept in sync with the user's setting by
-# App._sync_name_cap_mode). Module-level so both variable builders — the
-# App-side CSV one and the BrowserWorker-side DOM one (no settings access) —
-# share it without threading the setting through.
-_NAME_CAP_MODE = "standard"
-
-
-def _capitalize_name(name: str, mode: Optional[str] = None) -> str:
-    """Normalize a name's capitalization for use in template variables.
-    `mode` (defaults to the global _NAME_CAP_MODE):
-      'off'      — return the name exactly as stored;
-      'lower'    — only fix LOWERCASE entry errors ('john' → 'John'); leave
-                   ALL-CAPS and mixed case alone;
-      'standard' — also normalize ALL-CAPS to Title case ('JANE' → 'Jane'),
-                   while PRESERVING intentional mixed case (McDonald,
-                   O'Brien, Mary-Jane stay as-is).
-    Works per letter-run so hyphen/apostrophe parts are handled
-    (mary-jane → Mary-Jane)."""
-    if not name:
-        return name
-    m = mode or _NAME_CAP_MODE
-    if m == "off":
-        return name
-    if m == "lower":
-        return re.sub(r"\b[a-z]", lambda mo: mo.group(0).upper(), name)
-
-    # 'standard': title-case any run that's entirely lower OR entirely upper;
-    # leave mixed-case runs untouched so deliberate caps survive.
-    def _fix(mo):
-        w = mo.group(0)
-        if w.islower() or w.isupper():
-            return w[:1].upper() + w[1:].lower()
-        return w
-    return re.sub(r"[A-Za-z]+", _fix, name)
-
-
 # Task badge appearance per state. (mark, fg_color, text_color). 'passed'
 # /'returned'/'pending' come from the on-demand live-status fetch (the
 # list view's cellColorGreen/Red/Blue); 'submitted' is the CSV-only
@@ -6453,34 +6424,6 @@ _CSV_PM_EMAIL_COLS = [
     "PMEmail", "PM Email",
     "ProgramMentorEmail", "Program Mentor Email",
 ]
-
-
-_NAME_TITLES = frozenset({
-    "dr", "mr", "mrs", "ms", "prof", "rev", "sir", "madam", "mx",
-})
-
-
-def _names_loosely_match(a: str, b: str) -> bool:
-    """Tolerant first/last-name comparison. Strips common titles
-    ('Dr.', 'Prof.', etc.), splits on whitespace + commas, lower-
-    cases, and checks for ≥2-token overlap.
-
-    Catches all the realistic shapes the same person's name takes
-    across Salesforce vs Outlook: 'Jim Ashe' vs 'Ashe, Jim',
-    'Dr. Jim Ashe' vs 'Jim Ashe', 'Jim Albert Ashe' vs 'Jim Ashe'
-    all match. 'Jim Smith' vs 'Bob Smith' does NOT (one-token
-    overlap)."""
-    def _tokens(s: str) -> set[str]:
-        out: set[str] = set()
-        for raw in (s or "").replace(",", " ").split():
-            t = raw.strip(".,()[]<>'\"").lower()
-            if t and t not in _NAME_TITLES:
-                out.add(t)
-        return out
-    ta, tb = _tokens(a), _tokens(b)
-    if not ta or not tb:
-        return False
-    return len(ta & tb) >= 2
 
 
 def _first_present_value(row: dict, candidates: list[str]) -> str:
@@ -33235,12 +33178,11 @@ class App:
         self.worker.submit_fetch_task_status(sid, on_done)
 
     def _sync_name_cap_mode(self) -> None:
-        """Push the user's name-capitalization preference into the module
-        global the name-variable builders read (the BrowserWorker one has no
-        settings access). Call at startup + after the setting changes."""
-        global _NAME_CAP_MODE
-        _NAME_CAP_MODE = (getattr(self.settings, "name_capitalization",
-                                  "standard") or "standard")
+        """Push the user's name-capitalization preference into src/names so the
+        name-variable builders (incl. the BrowserWorker one, no settings access)
+        share it. Call at startup + after the setting changes."""
+        _set_name_cap_mode(getattr(self.settings, "name_capitalization",
+                                   "standard") or "standard")
 
     def _close_splash(self) -> None:
         """Dismiss the startup splash if it's up (idempotent)."""

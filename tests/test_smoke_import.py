@@ -28,6 +28,7 @@ SRC_MODULES = [
     "src.config",
     "src.dates",
     "src.ema_links",
+    "src.names",
     "src.scenarios",
     "src.note_form",
     "src.note_text",
