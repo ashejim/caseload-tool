@@ -71,6 +71,12 @@ from src.names import (
     names_loosely_match as _names_loosely_match,
     set_cap_mode as _set_name_cap_mode,
 )
+from src.colors import (
+    text_color_for_bg as _text_color_for_bg,
+    tint_hex as _tint_hex,
+    hover_color_for as _hover_color_for,
+    scope_banner_theme as _scope_banner_theme,
+)
 from src.scenarios import (
     SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
     ScenarioConfig, SuccessPath, NoteTemplate, NoteTemplateField,
@@ -5965,74 +5971,6 @@ GROUP_COLOR_PALETTE: list[tuple[str, str]] = [
     ("Brown", "#7a5a3c"),
     ("Gray", "#7a7a7a"),
 ]
-
-
-def _text_color_for_bg(hex_color: str) -> str:
-    """Return '#000000' or '#ffffff' — whichever contrasts better
-    against `hex_color`. Uses the YIQ luminance formula which
-    weights green most heavily (matches human perception of
-    brightness)."""
-    h = (hex_color or "").lstrip("#")
-    if len(h) == 3:
-        h = "".join(c + c for c in h)
-    if len(h) != 6:
-        return "#000000"
-    try:
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    except ValueError:
-        return "#000000"
-    yiq = (r * 299 + g * 587 + b * 114) / 1000
-    return "#000000" if yiq >= 128 else "#ffffff"
-
-
-def _tint_hex(hex_color: str, toward: str, t: float) -> str:
-    """Blend `hex_color` toward `toward` by fraction t (0→hex_color, 1→toward).
-    Returns the input unchanged if it can't be parsed."""
-    try:
-        a = (hex_color or "").lstrip("#")
-        b = (toward or "").lstrip("#")
-        if len(a) == 3:
-            a = "".join(c + c for c in a)
-        if len(b) == 3:
-            b = "".join(c + c for c in b)
-        ch = [round(int(a[i:i + 2], 16) * (1 - t) + int(b[i:i + 2], 16) * t)
-              for i in (0, 2, 4)]
-        return "#%02x%02x%02x" % tuple(ch)
-    except Exception:
-        return hex_color
-
-
-# Default (ungrouped) batch-banner palette — the original light blue.
-_SCOPE_BANNER_DEFAULT = (("#dbe8ff", "#22304a"), ("#1f4e8f", "#cfe0ff"))
-
-
-def _scope_banner_theme(base_hex: Optional[str]):
-    """(fg_color, text_color) CTk (light, dark) tuples for the batch banner,
-    tinted from a group's base color: a pale wash in light mode / a muted dark
-    wash in dark mode, with a legible same-hue label. Falls back to the default
-    light-blue when the action is ungrouped (base_hex falsy / unparseable)."""
-    base = (base_hex or "").strip()
-    if len(base.lstrip("#")) not in (3, 6):
-        return _SCOPE_BANNER_DEFAULT
-    fg = (_tint_hex(base, "#ffffff", 0.82), _tint_hex(base, "#1b1b1b", 0.72))
-    text = (_tint_hex(base, "#000000", 0.45), _tint_hex(base, "#ffffff", 0.60))
-    return (fg, text)
-
-
-def _hover_color_for(hex_color: str) -> str:
-    """Slightly darker version of `hex_color` for hover state.
-    Returns the input unchanged if it can't be parsed."""
-    h = (hex_color or "").lstrip("#")
-    if len(h) == 3:
-        h = "".join(c + c for c in h)
-    if len(h) != 6:
-        return hex_color
-    try:
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    except ValueError:
-        return hex_color
-    f = 0.82
-    return f"#{int(r * f):02x}{int(g * f):02x}{int(b * f):02x}"
 
 
 _DIALOG_GEOMETRY: dict[str, str] = {}

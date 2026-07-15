@@ -25,6 +25,7 @@ sys.path.insert(0, ROOT)
 # as they are created so the smoke test grows with the refactor.
 SRC_MODULES = [
     "src.version",
+    "src.colors",
     "src.config",
     "src.dates",
     "src.ema_links",
