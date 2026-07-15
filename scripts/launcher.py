@@ -63,6 +63,7 @@ from src.dates import (
     days_until, days_since, to_iso_date,
 )
 from src.ema_links import parse_ema_url, build_ema_url
+from src.note_text import note_body_to_html, note_html_to_text, fmt_note_date
 from src.scenarios import (
     SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
     ScenarioConfig, SuccessPath, NoteTemplate, NoteTemplateField,
@@ -253,23 +254,6 @@ def _wait_record_ready(page, max_ms: int = 2000) -> None:
             page.wait_for_timeout(150)
         except Exception:
             return
-
-
-def _note_body_to_html(text: str) -> str:
-    """Convert a plain-text note body into the simple paragraph HTML the
-    Salesforce note-save endpoint stores (each line a <p>; blank lines a
-    <p><br></p>) so an API-filed note reads the same as a form-typed one.
-    HTML-special characters are escaped; **bold** markers become <b>…</b>
-    (applied AFTER escaping so the tags survive) — mirrored by strip_md_bold on
-    the DOM form path."""
-    from src.note_form import md_bold_to_html
-    lines = (text or "").split("\n")
-    parts = [
-        ("<p>" + md_bold_to_html(html.escape(ln)) + "</p>")
-        if ln.strip() else "<p><br></p>"
-        for ln in lines
-    ]
-    return "".join(parts) or "<p><br></p>"
 
 
 class BrowserWorker:
@@ -5763,7 +5747,7 @@ class BrowserWorker:
                 note_type=note.interaction_type,
                 course_code=note.course_code,
                 subject=note.subject,
-                body_html=_note_body_to_html(note.body),
+                body_html=note_body_to_html(note.body),
                 activities=note.academic_activities,
             )
             if res.get("ok"):
@@ -6402,42 +6386,6 @@ def last_logged_action(student_id: str) -> str:
         return f"{when} · {scenario}" if scenario else when
     except Exception:
         return ""
-
-
-def note_html_to_text(s: str) -> str:
-    """Flatten a note body (Salesforce stores some as HTML in the
-    data-cell-value attr) to readable plain text."""
-    s = s or ""
-    s = re.sub(r"<\s*br\s*/?\s*>", "\n", s, flags=re.IGNORECASE)
-    s = re.sub(r"</\s*(p|div|li)\s*>", "\n", s, flags=re.IGNORECASE)
-    s = re.sub(r"<[^>]+>", "", s)          # strip remaining tags
-    s = html.unescape(s)                    # &nbsp; &amp; etc.
-    s = s.replace("\xa0", " ")
-    # Collapse runs of blank lines / trailing space.
-    lines = [ln.strip() for ln in s.splitlines()]
-    out, blank = [], False
-    for ln in lines:
-        if not ln:
-            if not blank and out:
-                out.append("")
-            blank = True
-        else:
-            out.append(ln)
-            blank = False
-    return "\n".join(out).strip()
-
-
-def fmt_note_date(iso: str) -> str:
-    """'2026-06-02T17:11:20.000Z' -> '6/02 5:11 PM'. Passes through
-    anything it can't parse."""
-    s = (iso or "").strip()
-    if not s:
-        return ""
-    try:
-        d = datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
-        return d.strftime("%m/%d %I:%M %p").lstrip("0")
-    except Exception:
-        return s[:16].replace("T", " ")
 
 
 def _attach_tooltip(widget, text: str) -> None:
@@ -16462,7 +16410,7 @@ class CaseloadPanel:
             save_settings(self.app.settings)
         except Exception:
             pass
-        body_html = _note_body_to_html(data["body"])
+        body_html = note_body_to_html(data["body"])
         self.app._append_log(
             f"Filing quick note ({data['interaction_type']}) for {name}…")
 

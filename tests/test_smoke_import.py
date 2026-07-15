@@ -30,6 +30,7 @@ SRC_MODULES = [
     "src.ema_links",
     "src.scenarios",
     "src.note_form",
+    "src.note_text",
     "src.caseload_filter",
     "src.caseload_csv",
     "src.history",
