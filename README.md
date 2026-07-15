@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/owl.png" alt="CaseloadNotes owl logo" width="150">
+</p>
+
 # CaseloadNotes — Caseload automation for WGU Course Instructors
 
 A Windows desktop tool that automates the repetitive Salesforce/Outlook/Mongoose
