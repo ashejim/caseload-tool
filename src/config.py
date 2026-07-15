@@ -314,12 +314,21 @@ _seed_user_templates()
 
 # ===== Settings (user-toggleable preferences) =====
 #
-# A small JSON file alongside scenarios.yaml in USER_CONFIG_DIR. Currently
-# only carries the advanced-mode toggle, but designed to grow — future
-# preferences (auto-refresh intervals, default themes, etc.) get added
-# as fields on the Settings dataclass without needing migration code.
+# A small JSON file alongside scenarios.yaml in USER_CONFIG_DIR. Designed to
+# grow — new preferences are added as fields on the Settings dataclass and pick
+# up their default automatically. Adding a field never needs migration code; a
+# migration is only needed when we want to CHANGE a value existing installs
+# already saved (see CURRENT_SETTINGS_VERSION and _migrate_settings).
 
 SETTINGS_PATH = USER_CONFIG_DIR / "settings.json"
+
+# Bump when a release must rewrite a value in existing settings.json files.
+# load_settings() compares this against the saved "settings_version" (absent ==
+# 0) and applies each newer migration once, then stamps the file to CURRENT so
+# it never re-runs. Fresh installs (no file) are born at CURRENT and skip all
+# migrations. History:
+#   1 — flip existing installs to text_send_via_api (API texting became default)
+CURRENT_SETTINGS_VERSION = 1
 
 
 @dataclass
@@ -327,6 +336,11 @@ class Settings:
     """User preferences persisted across sessions. Defaults are the
     "basic user" configuration — advanced features hidden until the
     user opts in via the Settings dialog."""
+    # Schema version of this settings file, used only to run one-time
+    # migrations of previously-saved values (see CURRENT_SETTINGS_VERSION).
+    # A fresh Settings() is born current; older files are stamped up after
+    # their migrations run.
+    settings_version: int = CURRENT_SETTINGS_VERSION
     advanced_mode: bool = False
     # Set True once the user has been through the first-run setup
     # (mode picker + Caseload Tool view introduction). When False on
@@ -433,8 +447,10 @@ class Settings:
     # compose flakiness, and auto-skips students who haven't opted in (Mongoose
     # is the opt-out source of truth). The compose modal stays the automatic
     # fallback if the API path errors. Default ON for new installs so texting
-    # "just works" without a segment export; existing users keep whatever they
-    # saved (save_settings serializes every field). Toggle off to drive the modal.
+    # "just works" without a segment export. Existing installs (saved under the
+    # old OFF default) are flipped ON once by the v1 settings migration so they
+    # stop getting the "text-ID export is stale" prompt; a user who then toggles
+    # it back off stays off (the migration runs once). Toggle off to drive the modal.
     text_send_via_api: bool = True
     # Source the caseload from the live grid JSON (getCaseLoadMainGridData) when
     # that feed is healthy, overlaying any CSV-only columns from the downloaded
@@ -508,9 +524,32 @@ def load_settings() -> Settings:
     valid = {f.name for f in fields(Settings)}
     filtered = {k: v for k, v in data.items() if k in valid}
     try:
-        return Settings(**filtered)
+        settings = Settings(**filtered)
     except Exception:
         return Settings()
+    # One-time migrations for a settings.json written by an older release.
+    # Keyed on the saved schema version (absent/garbage == 0). Fresh installs
+    # never reach here (no file → early return above), so they keep the current
+    # defaults untouched. Persist immediately so the version stamp sticks and the
+    # migration can't re-run and fight a user's later choice.
+    saved_version = data.get("settings_version", 0)
+    if not isinstance(saved_version, int) or saved_version < CURRENT_SETTINGS_VERSION:
+        _migrate_settings(settings, saved_version if isinstance(saved_version, int) else 0)
+        settings.settings_version = CURRENT_SETTINGS_VERSION
+        save_settings(settings)
+    return settings
+
+
+def _migrate_settings(settings: Settings, saved_version: int) -> None:
+    """Apply one-time upgrades to an existing settings.json in place. Each block
+    is guarded by the version it shipped in so it runs exactly once per install,
+    only while the file is below CURRENT_SETTINGS_VERSION."""
+    # v1: API texting became the default (skips the flaky compose modal and the
+    # segment-export freshness prompts). Flip installs still on the old
+    # segment/DOM path — they saved False under the pre-aa561bb default, not by
+    # a deliberate choice. After this they can toggle back off and it sticks.
+    if saved_version < 1:
+        settings.text_send_via_api = True
 
 
 def save_settings(settings: Settings) -> None:
