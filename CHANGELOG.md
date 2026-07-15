@@ -3,6 +3,54 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.19.0 — 2026-07-15
+
+Reusable **note templates**, a faster and louder fire experience, and a batch
+email fix.
+
+### Note templates
+- **Fill-in note forms.** Build reusable note templates in **Settings → Note
+  templates** — each a set of labelled fields (Purpose, Attempt, Summary, …)
+  with defaults. At fire time you tab through them and the filled result becomes
+  the note body. A field can be a single line, a paragraph box, a **dropdown**,
+  or a **date** (type it, pick from the calendar, or use quick-picks like "1
+  week"). Paste a "Label: default" block to build one in seconds.
+- **Choose at fire time.** A **Choose template ▾** button appears in the note
+  dialog, the quick-note (＋ Note), and the batch note step — pick one and it
+  fills the body. Templates are tagged by course / interaction type, so the
+  right ones are **suggested** for the student you're on (with "Show all…" for
+  the rest). Don't need one? Ignore the button — normal typing is unchanged.
+- **Default per note.** An action's note can bind a default template (in the
+  action editor) that opens its fill form automatically when it fires. Create /
+  edit templates right from the picker with **＋ New** / **✎ Edit**.
+- **Bold with `**text**`.** Wrap text in double asterisks to make it bold in the
+  filed note (e.g. a bold `**Purpose**` label).
+
+### Faster, louder fires
+- **Notes open faster.** Firing a note against the open record (e.g. a hotkey
+  action) no longer stalls a couple of seconds navigating to the Essential
+  Actions tab — it reuses the startup EA scan, so the note dialog appears
+  quickly.
+- **You can see what it's waiting on.** While the app is blocked on Salesforce
+  or Mongoose, the busy indicator — and the browser lock screen — now say
+  exactly what: "waiting on Salesforce — filing the note…", "waiting on Mongoose
+  — sending the text…", and so on.
+
+### Batch email review
+- **Deselecting an email no longer skips the note.** Unchecking students in the
+  email review used to drop them from the *whole* action. Now it only skips the
+  email — a prompt lets you keep their note/text or drop them entirely, and you
+  can skip the email step for everyone while still filing notes.
+
+### Other
+- **API texting on for everyone.** Existing installs now switch to sending texts
+  via the Mongoose API on first launch (matching new installs) — no more
+  "text-ID export is stale" prompts from the old segment-export path.
+- **Clickable Task badges.** A student's Task badges open the EMA Score Report
+  even when no status shows yet (caseload data can lag the real result).
+- **Open departed students.** In ⚑ Departures, click a student to open them in
+  the 🗄 Archived view and review / update their saved data.
+
 ## 0.18.0 — 2026-07-14
 
 Batch actions are now **reviewed right in the caseload viewer**, plus a
