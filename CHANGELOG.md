@@ -3,6 +3,16 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.19.1 — 2026-07-15
+
+- **A starter note template ships with new installs.** A fresh install now
+  includes a **"Student note"** template (Purpose / Outcome / Student action
+  items / Next follow-up / Summary), bound to the **Sample - quick note** action
+  — so pressing its hotkey opens the fill-in form and you can see how templates
+  work right away. Edit it in **Settings → Note templates**, or clear the note's
+  "Default template" to type a plain note instead. (Existing installs keep their
+  own actions — add templates yourself in Settings.)
+
 ## 0.19.0 — 2026-07-15
 
 Reusable **note templates**, a faster and louder fire experience, and a batch
