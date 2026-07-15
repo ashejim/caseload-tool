@@ -6170,29 +6170,6 @@ def apply_caseload_tree_font(size: int) -> None:
 # TZ_ABBR_TO_IANA, to_iso_date) now live in src/dates.py — imported at the top.
 
 
-def parse_task_status(val: str) -> tuple[str, str, int]:
-    """Interpret a caseload Task CSV cell, e.g. '2026-06-03 (1)'.
-
-    IMPORTANT: the CSV export only carries the most-recent submission
-    DATE and the number in parentheses, and that number is the ATTEMPT
-    COUNT — NOT a pass/fail flag. Pass/fail lives only in the live list
-    view's cell color/title (e.g. class 'cellColorGreen' + a title like
-    '… | Passed | 04/21/2026 | 1 Attempt | System: EMA'), which the CSV
-    export drops. So from the CSV alone we can only say 'submitted' vs
-    'not submitted' — we must NOT infer 'passed'. The real status is
-    fetched on demand (see CaseloadPanel._qv_task_badges).
-
-    Returns (state, date, attempts) where state is 'none' | 'submitted'.
-    """
-    s = (val or "").strip()
-    if not s:
-        return "none", "", 0
-    m = re.match(r"(\d{4}-\d{2}-\d{2}).*?\((\d+)\)", s)
-    if not m:
-        return "submitted", s[:10], 0
-    return "submitted", m.group(1), int(m.group(2))
-
-
 # Active name-capitalization mode (kept in sync with the user's setting by
 # App._sync_name_cap_mode). Module-level so both variable builders — the
 # App-side CSV one and the BrowserWorker-side DOM one (no settings access) —
@@ -16028,7 +16005,7 @@ class CaseloadPanel:
         self._qv_status_sid = sid
         badges: dict[str, tuple] = {}
         for i in (1, 2, 3):
-            state, date, attempts = parse_task_status(
+            state, date, attempts = caseload_csv.parse_task_status(
                 self._cell(row, f"Task{i}"))
             badge = ctk.CTkLabel(
                 bar, text=f"T{i}", corner_radius=6,
@@ -27503,7 +27480,8 @@ class App:
             tasks = cache.get(sid) or {}
             for n in tnums:
                 # Date + count from the CSV Task cell (e.g. "2026-09-13 (1)").
-                _, date, attempts = parse_task_status(r.get(f"Task{n}", ""))
+                _, date, attempts = caseload_csv.parse_task_status(
+                    r.get(f"Task{n}", ""))
                 r[f"Task{n}Date"] = date
                 r[f"Task{n}Count"] = str(attempts) if date else ""
                 # Status from the live cache (blank until the scrape lands).

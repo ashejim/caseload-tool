@@ -166,6 +166,23 @@ def test_ea_view_missing_sid_false_on_evaluate_error():
     assert ea_view_missing_student_id(_FakePage(raises=True)) is False
 
 
+# --- parse_task_status -----------------------------------------------------
+
+def test_parse_task_status():
+    assert caseload_csv.parse_task_status("") == ("none", "", 0)
+    assert caseload_csv.parse_task_status("   ") == ("none", "", 0)
+    # date + attempt count in parens
+    assert caseload_csv.parse_task_status("2026-06-03 (1)") == (
+        "submitted", "2026-06-03", 1)
+    assert caseload_csv.parse_task_status("2026-06-03 (12)") == (
+        "submitted", "2026-06-03", 12)
+    # date without a paren count -> submitted, 0 attempts
+    assert caseload_csv.parse_task_status("2026-06-03") == (
+        "submitted", "2026-06-03", 0)
+    # non-empty but unrecognized -> submitted, first 10 chars, 0
+    assert caseload_csv.parse_task_status("in progress")[0] == "submitted"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

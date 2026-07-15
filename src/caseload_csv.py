@@ -243,3 +243,26 @@ def csv_mtime(path: Path) -> Optional[datetime]:
         return datetime.fromtimestamp(Path(path).stat().st_mtime)
     except OSError:
         return None
+
+
+def parse_task_status(val: str) -> tuple[str, str, int]:
+    """Interpret a caseload Task CSV cell, e.g. '2026-06-03 (1)'.
+
+    IMPORTANT: the CSV export only carries the most-recent submission DATE and
+    the number in parentheses, and that number is the ATTEMPT COUNT — NOT a
+    pass/fail flag. Pass/fail lives only in the live list view's cell
+    color/title (e.g. class 'cellColorGreen' + a title like '… | Passed |
+    04/21/2026 | 1 Attempt | System: EMA'), which the CSV export drops. So from
+    the CSV alone we can only say 'submitted' vs 'not submitted' — we must NOT
+    infer 'passed'. The real status is fetched on demand (see the caseload
+    panel's task badges).
+
+    Returns (state, date, attempts) where state is 'none' | 'submitted'.
+    """
+    s = (val or "").strip()
+    if not s:
+        return "none", "", 0
+    m = re.match(r"(\d{4}-\d{2}-\d{2}).*?\((\d+)\)", s)
+    if not m:
+        return "submitted", s[:10], 0
+    return "submitted", m.group(1), int(m.group(2))
