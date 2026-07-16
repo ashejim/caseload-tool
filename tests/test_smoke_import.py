@@ -28,6 +28,8 @@ SRC_MODULES = [
     "src.colors",
     "src.config",
     "src.dates",
+    "src.hotkeys",
+    "src.ui_common",
     "src.ema_links",
     "src.names",
     "src.scenarios",

@@ -44,6 +44,18 @@ except Exception:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import caseload_csv, caseload_filter, email_template, history, hotkeys
+from src.ui_common import (
+    SECONDARY_BTN_KWARGS,
+    _ADD_BTN_BLUE,
+    _ADD_BTN_BLUE_HOVER,
+    _attach_tooltip,
+    _restore_dialog_geometry,
+    _save_dialog_geometry,
+    _fit_dialog_to_content,
+    _build_checkbox_images,
+    _configure_email_preview_tags,
+    attach_listbox_drag_reorder,
+)
 from src import success_path as success_path_store
 from src.browser import persistent_context
 from src.config import (
@@ -5851,15 +5863,6 @@ def open_hotkey_capture(parent, on_done: Callable[[str], None]) -> None:
 # the same gray as the dark-mode panel background — unreadable until
 # hovered. Explicit fg/text/border colors here give high contrast in
 # both light and dark mode.
-SECONDARY_BTN_KWARGS = dict(
-    fg_color=("gray82", "gray28"),
-    text_color=("gray10", "gray95"),
-    hover_color=("gray72", "gray38"),
-    border_width=1,
-    border_color=("gray60", "gray45"),
-)
-
-
 # Preset palette for scenario group colors. Muted enough to read
 # comfortably on both light and dark backgrounds; tuned so the
 # text-color helper (YIQ luminance) gives a sane white/black
@@ -5878,15 +5881,6 @@ GROUP_COLOR_PALETTE: list[tuple[str, str]] = [
     ("Brown", "#7a5a3c"),
     ("Gray", "#7a7a7a"),
 ]
-
-
-_DIALOG_GEOMETRY: dict[str, str] = {}
-_DIALOG_DEFAULTS: dict[str, str] = {
-    "find_and_pick": "480x440",
-    "additional_text": "640x420",
-    "batch_review": "720x560",
-    "html_template_editor": "900x640",
-}
 
 
 # Sentinel shown in the "Email font" dropdown when no font is set —
@@ -6095,57 +6089,6 @@ def last_logged_action(student_id: str) -> str:
         return f"{when} · {scenario}" if scenario else when
     except Exception:
         return ""
-
-
-def _attach_tooltip(widget, text: str) -> None:
-    """Lightweight hover tooltip for a widget (no dependency on any UI
-    framework — a borderless Toplevel shown on enter, hidden on leave).
-
-    Idempotent: calling it again with new text UPDATES the tooltip in place
-    rather than stacking another <Enter>/<Leave> binding. A widget repainted
-    with fresh text — e.g. a task badge whose 'submitted (loading…)' label
-    becomes 'passed' after the live status fetch — would otherwise keep the
-    first binding alive and show its STALE text on hover (green badge but a
-    'loading…' tooltip)."""
-    holder = getattr(widget, "_tooltip_state", None)
-    if holder is not None:
-        holder["text"] = text  # binding already exists — just update the text
-        return
-    holder = {"text": text, "tip": None}
-    try:
-        widget._tooltip_state = holder
-    except Exception:
-        pass
-
-    def show(_e=None):
-        if holder["tip"] is not None or not holder["text"]:
-            return
-        try:
-            x = widget.winfo_rootx() + 10
-            y = widget.winfo_rooty() + widget.winfo_height() + 4
-            tip = tk.Toplevel(widget)
-            tip.wm_overrideredirect(True)
-            tip.wm_geometry(f"+{x}+{y}")
-            tk.Label(
-                tip, text=holder["text"], justify="left",
-                background="#2b2b2b", foreground="#f0f0f0",
-                relief="solid", borderwidth=1, padx=6, pady=3,
-                font=("", 9),
-            ).pack()
-            holder["tip"] = tip
-        except Exception:
-            holder["tip"] = None
-
-    def hide(_e=None):
-        if holder["tip"] is not None:
-            try:
-                holder["tip"].destroy()
-            except Exception:
-                pass
-            holder["tip"] = None
-
-    widget.bind("<Enter>", show, add="+")
-    widget.bind("<Leave>", hide, add="+")
 
 
 # Variables exposed in the in-app HTML editor's "Insert variable"
@@ -7684,67 +7627,6 @@ def prompt_html_template_editor(
     return saved["value"]
 
 
-def _restore_dialog_geometry(dialog, key: str) -> None:
-    geom = _DIALOG_GEOMETRY.get(key, _DIALOG_DEFAULTS.get(key, ""))
-    if geom:
-        try:
-            dialog.geometry(geom)
-        except Exception:
-            dialog.geometry(_DIALOG_DEFAULTS.get(key, "400x300"))
-
-
-def _save_dialog_geometry(dialog, key: str) -> None:
-    try:
-        _DIALOG_GEOMETRY[key] = dialog.geometry()
-    except Exception:
-        pass
-
-
-def _fit_dialog_to_content(dialog, min_w: int = 0, min_h: int = 0,
-                           near_mouse: bool = False) -> None:
-    """Grow a popup so all of its packed content is visible, then pin that as
-    the minimum size. Needed for dialogs whose height varies with optional
-    sections (e.g. the note editor's Essential Actions block, which sits at
-    the bottom and was getting clipped when a smaller geometry was restored
-    from an earlier no-EA session). Never shrinks an already-larger window,
-    and clamps to the screen so it can't open off-edge.
-
-    `near_mouse` places the (sized) window just up-left of the pointer so the
-    cursor barely travels, instead of keeping any remembered position."""
-    try:
-        dialog.update_idletasks()
-        req_w = max(int(min_w), dialog.winfo_reqwidth())
-        req_h = max(int(min_h), dialog.winfo_reqheight())
-        sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
-        # Don't exceed the screen (leave a margin for the taskbar/title bar).
-        max_w = max(req_w, sw - 40)
-        max_h = max(req_h, sh - 80)
-        req_w, req_h = min(req_w, max_w), min(req_h, max_h)
-        geo = dialog.geometry()  # "WxH+X+Y" (W/H may be the 1x1 placeholder)
-        m = re.match(r"(\d+)x(\d+)", geo)
-        cur_w = int(m.group(1)) if m else 0
-        cur_h = int(m.group(2)) if m else 0
-        new_w = min(max(cur_w, req_w), max_w)
-        new_h = min(max(cur_h, req_h), max_h)
-        dialog.minsize(req_w, req_h)
-        if near_mouse:
-            try:
-                px, py = dialog.winfo_pointerxy()
-            except Exception:
-                px, py = 0, 0
-            x = min(max(px - 30, 0), max(sw - new_w, 0))
-            y = min(max(py - 30, 0), max(sh - new_h, 0))
-            dialog.geometry(f"{new_w}x{new_h}+{x}+{y}")
-        else:
-            # Keep a remembered position; for a fresh (1x1 placeholder)
-            # dialog, set size only and let the window manager place it.
-            has_pos = cur_w > 1 and cur_h > 1 and "+" in geo
-            pos = geo[geo.index("+"):] if has_pos else ""
-            dialog.geometry(f"{new_w}x{new_h}{pos}")
-    except Exception:
-        pass
-
-
 def prompt_calendar_pick(parent, initial_date=None):
     """Small monthly calendar picker. Click a day → returns that
     `datetime.date`. Returns None on cancel. Built from CTk widgets
@@ -9243,73 +9125,6 @@ def prompt_branch_unmatched(parent, labels, branch_titles, action_name):
     return result["value"]
 
 
-def attach_listbox_drag_reorder(listbox, items, refresh, on_change=None):
-    """Make a native ``tk.Listbox`` drag-reorderable, backed by the Python
-    list ``items``. During a drag a thin accent line marks the drop gap
-    between two rows; the move commits on release. ``refresh(sel=None)``
-    re-renders the listbox from ``items`` (selecting ``sel`` when given);
-    ``on_change()`` (optional) runs after a committed reorder. Shared by the
-    Choose-columns and caseload-panel-actions choosers."""
-    dark = ctk.get_appearance_mode() == "Dark"
-    accent = "#4aa3df" if dark else "#1f6aa5"
-    line = tk.Frame(listbox, height=2, bg=accent, bd=0, highlightthickness=0)
-    state = {"src": None}
-
-    def gap_index(y):
-        n = listbox.size()
-        if n == 0:
-            return 0
-        j = listbox.nearest(y)
-        bbox = listbox.bbox(j)
-        if bbox:
-            _, by, _, bh = bbox
-            if y > by + bh / 2:
-                j += 1
-        return max(0, min(j, n))
-
-    def show_line(gap):
-        n = listbox.size()
-        if n == 0:
-            line.place_forget()
-            return
-        if gap >= n:
-            bbox = listbox.bbox(n - 1)
-            y = (bbox[1] + bbox[3]) if bbox else 0
-        else:
-            bbox = listbox.bbox(gap)
-            y = bbox[1] if bbox else 0
-        line.place(x=2, y=max(0, y - 1), relwidth=1.0)
-        line.lift()
-
-    def on_press(e):
-        state["src"] = listbox.nearest(e.y)
-
-    def on_motion(e):
-        if state["src"] is None:
-            return
-        show_line(gap_index(e.y))
-        return "break"
-
-    def on_release(e):
-        src = state["src"]
-        state["src"] = None
-        line.place_forget()
-        if src is None:
-            return
-        dst = gap_index(e.y)
-        if dst > src:
-            dst -= 1
-        if 0 <= src < len(items) and dst != src:
-            items.insert(dst, items.pop(src))
-            refresh(sel=dst)
-            if on_change:
-                on_change()
-
-    listbox.bind("<ButtonPress-1>", on_press, add="+")
-    listbox.bind("<B1-Motion>", on_motion, add="+")
-    listbox.bind("<ButtonRelease-1>", on_release, add="+")
-
-
 class _HTMLToTkRenderer(HTMLParser):
     """Render simplified HTML into a Tk Text widget using tag-based
     formatting. Goal: legible to non-technical reviewers (FERPA), not
@@ -9491,46 +9306,6 @@ class _HTMLToTkRenderer(HTMLParser):
         end = self.text.index("end-1c")
         for tag in tags:
             self.text.tag_add(tag, start, end)
-
-
-def _configure_email_preview_tags(text_widget) -> None:
-    """Set up the tag styles used by `_HTMLToTkRenderer`. Colors
-    adapt to the current ctk appearance mode so the preview is
-    readable on both light and dark themes."""
-    mode = ctk.get_appearance_mode()
-    is_dark = mode == "Dark"
-    text_widget.tag_configure(
-        "bold", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-    )
-    text_widget.tag_configure(
-        "italic", font=ctk.CTkFont(family="Segoe UI", size=12, slant="italic"),
-    )
-    text_widget.tag_configure("underline", underline=True)
-    text_widget.tag_configure(
-        "link",
-        foreground="#79b8ff" if is_dark else "#1a73e8",
-        underline=True,
-    )
-    text_widget.tag_configure(
-        "url_hint",
-        foreground="#888888" if is_dark else "#666666",
-        font=ctk.CTkFont(family="Segoe UI", size=10),
-    )
-    text_widget.tag_configure(
-        "heading", font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
-    )
-    text_widget.tag_configure(
-        "image",
-        foreground="#5a4500" if not is_dark else "#ffd966",
-        background="#fff3c4" if not is_dark else "#3a3520",
-        font=ctk.CTkFont(family="Segoe UI", size=11, slant="italic"),
-    )
-    text_widget.tag_configure(
-        "unresolved_var",
-        foreground="#ffffff",
-        background="#cc0000",
-        font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-    )
 
 
 def prompt_segment_setup(parent, missing: list) -> bool:
@@ -10540,33 +10315,6 @@ def prompt_batch_email_review(
             cc_edits, bcc_edits)
 
 
-def _build_checkbox_images():
-    """Build (unchecked, checked) 16px checkbox PhotoImages in the CTk
-    style — an outlined box, and a filled blue box with a white tick. The
-    CALLER must keep a reference (else Tk GCs them and they render blank).
-    Needs a live Tk root. Shared by the caseload viewer's select-all header
-    and the batch-review popup so both look identical."""
-    from PIL import Image, ImageDraw, ImageTk
-    dark = ctk.get_appearance_mode() == "Dark"
-    blue = "#1f6aa5" if dark else "#3a7ebf"
-    border = "#6b6e70" if dark else "#979da2"
-    size, scale = 16, 4  # supersample then downscale for smooth edges
-    S = size * scale
-    pad, rad, bw = 1 * scale, 4 * scale, 2 * scale
-    un = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    ImageDraw.Draw(un).rounded_rectangle(
-        [pad, pad, S - pad, S - pad], radius=rad, outline=border, width=bw)
-    ch = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(ch)
-    d.rounded_rectangle(
-        [pad, pad, S - pad, S - pad], radius=rad, fill=blue, outline=blue)
-    d.line(
-        [(S * 0.27, S * 0.52), (S * 0.44, S * 0.69), (S * 0.74, S * 0.32)],
-        fill="white", width=bw, joint="curve")
-    return (ImageTk.PhotoImage(un.resize((size, size), Image.LANCZOS)),
-            ImageTk.PhotoImage(ch.resize((size, size), Image.LANCZOS)))
-
-
 def prompt_batch_review(
     parent,
     scenario_name: str,
@@ -11237,10 +10985,6 @@ def _option_checkbox(parent, text, variable=None, command=None, **kw):
 # Left indent (px) for a sub-option so it sits under its major part.
 _OPT_INDENT = 8
 
-# Vivid blue for the "+ Add …" affordance buttons in the editor, so the
-# add-a-thing actions stand out from other controls. (light, dark) tuples.
-_ADD_BTN_BLUE = ("#2f6fed", "#2f6fed")
-_ADD_BTN_BLUE_HOVER = ("#2558c8", "#2558c8")
 # Branch tab-strip colors: the active tab is the same vivid blue as the
 # "+ Add" affordances; inactive tabs are a muted slate so the selected
 # branch reads clearly.
