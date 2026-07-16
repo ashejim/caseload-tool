@@ -79,10 +79,12 @@ def fmt_date_short(value: str, current_year: Optional[int] = None) -> str:
     so this is safe to call on every grid cell, not just known date columns.
 
     `current_year` defaults to this year; pass it for deterministic tests."""
-    s = value or ""
-    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if not isinstance(value, str):
+        return value  # non-string cell (e.g. an int) — nothing to shorten
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", value)
     if not m:
         return value
+    s = value
     y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
     cur = current_year if current_year is not None else datetime.now().year
     short = f"{mo}/{d}" if y == cur else f"{mo}/{d}/{y}"

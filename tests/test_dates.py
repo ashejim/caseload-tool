@@ -79,6 +79,13 @@ def test_fmt_date_short_passthrough_non_dates():
     assert dates.fmt_date_short("2026-07", current_year=2026) == "2026-07"
 
 
+def test_fmt_date_short_non_string_passthrough():
+    # Grid cells aren't always strings — a non-str must pass through, not crash.
+    assert dates.fmt_date_short(5) == 5
+    assert dates.fmt_date_short(None) is None
+    assert dates.fmt_date_short(3.5) == 3.5
+
+
 def test_fmt_date_short_defaults_to_this_year():
     from datetime import date
     this_year = date.today().year
