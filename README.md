@@ -4,7 +4,10 @@
 
 # CaseloadNotes — Caseload automation for WGU Course Instructors
 
-A Windows desktop tool that automates the repetitive Salesforce/Outlook/Mongoose
+(Note automation)+(Text scheduler/automation)+(Mail merge)+(EA dashboard)+(Caseload)+(Data organization)...
+= caseload-tool
+
+A Windows desktop tool that organizes and automates the repetitive Salesforce/Outlook/Mongoose
 work of running a WGU course caseload — filing notes, sending emails and texts,
 and seeing at a glance who needs attention. It runs client-side under your own
 login, so **no Salesforce admin permissions are required**.
