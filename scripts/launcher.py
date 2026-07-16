@@ -6162,90 +6162,6 @@ TASK_STATE_LABELS: dict = {
     "submitted": "Submitted",
 }
 
-# A single "Task N" filter column routes to one of three HIDDEN facet
-# columns depending on the chosen operator, so the user filters one "Task 2"
-# entry by date, submission count, OR status (see _rewrite_task_filter):
-#   date ops    → Task{N}Date   (YYYY-MM-DD, from the CSV cell)
-#   numeric ops → Task{N}Count  (submission count, from the CSV cell)
-#   text ops    → Task{N}Status (Passed/Returned/In Process, from the scrape)
-_TASK_DATE_OPS = {
-    "is before", "is after", "is on", "is on or before", "is on or after",
-    "is within", "before", "after", "on", "on_or_before", "on_or_after",
-    "within",
-}
-_TASK_NUM_OPS = {
-    "more than", "less than", "at least", "at most",
-    "gt", "lt", "gte", "lte",
-}
-
-
-def _is_task_facet_col(col: str) -> bool:
-    """True for the hidden per-task facet helper columns (Task1Date,
-    Task2Count, Task3Status, …) — kept out of the grid + filter dropdowns;
-    the single visible 'Task N' column stands in for all three."""
-    return bool(re.fullmatch(r"Task\d+(Date|Count|Status)", col or ""))
-
-
-def _resolve_filter_columns(f: dict, headers: list) -> dict:
-    """Resolve a filter's display-name `column` to its CSV header, AND — for
-    a column-comparison value written as `{Display Name}` — resolve the
-    referenced column too, so the engine's per-row `row.get(...)` finds it.
-    Identity entries pass through unchanged."""
-    out = {**f, "column": caseload_csv.resolve_column(
-        f.get("column", ""), headers)}
-    m = re.fullmatch(r"\{(.+)\}", str(out.get("value", "")).strip())
-    if m:
-        out["value"] = "{" + caseload_csv.resolve_column(
-            m.group(1), headers) + "}"
-    return out
-
-
-def _rewrite_task_filter(f: dict) -> dict:
-    """Route a filter whose column is a 'TaskN' column to the right hidden
-    facet. Unambiguous ops route by operator: date ops → TaskNDate, numeric
-    ops → TaskNCount, empty/not-empty → TaskNDate ('did they submit'). The
-    ambiguous text ops (is/is not/contains/does not contain) route by the
-    VALUE:
-      - all-integer (incl. comma-OR like '2, 3') → submission COUNT,
-      - the special word 'Submitted' → 'has a submission' (passed/returned/
-        in-process all carry a date), so it maps to TaskNDate is-not-empty
-        (is-empty for the negated ops) and works even before the scrape,
-      - anything else → a status word → TaskNStatus.
-    So 'Task 2 is 2' filters count, 'Task 2 is Submitted' = has any
-    submission, 'Task 2 is Returned' filters status. Non-task filters pass
-    through. Eval-time only — the visible 'Task N' column is what the user
-    picks + sees in review."""
-    col = f.get("column") or ""
-    m = re.fullmatch(r"Task(\d+)", col)
-    if not m:
-        return f
-    n = m.group(1)
-    op = (f.get("op") or "").strip()
-    if op in _TASK_DATE_OPS:
-        facet = f"Task{n}Date"
-    elif op in _TASK_NUM_OPS:
-        facet = f"Task{n}Count"
-    elif op in ("is empty", "is not empty", "empty", "not_empty"):
-        facet = f"Task{n}Date"
-    else:  # is / is not / contains / does not contain
-        val = str(f.get("value") or "").strip()
-        parts = [p.strip() for p in val.split(",") if p.strip()]
-        if parts and all(re.fullmatch(r"\d+", p) for p in parts):
-            facet = f"Task{n}Count"
-        elif val.lower() == "submitted":
-            # "Submitted" = has been submitted (passed/returned/in-process —
-            # all have a date). Use the date facet's emptiness, not the
-            # colour-derived status (which has no real 'Submitted' value).
-            negated = op in ("is not", "does not contain",
-                             "not_equals", "not_contains")
-            return {**f, "column": f"Task{n}Date",
-                    "op": "is empty" if negated else "is not empty",
-                    "value": ""}
-        else:
-            facet = f"Task{n}Status"
-    return {**f, "column": facet}
-
-
 def last_logged_action(student_id: str) -> str:
     """Most recent action THIS app logged for a student (from
     note_log.csv), as 'Jun 01 · welcome'. Empty if none / unreadable.
@@ -16964,7 +16880,7 @@ class CaseloadPanel:
         if not rows:
             return []
         return [caseload_csv.display_for_column(h) for h in rows[0].keys()
-                if not _is_task_facet_col(h)]
+                if not caseload_filter.is_task_facet_col(h)]
 
     def _toggle_filters(self) -> None:
         if self._filters_open:
@@ -17062,7 +16978,7 @@ class CaseloadPanel:
             return list(rows)
         headers = list(rows[0].keys())
         filters = [
-            _rewrite_task_filter(_resolve_filter_columns(f, headers))
+            caseload_filter.rewrite_task_filter(caseload_filter.resolve_filter_columns(f, headers))
             for f in self._active_filters
         ]
         try:
@@ -17100,7 +17016,7 @@ class CaseloadPanel:
         if not rows:
             return []
         return [h for h in rows[0].keys()
-                if not _is_task_facet_col(h) and not str(h).startswith("sp:")]
+                if not caseload_filter.is_task_facet_col(h) and not str(h).startswith("sp:")]
 
     def _capture_current_view(self, name: str) -> dict:
         """Snapshot the current columns (order + shown/hidden) and filters."""
@@ -17711,7 +17627,7 @@ class CaseloadPanel:
         # in displaycolumns, which the tree doesn't define → ttk error → the
         # whole show/hide silently no-ops.
         headers = [h for h in rows[0].keys()
-                   if not _is_task_facet_col(h) and not h.startswith("_")]
+                   if not caseload_filter.is_task_facet_col(h) and not h.startswith("_")]
         # Capture any drag-resizes done since load so they aren't lost.
         self.persist_column_state()
         prefs = self._load_col_prefs()
@@ -17977,7 +17893,7 @@ class CaseloadPanel:
         # helpers behind the single visible "Task N" column — keep them out
         # of the grid (the Task1/2/3 columns already show date+count+glyph).
         headers = [h for h in rows[0].keys()
-                   if not _is_task_facet_col(h) and not h.startswith("_")]
+                   if not caseload_filter.is_task_facet_col(h) and not h.startswith("_")]
         if tuple(self.tree["columns"]) != tuple(headers):
             # Reset displaycolumns to "#all" BEFORE swapping the column set.
             # ttk validates the existing displaycolumns against the new
@@ -25447,7 +25363,7 @@ class App:
         # entries pass through unchanged.
         csv_headers = list(rows[0].keys()) if rows else []
         filters = [
-            _resolve_filter_columns(f, csv_headers)
+            caseload_filter.resolve_filter_columns(f, csv_headers)
             for f in scenario.batch.filters
         ]
 
@@ -25483,7 +25399,7 @@ class App:
         # Route any "Task N" filter to its date/count/status facet by op (the
         # original `filters` keep the visible "Task N" column for the safety
         # check above + the review display below; only evaluation is routed).
-        eval_filters = [_rewrite_task_filter(f) for f in filters]
+        eval_filters = [caseload_filter.rewrite_task_filter(f) for f in filters]
         matched = caseload_filter.apply_filters(eval_filters, rows)
         if not matched:
             messagebox.showinfo(
@@ -25518,7 +25434,7 @@ class App:
         # Resolved filters (for the review dialog's display columns).
         csv_headers = list(matched[0].keys()) if matched else []
         filters = [
-            _resolve_filter_columns(f, csv_headers)
+            caseload_filter.resolve_filter_columns(f, csv_headers)
             for f in scenario.batch.filters
         ]
         # Scope the caseload viewer to the review set — the two-step arm already
@@ -25767,7 +25683,7 @@ class App:
             if not conds:
                 compiled.append(None)
                 continue
-            filters = [_resolve_filter_columns(f, headers) for f in conds]
+            filters = [caseload_filter.resolve_filter_columns(f, headers) for f in conds]
             missing = [f.get("column", "") for f in filters
                        if f.get("column") and f.get("column") not in headers]
             if missing:
@@ -25778,7 +25694,7 @@ class App:
                     "branch.", error=True)
                 compiled.append(False)
                 continue
-            compiled.append([_rewrite_task_filter(f) for f in filters])
+            compiled.append([caseload_filter.rewrite_task_filter(f) for f in filters])
         per_row: dict = {}
         overlaps: dict = {}
         unmatched: list = []
@@ -26068,7 +25984,7 @@ class App:
 
         # Filter (same engine + safety check as the note/email batch).
         csv_headers = list(rows[0].keys()) if rows else []
-        filters = [_resolve_filter_columns(f, csv_headers)
+        filters = [caseload_filter.resolve_filter_columns(f, csv_headers)
                    for f in scenario.batch.filters]
         missing = [f.get("column", "") for f in filters
                    if f.get("column") and f.get("column") not in csv_headers]
@@ -26082,7 +25998,7 @@ class App:
                 "export:\n\n  • " + "\n  • ".join(missing) +
                 "\n\nAdd them to your list view, click ↻ Caseload, and retry.")
             return
-        eval_filters = [_rewrite_task_filter(f) for f in filters]
+        eval_filters = [caseload_filter.rewrite_task_filter(f) for f in filters]
         matched = caseload_filter.apply_filters(eval_filters, rows)
         if not matched:
             messagebox.showinfo(
@@ -26419,7 +26335,7 @@ class App:
         if not raw or not rows:
             return rows, [], False
         headers = list(rows[0].keys())
-        filters = [_resolve_filter_columns(f, headers) for f in raw]
+        filters = [caseload_filter.resolve_filter_columns(f, headers) for f in raw]
         missing = [f.get("column", "") for f in filters
                    if f.get("column") and f.get("column") not in headers]
         if missing:
@@ -26428,7 +26344,7 @@ class App:
                 f"({', '.join(repr(c) for c in missing)}) — not firing. Add "
                 "them to your Caseload view + ↻ Caseload.", error=True)
             return [], [], True
-        eval_filters = [_rewrite_task_filter(f) for f in filters]
+        eval_filters = [caseload_filter.rewrite_task_filter(f) for f in filters]
         keep, skipped = [], []
         for r in rows:
             if caseload_filter.apply_filters(eval_filters, [r]):
@@ -26452,7 +26368,7 @@ class App:
             conds = list(b.conditions or [])
             if not conds:
                 return b, i  # catch-all
-            filters = [_resolve_filter_columns(f, headers) for f in conds]
+            filters = [caseload_filter.resolve_filter_columns(f, headers) for f in conds]
             missing = [f.get("column", "") for f in filters
                        if f.get("column") and f.get("column") not in headers]
             if missing:
@@ -26462,7 +26378,7 @@ class App:
                     f"({', '.join(repr(c) for c in missing)}) — skipping this "
                     "branch.", error=True)
                 continue
-            eval_filters = [_rewrite_task_filter(f) for f in filters]
+            eval_filters = [caseload_filter.rewrite_task_filter(f) for f in filters]
             if caseload_filter.apply_filters(eval_filters, [row]):
                 return b, i
         return None, -1
@@ -27265,7 +27181,7 @@ class App:
             sample = rows[:40]
             refs = []
             for h in headers:
-                if _is_task_facet_col(h) or h == sel:
+                if caseload_filter.is_task_facet_col(h) or h == sel:
                     continue
                 ctype = caseload_filter.sniff_column_type(
                     [str(r.get(h, "") or "") for r in sample])
@@ -27335,7 +27251,7 @@ class App:
         """Inject HIDDEN per-task facet columns into each cached caseload row
         so a single visible 'Task N' column can be filtered by date, by
         submission count, OR by status (the operator picks which — see
-        _rewrite_task_filter). For each task number N present:
+        caseload_filter.rewrite_task_filter). For each task number N present:
           Task{N}Date   — YYYY-MM-DD from the CSV Task cell (always there)
           Task{N}Count  — submission count from the CSV Task cell
           Task{N}Status — Passed/Returned/In Process from the live scrape
@@ -31573,7 +31489,7 @@ class App:
         return [
             caseload_csv.display_for_column(h)
             for h in self._caseload_rows[0].keys()
-            if not _is_task_facet_col(h) and not str(h).startswith("sp:")
+            if not caseload_filter.is_task_facet_col(h) and not str(h).startswith("sp:")
         ]
 
     def _viewer_shown_columns(self) -> list:
@@ -31591,7 +31507,7 @@ class App:
             else:
                 cols = list(dc)
             return [caseload_csv.display_for_column(c) for c in cols
-                    if not _is_task_facet_col(c) and not str(c).startswith("sp:")]
+                    if not caseload_filter.is_task_facet_col(c) and not str(c).startswith("sp:")]
         except Exception:
             return []
 

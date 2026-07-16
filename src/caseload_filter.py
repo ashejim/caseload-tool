@@ -33,6 +33,8 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Optional
 
+from src import caseload_csv
+
 
 # Normalize long-form labels to short opcode used by the engine.
 _OP_ALIASES = {
@@ -308,3 +310,92 @@ def apply_filters(
         r for r in rows
         if all(evaluate_filter(f, r, today=today) for f in filters)
     ]
+
+
+# ============================================================
+# "Task N" facet routing.
+#
+# A single visible "Task N" filter column routes to one of three HIDDEN
+# facet columns depending on the chosen operator, so the user filters one
+# "Task 2" entry by date, submission count, OR status:
+#   date ops    → Task{N}Date   (YYYY-MM-DD, from the CSV cell)
+#   numeric ops → Task{N}Count  (submission count, from the CSV cell)
+#   text ops    → Task{N}Status (Passed/Returned/In Process, from the scrape)
+# ============================================================
+
+_TASK_DATE_OPS = {
+    "is before", "is after", "is on", "is on or before", "is on or after",
+    "is within", "before", "after", "on", "on_or_before", "on_or_after",
+    "within",
+}
+_TASK_NUM_OPS = {
+    "more than", "less than", "at least", "at most",
+    "gt", "lt", "gte", "lte",
+}
+
+
+def is_task_facet_col(col: str) -> bool:
+    """True for the hidden per-task facet helper columns (Task1Date,
+    Task2Count, Task3Status, …) — kept out of the grid + filter dropdowns;
+    the single visible 'Task N' column stands in for all three."""
+    return bool(re.fullmatch(r"Task\d+(Date|Count|Status)", col or ""))
+
+
+def resolve_filter_columns(f: dict, headers: list) -> dict:
+    """Resolve a filter's display-name `column` to its CSV header, AND — for
+    a column-comparison value written as `{Display Name}` — resolve the
+    referenced column too, so the engine's per-row `row.get(...)` finds it.
+    Identity entries pass through unchanged."""
+    out = {**f, "column": caseload_csv.resolve_column(
+        f.get("column", ""), headers)}
+    m = re.fullmatch(r"\{(.+)\}", str(out.get("value", "")).strip())
+    if m:
+        out["value"] = "{" + caseload_csv.resolve_column(
+            m.group(1), headers) + "}"
+    return out
+
+
+def rewrite_task_filter(f: dict) -> dict:
+    """Route a filter whose column is a 'TaskN' column to the right hidden
+    facet. Unambiguous ops route by operator: date ops → TaskNDate, numeric
+    ops → TaskNCount, empty/not-empty → TaskNDate ('did they submit'). The
+    ambiguous text ops (is/is not/contains/does not contain) route by the
+    VALUE:
+      - all-integer (incl. comma-OR like '2, 3') → submission COUNT,
+      - the special word 'Submitted' → 'has a submission' (passed/returned/
+        in-process all carry a date), so it maps to TaskNDate is-not-empty
+        (is-empty for the negated ops) and works even before the scrape,
+      - anything else → a status word → TaskNStatus.
+    So 'Task 2 is 2' filters count, 'Task 2 is Submitted' = has any
+    submission, 'Task 2 is Returned' filters status. Non-task filters pass
+    through. Eval-time only — the visible 'Task N' column is what the user
+    picks + sees in review."""
+    col = f.get("column") or ""
+    m = re.fullmatch(r"Task(\d+)", col)
+    if not m:
+        return f
+    n = m.group(1)
+    op = (f.get("op") or "").strip()
+    if op in _TASK_DATE_OPS:
+        facet = f"Task{n}Date"
+    elif op in _TASK_NUM_OPS:
+        facet = f"Task{n}Count"
+    elif op in ("is empty", "is not empty", "empty", "not_empty"):
+        facet = f"Task{n}Date"
+    else:  # is / is not / contains / does not contain
+        val = str(f.get("value") or "").strip()
+        parts = [p.strip() for p in val.split(",") if p.strip()]
+        if parts and all(re.fullmatch(r"\d+", p) for p in parts):
+            facet = f"Task{n}Count"
+        elif val.lower() == "submitted":
+            # "Submitted" = has been submitted (passed/returned/in-process —
+            # all have a date). Use the date facet's emptiness, not the
+            # colour-derived status (which has no real 'Submitted' value).
+            negated = op in ("is not", "does not contain",
+                             "not_equals", "not_contains")
+            return {**f, "column": f"Task{n}Date",
+                    "op": "is empty" if negated else "is not empty",
+                    "value": ""}
+        else:
+            facet = f"Task{n}Status"
+    return {**f, "column": facet}
