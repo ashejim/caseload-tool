@@ -266,3 +266,62 @@ def parse_task_status(val: str) -> tuple[str, str, int]:
     if not m:
         return "submitted", s[:10], 0
     return "submitted", m.group(1), int(m.group(2))
+
+
+# ============================================================
+# Student / PM email column recognition.
+#
+# Salesforce list-view exports include whatever columns the user has on
+# their view, and the header names vary by configuration — these cover
+# what we've seen in the wild. Tried in order; first non-empty match wins.
+# ============================================================
+
+STUDENT_EMAIL_COLS = [
+    "StudentEmail", "Student Email", "studentemail", "stuemail",
+    "PersonalEmail", "Personal Email", "Email",
+]
+PM_EMAIL_COLS = [
+    "MentorEmail", "Mentor Email", "mentoremail",
+    "PMEmail", "PM Email",
+    "ProgramMentorEmail", "Program Mentor Email",
+]
+
+
+def first_present_value(row: dict, candidates: list[str]) -> str:
+    """Pick the first non-empty value among `candidates` (a list of
+    possible column names). Returns "" if none of them exist or all
+    are blank. Robust against CSV column-naming variance without making
+    the user remember the exact spelling."""
+    for c in candidates:
+        v = row.get(c, "")
+        if v is not None:
+            s = str(v).strip()
+            if s:
+                return s
+    return ""
+
+
+def email_columns_present(row: dict) -> list[str]:
+    """Return every column name in `row` that looks like an email
+    column (case-insensitive 'email' substring). For diagnostic
+    logging when the known names didn't match — tells the user
+    which actual column header to add to our recognizer list."""
+    return [k for k in row.keys() if "email" in k.lower()]
+
+
+def has_student_email_column(rows: list[dict]) -> bool:
+    """Return True iff the cached caseload rows include any
+    student-email column we know how to read. Used by the pre-batch
+    warning to detect when the Caseload Tool view hasn't been set up
+    yet (and email lookup will have to fall back to per-student
+    row-mailto + contact-card scraping)."""
+    if not rows:
+        return False
+    headers = set(rows[0].keys())
+    for alias in STUDENT_EMAIL_COLS:
+        if alias in headers:
+            return True
+    # Lowercase tolerance for orgs that use a non-standard casing
+    # of "Email" (just shows up as "Email" / "email").
+    lc = {h.lower() for h in headers}
+    return "email" in lc

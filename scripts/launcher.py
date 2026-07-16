@@ -6264,60 +6264,6 @@ _TEMPLATE_INSERT_VARS_USER = [
 ]
 
 
-# CSV column names we'll look for when building student context
-# from a caseload row (batch mode). Salesforce list-view exports
-# include whatever columns the user has on their view, and the
-# header names vary by configuration — these cover what we've
-# seen in the wild. Tried in order; first non-empty match wins.
-_CSV_STUDENT_EMAIL_COLS = [
-    "StudentEmail", "Student Email", "studentemail", "stuemail",
-    "PersonalEmail", "Personal Email", "Email",
-]
-_CSV_PM_EMAIL_COLS = [
-    "MentorEmail", "Mentor Email", "mentoremail",
-    "PMEmail", "PM Email",
-    "ProgramMentorEmail", "Program Mentor Email",
-]
-
-
-def _first_present_value(row: dict, candidates: list[str]) -> str:
-    """Pick the first non-empty value among `candidates` (a list of
-    possible column names). Returns "" if none of them exist or all
-    are blank. Used to be robust against CSV column-naming variance
-    without making the user remember the exact spelling."""
-    for c in candidates:
-        v = row.get(c, "")
-        if v is not None:
-            s = str(v).strip()
-            if s:
-                return s
-    return ""
-
-
-def _email_columns_present(row: dict) -> list[str]:
-    """Return every column name in `row` that looks like an email
-    column (case-insensitive 'email' substring). For diagnostic
-    logging when the known names didn't match — tells the user
-    which actual column header to add to our recognizer list."""
-    return [k for k in row.keys() if "email" in k.lower()]
-
-
-def _csv_has_student_email_column(rows: list[dict]) -> bool:
-    """Return True iff the cached caseload rows include any
-    student-email column the launcher knows how to read. Used by
-    the pre-batch warning to detect when the Caseload Tool view
-    hasn't been set up yet (and email lookup will have to fall
-    back to per-student row-mailto + contact-card scraping)."""
-    if not rows:
-        return False
-    headers = set(rows[0].keys())
-    for alias in _CSV_STUDENT_EMAIL_COLS:
-        if alias in headers:
-            return True
-    # Lowercase tolerance for orgs that use a non-standard casing
-    # of "Email" (just shows up as "Email" / "email").
-    lc = {h.lower() for h in headers}
-    return "email" in lc
 
 
 # Per-appearance-mode color palette for the HTML editor's syntax
@@ -15756,7 +15702,7 @@ class CaseloadPanel:
             # emailed/noted this student (logged in note_log.csv, injected as
             # _pm_email_logged). Fall back to the PM's NAME, which Outlook
             # resolves against the WGU directory just like typing it.
-            pm_cc = _first_present_value(row, _CSV_PM_EMAIL_COLS)
+            pm_cc = caseload_csv.first_present_value(row, caseload_csv.PM_EMAIL_COLS)
             if not pm_cc:
                 pm_cc = self._cell(row, "_pm_email_logged")
             if not pm_cc:
@@ -26588,7 +26534,7 @@ class App:
                     if (not ctx_info["student_email"]
                             and not self._email_diag_logged):
                         self._email_diag_logged = True
-                        present = _email_columns_present(row)
+                        present = caseload_csv.email_columns_present(row)
                         if present:
                             self._append_log(
                                 "CSV email columns found but not recognized: "
@@ -27821,7 +27767,7 @@ class App:
         Tries each catalogued column name (DISPLAY_TO_CSV pairs +
         common display labels) and falls back to "" for any field
         that isn't present. Emails go through the longer alias list
-        in `_CSV_STUDENT_EMAIL_COLS` / `_CSV_PM_EMAIL_COLS` since
+        in `caseload_csv.STUDENT_EMAIL_COLS` / `caseload_csv.PM_EMAIL_COLS` since
         their names vary the most across user-configured views.
         `user_name` / `user_email` are NOT set here — _send_scenario_
         email tops those up from Outlook's CurrentUser."""
@@ -27844,13 +27790,13 @@ class App:
                 "stuprename", "Student Preferred Name",
                 "PreferredName", "Preferred Name") or first),
             "last_name": _capitalize_name(last),
-            "student_email": _first_present_value(
-                row, _CSV_STUDENT_EMAIL_COLS,
+            "student_email": caseload_csv.first_present_value(
+                row, caseload_csv.STUDENT_EMAIL_COLS,
             ),
             "student_id": _first("StudentID", "Student ID"),
             "course_code": _first("CourseCode", "Course Code"),
             "pm_name": _capitalize_name(_first("MentorName", "Program Mentor")),
-            "pm_email": _first_present_value(row, _CSV_PM_EMAIL_COLS),
+            "pm_email": caseload_csv.first_present_value(row, caseload_csv.PM_EMAIL_COLS),
             "program_name": _first("ProgramName", "Program Name"),
         }
 
@@ -32359,7 +32305,7 @@ class App:
         self._refresh_contact_ids(rows, silent=silent)
         # Cache whether the rows carry a student-email column so the pre-batch
         # warning + Settings status line don't have to scan rows again.
-        self._csv_has_student_email = _csv_has_student_email_column(rows)
+        self._csv_has_student_email = caseload_csv.has_student_email_column(rows)
         if not silent:
             age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
             self._append_log(

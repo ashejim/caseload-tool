@@ -183,6 +183,37 @@ def test_parse_task_status():
     assert caseload_csv.parse_task_status("in progress")[0] == "submitted"
 
 
+# --- email column helpers --------------------------------------------------
+
+def test_first_present_value_picks_first_nonblank():
+    row = {"a": "", "b": "  ", "c": "hit", "d": "later"}
+    assert caseload_csv.first_present_value(row, ["a", "b", "c", "d"]) == "hit"
+
+
+def test_first_present_value_none_when_all_blank_or_missing():
+    row = {"a": "", "b": None}
+    assert caseload_csv.first_present_value(row, ["a", "b", "missing"]) == ""
+
+
+def test_email_columns_present_case_insensitive():
+    row = {"StudentEmail": "x", "Name": "y", "pm_email": "z"}
+    assert caseload_csv.email_columns_present(row) == ["StudentEmail",
+                                                       "pm_email"]
+
+
+def test_has_student_email_column_known_alias():
+    assert caseload_csv.has_student_email_column([{"Student Email": "x"}])
+
+
+def test_has_student_email_column_lowercase_email():
+    assert caseload_csv.has_student_email_column([{"email": "x"}])
+
+
+def test_has_student_email_column_false_when_absent():
+    assert not caseload_csv.has_student_email_column([{"Name": "x"}])
+    assert not caseload_csv.has_student_email_column([])
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
