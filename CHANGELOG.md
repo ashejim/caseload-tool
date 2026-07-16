@@ -3,6 +3,20 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.19.2 — 2026-07-16
+
+- **Clear warning when email can't be sent.** Automated email sending needs
+  **Outlook Classic** (the desktop app) — the "new Outlook" and Outlook on the
+  web don't expose the automation it uses, and new Windows 11 PCs increasingly
+  ship with only "new Outlook". The app now checks for Outlook Classic at
+  startup and shows a one-time notice if it's missing, and any email failure
+  raises a loud, blocking message that names the likely cause and the fix
+  (install/enable Outlook Classic, or turn off the "New Outlook" switch) rather
+  than a quiet log line. Notes, texts, and the caseload viewer work without
+  Outlook. (A failed email was already never counted as sent.)
+- **Fixed a crash** when expanding **Settings → Appearance → Display (text size
+  & scaling)** — the section now opens correctly.
+
 ## 0.19.1 — 2026-07-15
 
 - **A starter note template ships with new installs.** A fresh install now
