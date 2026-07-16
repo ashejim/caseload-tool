@@ -81,7 +81,7 @@ from src.note_form import (
 from src.action_queue import ActionQueue, QueueItem, QueueStatus
 from src.dates import (
     TZ_ABBR_TO_IANA, effective_tz, student_local_time,
-    days_until, days_since, to_iso_date,
+    days_until, days_since, to_iso_date, fmt_date_short,
 )
 from src.ema_links import parse_ema_url, build_ema_url
 from src.note_text import note_body_to_html, note_html_to_text, fmt_note_date
@@ -15192,7 +15192,7 @@ class CaseloadPanel:
             d = days_until(val)
             if val and d is not None:
                 suffix = (f"{d}d" if d >= 0 else f"{-d}d ago")
-                val = f"{val}  ({suffix})"
+                val = f"{fmt_date_short(val)}  ({suffix})"
                 color = ("#b00020", "#ff7b72") if d <= 14 else \
                         ("#9a6700", "#ffd166") if d <= 30 else None
             if not self._cell(row, key):
@@ -15385,7 +15385,7 @@ class CaseloadPanel:
         label = status_text or default_label
         note = f"Task {i}: {label}"
         if date:
-            note += f"  ({date})"
+            note += f"  ({fmt_date_short(date)})"
         if attempts:
             note += f"  ·  {attempts} attempt" + ("s" if attempts != 1 else "")
         # Always clickable — even a task with no recorded status. Caseload data
@@ -17401,7 +17401,7 @@ class CaseloadPanel:
         live status hasn't been scraped yet shows ⚪ ("not loaded"). Non-task
         columns and empty cells pass through unchanged. Only the DISPLAY is
         decorated — sort/filter/search still run on the raw CSV dict."""
-        raw = r.get(header, "")
+        raw = fmt_date_short(r.get(header, ""))
         tnum = task_cols.get(header)
         if not tnum or not raw:
             return raw

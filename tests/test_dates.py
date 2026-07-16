@@ -52,6 +52,39 @@ def test_student_local_time_unknown_tz_is_blank():
     assert out and ("AM" in out or "PM" in out)
 
 
+def test_fmt_date_short_current_year_drops_year():
+    assert dates.fmt_date_short("2026-07-02", current_year=2026) == "7/2"
+    assert dates.fmt_date_short("2026-12-25", current_year=2026) == "12/25"
+
+
+def test_fmt_date_short_off_year_keeps_year():
+    assert dates.fmt_date_short("2025-07-02", current_year=2026) == "7/2/2025"
+    assert dates.fmt_date_short("2027-01-09", current_year=2026) == "1/9/2027"
+
+
+def test_fmt_date_short_preserves_remainder():
+    # Task cell: date + attempt count.
+    assert dates.fmt_date_short("2026-07-02 (3)", current_year=2026) == \
+        "7/2 (3)"
+    # Timestamp: keeps the trailing time portion.
+    assert dates.fmt_date_short("2025-07-02T14:00", current_year=2026) == \
+        "7/2/2025T14:00"
+
+
+def test_fmt_date_short_passthrough_non_dates():
+    assert dates.fmt_date_short("") == ""
+    assert dates.fmt_date_short("Jane Roe") == "Jane Roe"
+    assert dates.fmt_date_short("012253133") == "012253133"
+    # not a full ISO date -> unchanged
+    assert dates.fmt_date_short("2026-07", current_year=2026) == "2026-07"
+
+
+def test_fmt_date_short_defaults_to_this_year():
+    from datetime import date
+    this_year = date.today().year
+    assert dates.fmt_date_short(f"{this_year}-03-04") == "3/4"
+
+
 def test_text_message_reexports_stay_in_sync():
     # text_message re-imports these from dates; the objects must be identical.
     from src import text_message as tm

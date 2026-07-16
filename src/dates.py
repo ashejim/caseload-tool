@@ -69,6 +69,26 @@ def days_since(date_str: str) -> Optional[int]:
     return None if du is None else -du
 
 
+def fmt_date_short(value: str, current_year: Optional[int] = None) -> str:
+    """Compact display for a leading ISO date: 'YYYY-MM-DD' -> 'M/D', dropping
+    the year when it matches the current year and using 'M/D/YYYY' otherwise
+    (so day + month stay prominent and only off-year dates carry the year).
+
+    Any remainder after the date is preserved (e.g. a task cell's ' (2)' or a
+    'T…' time), and a string without a leading ISO date is returned unchanged —
+    so this is safe to call on every grid cell, not just known date columns.
+
+    `current_year` defaults to this year; pass it for deterministic tests."""
+    s = value or ""
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if not m:
+        return value
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    cur = current_year if current_year is not None else datetime.now().year
+    short = f"{mo}/{d}" if y == cur else f"{mo}/{d}/{y}"
+    return short + s[m.end():]
+
+
 def to_iso_date(s: str) -> str:
     """Normalize a date string to ISO 'YYYY-MM-DD'. Accepts already-ISO and
     MM/DD/YYYY; unknown formats are returned unchanged (best-effort)."""
