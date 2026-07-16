@@ -30182,7 +30182,9 @@ class App:
                 disp_body.pack_forget()
                 disp_open["v"] = False
             else:
-                disp_body.pack(fill="x", before=alerts_sep)
+                # Display is the last section in the Appearance tab, so its
+                # body just expands directly below the header.
+                disp_body.pack(fill="x")
                 disp_open["v"] = True
             disp_header.configure(text=_disp_label())
             _refit()
