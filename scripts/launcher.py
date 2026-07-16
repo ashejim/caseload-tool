@@ -3324,6 +3324,97 @@ class BrowserWorker:
                     stack.append(child)
         return out
 
+    def _process_exe_names(self) -> dict:
+        """pid → lowercased exe filename, via a Toolhelp32 snapshot. Lets us
+        tell whether a window's owning process is msedge.exe. Empty on error."""
+        import ctypes
+        from ctypes import wintypes
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == -1 or snap == 0:
+            return {}
+        out: dict = {}
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                out[entry.th32ProcessID] = (entry.szExeFile or "").lower()
+                ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+        return out
+
+    def has_foreign_edge_window(self) -> bool:
+        """True if a VISIBLE Microsoft Edge window is open that isn't ours — i.e.
+        the user has their own Edge running. Because we drive Edge (channel
+        msedge), an already-open Edge can prevent our Playwright Edge from
+        getting its own instance/session (Edge single-instance). Background
+        'startup boost' msedge.exe processes have no visible window, so they
+        don't trip this. Windows only; False on any error / off-Windows."""
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return False
+        names = self._process_exe_names()
+        if not names:
+            return False
+        try:
+            ours = self._descendant_pids()
+        except Exception:
+            ours = set()
+        ours.add(os.getpid())
+        user32 = ctypes.windll.user32
+        hit = {"v": False}
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                cls = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, cls, 256)
+                if cls.value != "Chrome_WidgetWin_1":
+                    return True
+                if user32.GetWindowTextLengthW(hwnd) <= 0:
+                    return True
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value in ours:
+                    return True
+                if names.get(pid.value, "") == "msedge.exe":
+                    hit["v"] = True
+                    return False  # found one — stop enumerating
+            except Exception:
+                pass
+            return True
+
+        try:
+            user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        except Exception:
+            return False
+        return hit["v"]
+
     def _raise_browser_window(self, title_hint: str = "") -> None:
         """Pull the launcher's browser window to the OS foreground.
         `page.bring_to_front()` only activates the tab *within* the
@@ -19995,9 +20086,22 @@ class App:
             self.root.wait_variable(done_var)
         if not holder["ok"]:
             self._append_log(
-                "Salesforce isn't signed in (SSO likely timed out) — brought "
-                "the browser forward. Sign in to Salesforce, then re-fire the "
-                "action. (Texts/emails/notes were NOT run.)", error=True)
+                "Couldn't find a signed-in Salesforce page — brought the "
+                "browser forward. Sign in to Salesforce (SSO may have timed "
+                "out), then re-fire the action. (Texts/emails/notes were NOT "
+                "run.)", error=True)
+            # A common first-run cause: the user's own Edge is open, so our
+            # Edge never got its own session. Add the actionable hint.
+            try:
+                if self.worker.has_foreign_edge_window() and \
+                        self.worker._locate_browser_hwnd() is None:
+                    self._append_log(
+                        "  ↳ It looks like your personal Microsoft Edge is "
+                        "open. This app runs its OWN Edge — close ALL your "
+                        "Edge windows, then fully close and reopen the app.",
+                        error=True)
+            except Exception:
+                pass
         return holder["ok"]
 
     def _open_mongoose_clicked(self) -> None:
@@ -23505,6 +23609,9 @@ class App:
             self._splash_step("Launching browser + signing in…", 0.08)
             self.root.after(500, self._poll_worker_then_auto_download)
             return
+        # Browser is up — if the user's own Edge blocked us from getting our own
+        # session, tell them (once the windows have settled).
+        self.root.after(1500, self._maybe_edge_conflict_notice)
         self._set_busy("Auto-refreshing caseload + Essential Actions…")
         self._append_log("Auto-refreshing caseload CSV...")
         self._splash_step("Downloading caseload…", 0.25)
@@ -25705,6 +25812,16 @@ class App:
             ("👤",
              "Off-caseload students — look up and file notes for students in "
              "your course who are assigned to another instructor."),
+        ])
+
+        _card("If Salesforce won't sign in", [
+            ("🌐",
+             "This app runs its OWN Microsoft Edge to reach Salesforce. If your "
+             "personal Edge is already open, Windows makes them share one "
+             "session and the app may not be able to sign in. Close ALL your "
+             "Edge windows, then fully close and reopen the app — it opens its "
+             "own Edge. (Chrome / Vivaldi / other browsers are fine; only Edge "
+             "conflicts.)"),
         ])
 
         _card("Before you send email", [
@@ -28169,6 +28286,63 @@ class App:
             return False
         self.root.wait_variable(done_var)
         return holder["ok"]
+
+    def _maybe_edge_conflict_notice(self) -> None:
+        """One-time notice when the user's own Microsoft Edge is blocking us. We
+        drive Edge (channel msedge); if the user already has Edge open, Edge's
+        single-instance behaviour can stop our Playwright Edge from getting its
+        own session — the tell is a foreign Edge window present while we can't
+        find a browser window of our own. That precise pairing keeps it from
+        nagging Edge-daily users whose session came up fine. Dismissible."""
+        if getattr(self.settings, "edge_conflict_notice_dismissed", False):
+            return
+        try:
+            if not self.worker.has_foreign_edge_window():
+                return
+            if self.worker._locate_browser_hwnd() is not None:
+                return  # we DID find our own window → no conflict
+        except Exception:
+            return
+
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("Close your other Edge windows")
+        dlg.transient(self.root)
+        try:
+            dlg.attributes("-topmost", True)
+        except Exception:
+            pass
+        frm = ctk.CTkFrame(dlg, fg_color="transparent")
+        frm.pack(fill="both", expand=True, padx=16, pady=14)
+        ctk.CTkLabel(
+            frm, text="⚠  Microsoft Edge is already open",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", pady=(0, 8))
+        ctk.CTkLabel(
+            frm, text=(
+                "This app runs its OWN Microsoft Edge to reach Salesforce. "
+                "When your personal Edge is already open, Windows makes them "
+                "share one session — which can stop the app from signing in "
+                "(you'll see \"Salesforce isn't signed in\").\n\n"
+                "Fix: close ALL your Edge windows, then fully close and reopen "
+                "this app. The app will open its own Edge."),
+            justify="left", wraplength=460,
+        ).pack(anchor="w")
+        dont = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(frm, text="Don't show this again",
+                        variable=dont).pack(anchor="w", pady=(12, 10))
+
+        def _close() -> None:
+            if dont.get():
+                self.settings.edge_conflict_notice_dismissed = True
+                try:
+                    save_settings(self.settings)
+                except Exception:
+                    pass
+            dlg.destroy()
+
+        ctk.CTkButton(frm, text="OK", width=90, command=_close).pack(anchor="e")
+        dlg.protocol("WM_DELETE_WINDOW", _close)
+        _fit_dialog_to_content(dlg, min_w=500)
 
     def _maybe_outlook_classic_notice(self) -> None:
         """One-time startup heads-up when Outlook Classic isn't registered on

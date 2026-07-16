@@ -129,6 +129,13 @@ with a known-publisher certificate:
 
 ### 3. First-run — sign in
 
+> **🌐 Close your other Microsoft Edge windows first.** The app runs its **own**
+> Edge to reach Salesforce. If your personal Edge is already open, Windows makes
+> them share one session and the app may not be able to sign in (you'll see
+> *"Salesforce isn't signed in"*). Close all Edge windows, then launch the app —
+> it opens its own Edge. (Your day-to-day browser, e.g. Chrome/Vivaldi, is fine;
+> only **Edge** conflicts.)
+
 Double-click `CaseloadNotes.exe`. A browser window opens — sign in to Salesforce
 as you normally would (SSO/MFA). The session is saved and reused on every
 subsequent launch, so you won't have to sign in again. The welcome screen lets
