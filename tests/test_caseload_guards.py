@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src import caseload_csv  # noqa: E402
 from src.student_lookup import (  # noqa: E402
     ea_rows_from_records, ea_view_missing_student_id, _EA_COLCHECK_JS,
+    typo_variants,
 )
 
 CRITICAL = ("StudentID",)
@@ -212,6 +213,28 @@ def test_has_student_email_column_lowercase_email():
 def test_has_student_email_column_false_when_absent():
     assert not caseload_csv.has_student_email_column([{"Name": "x"}])
     assert not caseload_csv.has_student_email_column([])
+
+
+# --- typo_variants ---------------------------------------------------------
+
+def test_typo_variants_adjacent_swaps():
+    assert typo_variants("josh") == ["ojsh", "jsoh", "johs"]
+
+
+def test_typo_variants_count_and_excludes_original():
+    v = typo_variants("abc")  # ab|c -> bac, acb ; 'abc' itself excluded
+    assert "abc" not in v
+    assert v == ["bac", "acb"]
+
+
+def test_typo_variants_short_query():
+    assert typo_variants("a") == []
+    assert typo_variants("") == []
+
+
+def test_typo_variants_dedupes_repeated_chars():
+    # 'aa' swapped is still 'aa' == original -> dropped as a dup.
+    assert typo_variants("aa") == []
 
 
 if __name__ == "__main__":

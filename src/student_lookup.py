@@ -17,6 +17,24 @@ NOTE_HEADER_PREFIX = "Create a New Student Note for "
 COURSE_CODE_RE = re.compile(r"\s*([A-Z]\d{3})")
 
 
+def typo_variants(query: str) -> list[str]:
+    """All adjacent-transposition variants of `query`. Most natural
+    one-typo cases (e.g. 'jsoh' for 'josh') are a single adjacent
+    swap, so trying each against Salesforce's row filter often
+    surfaces the right student even when fuzzy doesn't have enough
+    of the table in view."""
+    out: list[str] = []
+    seen = {query}
+    for i in range(len(query) - 1):
+        chars = list(query)
+        chars[i], chars[i + 1] = chars[i + 1], chars[i]
+        v = "".join(chars)
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 def _parse_mailto(href: str) -> tuple[str, str]:
     """Extract (primary, cc) addresses from a mailto: href. Returns
     empty strings for missing fields. Handles URL encoding."""

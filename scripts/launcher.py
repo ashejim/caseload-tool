@@ -93,6 +93,7 @@ from src.student_lookup import (
     lookup_caseload_student,
     _parse_mailto,
     scrape_student_email_from_page,
+    typo_variants,
 )
 
 # Success-path step statuses that can be targeted in a filter. Matches the
@@ -195,24 +196,6 @@ def activities_disabled_for(fmt: str, typ: str) -> bool:
 # ============================================================
 # Browser worker — owns Playwright in its own thread.
 # ============================================================
-
-
-def _typo_variants(query: str) -> list[str]:
-    """All adjacent-transposition variants of `query`. Most natural
-    one-typo cases (e.g. 'jsoh' for 'josh') are a single adjacent
-    swap, so trying each against Salesforce's row filter often
-    surfaces the right student even when fuzzy doesn't have enough
-    of the table in view."""
-    out: list[str] = []
-    seen = {query}
-    for i in range(len(query) - 1):
-        chars = list(query)
-        chars[i], chars[i + 1] = chars[i + 1], chars[i]
-        v = "".join(chars)
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
 
 
 def _wait_grid_settled(page, max_ms: int = 1500) -> None:
@@ -2198,7 +2181,7 @@ class BrowserWorker:
 
             # Step 4: adjacent-transposition typo variants.
             if len(query) >= 3 and filter_input is not None:
-                for variant in _typo_variants(query):
+                for variant in typo_variants(query):
                     self.on_status(f"Trying typo correction {variant!r}...")
                     matches = _try_filter(variant)
                     if matches:
