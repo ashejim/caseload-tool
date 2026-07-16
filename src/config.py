@@ -478,6 +478,10 @@ class Settings:
     # who declined encryption isn't nagged on every launch (they can still turn
     # it on from Settings).
     encryption_offer_seen: bool = False
+    # Set once the user has dismissed the "email needs Outlook Classic" startup
+    # notice (shown when Classic's COM server isn't registered), so we don't nag
+    # every launch. Reset implicitly if they never dismissed it.
+    outlook_classic_notice_dismissed: bool = False
     # Caseload-panel "Fire action" menu: JSON list of scenario names, in the
     # order they appear in the right-click / Right-arrow action menu. Empty =
     # fall back to the per-scenario "Show as a caseload-panel action" flags

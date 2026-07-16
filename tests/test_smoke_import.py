@@ -44,6 +44,7 @@ SRC_MODULES = [
     "src.text_message",
     "src.mongoose_contacts",
     "src.email_template",
+    "src.outlook_email",
     "src.action_queue",
 ]
 

@@ -99,6 +99,59 @@ def is_ready() -> bool:
     return False
 
 
+# One canonical, actionable explanation shown wherever email can't reach
+# Outlook — kept here so the startup notice, the pre-flight, and the single-fire
+# error dialog all say the same thing.
+OUTLOOK_CLASSIC_REQUIRED_MSG = (
+    "Email sending needs Outlook Classic — the installed desktop app.\n\n"
+    "The \"new Outlook\" and Outlook on the web are NOT supported for "
+    "automated sending (they don't expose the automation Outlook Classic "
+    "does).\n\n"
+    "If email isn't working, install or enable Outlook Classic, or turn OFF "
+    "the \"New Outlook\" switch in the top-right of the Outlook window."
+)
+
+
+def classic_available() -> Optional[bool]:
+    """Whether Outlook Classic's COM automation server is registered on this
+    machine — the desktop app that `Dispatch("Outlook.Application")` needs.
+
+    Cheap: reads the registry only, never launches Outlook. Returns:
+      True  — Classic is registered (COM send should work),
+      False — not registered (likely only "new Outlook"/web is installed),
+      None  — can't tell (non-Windows, or the registry read failed) — callers
+              should treat None as "don't warn".
+
+    This is a *capability* check, not a liveness check; `is_ready()` (which
+    dispatches Outlook) remains the authority for whether a send will succeed.
+    """
+    try:
+        import winreg
+    except Exception:
+        return None
+    try:
+        # ProgID "Outlook.Application" → its CLSID → confirm a registered
+        # COM server exists for that CLSID. New Outlook doesn't register this.
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,
+                            r"Outlook.Application\CLSID") as k:
+            clsid, _ = winreg.QueryValueEx(k, "")
+        if not clsid:
+            return False
+        for server in ("LocalServer32", "InprocServer32"):
+            try:
+                winreg.OpenKey(
+                    winreg.HKEY_CLASSES_ROOT,
+                    rf"CLSID\{clsid}\{server}").Close()
+                return True
+            except OSError:
+                continue
+        return False
+    except OSError:
+        return False
+    except Exception:
+        return None
+
+
 def compose_email(
     to: str,
     cc: str = "",

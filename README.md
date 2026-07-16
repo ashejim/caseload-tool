@@ -110,6 +110,13 @@ Download `CaseloadNotes-vX.Y.Z.zip` from
 anywhere — Desktop, Documents, wherever. You need Microsoft Edge installed
 (default on Windows 10/11).
 
+> **📧 Email sending requires Outlook Classic** — the installed desktop app.
+> The **"new Outlook"** and **Outlook on the web** are *not* supported for
+> automated sending (they don't expose the automation Outlook Classic does).
+> If email isn't working, install/enable Outlook Classic, or turn **off** the
+> **"New Outlook"** switch in the top-right of the Outlook window. (Everything
+> else — notes, texts, the caseload viewer — works without Outlook.)
+
 ### 2. First-run — unblock the app
 
 Windows 11 may block the launcher on first run because the build isn't signed

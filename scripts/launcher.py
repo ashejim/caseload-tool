@@ -16906,6 +16906,10 @@ class App:
         # instant. Failures log a hint but never block startup.
         self.root.after(500, self._poll_worker_then_auto_download)
 
+        # One-time heads-up if this machine has no Outlook Classic (email
+        # sending needs it — "new Outlook"/web can't be automated).
+        self.root.after(700, self._maybe_outlook_classic_notice)
+
     # ----- Main (left) pane -----
 
     def _build_main_pane(self) -> None:
@@ -22745,8 +22749,15 @@ class App:
                 from src import outlook_email
                 if not outlook_email.is_ready():
                     self._append_log(
-                        "Outlook isn't available / not signed in — action not "
-                        "run.", error=True)
+                        "Outlook isn't available — action not run.", error=True)
+                    # LOUD + actionable: name the likely cause (only New
+                    # Outlook / web installed) so the user can fix it, and
+                    # never let a down Outlook look like a completed send.
+                    detail = "Outlook isn't available / not signed in."
+                    if outlook_email.classic_available() is False:
+                        detail = ("Outlook Classic isn't installed on this PC "
+                                  "(only \"new Outlook\" or the web version).")
+                    self._alert_outlook_unavailable(detail)
                     return {"ok": False, "service_down": "Outlook",
                             "detail": "Outlook not available — open Outlook + "
                                       "retry"}
@@ -25523,7 +25534,8 @@ class App:
                         )
                         _time.sleep(2)
             if last_err is not None:
-                self._append_log(f"Auto-send failed for {full_name}: {last_err}")
+                self._append_log(
+                    f"Auto-send failed for {full_name}: {last_err}", error=True)
                 return False
             return True
 
@@ -25534,12 +25546,15 @@ class App:
                 html_body=body_html, inline_images=inline_images, bcc=bcc,
             )
         except Exception as e:
-            self._append_log(f"Outlook compose failed: {e}")
+            self._append_log(f"Outlook compose failed: {e}", error=True)
             # Use topmost dialog: Outlook may have partially opened
             # before failing and could still own focus.
+            from src import outlook_email
+            hint = ("\n\n" + outlook_email.OUTLOOK_CLASSIC_REQUIRED_MSG
+                    if outlook_email.classic_available() is False else "")
             return ask_yes_no_topmost(
                 self.root, "Email failed",
-                f"Couldn't open the email in Outlook:\n\n{e}\n\n"
+                f"Couldn't open the email in Outlook:\n\n{e}{hint}\n\n"
                 "Proceed with the note only?",
             )
 
@@ -27766,6 +27781,16 @@ class App:
             ("👤",
              "Off-caseload students — look up and file notes for students in "
              "your course who are assigned to another instructor."),
+        ])
+
+        _card("Before you send email", [
+            ("📧",
+             "Sending email needs Outlook Classic — the installed desktop "
+             "app. The \"new Outlook\" and Outlook on the web are not "
+             "supported for automated sending. If email isn't working, "
+             "install/enable Outlook Classic, or turn OFF the \"New Outlook\" "
+             "switch in the top-right of the Outlook window. Notes, texts, "
+             "and the caseload viewer all work without Outlook."),
         ])
 
         _card("Tips", [
@@ -30220,6 +30245,87 @@ class App:
             return False
         self.root.wait_variable(done_var)
         return holder["ok"]
+
+    def _maybe_outlook_classic_notice(self) -> None:
+        """One-time startup heads-up when Outlook Classic isn't registered on
+        this machine — automated email sending needs it ("new Outlook" / web
+        can't be driven). Only fires when we're CONFIDENT Classic is missing
+        (classic_available() is False); a None ('can't tell') stays silent so we
+        never nag on a false alarm. Dismissible for good via 'Don't show again'."""
+        if getattr(self.settings, "outlook_classic_notice_dismissed", False):
+            return
+        try:
+            from src import outlook_email
+            if outlook_email.classic_available() is not False:
+                return
+        except Exception:
+            return
+
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("Email needs Outlook Classic")
+        dlg.transient(self.root)
+        try:
+            dlg.attributes("-topmost", True)
+        except Exception:
+            pass
+        frm = ctk.CTkFrame(dlg, fg_color="transparent")
+        frm.pack(fill="both", expand=True, padx=16, pady=14)
+        ctk.CTkLabel(
+            frm, text="⚠  Email sending may not work on this PC",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", pady=(0, 8))
+        ctk.CTkLabel(
+            frm, text=outlook_email.OUTLOOK_CLASSIC_REQUIRED_MSG,
+            justify="left", wraplength=440,
+        ).pack(anchor="w")
+        dont = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(frm, text="Don't show this again",
+                        variable=dont).pack(anchor="w", pady=(12, 10))
+
+        def _close() -> None:
+            if dont.get():
+                self.settings.outlook_classic_notice_dismissed = True
+                try:
+                    save_settings(self.settings)
+                except Exception:
+                    pass
+            dlg.destroy()
+
+        ctk.CTkButton(frm, text="OK", width=90, command=_close).pack(anchor="e")
+        dlg.protocol("WM_DELETE_WINDOW", _close)
+        _fit_dialog_to_content(dlg, min_w=480)
+
+    def _alert_outlook_unavailable(self, detail: str) -> None:
+        """Loud, blocking, topmost alert that email couldn't be sent because
+        Outlook Classic isn't reachable. Topmost + grab so it can't hide behind
+        an Outlook window (see the modal-behind-Outlook gotcha)."""
+        from src import outlook_email
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("Email unavailable — Outlook Classic")
+        dlg.transient(self.root)
+        try:
+            dlg.attributes("-topmost", True)
+        except Exception:
+            pass
+        frm = ctk.CTkFrame(dlg, fg_color="transparent")
+        frm.pack(fill="both", expand=True, padx=16, pady=14)
+        ctk.CTkLabel(
+            frm, text="⚠  Couldn't send email",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", pady=(0, 8))
+        ctk.CTkLabel(
+            frm, text=f"{detail}\n\n{outlook_email.OUTLOOK_CLASSIC_REQUIRED_MSG}",
+            justify="left", wraplength=460,
+        ).pack(anchor="w")
+        ctk.CTkButton(frm, text="OK", width=90,
+                      command=dlg.destroy).pack(anchor="e", pady=(12, 0))
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        _fit_dialog_to_content(dlg, min_w=500)
+        try:
+            dlg.grab_set()
+            self.root.wait_window(dlg)
+        except Exception:
+            pass
 
     def _maybe_startup_mongoose_refresh(self) -> None:
         """Auto-refresh the Mongoose text-ID export at startup when it EXISTS but
