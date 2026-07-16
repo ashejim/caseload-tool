@@ -41,6 +41,9 @@ src/              domain logic + integrations (importable, mostly GUI-free)
   browser.py, selectors.py, grid_rows.py   Playwright + Salesforce DOM helpers
   action_queue.py     queue of batch actions to run later
   proc_priority.py    process priority tweaks
+  ui_common.py        shared UI primitives (button styles, dialog sizing/
+                      geometry, tooltip, checkbox images, listbox drag)
+  dialogs.py          standalone modal dialogs (parent + args → value)
 
 tests/            unit tests (pure logic) + a smoke-import test
 CHANGELOG.md      user-facing release notes (see src/version.py for the scheme)
@@ -78,10 +81,14 @@ green and the app launchable:
 1. **Domain logic → `src/`.** Pure, GUI-free helpers move out of `launcher.py`
    into named, unit-tested `src/` modules (e.g. `src/dates.py`). Safest first —
    these are testable and don't touch the UI.
-2. **Shared UI kernel → `src/ui_common.py`.** The small primitives dialogs and
-   panels share (button styles, tooltips, dialog sizing, color helpers).
-3. **Dialogs → `src/dialogs.py`.** The `prompt_*` functions (self-contained:
-   parent + args → return value).
+2. **Shared UI kernel → `src/ui_common.py`.** DONE — the small primitives
+   dialogs and panels share (button styles, tooltips, dialog sizing/geometry,
+   checkbox images, listbox drag). Re-imported into `launcher.py` so call sites
+   are unchanged.
+3. **Dialogs → `src/dialogs.py`.** Mostly DONE — 19 self-contained `prompt_*`
+   modals (parent + args → value) moved out. The two rich-text dialogs (HTML
+   template editor + batch email review) remain in `launcher.py` pending the
+   `RichTextEditor` widget extraction.
 4. **Panels + worker → own modules.** `caseload_panel.py`, `scenario_editor.py`,
    `browser_worker.py`, etc.
 5. **Slim `App`.** Split the controller by concern (fire flow / batch / EA /

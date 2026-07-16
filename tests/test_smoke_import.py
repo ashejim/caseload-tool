@@ -30,6 +30,7 @@ SRC_MODULES = [
     "src.dates",
     "src.hotkeys",
     "src.ui_common",
+    "src.dialogs",
     "src.ema_links",
     "src.names",
     "src.scenarios",
