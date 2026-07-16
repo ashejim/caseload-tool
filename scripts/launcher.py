@@ -43,7 +43,7 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import caseload_csv, caseload_filter, email_template, history
+from src import caseload_csv, caseload_filter, email_template, history, hotkeys
 from src import success_path as success_path_store
 from src.browser import persistent_context
 from src.config import (
@@ -5805,54 +5805,6 @@ class BrowserWorker:
 # Hotkey helpers
 # ============================================================
 
-def to_pynput_hotkey_string(spec: str) -> str:
-    """Convert 'F1' or 'Ctrl+Shift+1' to pynput HotKey.parse syntax."""
-    parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
-    if not parts:
-        raise ValueError("empty hotkey spec")
-    out = []
-    for p in parts:
-        if p in ("ctrl", "control"):
-            out.append("<ctrl>")
-        elif p == "shift":
-            out.append("<shift>")
-        elif p == "alt":
-            out.append("<alt>")
-        elif p in ("cmd", "win", "super"):
-            out.append("<cmd>")
-        elif p.startswith("f") and p[1:].isdigit():
-            out.append(f"<{p}>")
-        elif len(p) == 1:
-            out.append(p)
-        else:
-            out.append(f"<{p}>")
-    return "+".join(out)
-
-
-def _standalone_fkey_vk(spec: str) -> Optional[int]:
-    parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
-    if len(parts) != 1:
-        return None
-    p = parts[0]
-    if p.startswith("f") and p[1:].isdigit():
-        n = int(p[1:])
-        if 1 <= n <= 24:
-            return 0x70 + (n - 1)
-    return None
-
-
-def _keysym_to_hotkey_part(ks: str) -> str:
-    """Translate a Tk keysym to our hotkey notation."""
-    if ks.startswith("F") and ks[1:].isdigit():
-        return ks
-    if len(ks) == 1:
-        return ks.upper()
-    return ks
-
-
-_HOTKEY_MOD_ORDER = ("Ctrl", "Shift", "Alt")
-
-
 def open_hotkey_capture(parent, on_done: Callable[[str], None]) -> None:
     """Pop a modal that captures a key combination. Calls on_done with
     the captured string (e.g. 'Ctrl+Shift+A', 'F4') or "" on cancel.
@@ -5885,7 +5837,7 @@ def open_hotkey_capture(parent, on_done: Callable[[str], None]) -> None:
     finished = {"done": False}
 
     def current_mods_str() -> str:
-        mods = [m for m in _HOTKEY_MOD_ORDER if m in held]
+        mods = [m for m in hotkeys.HOTKEY_MOD_ORDER if m in held]
         return "+".join(mods) if mods else "—"
 
     def finish(combo: str) -> None:
@@ -5917,8 +5869,8 @@ def open_hotkey_capture(parent, on_done: Callable[[str], None]) -> None:
             held.add("Alt"); preview_var.set(current_mods_str()); return
         if ks in ("Super_L", "Super_R", "Win_L", "Win_R", "Caps_Lock", "Num_Lock"):
             return
-        mods = [m for m in _HOTKEY_MOD_ORDER if m in held]
-        combo = "+".join(mods + [_keysym_to_hotkey_part(ks)])
+        mods = [m for m in hotkeys.HOTKEY_MOD_ORDER if m in held]
+        combo = "+".join(mods + [hotkeys.keysym_to_hotkey_part(ks)])
         preview_var.set(combo)
         dialog.after(150, lambda: finish(combo))
 
@@ -22541,14 +22493,14 @@ class App:
             if not sc.hotkey:
                 continue
             try:
-                hk_string = to_pynput_hotkey_string(sc.hotkey)
+                hk_string = hotkeys.to_pynput_hotkey_string(sc.hotkey)
                 parsed = keyboard.HotKey.parse(hk_string)
             except Exception as e:
                 self._post_status(f"Skipped hotkey {sc.hotkey!r}: {e}")
                 continue
             cb = (lambda s=sc: self._fire_from_hotkey(s))
             self._hotkeys.append(keyboard.HotKey(parsed, cb))
-            vk = _standalone_fkey_vk(sc.hotkey)
+            vk = hotkeys.standalone_fkey_vk(sc.hotkey)
             if vk is not None:
                 self._suppress_vks.add(vk)
 
@@ -22556,10 +22508,10 @@ class App:
         qn_hk = (getattr(self.settings, "quick_note_hotkey", "") or "").strip()
         if qn_hk:
             try:
-                parsed = keyboard.HotKey.parse(to_pynput_hotkey_string(qn_hk))
+                parsed = keyboard.HotKey.parse(hotkeys.to_pynput_hotkey_string(qn_hk))
                 self._hotkeys.append(keyboard.HotKey(
                     parsed, lambda: self._fire_quick_note_hotkey()))
-                vk = _standalone_fkey_vk(qn_hk)
+                vk = hotkeys.standalone_fkey_vk(qn_hk)
                 if vk is not None:
                     self._suppress_vks.add(vk)
             except Exception as e:
