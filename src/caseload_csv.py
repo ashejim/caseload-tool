@@ -63,6 +63,11 @@ DISPLAY_TO_CSV: dict[str, str] = {
     "Days Since Course Start": "DaysSinceCourseStart",
     "Days Until Term End": "DaysUntilTermEnd",
     "Task Stalled (days)": "TaskStalledDays",
+    # The date a student's coursework effectively ends: their IC (incomplete /
+    # extension) date when they have one, else the term end date. Filter this
+    # (e.g. "is within this month") to catch students actually finishing soon —
+    # an IC overrides a later term end, which a raw Term End filter would miss.
+    "Effective End Date": "EffectiveEndDate",
 }
 
 

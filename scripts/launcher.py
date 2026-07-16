@@ -24320,6 +24320,7 @@ class App:
           DaysSinceLastContact  — today − 'Last Assigned CI Contact'
           DaysSinceCourseStart  — today − Course Start Date
           DaysUntilTermEnd      — Term End Date − today (negative if past)
+          EffectiveEndDate      — IC end date if present, else Term End Date
           LastActionType        — action name of the latest note we logged
           DaysSinceLastAction   — today − that note's date
           TaskStalledDays       — days the task status has been unchanged
@@ -24346,6 +24347,12 @@ class App:
                 days_since(str(r.get("CourseStartDate", "") or "")))
             r["DaysUntilTermEnd"] = _num(
                 days_until(str(r.get("TermEndDate", "") or "")))
+            # Effective end = the IC (incomplete/extension) date when present,
+            # else the term end. An IC is the operative deadline, so it
+            # overrides term end (which may be later).
+            _ic = str(r.get("Icenddate", "") or "").strip()
+            r["EffectiveEndDate"] = _ic or str(
+                r.get("TermEndDate", "") or "").strip()
             ent = by_key.get((sid, course)) or by_sid.get(sid)
             if ent:
                 r["LastActionType"] = ent[1]

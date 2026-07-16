@@ -94,6 +94,31 @@ def test_rewrite_text_op_status_word_routes_to_status():
     assert out["column"] == "Task2Status"
 
 
+# --- "Effective End Date" synthetic column ---------------------------------
+# Computed per row in launcher (_inject_signal_columns) as IC-end-if-present-
+# else-term-end, registered in caseload_csv.DISPLAY_TO_CSV, then filtered here.
+
+def test_effective_end_within_this_month():
+    from datetime import date
+    today = date(2026, 7, 16)
+    filt = {"column": "EffectiveEndDate", "op": "is within",
+            "value": "this month"}
+    # IC-bound student ending 7/31 -> matches.
+    assert caseload_filter.evaluate_filter(
+        filt, {"EffectiveEndDate": "2026-07-31"}, today=today)
+    # Student whose effective end is a later term -> excluded.
+    assert not caseload_filter.evaluate_filter(
+        filt, {"EffectiveEndDate": "2026-12-31"}, today=today)
+
+
+def test_effective_end_column_display_mapping():
+    from src import caseload_csv
+    assert caseload_csv.resolve_column("Effective End Date", []) == \
+        "EffectiveEndDate"
+    assert caseload_csv.display_for_column("EffectiveEndDate") == \
+        "Effective End Date"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
