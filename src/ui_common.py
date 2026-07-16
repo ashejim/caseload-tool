@@ -283,3 +283,93 @@ def attach_listbox_drag_reorder(listbox, items, refresh, on_change=None):
     listbox.bind("<ButtonPress-1>", on_press, add="+")
     listbox.bind("<B1-Motion>", on_motion, add="+")
     listbox.bind("<ButtonRelease-1>", on_release, add="+")
+
+
+# ---- Adjustable text sizes (per "channel") -------------------------------
+# Named font channels so each reading/editing surface can carry its own
+# user-adjustable text size: 'activity' (log), 'viewer' (caseload table),
+# 'email' (FERPA reviewer), 'editor' (note bodies + template editor).
+# CTkTextbox surfaces register via register_font_box(); non-CTk surfaces
+# (the ttk caseload Treeview) register an apply callback via
+# register_font_apply(). Ctrl +/- and Ctrl+MouseWheel on a registered
+# widget adjust that channel live. The App wires _FONT_PERSIST to save.
+UI_FONT_CHANNELS = ("activity", "viewer", "email", "editor", "notes")
+UI_FONT_DEFAULTS = {"activity": 13, "viewer": 11, "email": 12, "editor": 12,
+                    "notes": 12}
+UI_FONT_MIN, UI_FONT_MAX = 8, 40
+_font_sizes: dict = dict(UI_FONT_DEFAULTS)
+_font_boxes: dict = {c: [] for c in UI_FONT_CHANNELS}
+_font_applies: dict = {c: [] for c in UI_FONT_CHANNELS}
+_FONT_PERSIST: list = [None]  # holder for persist callback(channel, size)
+
+
+def font_size(channel: str) -> int:
+    return _font_sizes.get(channel, 13)
+
+
+def _set_box_font(box, n: int) -> None:
+    """Apply font size `n` to a text box. CTk text boxes need a CTkFont (DPI
+    scaling); a native tk.Text (the activity log) takes a (family, size)
+    tuple."""
+    if hasattr(box, "_textbox"):          # CTkTextbox
+        box.configure(font=ctk.CTkFont(size=n))
+    else:                                  # native tk.Text
+        box.configure(font=("Segoe UI", n))
+
+
+def set_font_size(channel: str, n: int, persist: bool = True) -> None:
+    """Set a channel's text size (clamped) and apply to all its widgets."""
+    n = max(UI_FONT_MIN, min(UI_FONT_MAX, int(n)))
+    _font_sizes[channel] = n
+    for b in list(_font_boxes.get(channel, [])):
+        try:
+            _set_box_font(b, n)
+        except Exception:
+            try:
+                _font_boxes[channel].remove(b)
+            except ValueError:
+                pass
+    for cb in list(_font_applies.get(channel, [])):
+        try:
+            cb(n)
+        except Exception:
+            pass
+    if persist and _FONT_PERSIST[0]:
+        try:
+            _FONT_PERSIST[0](channel, n)
+        except Exception:
+            pass
+
+
+def bind_font_hotkeys(channel: str, widget) -> None:
+    """Bind Ctrl +/- and Ctrl+MouseWheel on `widget` to adjust `channel`."""
+    def bump(d):
+        set_font_size(channel, _font_sizes[channel] + d)
+        return "break"
+    widget.bind("<Control-MouseWheel>",
+                lambda e: bump(1 if e.delta > 0 else -1))
+    widget.bind("<Control-plus>", lambda e: bump(1))
+    widget.bind("<Control-equal>", lambda e: bump(1))  # Ctrl+= (no shift)
+    widget.bind("<Control-minus>", lambda e: bump(-1))
+
+
+def register_font_box(channel: str, box, hotkeys: bool = True) -> None:
+    """Register a CTkTextbox to a font channel: apply the current size and
+    (optionally) bind the zoom hotkeys."""
+    _font_boxes.setdefault(channel, []).append(box)
+    try:
+        _set_box_font(box, _font_sizes[channel])
+    except Exception:
+        pass
+    if hotkeys:
+        bind_font_hotkeys(channel, box)
+
+
+def register_font_apply(channel: str, cb) -> None:
+    """Register an apply callback cb(size) for a non-CTkTextbox surface
+    (e.g. the caseload Treeview style). Called now + on every change."""
+    _font_applies.setdefault(channel, []).append(cb)
+    try:
+        cb(_font_sizes[channel])
+    except Exception:
+        pass
