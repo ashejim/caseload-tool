@@ -3390,25 +3390,31 @@ class BrowserWorker:
         except Exception:
             return
 
-        # Pick: descendant of us > title matches the page > sole candidate.
+        # Pick OUR browser's window. Chrome, Edge, Vivaldi, Claude, Discord,
+        # etc. all share the Chrome_WidgetWin_1 class, so a title or "only one
+        # window" guess across EVERY Chromium window could grab the user's own
+        # browser and yank it around. So: only a window owned by our descendant
+        # process counts as ours (prefer one whose title matches the page);
+        # fall back to a sole system-wide candidate only when it's unambiguous.
         chosen = None  # (hwnd, pid)
         mine = [c for c in cands if c[1] in ours]
         if mine:
             chosen = (mine[0][0], mine[0][1])
-        elif title_hint:
-            h = title_hint.lower()
-            for c in cands:
-                if c[2] and h in c[2].lower():
-                    chosen = (c[0], c[1])
-                    break
-        if chosen is None and len(cands) == 1:
+            if title_hint:
+                h = title_hint.lower()
+                for c in mine:
+                    if c[2] and h in c[2].lower():
+                        chosen = (c[0], c[1])
+                        break
+        elif len(cands) == 1:
             chosen = (cands[0][0], cands[0][1])
         if chosen is None:
-            # Only worth a log line when we couldn't find our window —
-            # a successful raise is self-evident (the window appears).
+            # Couldn't find OUR window. Usually means our Edge shares a process
+            # with the user's already-open Edge (single-instance), so none of
+            # the enumerated windows trace back to us.
             self.on_status(
-                f"  [raise] couldn't locate browser window "
-                f"({len(cands)} chromium window(s) seen)"
+                f"  [raise] couldn't find our browser window "
+                f"({len(mine)} of {len(cands)} Chromium window(s) are ours)"
             )
             return
         # Cache hwnd + owning pid for the fast path and the focus guard.
