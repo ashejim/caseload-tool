@@ -56,7 +56,16 @@ from src.config import (
 )
 from src import crypto_store
 from src.version import __version__
-from src.note_form import NoteData
+from src.note_form import (
+    NoteData,
+    INTERACTION_FORMATS,
+    INTERACTION_TYPES_SINGLE,
+    INTERACTION_TYPES_MULTI,
+    ACTIVITY_DISABLE_TYPES_SINGLE,
+    ACADEMIC_ACTIVITY_LABELS,
+    types_for_format,
+    activities_disabled_for,
+)
 from src.action_queue import ActionQueue, QueueItem, QueueStatus
 from src.dates import (
     TZ_ABBR_TO_IANA, effective_tz, student_local_time,
@@ -153,44 +162,6 @@ CSV_HEADER = [
 CSV_COLUMN_RENAMES = {
     "email": "pm_email",  # earlier schema labelled it just "email"
 }
-
-# Values matching the Caseload form's dropdown + checkbox labels.
-INTERACTION_TYPES_SINGLE = [
-    "Email to Student", "Live Call", "Email from Student", "Video Call",
-    "Course Chatter Response", "Voicemail to Student",
-    "Instant Message (IM) / Text", "Voicemail from Student",
-    "Webinar Attendance Noted", "Admin Note", "Mass Email", "Cohort Event",
-]
-INTERACTION_TYPES_MULTI = [
-    "Live Call and Email to Student", "Email Exchange with Student",
-    "Voicemail and Email to Student", "Voicemail/Email and Text to Student",
-    "Voicemail to Student and Text Message", "Live Call and Text Message",
-    "Email to Student and Text Message", "Video Call and Email to Student",
-    "Voicemail from Student and Email to Student",
-    "Voicemail Full/Email to Student",
-]
-# Single Interaction types that disable Academic Activities (one-way /
-# administrative / outbound interactions where no student engagement
-# needs to be characterized).
-ACTIVITY_DISABLE_TYPES_SINGLE = {
-    "Email to Student", "Voicemail to Student", "Admin Note", "Mass Email",
-}
-ACADEMIC_ACTIVITY_LABELS = [
-    "Course/Program Information Discussed",
-    "Course/Program Information Requested",
-    "Set Academic Goals",
-    "Student Learning Occurred",
-    "Personal obstacles/non-academic content covered",
-]
-INTERACTION_FORMATS = ["Single Interaction", "Multiple Interactions"]
-
-
-def types_for_format(fmt: str) -> list[str]:
-    return INTERACTION_TYPES_MULTI if fmt == "Multiple Interactions" else INTERACTION_TYPES_SINGLE
-
-
-def activities_disabled_for(fmt: str, typ: str) -> bool:
-    return fmt == "Single Interaction" and typ in ACTIVITY_DISABLE_TYPES_SINGLE
 
 
 # ============================================================
