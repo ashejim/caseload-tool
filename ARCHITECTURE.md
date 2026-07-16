@@ -27,8 +27,9 @@ src/              domain logic + integrations (importable, mostly GUI-free)
   scenarios.py        "actions" (scenarios) + note templates: YAML load/save + models
   note_form.py        the Salesforce note form model (NoteData) + fillers
   dates.py            date/timezone helpers (single source of truth)
-  caseload_csv.py     caseload CSV parsing + column handling
-  caseload_filter.py  the filter engine ("column is any of …")
+  hotkeys.py          hotkey-spec string conversions (pynput / vk / keysym)
+  caseload_csv.py     caseload CSV parsing + column handling + email-col recog
+  caseload_filter.py  the filter engine + "Task N" facet routing
   student_lookup.py   finding/opening a student in the live Salesforce list
   history.py          local SQLite snapshots + departures + passed-outcomes archive
   success_path.py     per-course step checklists → recommended next action
