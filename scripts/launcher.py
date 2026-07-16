@@ -92,6 +92,7 @@ from src.scenarios import (
     NOTE_FIELD_KINDS, load_groups, load_scenarios, load_note_templates,
     load_success_paths, note_template_to_dict, parse_note_template_text,
     render_note_template, run_scenario, success_path_to_dict, _note_from_dict,
+    _branch_to_dict,
 )
 from src.student_lookup import (
     click_caseload_row,
@@ -11670,58 +11671,6 @@ class NoteEditor:
 # the shared email/text/notes widgets as the user switches branch tabs.
 # ============================================================
 
-def _email_cfg_to_dict(e: Optional[EmailConfig]) -> Optional[dict]:
-    if e is None:
-        return None
-    return {
-        "subject": e.subject, "body_html_file": e.body_html_file, "to": e.to,
-        "signature_file": e.signature_file,
-        "inline_images": list(e.inline_images or []),
-        "cc_pm": e.cc_pm, "pick_template": e.pick_template,
-        "font_family": e.font_family, "font_size": e.font_size,
-    }
-
-
-def _text_cfg_to_dict(t) -> Optional[dict]:
-    if t is None:
-        return None
-    return {
-        "body": t.body, "body_file": t.body_file, "schedule": True,
-        "window_start_hour": t.window_start_hour,
-        "window_end_hour": t.window_end_hour,
-        "inbox_label": t.inbox_label, "commit": t.commit,
-    }
-
-
-def _note_cfg_to_dict(n) -> dict:
-    d = {
-        "interaction_format": n.interaction_format,
-        "interaction_type": n.interaction_type,
-        "body": n.body,
-        "academic_activities": list(n.academic_activities or []),
-        "submit": n.submit,
-        "append_clipboard": n.append_clipboard,
-        "enter_additional_text": n.enter_additional_text,
-    }
-    if getattr(n, "course_code_override", ""):
-        d["course_code_override"] = n.course_code_override
-    if n.subject:
-        d["subject"] = n.subject
-    return d
-
-
-def _branch_cfg_to_dict(bc) -> dict:
-    """One BranchConfig -> the editor's in-memory branch dict."""
-    return {
-        "title": bc.title or "",
-        "conditions": list(bc.conditions or []),
-        "email": _email_cfg_to_dict(bc.email),
-        "text": _text_cfg_to_dict(bc.text),
-        "notes": [_note_cfg_to_dict(n) for n in (bc.notes or [])],
-        "color": getattr(bc, "color", "") or "",
-    }
-
-
 # ============================================================
 # Scenario editor — one per scenario, swapped into the editor pane's
 # shared content frame by the stacked group tab-strips.
@@ -13514,7 +13463,7 @@ class ScenarioEditor:
         if branches:
             self.batch_mode_var.set(False)
             self.filter_single_var.set(False)
-            self.branches = [_branch_cfg_to_dict(bc) for bc in branches]
+            self.branches = [_branch_to_dict(bc) for bc in branches]
             self._active_branch = None  # cleared so _load_branch won't snapshot
             self._load_branch(0)
         else:
