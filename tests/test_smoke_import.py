@@ -30,6 +30,7 @@ SRC_MODULES = [
     "src.dates",
     "src.hotkeys",
     "src.ui_common",
+    "src.os_open",
     "src.rich_text",
     "src.dialogs",
     "src.ema_links",
