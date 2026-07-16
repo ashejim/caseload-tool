@@ -42,8 +42,10 @@ src/              domain logic + integrations (importable, mostly GUI-free)
   action_queue.py     queue of batch actions to run later
   proc_priority.py    process priority tweaks
   ui_common.py        shared UI primitives (button styles, dialog sizing/
-                      geometry, tooltip, checkbox images, listbox drag)
+                      geometry, tooltip, checkbox images, listbox drag, fonts)
   dialogs.py          standalone modal dialogs (parent + args → value)
+  rich_text.py        RichTextEditor widget + HTML parsers + clipboard HTML
+  os_open.py          open URIs/files in external apps (Edge, default, Word)
 
 tests/            unit tests (pure logic) + a smoke-import test
 CHANGELOG.md      user-facing release notes (see src/version.py for the scheme)
@@ -85,10 +87,9 @@ green and the app launchable:
    dialogs and panels share (button styles, tooltips, dialog sizing/geometry,
    checkbox images, listbox drag). Re-imported into `launcher.py` so call sites
    are unchanged.
-3. **Dialogs → `src/dialogs.py`.** Mostly DONE — 19 self-contained `prompt_*`
-   modals (parent + args → value) moved out. The two rich-text dialogs (HTML
-   template editor + batch email review) remain in `launcher.py` pending the
-   `RichTextEditor` widget extraction.
+3. **Dialogs → `src/dialogs.py`.** DONE — all 21 `prompt_*` modals moved out,
+   including the two rich-text ones, once `RichTextEditor` was lifted into
+   `src/rich_text.py` and the external-open helpers into `src/os_open.py`.
 4. **Panels + worker → own modules.** `caseload_panel.py`, `scenario_editor.py`,
    `browser_worker.py`, etc.
 5. **Slim `App`.** Split the controller by concern (fire flow / batch / EA /

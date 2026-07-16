@@ -27,6 +27,28 @@ SECONDARY_BTN_KWARGS = dict(
 _ADD_BTN_BLUE = ("#2f6fed", "#2f6fed")
 _ADD_BTN_BLUE_HOVER = ("#2558c8", "#2558c8")
 
+# Variables exposed in the "Insert variable" toolbars (the note/email editor
+# and the HTML template editor). Display label → variable name, so users see
+# the friendly name but the inserted `{{var}}` matches what the renderer wants.
+_TEMPLATE_INSERT_VARS_STUDENT = [
+    ("First name", "first_name"),
+    ("Preferred name", "preferred_name"),
+    ("Last name", "last_name"),
+    ("Full name", "full_name"),
+    ("Student email", "student_email"),
+    ("Student ID", "student_id"),
+    ("Course code", "course_code"),
+    ("Program name", "program_name"),
+]
+_TEMPLATE_INSERT_VARS_PM = [
+    ("PM name", "pm_name"),
+    ("PM email", "pm_email"),
+]
+_TEMPLATE_INSERT_VARS_USER = [
+    ("Your name", "user_name"),
+    ("Your email", "user_email"),
+]
+
 
 # Per-session memory of each named dialog's last size/position, so reopening a
 # resized popup restores it. Defaults seed a sensible first-open size.
