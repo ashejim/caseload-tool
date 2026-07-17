@@ -3,6 +3,29 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.20.0 — 2026-07-17
+
+- **Compact dates in the views.** Dates now show as **7/2** instead of
+  2026-07-02 — month and day, with the year shown only when it isn't the
+  current year — so the caseload grid, task badges, and countdowns read cleaner.
+- **New "Effective End Date" filter column.** The date a student's coursework
+  effectively ends: their **IC (incomplete/extension) date** when they have one,
+  otherwise the term end date. Filter it (e.g. *is within · this month*), sort
+  by it, or show it in the grid to catch students actually finishing soon that a
+  raw Term End filter would miss.
+- **Clearer heads-up when your own Edge blocks the app.** The app runs its own
+  Microsoft Edge to reach Salesforce; if your personal Edge is already open,
+  Windows makes them share one session and the app may not sign in. It now warns
+  you (once) to close your other Edge windows, and the sign-in error names this
+  cause. It also never grabs your personal browser window by mistake.
+- **Honest text-scheduling counts.** A batch/single-fire text summary no longer
+  reports recipients as "scheduled" when the Mongoose API actually skipped them
+  (not in Mongoose / not opted in) — it now shows what was scheduled vs skipped.
+- **Under the hood:** the ~34k-line `scripts/launcher.py` has been decomposed
+  into focused modules (dialogs, rich-text editor, shared UI kernel, and many
+  pure-logic helpers under `src/`). No behavior change intended — this is
+  groundwork for faster, safer future development.
+
 ## 0.19.2 — 2026-07-16
 
 - **Clear warning when email can't be sent.** Automated email sending needs
