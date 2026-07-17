@@ -286,6 +286,62 @@ def _branches_from_list(items) -> list["BranchConfig"]:
     return out
 
 
+# --- config objects → plain dicts (inverse of the *_from_dict family) ------
+# Used by the scenario editor to hydrate its in-memory working copy of a
+# branch/note/email/text before the user edits it.
+
+def _email_to_dict(e: Optional[EmailConfig]) -> Optional[dict]:
+    if e is None:
+        return None
+    return {
+        "subject": e.subject, "body_html_file": e.body_html_file, "to": e.to,
+        "signature_file": e.signature_file,
+        "inline_images": list(e.inline_images or []),
+        "cc_pm": e.cc_pm, "pick_template": e.pick_template,
+        "font_family": e.font_family, "font_size": e.font_size,
+    }
+
+
+def _text_to_dict(t: Optional[TextConfig]) -> Optional[dict]:
+    if t is None:
+        return None
+    return {
+        "body": t.body, "body_file": t.body_file, "schedule": True,
+        "window_start_hour": t.window_start_hour,
+        "window_end_hour": t.window_end_hour,
+        "inbox_label": t.inbox_label, "commit": t.commit,
+    }
+
+
+def _note_to_dict(n: NoteData) -> dict:
+    d = {
+        "interaction_format": n.interaction_format,
+        "interaction_type": n.interaction_type,
+        "body": n.body,
+        "academic_activities": list(n.academic_activities or []),
+        "submit": n.submit,
+        "append_clipboard": n.append_clipboard,
+        "enter_additional_text": n.enter_additional_text,
+    }
+    if getattr(n, "course_code_override", ""):
+        d["course_code_override"] = n.course_code_override
+    if n.subject:
+        d["subject"] = n.subject
+    return d
+
+
+def _branch_to_dict(bc: "BranchConfig") -> dict:
+    """One BranchConfig -> the editor's in-memory branch dict."""
+    return {
+        "title": bc.title or "",
+        "conditions": list(bc.conditions or []),
+        "email": _email_to_dict(bc.email),
+        "text": _text_to_dict(bc.text),
+        "notes": [_note_to_dict(n) for n in (bc.notes or [])],
+        "color": getattr(bc, "color", "") or "",
+    }
+
+
 def _batch_from_dict(d: Optional[dict]) -> Optional[BatchConfig]:
     if d is None:  # `batch:` key absent — not a batch scenario
         return None

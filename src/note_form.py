@@ -19,6 +19,49 @@ from src.config import SCREENSHOTS_DIR
 
 InteractionFormat = Literal["Single Interaction", "Multiple Interactions"]
 
+# Values matching the Caseload note form's dropdown + checkbox labels.
+INTERACTION_FORMATS = ["Single Interaction", "Multiple Interactions"]
+INTERACTION_TYPES_SINGLE = [
+    "Email to Student", "Live Call", "Email from Student", "Video Call",
+    "Course Chatter Response", "Voicemail to Student",
+    "Instant Message (IM) / Text", "Voicemail from Student",
+    "Webinar Attendance Noted", "Admin Note", "Mass Email", "Cohort Event",
+]
+INTERACTION_TYPES_MULTI = [
+    "Live Call and Email to Student", "Email Exchange with Student",
+    "Voicemail and Email to Student", "Voicemail/Email and Text to Student",
+    "Voicemail to Student and Text Message", "Live Call and Text Message",
+    "Email to Student and Text Message", "Video Call and Email to Student",
+    "Voicemail from Student and Email to Student",
+    "Voicemail Full/Email to Student",
+]
+# Single Interaction types that disable Academic Activities (one-way /
+# administrative / outbound interactions where no student engagement
+# needs to be characterized).
+ACTIVITY_DISABLE_TYPES_SINGLE = {
+    "Email to Student", "Voicemail to Student", "Admin Note", "Mass Email",
+}
+ACADEMIC_ACTIVITY_LABELS = [
+    "Course/Program Information Discussed",
+    "Course/Program Information Requested",
+    "Set Academic Goals",
+    "Student Learning Occurred",
+    "Personal obstacles/non-academic content covered",
+]
+
+
+def types_for_format(fmt: str) -> list[str]:
+    """Interaction-type options offered for a given interaction format."""
+    return (INTERACTION_TYPES_MULTI if fmt == "Multiple Interactions"
+            else INTERACTION_TYPES_SINGLE)
+
+
+def activities_disabled_for(fmt: str, typ: str) -> bool:
+    """True when Academic Activities should be disabled for this
+    format/type pairing (one-way single interactions carry no activities)."""
+    return fmt == "Single Interaction" and typ in ACTIVITY_DISABLE_TYPES_SINGLE
+
+
 # Minimal markdown bold: **text** → bold. Used so a note template can bold a
 # label (e.g. **Purpose**). The API note path stores HTML, so it renders real
 # bold; the DOM form path types plain text, so it strips the markers instead of

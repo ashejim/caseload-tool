@@ -482,6 +482,9 @@ class Settings:
     # notice (shown when Classic's COM server isn't registered), so we don't nag
     # every launch. Reset implicitly if they never dismissed it.
     outlook_classic_notice_dismissed: bool = False
+    # Set once the user dismisses the "close your other Edge windows" notice
+    # (shown only when their own Edge appears to be blocking our Edge session).
+    edge_conflict_notice_dismissed: bool = False
     # Caseload-panel "Fire action" menu: JSON list of scenario names, in the
     # order they appear in the right-click / Right-arrow action menu. Empty =
     # fall back to the per-scenario "Show as a caseload-panel action" flags

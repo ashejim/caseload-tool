@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src import caseload_csv  # noqa: E402
 from src.student_lookup import (  # noqa: E402
     ea_rows_from_records, ea_view_missing_student_id, _EA_COLCHECK_JS,
+    typo_variants,
 )
 
 CRITICAL = ("StudentID",)
@@ -164,6 +165,76 @@ def test_ea_view_missing_sid_false_when_no_data_rows():
 
 def test_ea_view_missing_sid_false_on_evaluate_error():
     assert ea_view_missing_student_id(_FakePage(raises=True)) is False
+
+
+# --- parse_task_status -----------------------------------------------------
+
+def test_parse_task_status():
+    assert caseload_csv.parse_task_status("") == ("none", "", 0)
+    assert caseload_csv.parse_task_status("   ") == ("none", "", 0)
+    # date + attempt count in parens
+    assert caseload_csv.parse_task_status("2026-06-03 (1)") == (
+        "submitted", "2026-06-03", 1)
+    assert caseload_csv.parse_task_status("2026-06-03 (12)") == (
+        "submitted", "2026-06-03", 12)
+    # date without a paren count -> submitted, 0 attempts
+    assert caseload_csv.parse_task_status("2026-06-03") == (
+        "submitted", "2026-06-03", 0)
+    # non-empty but unrecognized -> submitted, first 10 chars, 0
+    assert caseload_csv.parse_task_status("in progress")[0] == "submitted"
+
+
+# --- email column helpers --------------------------------------------------
+
+def test_first_present_value_picks_first_nonblank():
+    row = {"a": "", "b": "  ", "c": "hit", "d": "later"}
+    assert caseload_csv.first_present_value(row, ["a", "b", "c", "d"]) == "hit"
+
+
+def test_first_present_value_none_when_all_blank_or_missing():
+    row = {"a": "", "b": None}
+    assert caseload_csv.first_present_value(row, ["a", "b", "missing"]) == ""
+
+
+def test_email_columns_present_case_insensitive():
+    row = {"StudentEmail": "x", "Name": "y", "pm_email": "z"}
+    assert caseload_csv.email_columns_present(row) == ["StudentEmail",
+                                                       "pm_email"]
+
+
+def test_has_student_email_column_known_alias():
+    assert caseload_csv.has_student_email_column([{"Student Email": "x"}])
+
+
+def test_has_student_email_column_lowercase_email():
+    assert caseload_csv.has_student_email_column([{"email": "x"}])
+
+
+def test_has_student_email_column_false_when_absent():
+    assert not caseload_csv.has_student_email_column([{"Name": "x"}])
+    assert not caseload_csv.has_student_email_column([])
+
+
+# --- typo_variants ---------------------------------------------------------
+
+def test_typo_variants_adjacent_swaps():
+    assert typo_variants("josh") == ["ojsh", "jsoh", "johs"]
+
+
+def test_typo_variants_count_and_excludes_original():
+    v = typo_variants("abc")  # ab|c -> bac, acb ; 'abc' itself excluded
+    assert "abc" not in v
+    assert v == ["bac", "acb"]
+
+
+def test_typo_variants_short_query():
+    assert typo_variants("a") == []
+    assert typo_variants("") == []
+
+
+def test_typo_variants_dedupes_repeated_chars():
+    # 'aa' swapped is still 'aa' == original -> dropped as a dup.
+    assert typo_variants("aa") == []
 
 
 if __name__ == "__main__":

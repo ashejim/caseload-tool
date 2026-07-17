@@ -43,7 +43,36 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import caseload_csv, caseload_filter, email_template, history
+from src import caseload_csv, caseload_filter, email_template, history, hotkeys
+from src.ui_common import (
+    SECONDARY_BTN_KWARGS,
+    _ADD_BTN_BLUE,
+    _ADD_BTN_BLUE_HOVER,
+    _TEMPLATE_INSERT_VARS_STUDENT,
+    _TEMPLATE_INSERT_VARS_PM,
+    _TEMPLATE_INSERT_VARS_USER,
+    _attach_tooltip,
+    _restore_dialog_geometry,
+    _save_dialog_geometry,
+    _fit_dialog_to_content,
+    _build_checkbox_images,
+    _configure_email_preview_tags,
+    attach_listbox_drag_reorder,
+    UI_FONT_CHANNELS,
+    UI_FONT_DEFAULTS,
+    UI_FONT_MIN,
+    UI_FONT_MAX,
+    _font_sizes,
+    _font_boxes,
+    _font_applies,
+    _FONT_PERSIST,
+    font_size,
+    _set_box_font,
+    set_font_size,
+    bind_font_hotkeys,
+    register_font_box,
+    register_font_apply,
+)
 from src import success_path as success_path_store
 from src.browser import persistent_context
 from src.config import (
@@ -56,15 +85,45 @@ from src.config import (
 )
 from src import crypto_store
 from src.version import __version__
-from src.note_form import NoteData
+from src.note_form import (
+    NoteData,
+    INTERACTION_FORMATS,
+    INTERACTION_TYPES_SINGLE,
+    INTERACTION_TYPES_MULTI,
+    ACTIVITY_DISABLE_TYPES_SINGLE,
+    ACADEMIC_ACTIVITY_LABELS,
+    types_for_format,
+    activities_disabled_for,
+)
 from src.action_queue import ActionQueue, QueueItem, QueueStatus
+from src.dates import (
+    TZ_ABBR_TO_IANA, effective_tz, student_local_time,
+    days_until, days_since, to_iso_date, fmt_date_short,
+)
+from src.ema_links import parse_ema_url, build_ema_url
+from src.note_text import note_body_to_html, note_html_to_text, fmt_note_date
+# Public helpers imported under their existing private aliases so the many
+# in-file call sites stay unchanged.
+from src.names import (
+    capitalize_name as _capitalize_name,
+    names_loosely_match as _names_loosely_match,
+    set_cap_mode as _set_name_cap_mode,
+)
+from src.colors import (
+    text_color_for_bg as _text_color_for_bg,
+    tint_hex as _tint_hex,
+    hover_color_for as _hover_color_for,
+    scope_banner_theme as _scope_banner_theme,
+)
 from src.scenarios import (
     SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
     ScenarioConfig, SuccessPath, NoteTemplate, NoteTemplateField,
     NOTE_FIELD_KINDS, load_groups, load_scenarios, load_note_templates,
     load_success_paths, note_template_to_dict, parse_note_template_text,
     render_note_template, run_scenario, success_path_to_dict, _note_from_dict,
+    _branch_to_dict,
 )
+from src.os_open import _open_externally
 from src.student_lookup import (
     click_caseload_row,
     find_and_click_student,
@@ -74,6 +133,32 @@ from src.student_lookup import (
     lookup_caseload_student,
     _parse_mailto,
     scrape_student_email_from_page,
+    typo_variants,
+)
+# Standalone modal dialogs — extracted to src/dialogs.py. Imported back under
+# their existing names so the many in-file call sites stay unchanged.
+from src.dialogs import (
+    open_hotkey_capture,
+    prompt_add_image_dialog,
+    prompt_calendar_pick,
+    prompt_find_and_pick,
+    prompt_quick_note,
+    prompt_additional_text,
+    pick_note_template,
+    prompt_fill_note_template,
+    prompt_edit_note,
+    prompt_text_review,
+    ask_yes_no_topmost,
+    prompt_mongoose_stale,
+    prompt_column_picker,
+    prompt_override_selection,
+    prompt_branch_unmatched,
+    prompt_segment_setup,
+    prompt_batch_text_review,
+    prompt_email_deselect_choice,
+    prompt_batch_review,
+    prompt_html_template_editor,
+    prompt_batch_email_review,
 )
 
 # Success-path step statuses that can be targeted in a filter. Matches the
@@ -134,66 +219,10 @@ CSV_COLUMN_RENAMES = {
     "email": "pm_email",  # earlier schema labelled it just "email"
 }
 
-# Values matching the Caseload form's dropdown + checkbox labels.
-INTERACTION_TYPES_SINGLE = [
-    "Email to Student", "Live Call", "Email from Student", "Video Call",
-    "Course Chatter Response", "Voicemail to Student",
-    "Instant Message (IM) / Text", "Voicemail from Student",
-    "Webinar Attendance Noted", "Admin Note", "Mass Email", "Cohort Event",
-]
-INTERACTION_TYPES_MULTI = [
-    "Live Call and Email to Student", "Email Exchange with Student",
-    "Voicemail and Email to Student", "Voicemail/Email and Text to Student",
-    "Voicemail to Student and Text Message", "Live Call and Text Message",
-    "Email to Student and Text Message", "Video Call and Email to Student",
-    "Voicemail from Student and Email to Student",
-    "Voicemail Full/Email to Student",
-]
-# Single Interaction types that disable Academic Activities (one-way /
-# administrative / outbound interactions where no student engagement
-# needs to be characterized).
-ACTIVITY_DISABLE_TYPES_SINGLE = {
-    "Email to Student", "Voicemail to Student", "Admin Note", "Mass Email",
-}
-ACADEMIC_ACTIVITY_LABELS = [
-    "Course/Program Information Discussed",
-    "Course/Program Information Requested",
-    "Set Academic Goals",
-    "Student Learning Occurred",
-    "Personal obstacles/non-academic content covered",
-]
-INTERACTION_FORMATS = ["Single Interaction", "Multiple Interactions"]
-
-
-def types_for_format(fmt: str) -> list[str]:
-    return INTERACTION_TYPES_MULTI if fmt == "Multiple Interactions" else INTERACTION_TYPES_SINGLE
-
-
-def activities_disabled_for(fmt: str, typ: str) -> bool:
-    return fmt == "Single Interaction" and typ in ACTIVITY_DISABLE_TYPES_SINGLE
-
 
 # ============================================================
 # Browser worker — owns Playwright in its own thread.
 # ============================================================
-
-
-def _typo_variants(query: str) -> list[str]:
-    """All adjacent-transposition variants of `query`. Most natural
-    one-typo cases (e.g. 'jsoh' for 'josh') are a single adjacent
-    swap, so trying each against Salesforce's row filter often
-    surfaces the right student even when fuzzy doesn't have enough
-    of the table in view."""
-    out: list[str] = []
-    seen = {query}
-    for i in range(len(query) - 1):
-        chars = list(query)
-        chars[i], chars[i + 1] = chars[i + 1], chars[i]
-        v = "".join(chars)
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
 
 
 def _wait_grid_settled(page, max_ms: int = 1500) -> None:
@@ -248,41 +277,6 @@ def _wait_record_ready(page, max_ms: int = 2000) -> None:
             page.wait_for_timeout(150)
         except Exception:
             return
-
-
-def _note_body_to_html(text: str) -> str:
-    """Convert a plain-text note body into the simple paragraph HTML the
-    Salesforce note-save endpoint stores (each line a <p>; blank lines a
-    <p><br></p>) so an API-filed note reads the same as a form-typed one.
-    HTML-special characters are escaped; **bold** markers become <b>…</b>
-    (applied AFTER escaping so the tags survive) — mirrored by strip_md_bold on
-    the DOM form path."""
-    from src.note_form import md_bold_to_html
-    lines = (text or "").split("\n")
-    parts = [
-        ("<p>" + md_bold_to_html(html.escape(ln)) + "</p>")
-        if ln.strip() else "<p><br></p>"
-        for ln in lines
-    ]
-    return "".join(parts) or "<p><br></p>"
-
-
-def _to_iso_date(s: str) -> str:
-    """Normalize a follow-up date string to ISO 'YYYY-MM-DD' for the Aura save
-    (the UI passes MM/DD/YYYY; already-ISO passes through). Unknown formats are
-    returned unchanged."""
-    s = (s or "").strip()
-    if not s:
-        return ""
-    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
-    if m:
-        y, mo, d = m.groups()
-        return f"{y}-{int(mo):02d}-{int(d):02d}"
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)   # MM/DD/YYYY
-    if m:
-        mo, d, y = m.groups()
-        return f"{y}-{int(mo):02d}-{int(d):02d}"
-    return s
 
 
 class BrowserWorker:
@@ -2214,7 +2208,7 @@ class BrowserWorker:
 
             # Step 4: adjacent-transposition typo variants.
             if len(query) >= 3 and filter_input is not None:
-                for variant in _typo_variants(query):
+                for variant in typo_variants(query):
                     self.on_status(f"Trying typo correction {variant!r}...")
                     matches = _try_filter(variant)
                     if matches:
@@ -3116,7 +3110,7 @@ class BrowserWorker:
             # The Apex method wants the date as a JSON-QUOTED ISO string, e.g.
             # the literal characters "2026-07-31" (quotes included) — observed
             # in the capture. The UI passes MM/DD/YYYY, so normalize to ISO.
-            iso = _to_iso_date(date)
+            iso = to_iso_date(date)
             params = {"theStudentAcaCourseId": acac,
                       "theCourseFollowupDate": f'"{iso}"'}
         else:
@@ -3330,6 +3324,97 @@ class BrowserWorker:
                     stack.append(child)
         return out
 
+    def _process_exe_names(self) -> dict:
+        """pid → lowercased exe filename, via a Toolhelp32 snapshot. Lets us
+        tell whether a window's owning process is msedge.exe. Empty on error."""
+        import ctypes
+        from ctypes import wintypes
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == -1 or snap == 0:
+            return {}
+        out: dict = {}
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                out[entry.th32ProcessID] = (entry.szExeFile or "").lower()
+                ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+        return out
+
+    def has_foreign_edge_window(self) -> bool:
+        """True if a VISIBLE Microsoft Edge window is open that isn't ours — i.e.
+        the user has their own Edge running. Because we drive Edge (channel
+        msedge), an already-open Edge can prevent our Playwright Edge from
+        getting its own instance/session (Edge single-instance). Background
+        'startup boost' msedge.exe processes have no visible window, so they
+        don't trip this. Windows only; False on any error / off-Windows."""
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return False
+        names = self._process_exe_names()
+        if not names:
+            return False
+        try:
+            ours = self._descendant_pids()
+        except Exception:
+            ours = set()
+        ours.add(os.getpid())
+        user32 = ctypes.windll.user32
+        hit = {"v": False}
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                cls = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, cls, 256)
+                if cls.value != "Chrome_WidgetWin_1":
+                    return True
+                if user32.GetWindowTextLengthW(hwnd) <= 0:
+                    return True
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value in ours:
+                    return True
+                if names.get(pid.value, "") == "msedge.exe":
+                    hit["v"] = True
+                    return False  # found one — stop enumerating
+            except Exception:
+                pass
+            return True
+
+        try:
+            user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        except Exception:
+            return False
+        return hit["v"]
+
     def _raise_browser_window(self, title_hint: str = "") -> None:
         """Pull the launcher's browser window to the OS foreground.
         `page.bring_to_front()` only activates the tab *within* the
@@ -3396,25 +3481,31 @@ class BrowserWorker:
         except Exception:
             return
 
-        # Pick: descendant of us > title matches the page > sole candidate.
+        # Pick OUR browser's window. Chrome, Edge, Vivaldi, Claude, Discord,
+        # etc. all share the Chrome_WidgetWin_1 class, so a title or "only one
+        # window" guess across EVERY Chromium window could grab the user's own
+        # browser and yank it around. So: only a window owned by our descendant
+        # process counts as ours (prefer one whose title matches the page);
+        # fall back to a sole system-wide candidate only when it's unambiguous.
         chosen = None  # (hwnd, pid)
         mine = [c for c in cands if c[1] in ours]
         if mine:
             chosen = (mine[0][0], mine[0][1])
-        elif title_hint:
-            h = title_hint.lower()
-            for c in cands:
-                if c[2] and h in c[2].lower():
-                    chosen = (c[0], c[1])
-                    break
-        if chosen is None and len(cands) == 1:
+            if title_hint:
+                h = title_hint.lower()
+                for c in mine:
+                    if c[2] and h in c[2].lower():
+                        chosen = (c[0], c[1])
+                        break
+        elif len(cands) == 1:
             chosen = (cands[0][0], cands[0][1])
         if chosen is None:
-            # Only worth a log line when we couldn't find our window —
-            # a successful raise is self-evident (the window appears).
+            # Couldn't find OUR window. Usually means our Edge shares a process
+            # with the user's already-open Edge (single-instance), so none of
+            # the enumerated windows trace back to us.
             self.on_status(
-                f"  [raise] couldn't locate browser window "
-                f"({len(cands)} chromium window(s) seen)"
+                f"  [raise] couldn't find our browser window "
+                f"({len(mine)} of {len(cands)} Chromium window(s) are ours)"
             )
             return
         # Cache hwnd + owning pid for the fast path and the focus guard.
@@ -5776,7 +5867,7 @@ class BrowserWorker:
                 note_type=note.interaction_type,
                 course_code=note.course_code,
                 subject=note.subject,
-                body_html=_note_body_to_html(note.body),
+                body_html=note_body_to_html(note.body),
                 activities=note.academic_activities,
             )
             if res.get("ok"):
@@ -5817,158 +5908,6 @@ class BrowserWorker:
             return False
 
 
-# ============================================================
-# Hotkey helpers
-# ============================================================
-
-def to_pynput_hotkey_string(spec: str) -> str:
-    """Convert 'F1' or 'Ctrl+Shift+1' to pynput HotKey.parse syntax."""
-    parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
-    if not parts:
-        raise ValueError("empty hotkey spec")
-    out = []
-    for p in parts:
-        if p in ("ctrl", "control"):
-            out.append("<ctrl>")
-        elif p == "shift":
-            out.append("<shift>")
-        elif p == "alt":
-            out.append("<alt>")
-        elif p in ("cmd", "win", "super"):
-            out.append("<cmd>")
-        elif p.startswith("f") and p[1:].isdigit():
-            out.append(f"<{p}>")
-        elif len(p) == 1:
-            out.append(p)
-        else:
-            out.append(f"<{p}>")
-    return "+".join(out)
-
-
-def _standalone_fkey_vk(spec: str) -> Optional[int]:
-    parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
-    if len(parts) != 1:
-        return None
-    p = parts[0]
-    if p.startswith("f") and p[1:].isdigit():
-        n = int(p[1:])
-        if 1 <= n <= 24:
-            return 0x70 + (n - 1)
-    return None
-
-
-def _keysym_to_hotkey_part(ks: str) -> str:
-    """Translate a Tk keysym to our hotkey notation."""
-    if ks.startswith("F") and ks[1:].isdigit():
-        return ks
-    if len(ks) == 1:
-        return ks.upper()
-    return ks
-
-
-_HOTKEY_MOD_ORDER = ("Ctrl", "Shift", "Alt")
-
-
-def open_hotkey_capture(parent, on_done: Callable[[str], None]) -> None:
-    """Pop a modal that captures a key combination. Calls on_done with
-    the captured string (e.g. 'Ctrl+Shift+A', 'F4') or "" on cancel.
-    Modifier keys are not finalized until a non-modifier is pressed."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Press hotkey")
-    dialog.geometry("420x240")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-
-    ctk.CTkLabel(
-        dialog,
-        text=("Press the keys you want as the hotkey.\n"
-              "Example: F3, or hold Ctrl+Shift then press A.\n"
-              "Esc to cancel.\n\n"
-              "Avoid browser-claimed F-keys: F1 (help), F6 (address bar),\n"
-              "F11 (fullscreen), F12 (devtools) — Chromium intercepts these\n"
-              "before our hook can fire."),
-        justify="left",
-    ).pack(padx=20, pady=(15, 5))
-
-    preview_var = ctk.StringVar(value="—")
-    ctk.CTkLabel(
-        dialog, textvariable=preview_var,
-        font=ctk.CTkFont(size=18, weight="bold"),
-    ).pack(pady=4)
-
-    held: set[str] = set()
-    finished = {"done": False}
-
-    def current_mods_str() -> str:
-        mods = [m for m in _HOTKEY_MOD_ORDER if m in held]
-        return "+".join(mods) if mods else "—"
-
-    def finish(combo: str) -> None:
-        if finished["done"]:
-            return
-        finished["done"] = True
-        try:
-            dialog.grab_release()
-        except Exception:
-            pass
-        try:
-            dialog.destroy()
-        except Exception:
-            pass
-        on_done(combo)
-
-    def on_press(event):
-        if finished["done"]:
-            return
-        ks = event.keysym
-        if ks == "Escape":
-            finish("")
-            return
-        if ks in ("Control_L", "Control_R"):
-            held.add("Ctrl"); preview_var.set(current_mods_str()); return
-        if ks in ("Shift_L", "Shift_R"):
-            held.add("Shift"); preview_var.set(current_mods_str()); return
-        if ks in ("Alt_L", "Alt_R"):
-            held.add("Alt"); preview_var.set(current_mods_str()); return
-        if ks in ("Super_L", "Super_R", "Win_L", "Win_R", "Caps_Lock", "Num_Lock"):
-            return
-        mods = [m for m in _HOTKEY_MOD_ORDER if m in held]
-        combo = "+".join(mods + [_keysym_to_hotkey_part(ks)])
-        preview_var.set(combo)
-        dialog.after(150, lambda: finish(combo))
-
-    def on_release(event):
-        ks = event.keysym
-        if ks in ("Control_L", "Control_R"): held.discard("Ctrl")
-        elif ks in ("Shift_L", "Shift_R"): held.discard("Shift")
-        elif ks in ("Alt_L", "Alt_R"): held.discard("Alt")
-        if not finished["done"]:
-            preview_var.set(current_mods_str())
-
-    dialog.bind("<KeyPress>", on_press)
-    dialog.bind("<KeyRelease>", on_release)
-    ctk.CTkButton(dialog, text="Cancel", command=lambda: finish(""), width=90).pack(pady=10)
-    dialog.focus_set()
-
-
-# Remembers each user-movable dialog's last geometry across opens so
-# they reopen where the user last placed/sized them. Persists only
-# within a launcher session (intentional — restart resets to defaults).
-# Secondary-button styling. Previously many call sites used
-# `fg_color="transparent", border_width=1` which renders the text in
-# the same gray as the dark-mode panel background — unreadable until
-# hovered. Explicit fg/text/border colors here give high contrast in
-# both light and dark mode.
-SECONDARY_BTN_KWARGS = dict(
-    fg_color=("gray82", "gray28"),
-    text_color=("gray10", "gray95"),
-    hover_color=("gray72", "gray38"),
-    border_width=1,
-    border_color=("gray60", "gray45"),
-)
-
-
 # Preset palette for scenario group colors. Muted enough to read
 # comfortably on both light and dark backgrounds; tuned so the
 # text-color helper (YIQ luminance) gives a sane white/black
@@ -5989,83 +5928,6 @@ GROUP_COLOR_PALETTE: list[tuple[str, str]] = [
 ]
 
 
-def _text_color_for_bg(hex_color: str) -> str:
-    """Return '#000000' or '#ffffff' — whichever contrasts better
-    against `hex_color`. Uses the YIQ luminance formula which
-    weights green most heavily (matches human perception of
-    brightness)."""
-    h = (hex_color or "").lstrip("#")
-    if len(h) == 3:
-        h = "".join(c + c for c in h)
-    if len(h) != 6:
-        return "#000000"
-    try:
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    except ValueError:
-        return "#000000"
-    yiq = (r * 299 + g * 587 + b * 114) / 1000
-    return "#000000" if yiq >= 128 else "#ffffff"
-
-
-def _tint_hex(hex_color: str, toward: str, t: float) -> str:
-    """Blend `hex_color` toward `toward` by fraction t (0→hex_color, 1→toward).
-    Returns the input unchanged if it can't be parsed."""
-    try:
-        a = (hex_color or "").lstrip("#")
-        b = (toward or "").lstrip("#")
-        if len(a) == 3:
-            a = "".join(c + c for c in a)
-        if len(b) == 3:
-            b = "".join(c + c for c in b)
-        ch = [round(int(a[i:i + 2], 16) * (1 - t) + int(b[i:i + 2], 16) * t)
-              for i in (0, 2, 4)]
-        return "#%02x%02x%02x" % tuple(ch)
-    except Exception:
-        return hex_color
-
-
-# Default (ungrouped) batch-banner palette — the original light blue.
-_SCOPE_BANNER_DEFAULT = (("#dbe8ff", "#22304a"), ("#1f4e8f", "#cfe0ff"))
-
-
-def _scope_banner_theme(base_hex: Optional[str]):
-    """(fg_color, text_color) CTk (light, dark) tuples for the batch banner,
-    tinted from a group's base color: a pale wash in light mode / a muted dark
-    wash in dark mode, with a legible same-hue label. Falls back to the default
-    light-blue when the action is ungrouped (base_hex falsy / unparseable)."""
-    base = (base_hex or "").strip()
-    if len(base.lstrip("#")) not in (3, 6):
-        return _SCOPE_BANNER_DEFAULT
-    fg = (_tint_hex(base, "#ffffff", 0.82), _tint_hex(base, "#1b1b1b", 0.72))
-    text = (_tint_hex(base, "#000000", 0.45), _tint_hex(base, "#ffffff", 0.60))
-    return (fg, text)
-
-
-def _hover_color_for(hex_color: str) -> str:
-    """Slightly darker version of `hex_color` for hover state.
-    Returns the input unchanged if it can't be parsed."""
-    h = (hex_color or "").lstrip("#")
-    if len(h) == 3:
-        h = "".join(c + c for c in h)
-    if len(h) != 6:
-        return hex_color
-    try:
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    except ValueError:
-        return hex_color
-    f = 0.82
-    return f"#{int(r * f):02x}{int(g * f):02x}{int(b * f):02x}"
-
-
-_DIALOG_GEOMETRY: dict[str, str] = {}
-_DIALOG_DEFAULTS: dict[str, str] = {
-    "find_and_pick": "480x440",
-    "additional_text": "640x420",
-    "batch_review": "720x560",
-    "html_template_editor": "900x640",
-}
-
-
 # Sentinel shown in the "Email font" dropdown when no font is set —
 # meaning Outlook's compose default applies (no CSS injection). Kept
 # as a constant so the UI label and the serialize check stay in sync.
@@ -6076,96 +5938,6 @@ EMAIL_FONT_DEFAULT_LABEL = "(Outlook default)"
 # fired while its email still contains this, the user hasn't swapped in
 # their own address yet — warn before sending (see App._fire).
 SAMPLE_EMAIL_PLACEHOLDER = "your.email@wgu.edu"
-
-
-# ---- Adjustable text sizes (per "channel") -------------------------------
-# Named font channels so each reading/editing surface can carry its own
-# user-adjustable text size: 'activity' (log), 'viewer' (caseload table),
-# 'email' (FERPA reviewer), 'editor' (note bodies + template editor).
-# CTkTextbox surfaces register via register_font_box(); non-CTk surfaces
-# (the ttk caseload Treeview) register an apply callback via
-# register_font_apply(). Ctrl +/- and Ctrl+MouseWheel on a registered
-# widget adjust that channel live. The App wires _FONT_PERSIST to save.
-UI_FONT_CHANNELS = ("activity", "viewer", "email", "editor", "notes")
-UI_FONT_DEFAULTS = {"activity": 13, "viewer": 11, "email": 12, "editor": 12,
-                    "notes": 12}
-UI_FONT_MIN, UI_FONT_MAX = 8, 40
-_font_sizes: dict = dict(UI_FONT_DEFAULTS)
-_font_boxes: dict = {c: [] for c in UI_FONT_CHANNELS}
-_font_applies: dict = {c: [] for c in UI_FONT_CHANNELS}
-_FONT_PERSIST: list = [None]  # holder for persist callback(channel, size)
-
-
-def font_size(channel: str) -> int:
-    return _font_sizes.get(channel, 13)
-
-
-def _set_box_font(box, n: int) -> None:
-    """Apply font size `n` to a text box. CTk text boxes need a CTkFont (DPI
-    scaling); a native tk.Text (the activity log) takes a (family, size)
-    tuple."""
-    if hasattr(box, "_textbox"):          # CTkTextbox
-        box.configure(font=ctk.CTkFont(size=n))
-    else:                                  # native tk.Text
-        box.configure(font=("Segoe UI", n))
-
-
-def set_font_size(channel: str, n: int, persist: bool = True) -> None:
-    """Set a channel's text size (clamped) and apply to all its widgets."""
-    n = max(UI_FONT_MIN, min(UI_FONT_MAX, int(n)))
-    _font_sizes[channel] = n
-    for b in list(_font_boxes.get(channel, [])):
-        try:
-            _set_box_font(b, n)
-        except Exception:
-            try:
-                _font_boxes[channel].remove(b)
-            except ValueError:
-                pass
-    for cb in list(_font_applies.get(channel, [])):
-        try:
-            cb(n)
-        except Exception:
-            pass
-    if persist and _FONT_PERSIST[0]:
-        try:
-            _FONT_PERSIST[0](channel, n)
-        except Exception:
-            pass
-
-
-def bind_font_hotkeys(channel: str, widget) -> None:
-    """Bind Ctrl +/- and Ctrl+MouseWheel on `widget` to adjust `channel`."""
-    def bump(d):
-        set_font_size(channel, _font_sizes[channel] + d)
-        return "break"
-    widget.bind("<Control-MouseWheel>",
-                lambda e: bump(1 if e.delta > 0 else -1))
-    widget.bind("<Control-plus>", lambda e: bump(1))
-    widget.bind("<Control-equal>", lambda e: bump(1))  # Ctrl+= (no shift)
-    widget.bind("<Control-minus>", lambda e: bump(-1))
-
-
-def register_font_box(channel: str, box, hotkeys: bool = True) -> None:
-    """Register a CTkTextbox to a font channel: apply the current size and
-    (optionally) bind the zoom hotkeys."""
-    _font_boxes.setdefault(channel, []).append(box)
-    try:
-        _set_box_font(box, _font_sizes[channel])
-    except Exception:
-        pass
-    if hotkeys:
-        bind_font_hotkeys(channel, box)
-
-
-def register_font_apply(channel: str, cb) -> None:
-    """Register an apply callback cb(size) for a non-CTkTextbox surface
-    (e.g. the caseload Treeview style). Called now + on every change."""
-    _font_applies.setdefault(channel, []).append(cb)
-    try:
-        cb(_font_sizes[channel])
-    except Exception:
-        pass
 
 
 _viewer_font_registered = [False]
@@ -6195,111 +5967,8 @@ def apply_caseload_tree_font(size: int) -> None:
 # WGU caseload exports a bare timezone abbreviation (EST/CST/...). Map
 # to IANA zones so we can show the correct *current* local time with DST
 # handled (e.g. EST in June is really EDT).
-_TZ_ABBR_TO_IANA = {
-    "EST": "America/New_York", "EDT": "America/New_York",
-    "CST": "America/Chicago", "CDT": "America/Chicago",
-    "MST": "America/Denver", "MDT": "America/Denver",
-    "PST": "America/Los_Angeles", "PDT": "America/Los_Angeles",
-    "AKST": "America/Anchorage", "AKDT": "America/Anchorage",
-    "HST": "Pacific/Honolulu",       # Hawaii — no DST
-    "ChS": "Pacific/Guam", "ChST": "Pacific/Guam",  # Chamorro — no DST
-}
-
-
-def student_local_time(tz_abbr: str) -> str:
-    """Current local time for a student given their CSV timezone
-    abbreviation, e.g. 'EST' -> '2:14 PM'. Empty string if unknown."""
-    tz_abbr = (tz_abbr or "").strip()
-    iana = _TZ_ABBR_TO_IANA.get(tz_abbr)
-    if not iana:
-        return ""
-    try:
-        from zoneinfo import ZoneInfo
-        now = datetime.now(ZoneInfo(iana))
-        return now.strftime("%I:%M %p").lstrip("0")
-    except Exception:
-        return ""
-
-
-def days_until(date_str: str) -> Optional[int]:
-    """Whole days from today until an ISO 'YYYY-MM-DD' date (negative if
-    past). None if unparseable."""
-    s = (date_str or "").strip()[:10]
-    if not s:
-        return None
-    try:
-        d = datetime.strptime(s, "%Y-%m-%d").date()
-        return (d - datetime.now().date()).days
-    except Exception:
-        return None
-
-
-def days_since(date_str: str) -> Optional[int]:
-    """Whole days from an ISO date/timestamp until today (negative if the
-    date is in the future). None if unparseable. The inverse of days_until —
-    used for 'days since last contact / course start / last action'. Accepts a
-    full timestamp too (only the leading YYYY-MM-DD is read)."""
-    du = days_until(date_str)
-    return None if du is None else -du
-
-
-def parse_task_status(val: str) -> tuple[str, str, int]:
-    """Interpret a caseload Task CSV cell, e.g. '2026-06-03 (1)'.
-
-    IMPORTANT: the CSV export only carries the most-recent submission
-    DATE and the number in parentheses, and that number is the ATTEMPT
-    COUNT — NOT a pass/fail flag. Pass/fail lives only in the live list
-    view's cell color/title (e.g. class 'cellColorGreen' + a title like
-    '… | Passed | 04/21/2026 | 1 Attempt | System: EMA'), which the CSV
-    export drops. So from the CSV alone we can only say 'submitted' vs
-    'not submitted' — we must NOT infer 'passed'. The real status is
-    fetched on demand (see CaseloadPanel._qv_task_badges).
-
-    Returns (state, date, attempts) where state is 'none' | 'submitted'.
-    """
-    s = (val or "").strip()
-    if not s:
-        return "none", "", 0
-    m = re.match(r"(\d{4}-\d{2}-\d{2}).*?\((\d+)\)", s)
-    if not m:
-        return "submitted", s[:10], 0
-    return "submitted", m.group(1), int(m.group(2))
-
-
-# Active name-capitalization mode (kept in sync with the user's setting by
-# App._sync_name_cap_mode). Module-level so both variable builders — the
-# App-side CSV one and the BrowserWorker-side DOM one (no settings access) —
-# share it without threading the setting through.
-_NAME_CAP_MODE = "standard"
-
-
-def _capitalize_name(name: str, mode: Optional[str] = None) -> str:
-    """Normalize a name's capitalization for use in template variables.
-    `mode` (defaults to the global _NAME_CAP_MODE):
-      'off'      — return the name exactly as stored;
-      'lower'    — only fix LOWERCASE entry errors ('john' → 'John'); leave
-                   ALL-CAPS and mixed case alone;
-      'standard' — also normalize ALL-CAPS to Title case ('JANE' → 'Jane'),
-                   while PRESERVING intentional mixed case (McDonald,
-                   O'Brien, Mary-Jane stay as-is).
-    Works per letter-run so hyphen/apostrophe parts are handled
-    (mary-jane → Mary-Jane)."""
-    if not name:
-        return name
-    m = mode or _NAME_CAP_MODE
-    if m == "off":
-        return name
-    if m == "lower":
-        return re.sub(r"\b[a-z]", lambda mo: mo.group(0).upper(), name)
-
-    # 'standard': title-case any run that's entirely lower OR entirely upper;
-    # leave mixed-case runs untouched so deliberate caps survive.
-    def _fix(mo):
-        w = mo.group(0)
-        if w.islower() or w.isupper():
-            return w[:1].upper() + w[1:].lower()
-        return w
-    return re.sub(r"[A-Za-z]+", _fix, name)
+# Date/timezone helpers (student_local_time, days_until, days_since, effective_tz,
+# TZ_ABBR_TO_IANA, to_iso_date) now live in src/dates.py — imported at the top.
 
 
 # Task badge appearance per state. (mark, fg_color, text_color). 'passed'
@@ -6349,90 +6018,6 @@ TASK_STATE_LABELS: dict = {
     "submitted": "Submitted",
 }
 
-# A single "Task N" filter column routes to one of three HIDDEN facet
-# columns depending on the chosen operator, so the user filters one "Task 2"
-# entry by date, submission count, OR status (see _rewrite_task_filter):
-#   date ops    → Task{N}Date   (YYYY-MM-DD, from the CSV cell)
-#   numeric ops → Task{N}Count  (submission count, from the CSV cell)
-#   text ops    → Task{N}Status (Passed/Returned/In Process, from the scrape)
-_TASK_DATE_OPS = {
-    "is before", "is after", "is on", "is on or before", "is on or after",
-    "is within", "before", "after", "on", "on_or_before", "on_or_after",
-    "within",
-}
-_TASK_NUM_OPS = {
-    "more than", "less than", "at least", "at most",
-    "gt", "lt", "gte", "lte",
-}
-
-
-def _is_task_facet_col(col: str) -> bool:
-    """True for the hidden per-task facet helper columns (Task1Date,
-    Task2Count, Task3Status, …) — kept out of the grid + filter dropdowns;
-    the single visible 'Task N' column stands in for all three."""
-    return bool(re.fullmatch(r"Task\d+(Date|Count|Status)", col or ""))
-
-
-def _resolve_filter_columns(f: dict, headers: list) -> dict:
-    """Resolve a filter's display-name `column` to its CSV header, AND — for
-    a column-comparison value written as `{Display Name}` — resolve the
-    referenced column too, so the engine's per-row `row.get(...)` finds it.
-    Identity entries pass through unchanged."""
-    out = {**f, "column": caseload_csv.resolve_column(
-        f.get("column", ""), headers)}
-    m = re.fullmatch(r"\{(.+)\}", str(out.get("value", "")).strip())
-    if m:
-        out["value"] = "{" + caseload_csv.resolve_column(
-            m.group(1), headers) + "}"
-    return out
-
-
-def _rewrite_task_filter(f: dict) -> dict:
-    """Route a filter whose column is a 'TaskN' column to the right hidden
-    facet. Unambiguous ops route by operator: date ops → TaskNDate, numeric
-    ops → TaskNCount, empty/not-empty → TaskNDate ('did they submit'). The
-    ambiguous text ops (is/is not/contains/does not contain) route by the
-    VALUE:
-      - all-integer (incl. comma-OR like '2, 3') → submission COUNT,
-      - the special word 'Submitted' → 'has a submission' (passed/returned/
-        in-process all carry a date), so it maps to TaskNDate is-not-empty
-        (is-empty for the negated ops) and works even before the scrape,
-      - anything else → a status word → TaskNStatus.
-    So 'Task 2 is 2' filters count, 'Task 2 is Submitted' = has any
-    submission, 'Task 2 is Returned' filters status. Non-task filters pass
-    through. Eval-time only — the visible 'Task N' column is what the user
-    picks + sees in review."""
-    col = f.get("column") or ""
-    m = re.fullmatch(r"Task(\d+)", col)
-    if not m:
-        return f
-    n = m.group(1)
-    op = (f.get("op") or "").strip()
-    if op in _TASK_DATE_OPS:
-        facet = f"Task{n}Date"
-    elif op in _TASK_NUM_OPS:
-        facet = f"Task{n}Count"
-    elif op in ("is empty", "is not empty", "empty", "not_empty"):
-        facet = f"Task{n}Date"
-    else:  # is / is not / contains / does not contain
-        val = str(f.get("value") or "").strip()
-        parts = [p.strip() for p in val.split(",") if p.strip()]
-        if parts and all(re.fullmatch(r"\d+", p) for p in parts):
-            facet = f"Task{n}Count"
-        elif val.lower() == "submitted":
-            # "Submitted" = has been submitted (passed/returned/in-process —
-            # all have a date). Use the date facet's emptiness, not the
-            # colour-derived status (which has no real 'Submitted' value).
-            negated = op in ("is not", "does not contain",
-                             "not_equals", "not_contains")
-            return {**f, "column": f"Task{n}Date",
-                    "op": "is empty" if negated else "is not empty",
-                    "value": ""}
-        else:
-            facet = f"Task{n}Status"
-    return {**f, "column": facet}
-
-
 def last_logged_action(student_id: str) -> str:
     """Most recent action THIS app logged for a student (from
     note_log.csv), as 'Jun 01 · welcome'. Empty if none / unreadable.
@@ -6461,4739 +6046,6 @@ def last_logged_action(student_id: str) -> str:
         return ""
 
 
-def note_html_to_text(s: str) -> str:
-    """Flatten a note body (Salesforce stores some as HTML in the
-    data-cell-value attr) to readable plain text."""
-    s = s or ""
-    s = re.sub(r"<\s*br\s*/?\s*>", "\n", s, flags=re.IGNORECASE)
-    s = re.sub(r"</\s*(p|div|li)\s*>", "\n", s, flags=re.IGNORECASE)
-    s = re.sub(r"<[^>]+>", "", s)          # strip remaining tags
-    s = html.unescape(s)                    # &nbsp; &amp; etc.
-    s = s.replace("\xa0", " ")
-    # Collapse runs of blank lines / trailing space.
-    lines = [ln.strip() for ln in s.splitlines()]
-    out, blank = [], False
-    for ln in lines:
-        if not ln:
-            if not blank and out:
-                out.append("")
-            blank = True
-        else:
-            out.append(ln)
-            blank = False
-    return "\n".join(out).strip()
-
-
-def fmt_note_date(iso: str) -> str:
-    """'2026-06-02T17:11:20.000Z' -> '6/02 5:11 PM'. Passes through
-    anything it can't parse."""
-    s = (iso or "").strip()
-    if not s:
-        return ""
-    try:
-        d = datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
-        return d.strftime("%m/%d %I:%M %p").lstrip("0")
-    except Exception:
-        return s[:16].replace("T", " ")
-
-
-_EMA_URL_RE = re.compile(
-    r"tasks\.wgu\.edu/student/(\d+)/course/(\d+)/task/(\d+)/score-report",
-    re.I)
-
-
-def parse_ema_url(url: str) -> Optional[dict]:
-    """Pull the ids out of an EMA Score Report URL, e.g.
-    https://tasks.wgu.edu/student/009930908/course/33860018/task/4521/score-report
-    -> {student_id, course_id, task_id}. None if it doesn't match."""
-    m = _EMA_URL_RE.search(url or "")
-    if not m:
-        return None
-    return {"student_id": m.group(1), "course_id": m.group(2),
-            "task_id": m.group(3)}
-
-
-def build_ema_url(student_id: str, course_id: str, task_id: str) -> str:
-    return (f"https://tasks.wgu.edu/student/{student_id}"
-            f"/course/{course_id}/task/{task_id}/score-report")
-
-
-def _attach_tooltip(widget, text: str) -> None:
-    """Lightweight hover tooltip for a widget (no dependency on any UI
-    framework — a borderless Toplevel shown on enter, hidden on leave).
-
-    Idempotent: calling it again with new text UPDATES the tooltip in place
-    rather than stacking another <Enter>/<Leave> binding. A widget repainted
-    with fresh text — e.g. a task badge whose 'submitted (loading…)' label
-    becomes 'passed' after the live status fetch — would otherwise keep the
-    first binding alive and show its STALE text on hover (green badge but a
-    'loading…' tooltip)."""
-    holder = getattr(widget, "_tooltip_state", None)
-    if holder is not None:
-        holder["text"] = text  # binding already exists — just update the text
-        return
-    holder = {"text": text, "tip": None}
-    try:
-        widget._tooltip_state = holder
-    except Exception:
-        pass
-
-    def show(_e=None):
-        if holder["tip"] is not None or not holder["text"]:
-            return
-        try:
-            x = widget.winfo_rootx() + 10
-            y = widget.winfo_rooty() + widget.winfo_height() + 4
-            tip = tk.Toplevel(widget)
-            tip.wm_overrideredirect(True)
-            tip.wm_geometry(f"+{x}+{y}")
-            tk.Label(
-                tip, text=holder["text"], justify="left",
-                background="#2b2b2b", foreground="#f0f0f0",
-                relief="solid", borderwidth=1, padx=6, pady=3,
-                font=("", 9),
-            ).pack()
-            holder["tip"] = tip
-        except Exception:
-            holder["tip"] = None
-
-    def hide(_e=None):
-        if holder["tip"] is not None:
-            try:
-                holder["tip"].destroy()
-            except Exception:
-                pass
-            holder["tip"] = None
-
-    widget.bind("<Enter>", show, add="+")
-    widget.bind("<Leave>", hide, add="+")
-
-
-# Variables exposed in the in-app HTML editor's "Insert variable"
-# toolbar. Display label → variable name (so users see the friendly
-# name but the inserted `{{var}}` matches what the renderer accepts).
-_TEMPLATE_INSERT_VARS_STUDENT = [
-    ("First name", "first_name"),
-    ("Preferred name", "preferred_name"),
-    ("Last name", "last_name"),
-    ("Full name", "full_name"),
-    ("Student email", "student_email"),
-    ("Student ID", "student_id"),
-    ("Course code", "course_code"),
-    ("Program name", "program_name"),
-]
-_TEMPLATE_INSERT_VARS_PM = [
-    ("PM name", "pm_name"),
-    ("PM email", "pm_email"),
-]
-_TEMPLATE_INSERT_VARS_USER = [
-    ("Your name", "user_name"),
-    ("Your email", "user_email"),
-]
-
-
-# CSV column names we'll look for when building student context
-# from a caseload row (batch mode). Salesforce list-view exports
-# include whatever columns the user has on their view, and the
-# header names vary by configuration — these cover what we've
-# seen in the wild. Tried in order; first non-empty match wins.
-_CSV_STUDENT_EMAIL_COLS = [
-    "StudentEmail", "Student Email", "studentemail", "stuemail",
-    "PersonalEmail", "Personal Email", "Email",
-]
-_CSV_PM_EMAIL_COLS = [
-    "MentorEmail", "Mentor Email", "mentoremail",
-    "PMEmail", "PM Email",
-    "ProgramMentorEmail", "Program Mentor Email",
-]
-
-
-_NAME_TITLES = frozenset({
-    "dr", "mr", "mrs", "ms", "prof", "rev", "sir", "madam", "mx",
-})
-
-
-def _names_loosely_match(a: str, b: str) -> bool:
-    """Tolerant first/last-name comparison. Strips common titles
-    ('Dr.', 'Prof.', etc.), splits on whitespace + commas, lower-
-    cases, and checks for ≥2-token overlap.
-
-    Catches all the realistic shapes the same person's name takes
-    across Salesforce vs Outlook: 'Jim Ashe' vs 'Ashe, Jim',
-    'Dr. Jim Ashe' vs 'Jim Ashe', 'Jim Albert Ashe' vs 'Jim Ashe'
-    all match. 'Jim Smith' vs 'Bob Smith' does NOT (one-token
-    overlap)."""
-    def _tokens(s: str) -> set[str]:
-        out: set[str] = set()
-        for raw in (s or "").replace(",", " ").split():
-            t = raw.strip(".,()[]<>'\"").lower()
-            if t and t not in _NAME_TITLES:
-                out.add(t)
-        return out
-    ta, tb = _tokens(a), _tokens(b)
-    if not ta or not tb:
-        return False
-    return len(ta & tb) >= 2
-
-
-def _first_present_value(row: dict, candidates: list[str]) -> str:
-    """Pick the first non-empty value among `candidates` (a list of
-    possible column names). Returns "" if none of them exist or all
-    are blank. Used to be robust against CSV column-naming variance
-    without making the user remember the exact spelling."""
-    for c in candidates:
-        v = row.get(c, "")
-        if v is not None:
-            s = str(v).strip()
-            if s:
-                return s
-    return ""
-
-
-def _email_columns_present(row: dict) -> list[str]:
-    """Return every column name in `row` that looks like an email
-    column (case-insensitive 'email' substring). For diagnostic
-    logging when the known names didn't match — tells the user
-    which actual column header to add to our recognizer list."""
-    return [k for k in row.keys() if "email" in k.lower()]
-
-
-def _csv_has_student_email_column(rows: list[dict]) -> bool:
-    """Return True iff the cached caseload rows include any
-    student-email column the launcher knows how to read. Used by
-    the pre-batch warning to detect when the Caseload Tool view
-    hasn't been set up yet (and email lookup will have to fall
-    back to per-student row-mailto + contact-card scraping)."""
-    if not rows:
-        return False
-    headers = set(rows[0].keys())
-    for alias in _CSV_STUDENT_EMAIL_COLS:
-        if alias in headers:
-            return True
-    # Lowercase tolerance for orgs that use a non-standard casing
-    # of "Email" (just shows up as "Email" / "email").
-    lc = {h.lower() for h in headers}
-    return "email" in lc
-
-
-# Per-appearance-mode color palette for the HTML editor's syntax
-# highlighter. Picked to read clearly on each background without
-# requiring an exact theme match; close to VS Code defaults.
-_HTML_HIGHLIGHT_COLORS: dict[str, dict[str, str]] = {
-    "Dark": {
-        "comment": "#6a9955",   # mossy green
-        "tag":     "#569cd6",   # sky blue
-        "value":   "#ce9178",   # warm orange
-        "var_fg":  "#ffd966",   # gold
-        "var_bg":  "#3a3520",   # dim amber
-    },
-    "Light": {
-        "comment": "#008000",   # green
-        "tag":     "#800080",   # purple — classic HTML-tag color
-        "value":   "#a31515",   # dark red
-        "var_fg":  "#0451a5",   # navy
-        "var_bg":  "#fff3c4",   # pale yellow
-    },
-}
-
-# Compiled regex patterns reused across every highlight pass.
-# Comments come first (multi-line, can swallow `<`); tag pattern is
-# non-greedy and matches up to the next `>`; var pattern matches
-# `{{ name }}` with optional whitespace.
-_HTML_HIGHLIGHT_PATTERNS: dict[str, re.Pattern] = {
-    "comment": re.compile(r"<!--[\s\S]*?-->"),
-    "tag":     re.compile(r"</?[a-zA-Z][^>]*?>", re.DOTALL),
-    "var":     re.compile(r"\{\{\s*\w+\s*\}\}"),
-    "value":   re.compile(r'"[^"]*"'),
-}
-
-
-def _open_in_edge(uri: str) -> bool:
-    """Launch Microsoft Edge with `uri`. If Edge is already running,
-    the URL opens as a new tab (standard Edge behavior on Windows);
-    otherwise a fresh Edge process opens. Returns True on success.
-
-    We try in order: explicit msedge.exe path → shell `start msedge`
-    → fall through to the user's default browser. The standard-
-    install paths cover the vast majority of Windows machines; the
-    `start` fallback handles Edge installed somewhere unusual but
-    still registered with the shell."""
-    import subprocess
-    edge_paths = [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ]
-    for exe in edge_paths:
-        if Path(exe).exists():
-            try:
-                subprocess.Popen([exe, uri])
-                return True
-            except Exception:
-                continue
-    try:
-        # `start` lets the shell resolve msedge from registered apps;
-        # works for portable installs and non-default locations.
-        subprocess.Popen(["cmd", "/c", "start", "", "msedge", uri], shell=False)
-        return True
-    except Exception:
-        pass
-    return False
-
-
-def _open_externally(path: Path) -> tuple[bool, str]:
-    """Open `path` in whatever app the OS has associated with the
-    file type (`os.startfile` on Windows). Lets users pick their
-    own HTML editor — set VS Code / Notepad++ / Sublime / etc. as
-    the default for .html in Windows Settings and clicks here will
-    route there. Returns (success, message)."""
-    try:
-        import os
-        os.startfile(str(path))
-        return True, "Opened in default app."
-    except Exception as e:
-        return False, f"Couldn't open file: {e}"
-
-
-def _open_template_in_word(path: Path) -> tuple[bool, str]:
-    """Launch MS Word (via COM) opened to `path`. Returns
-    (success, message). Falls back gracefully when Word isn't
-    installed — caller can fall back to os.startfile or just
-    show the message.
-
-    NOTE: kept for backward-compat and as an escape-hatch path,
-    but the main editor flow now uses `_open_externally` which is
-    more reliable and lets users pick any editor via the .html
-    file association."""
-    try:
-        import win32com.client
-        word = win32com.client.Dispatch("Word.Application")
-        word.Documents.Open(str(path))
-        word.Visible = True
-        return True, "Opened in Word."
-    except Exception as e:
-        return False, f"Word not available: {e}"
-
-
-def prompt_add_image_dialog(
-    parent, templates_dir: Path,
-) -> tuple[Optional[str], Optional[str]]:
-    """Modal dialog for adding an inline (CID-embedded) image to a
-    template. Walks the user through choosing a file, sizing it, and
-    optionally linking it; on Insert it copies the file into the
-    templates folder (if not already there) and builds an `<img
-    src="cid:STEM">` snippet for the editor to drop at the cursor.
-
-    Returns:
-        (html_snippet, filename) on Insert — caller drops the
-        snippet into the template AND registers `filename` in the
-        scenario's inline_images list so the runtime knows to
-        attach + bind the CID. Returns (None, None) on Cancel.
-
-    Pillow is used opportunistically to read natural dimensions when
-    the user picks a file, so width/height auto-populate."""
-    from tkinter import messagebox, filedialog
-    import shutil
-
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Add image")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    result = {"html": None, "filename": None}
-    state = {"src_path": None}
-
-    # Row 1: source file picker
-    file_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    file_row.pack(fill="x", padx=14, pady=(14, 4))
-    ctk.CTkLabel(file_row, text="Image file:", width=80, anchor="w").pack(side="left")
-    file_entry = ctk.CTkEntry(
-        file_row, placeholder_text="click Browse…", width=320,
-    )
-    file_entry.pack(side="left", padx=(4, 4))
-
-    def on_browse() -> None:
-        path = filedialog.askopenfilename(
-            parent=dialog,
-            title="Choose image",
-            filetypes=[
-                ("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
-                ("All files", "*.*"),
-            ],
-        )
-        if not path:
-            return
-        p = Path(path)
-        state["src_path"] = p
-        file_entry.delete(0, "end")
-        file_entry.insert(0, str(p))
-        # Auto-fill width/height from the image's natural dimensions.
-        # Failure (Pillow missing, file unreadable) is silent — the
-        # user can still type values manually.
-        try:
-            from PIL import Image
-            with Image.open(p) as im:
-                w, h = im.size
-            width_entry.delete(0, "end")
-            width_entry.insert(0, str(w))
-            height_entry.delete(0, "end")
-            height_entry.insert(0, str(h))
-        except Exception:
-            pass
-
-    ctk.CTkButton(
-        file_row, text="Browse…", width=90, command=on_browse,
-    ).pack(side="left", padx=(4, 0))
-
-    # Row 2: dimensions
-    dim_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    dim_row.pack(fill="x", padx=14, pady=4)
-    ctk.CTkLabel(dim_row, text="Width:", width=80, anchor="w").pack(side="left")
-    width_entry = ctk.CTkEntry(
-        dim_row, placeholder_text="px (auto)", width=100,
-    )
-    width_entry.pack(side="left", padx=(4, 12))
-    ctk.CTkLabel(dim_row, text="Height:").pack(side="left")
-    height_entry = ctk.CTkEntry(
-        dim_row, placeholder_text="px (auto)", width=100,
-    )
-    height_entry.pack(side="left", padx=(4, 0))
-
-    # Row 3: alt text
-    alt_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    alt_row.pack(fill="x", padx=14, pady=4)
-    ctk.CTkLabel(alt_row, text="Alt text:", width=80, anchor="w").pack(side="left")
-    alt_entry = ctk.CTkEntry(
-        alt_row, placeholder_text="shown if image fails / for accessibility",
-        width=380,
-    )
-    alt_entry.pack(side="left", padx=(4, 0))
-
-    # Row 4: optional clickable link
-    link_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    link_row.pack(fill="x", padx=14, pady=4)
-    ctk.CTkLabel(link_row, text="Link to:", width=80, anchor="w").pack(side="left")
-    link_entry = ctk.CTkEntry(
-        link_row,
-        placeholder_text="optional — clicking the image opens this URL",
-        width=380,
-    )
-    link_entry.pack(side="left", padx=(4, 0))
-
-    # Hint
-    ctk.CTkLabel(
-        dialog,
-        text="The image gets copied to your templates folder and "
-             "embedded via cid: so it travels with the email (no "
-             "remote-image warning on the recipient's side).",
-        font=ctk.CTkFont(size=11),
-        text_color=("gray45", "gray65"),
-        wraplength=480, justify="left",
-    ).pack(padx=14, pady=(6, 4), anchor="w")
-
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(fill="x", padx=14, pady=(8, 14))
-
-    def do_insert() -> None:
-        src = state["src_path"]
-        if not src or not Path(src).exists():
-            messagebox.showerror(
-                "No image selected",
-                "Click Browse… and choose an image file first.",
-                parent=dialog,
-            )
-            return
-        target = templates_dir / src.name
-        if src.resolve() != target.resolve():
-            try:
-                templates_dir.mkdir(parents=True, exist_ok=True)
-                if target.exists():
-                    if not messagebox.askyesno(
-                        "Overwrite?",
-                        f"{src.name} already exists in your templates "
-                        f"folder. Overwrite with the new file?",
-                        parent=dialog,
-                    ):
-                        return
-                shutil.copyfile(src, target)
-            except Exception as e:
-                messagebox.showerror(
-                    "Copy failed",
-                    f"Couldn't copy the image into the templates folder:\n\n{e}",
-                    parent=dialog,
-                )
-                return
-        cid = target.stem
-        # html.escape would over-escape attribute values; for the
-        # subset of chars that matter inside an attribute (`"`) a
-        # simple replace is enough.
-        def _attr(s: str) -> str:
-            return s.replace("&", "&amp;").replace('"', "&quot;")
-        attrs = [f'src="cid:{cid}"']
-        alt = alt_entry.get().strip()
-        if alt:
-            attrs.append(f'alt="{_attr(alt)}"')
-        w = width_entry.get().strip()
-        if w:
-            attrs.append(f'width="{_attr(w)}"')
-        h = height_entry.get().strip()
-        if h:
-            attrs.append(f'height="{_attr(h)}"')
-        attrs.append('style="display:block; border:0;"')
-        img_tag = f"<img {' '.join(attrs)} />"
-        link = link_entry.get().strip()
-        if link:
-            snippet = f'<p>\n  <a href="{_attr(link)}">\n    {img_tag}\n  </a>\n</p>'
-        else:
-            snippet = f"<p>{img_tag}</p>"
-        result["html"] = snippet
-        result["filename"] = target.name
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    def do_cancel() -> None:
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    ctk.CTkButton(
-        btn_row, text="Insert", width=110, command=do_insert,
-    ).pack(side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text="Cancel", width=90, command=do_cancel,
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-    dialog.protocol("WM_DELETE_WINDOW", do_cancel)
-    dialog.bind("<Escape>", lambda _e: do_cancel())
-    dialog.lift()
-    dialog.focus_force()
-
-    parent.wait_window(dialog)
-    return result["html"], result["filename"]
-
-
-def _extract_cf_html_fragment(raw: bytes) -> Optional[str]:
-    """Pull the copied HTML fragment out of a Windows 'HTML Format' clipboard
-    payload. The payload is a header (Version/StartHTML/StartFragment/… BYTE
-    offsets) followed by HTML with <!--StartFragment-->…<!--EndFragment-->
-    markers around the actual selection. Prefer the byte offsets (exact), fall
-    back to the comment markers, then the whole thing."""
-    try:
-        header = raw[:256].decode("ascii", "replace")
-        sf = re.search(r"StartFragment:(\d+)", header)
-        ef = re.search(r"EndFragment:(\d+)", header)
-        if sf and ef:
-            frag = raw[int(sf.group(1)):int(ef.group(1))]
-            return frag.decode("utf-8", "replace")
-    except Exception:
-        pass
-    try:
-        text = raw.decode("utf-8", "replace")
-    except Exception:
-        return None
-    s = text.find("<!--StartFragment-->")
-    e = text.find("<!--EndFragment-->")
-    if s != -1 and e != -1:
-        return text[s + len("<!--StartFragment-->"):e]
-    return text or None
-
-
-def _clipboard_html_fragment() -> Optional[str]:
-    """The clipboard's rich-HTML form (with links/formatting), or None when
-    the clipboard has no HTML (so callers fall back to plain-text paste).
-    Windows-only via pywin32's win32clipboard (already a dependency)."""
-    try:
-        import win32clipboard as wc
-    except Exception:
-        return None
-    try:
-        wc.OpenClipboard()
-    except Exception:
-        return None
-    try:
-        cf = wc.RegisterClipboardFormat("HTML Format")
-        if not wc.IsClipboardFormatAvailable(cf):
-            return None
-        raw = wc.GetClipboardData(cf)
-    except Exception:
-        return None
-    finally:
-        try:
-            wc.CloseClipboard()
-        except Exception:
-            pass
-    if isinstance(raw, str):
-        raw = raw.encode("utf-8", "replace")
-    if not isinstance(raw, (bytes, bytearray)):
-        return None
-    return _extract_cf_html_fragment(bytes(raw))
-
-
-class _EditorHTMLParser(HTMLParser):
-    """Parse simple HTML into a RichTextEditor's Tk Text with editable
-    tags. Companion to RichTextEditor.to_html — handles paragraphs,
-    headings, b/i/u, links, alignment, images, and (for round-tripping
-    older templates) bullet/numbered lists rendered as plain lines."""
-
-    def __init__(self, editor: "RichTextEditor", anchor: str = "end"):
-        super().__init__()
-        self.ed = editor
-        self.t = editor.text
-        # Where parsed content lands: "end" when building the whole document
-        # (set_html), or "insert" to splice at the cursor (rich paste). `_here`
-        # is the matching "current position" index — "end-1c" sits just before
-        # the Text widget's permanent trailing newline; the insert mark needs
-        # no such offset.
-        self.anchor = anchor
-        self._here = "end-1c" if anchor == "end" else "insert"
-        self._inline: list[str] = []        # active bold/italic/underline
-        self._link: Optional[str] = None    # active link tag name
-        self._block_start: Optional[str] = None
-        self._block: str = "p"              # p | h2
-        self._align: str = "left"
-        self._list: list[str] = []          # ul/ol nesting (round-trip only)
-        self._ol_n: list[int] = []
-        self._skip = 0
-        self._pending_nl = False            # emit a newline before next block
-
-    _SKIP = {"style", "script", "head", "title", "meta", "link"}
-
-    def _begin_block(self, block: str, align: str) -> None:
-        if self._pending_nl:
-            self.t.insert(self.anchor, "\n")
-        self._pending_nl = False
-        self._block_start = self.t.index(self._here)
-        self._block = block
-        self._align = align
-
-    def _end_block(self) -> None:
-        if self._block_start is None:
-            return
-        end = self.t.index(self._here)
-        if self._block == "h2":
-            self.t.tag_add("h2", self._block_start, end)
-        elif self._block in ("ul", "ol"):
-            self.t.tag_add(self._block, self._block_start, end)
-        if self._align == "center":
-            self.t.tag_add("align_center", self._block_start, end)
-        elif self._align == "right":
-            self.t.tag_add("align_right", self._block_start, end)
-        self._block_start = None
-        self._pending_nl = True
-
-    @staticmethod
-    def _align_of(attrs: dict) -> str:
-        style = (attrs.get("style", "") or "").lower()
-        if "text-align:center" in style.replace(" ", ""):
-            return "center"
-        if "text-align:right" in style.replace(" ", ""):
-            return "right"
-        return "left"
-
-    def handle_starttag(self, tag, attrs):
-        if tag in self._SKIP:
-            self._skip += 1
-            return
-        if self._skip:
-            return
-        d = dict(attrs)
-        if tag in ("p", "div"):
-            # div is treated as a paragraph break — web/Outlook content uses
-            # it per line; the pending-newline logic keeps siblings on
-            # separate lines without breaking on benign nesting.
-            self._begin_block("p", self._align_of(d))
-        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
-            self._begin_block("h2", self._align_of(d))
-        elif tag == "br":
-            self.t.insert(self.anchor, "\n")
-        elif tag in ("b", "strong"):
-            self._inline.append("bold")
-        elif tag in ("i", "em"):
-            self._inline.append("italic")
-        elif tag == "u":
-            self._inline.append("underline")
-        elif tag == "a":
-            self._link = self.ed._new_link(d.get("href", ""))
-        elif tag in ("ul", "ol"):
-            self._list.append(tag)
-            self._ol_n.append(0)
-        elif tag == "li":
-            if self._pending_nl:
-                self.t.insert(self.anchor, "\n")
-            self._pending_nl = False
-            self._block_start = self.t.index(self._here)
-            kind = "ol" if (self._list and self._list[-1] == "ol") else "ul"
-            self._block, self._align = kind, "left"
-            mstart = self.t.index(self._here)
-            if kind == "ol":
-                self._ol_n[-1] += 1
-                self.t.insert(self.anchor, "%d. " % self._ol_n[-1])
-            else:
-                self.t.insert(self.anchor, "• ")
-            self.t.tag_add("listmarker", mstart, self._here)
-        elif tag == "img":
-            self.ed._insert_image_token(
-                d.get("src", ""), pending_nl=self._pending_nl,
-                anchor=self.anchor)
-            self._pending_nl = True
-
-    def handle_endtag(self, tag):
-        if tag in self._SKIP:
-            self._skip = max(0, self._skip - 1)
-            return
-        if self._skip:
-            return
-        if tag in ("p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li"):
-            self._end_block()
-        elif tag in ("b", "strong"):
-            self._pop("bold")
-        elif tag in ("i", "em"):
-            self._pop("italic")
-        elif tag == "u":
-            self._pop("underline")
-        elif tag == "a":
-            self._link = None
-        elif tag in ("ul", "ol"):
-            if self._list:
-                self._list.pop()
-                self._ol_n.pop()
-
-    def _pop(self, name: str) -> None:
-        for i in range(len(self._inline) - 1, -1, -1):
-            if self._inline[i] == name:
-                del self._inline[i]
-                return
-
-    def _insert(self, text: str) -> None:
-        tags = tuple(self._inline) + ((self._link,) if self._link else ())
-        self.t.insert(self.anchor, text, tags)
-
-    def handle_data(self, data):
-        if self._skip:
-            return
-        collapsed = re.sub(r"\s+", " ", data)
-        if not collapsed.strip() and "\n" in data:
-            return
-        if collapsed:
-            self._insert(collapsed)
-
-    def handle_entityref(self, name):
-        if not self._skip:
-            self._insert(html.unescape(f"&{name};"))
-
-    def handle_charref(self, name):
-        if not self._skip:
-            self._insert(html.unescape(f"&#{name};"))
-
-
-class RichTextEditor:
-    """Lightweight rich-text editor over tk.Text that round-trips to
-    simple, email-friendly HTML. Block model is LINE-BASED: each logical
-    line is one block — a paragraph by default, or a heading; alignment is
-    a per-line attribute. Inline runs carry bold/italic/underline/link
-    tags. {{vars}} are literal text; images are placeholder tokens that
-    serialize back to `<img src="cid:…">`. (Lists are a later phase.)"""
-
-    _INLINE = ("bold", "italic", "underline")
-
-    def __init__(self, parent, base_size: int = 11,
-                 on_add_image: Optional[Callable] = None,
-                 on_insert_var=None):
-        self.frame = ctk.CTkFrame(parent, fg_color="transparent")
-        self.frame.grid_rowconfigure(1, weight=1)
-        self.frame.grid_columnconfigure(0, weight=1)
-        self._base_size = base_size
-        self._link_seq = 0
-        self._links: dict[str, str] = {}
-        self._img_seq = 0
-        self._imgs: dict[str, str] = {}
-        self._on_add_image = on_add_image
-
-        self._build_toolbar()
-
-        wrap = ctk.CTkFrame(self.frame)
-        wrap.grid(row=1, column=0, sticky="nsew")
-        wrap.grid_rowconfigure(0, weight=1)
-        wrap.grid_columnconfigure(0, weight=1)
-        dark = ctk.get_appearance_mode() == "Dark"
-        bg, fg = ("#2b2b2b", "#dce4ee") if dark else ("#ffffff", "#1a1a1a")
-        self.text = tk.Text(
-            wrap, wrap="word", undo=True, borderwidth=0,
-            font=("Segoe UI", base_size), padx=10, pady=8,
-            background=bg, foreground=fg, insertbackground=fg,
-            spacing3=4,
-        )
-        self.text.grid(row=0, column=0, sticky="nsew")
-        vsb = ttk.Scrollbar(wrap, command=self.text.yview)
-        vsb.grid(row=0, column=1, sticky="ns")
-        self.text.configure(yscrollcommand=vsb.set)
-        self._configure_tags()
-        # Enter continues/exits a list; Space drives Markdown shortcuts.
-        self.text.bind("<Return>", self._on_return)
-        self.text.bind("<KeyPress-space>", self._on_space)
-        # Rich paste: keep links/bold/etc. when the clipboard carries HTML.
-        self.text.bind("<<Paste>>", self._on_paste)
-
-    # ----- setup -----
-
-    def _configure_tags(self) -> None:
-        base = tkfont.Font(family="Segoe UI", size=self._base_size)
-        self.text.tag_configure(
-            "bold", font=tkfont.Font(
-                family="Segoe UI", size=self._base_size, weight="bold"))
-        self.text.tag_configure(
-            "italic", font=tkfont.Font(
-                family="Segoe UI", size=self._base_size, slant="italic"))
-        self.text.tag_configure(
-            "underline", font=tkfont.Font(
-                family="Segoe UI", size=self._base_size, underline=True))
-        self.text.tag_configure(
-            "h2", font=tkfont.Font(
-                family="Segoe UI", size=self._base_size + 6, weight="bold"),
-            spacing1=8, spacing3=4)
-        self.text.tag_configure("align_center", justify="center")
-        self.text.tag_configure("align_right", justify="right")
-        self.text.tag_configure("ul", lmargin1=22, lmargin2=38)
-        self.text.tag_configure("ol", lmargin1=22, lmargin2=38)
-        self.text.tag_configure("listmarker")  # marks bullet/number prefix
-        self.text.tag_configure(
-            "image", foreground=("#1f6aa5" if ctk.get_appearance_mode() ==
-                                 "Dark" else "#3a7ebf"))
-        del base
-
-    def _build_toolbar(self) -> None:
-        bar = ctk.CTkFrame(self.frame, fg_color="transparent")
-        bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-
-        def btn(text, cmd, w=34):
-            return ctk.CTkButton(
-                bar, text=text, width=w, height=26, command=cmd,
-                font=ctk.CTkFont(size=12), **SECONDARY_BTN_KWARGS)
-
-        btn("B", lambda: self._toggle_inline("bold"), 30).pack(
-            side="left", padx=1)
-        btn("I", lambda: self._toggle_inline("italic"), 30).pack(
-            side="left", padx=1)
-        btn("U", lambda: self._toggle_inline("underline"), 30).pack(
-            side="left", padx=1)
-        btn("Heading", self._toggle_heading, 64).pack(side="left", padx=(8, 1))
-        btn("• List", lambda: self._toggle_list("ul"), 52).pack(
-            side="left", padx=(6, 1))
-        btn("1. List", lambda: self._toggle_list("ol"), 56).pack(
-            side="left", padx=1)
-        ctk.CTkLabel(
-            bar, text="Align:", font=ctk.CTkFont(size=11),
-        ).pack(side="left", padx=(8, 2))
-        btn("Left", lambda: self._set_align("left"), 48).pack(
-            side="left", padx=1)
-        btn("Center", lambda: self._set_align("center"), 58).pack(
-            side="left", padx=1)
-        btn("Right", lambda: self._set_align("right"), 52).pack(
-            side="left", padx=1)
-        btn("🔗 Link", self._add_link, 64).pack(side="left", padx=(8, 1))
-        if self._on_add_image:
-            btn("🖼 Image", lambda: self._on_add_image(), 70).pack(
-                side="left", padx=1)
-
-    # ----- formatting actions -----
-
-    def _sel_range(self):
-        try:
-            return self.text.index("sel.first"), self.text.index("sel.last")
-        except tk.TclError:
-            return None
-
-    def _toggle_inline(self, tag: str) -> None:
-        rng = self._sel_range()
-        if not rng:
-            return
-        a, b = rng
-        # If every char already has the tag, remove it; else add it.
-        on = all(tag in self.text.tag_names(f"{a}+{i}c")
-                 for i in range(self._span(a, b)))
-        if on:
-            self.text.tag_remove(tag, a, b)
-        else:
-            self.text.tag_add(tag, a, b)
-        self.text.focus_set()
-
-    def _span(self, a: str, b: str) -> int:
-        return max(0, len(self.text.get(a, b)))
-
-    def _line_range(self):
-        sel = self._sel_range()
-        if sel:
-            first = int(sel[0].split(".")[0])
-            last = int(sel[1].split(".")[0])
-        else:
-            first = last = int(self.text.index("insert").split(".")[0])
-        return first, last
-
-    def _line_block_kind(self, ln: int) -> Optional[str]:
-        names = self.text.tag_names(f"{ln}.0")
-        for k in ("h2", "ul", "ol"):
-            if k in names:
-                return k
-        return None
-
-    def _strip_marker(self, ln: int) -> None:
-        """Remove a leading bullet/number marker from a list line."""
-        a = f"{ln}.0"
-        rng = self.text.tag_nextrange("listmarker", a, f"{ln}.end")
-        if rng and self.text.compare(rng[0], "==", a):
-            self.text.delete(rng[0], rng[1])
-
-    def _set_line_block(self, ln: int, block: Optional[str]) -> None:
-        """Set a line's block type: None (paragraph), 'h2', 'ul', or 'ol'.
-        Markers for list lines are (re)generated by _renumber_lists."""
-        a, b = f"{ln}.0", f"{ln + 1}.0"
-        self._strip_marker(ln)
-        for t in ("h2", "ul", "ol"):
-            self.text.tag_remove(t, a, b)
-        if block in ("h2", "ul", "ol"):
-            self.text.tag_add(block, a, b)
-
-    def _renumber_lists(self) -> None:
-        """Rewrite every list line's marker: '• ' for bullets, sequential
-        '1. 2. …' for numbered runs (restarting after any break)."""
-        last = int(self.text.index("end-1c").split(".")[0])
-        prev = None
-        n = 0
-        for ln in range(1, last + 1):
-            kind = self._line_block_kind(ln)
-            kind = kind if kind in ("ul", "ol") else None
-            if kind == "ol":
-                n = (n + 1) if prev == "ol" else 1
-            prev = kind
-            if kind:
-                self._strip_marker(ln)
-                marker = (f"{n}. " if kind == "ol" else "• ")
-                self.text.insert(f"{ln}.0", marker)
-                self.text.tag_add(
-                    "listmarker", f"{ln}.0", f"{ln}.0 + {len(marker)}c")
-                self.text.tag_add(kind, f"{ln}.0", f"{ln + 1}.0")
-
-    def _toggle_heading(self) -> None:
-        first, last = self._line_range()
-        all_h2 = all(self._line_block_kind(ln) == "h2"
-                     for ln in range(first, last + 1))
-        for ln in range(first, last + 1):
-            self._set_line_block(ln, None if all_h2 else "h2")
-        self.text.focus_set()
-
-    def _toggle_list(self, kind: str) -> None:
-        first, last = self._line_range()
-        all_kind = all(self._line_block_kind(ln) == kind
-                       for ln in range(first, last + 1))
-        for ln in range(first, last + 1):
-            self._set_line_block(ln, None if all_kind else kind)
-        self._renumber_lists()
-        self.text.focus_set()
-
-    def _on_return(self, event=None):
-        """Inside a list: Enter starts a new item; Enter on an empty item
-        leaves the list. Elsewhere: default newline (new paragraph)."""
-        ln = int(self.text.index("insert").split(".")[0])
-        kind = self._line_block_kind(ln)
-        if kind not in ("ul", "ol"):
-            return  # default
-        line = self.text.get(f"{ln}.0", f"{ln}.end")
-        content = re.sub(r"^(?:•\s*|\d+\.\s*)", "", line)
-        if not content.strip():
-            self._set_line_block(ln, None)
-            self._renumber_lists()
-            return "break"
-        self.text.insert("insert", "\n")
-        newln = int(self.text.index("insert").split(".")[0])
-        self.text.tag_add(kind, f"{newln}.0", f"{newln + 1}.0")
-        self._renumber_lists()
-        self.text.see("insert")
-        return "break"
-
-    def _on_space(self, event=None):
-        """Markdown shortcuts on the space key. Line-start: '# '→heading,
-        '- '/'* '/'+ '→bullets, '1. '→numbered. Inline (token then space):
-        **bold**, *italic* / _italic_, [text](url)."""
-        ln, col = map(int, self.text.index("insert").split("."))
-        before = self.text.get(f"{ln}.0", "insert")
-        if before == "#":
-            self.text.delete(f"{ln}.0", "insert")
-            self._set_line_block(ln, "h2")
-            return "break"
-        if before in ("-", "*", "+"):
-            self.text.delete(f"{ln}.0", "insert")
-            self._set_line_block(ln, "ul")
-            self._renumber_lists()
-            return "break"
-        if re.fullmatch(r"\d+\.", before):
-            self.text.delete(f"{ln}.0", "insert")
-            self._set_line_block(ln, "ol")
-            self._renumber_lists()
-            return "break"
-        # Inline tokens ending right at the cursor.
-        for pat, tag in (
-            (r"\*\*([^*]+)\*\*$", "bold"),
-            (r"__([^_]+)__$", "bold"),
-            (r"(?<!\*)\*([^*\s][^*]*)\*$", "italic"),
-            (r"(?<!_)_([^_\s][^_]*)_$", "italic"),
-        ):
-            m = re.search(pat, before)
-            if m:
-                a = f"{ln}.{col - len(m.group(0))}"
-                self.text.delete(a, "insert")
-                self.text.insert(a, m.group(1), (tag,))
-                return  # let the space type normally after the run
-        m = re.search(r"\[([^\]]+)\]\(([^)]+)\)$", before)
-        if m:
-            a = f"{ln}.{col - len(m.group(0))}"
-            link_tag = self._new_link(m.group(2))
-            self.text.delete(a, "insert")
-            self.text.insert(a, m.group(1), (link_tag,))
-            return
-        return
-
-    def _set_align(self, how: str) -> None:
-        first, last = self._line_range()
-        for ln in range(first, last + 1):
-            # Tk's `justify` only takes effect when the tag spans the full
-            # line INCLUDING its newline — hence {ln}.0 .. {ln+1}.0.
-            a, b = f"{ln}.0", f"{ln + 1}.0"
-            self.text.tag_remove("align_center", a, b)
-            self.text.tag_remove("align_right", a, b)
-            if how == "center":
-                self.text.tag_add("align_center", a, b)
-            elif how == "right":
-                self.text.tag_add("align_right", a, b)
-        self.text.focus_set()
-
-    def _add_link(self) -> None:
-        rng = self._sel_range()
-        if not rng:
-            from tkinter import messagebox
-            messagebox.showinfo(
-                "Add link", "Select the text to turn into a link first.")
-            return
-        url = ctk.CTkInputDialog(
-            text="Link URL (https://… or mailto:…):", title="Add link").get_input()
-        if not url:
-            return
-        tag = self._new_link(url.strip())
-        self.text.tag_add(tag, rng[0], rng[1])
-        self.text.focus_set()
-
-    def _new_link(self, href: str) -> str:
-        self._link_seq += 1
-        tag = f"link#{self._link_seq}"
-        self._links[tag] = href
-        # Preview link color matches the configured email link color in light
-        # mode (WYSIWYG); dark mode keeps a lighter blue for readability on the
-        # dark editor background.
-        dark = ctk.get_appearance_mode() == "Dark"
-        self.text.tag_configure(
-            tag, foreground=("#79b8ff" if dark else email_link_color()),
-            underline=True)
-        return tag
-
-    def insert_text(self, text: str) -> None:
-        self.text.insert("insert", text)
-        self.text.focus_set()
-
-    def _insert_image_token(self, src: str, pending_nl: bool = False,
-                            anchor: str = "end") -> None:
-        here = "end-1c" if anchor == "end" else "insert"
-        if pending_nl:
-            self.text.insert(anchor, "\n")
-        stem = src[4:] if src.startswith("cid:") else src.rsplit("/", 1)[-1]
-        self._img_seq += 1
-        tag = f"img#{self._img_seq}"
-        self._imgs[tag] = src
-        start = self.text.index(here)
-        self.text.insert(anchor, f"🖼 {stem}")
-        self.text.tag_add("image", start, here)
-        self.text.tag_add(tag, start, here)
-
-    def insert_image(self, src: str) -> None:
-        """Insert an image placeholder at a fresh line near the cursor."""
-        self.text.insert("insert", "\n")
-        stem = src[4:] if src.startswith("cid:") else src.rsplit("/", 1)[-1]
-        self._img_seq += 1
-        tag = f"img#{self._img_seq}"
-        self._imgs[tag] = src if src.startswith("cid:") else f"cid:{stem}"
-        start = self.text.index("insert")
-        self.text.insert("insert", f"🖼 {stem}")
-        self.text.tag_add("image", start, "insert")
-        self.text.tag_add(tag, start, "insert")
-        self.text.insert("insert", "\n")
-        self.text.focus_set()
-
-    # ----- HTML <-> editor -----
-
-    def set_html(self, html_text: str) -> None:
-        self.text.delete("1.0", "end")
-        for t in list(self._links):
-            self._links.pop(t, None)
-        self._imgs.clear()
-        self._link_seq = self._img_seq = 0
-        parser = _EditorHTMLParser(self)
-        try:
-            parser.feed(html_text or "")
-            parser.close()
-        except Exception:
-            # Fall back to dropping the raw text in unstyled.
-            self.text.insert("1.0", html_text or "")
-        # Trim a leading blank line the block logic may have produced.
-        if self.text.get("1.0", "1.end").strip() == "" and \
-                int(self.text.index("end-1c").split(".")[0]) > 1:
-            self.text.delete("1.0", "2.0")
-        self._renumber_lists()  # normalize bullet/number markers
-        self.text.edit_reset()
-
-    def _on_paste(self, event=None):
-        """Paste rich content (links, bold, etc.) when the clipboard carries
-        HTML, by parsing it in at the cursor. With no HTML on the clipboard,
-        returns None so Tk's default plain-text paste runs unchanged."""
-        frag = _clipboard_html_fragment()
-        if not frag or not frag.strip():
-            return None  # plain text only -> let the default <<Paste>> proceed
-        try:
-            if self.text.tag_ranges("sel"):
-                self.text.delete("sel.first", "sel.last")
-        except Exception:
-            pass
-        parser = _EditorHTMLParser(self, anchor="insert")
-        try:
-            parser.feed(frag)
-            parser.close()
-        except Exception:
-            pass  # best-effort: whatever parsed before the error stays
-        self._renumber_lists()
-        try:
-            self.text.see("insert")
-        except Exception:
-            pass
-        self.text.focus_set()
-        return "break"  # consumed — skip the default plain-text paste
-
-    def _inline_key_at(self, idx: str):
-        names = self.text.tag_names(idx)
-        inline = tuple(n for n in self._INLINE if n in names)
-        link = next((n for n in names if n.startswith("link#")), None)
-        return inline, link
-
-    def _img_tag_on_line(self, ln: int) -> Optional[str]:
-        for n in self.text.tag_names(f"{ln}.0"):
-            if n.startswith("img#"):
-                return n
-        return None
-
-    def _serialize_line(self, ln: int) -> str:
-        line = self.text.get(f"{ln}.0", f"{ln}.end")
-        runs = []  # (text, (inline_tuple, link))
-        for col, ch in enumerate(line):
-            key = self._inline_key_at(f"{ln}.{col}")
-            if runs and runs[-1][1] == key:
-                runs[-1][0].append(ch)
-            else:
-                runs.append(([ch], key))
-        out = []
-        color = email_link_color()
-        for chars, (inline, link) in runs:
-            text = html.escape("".join(chars))
-            opens, closes = "", ""
-            if link:
-                href = html.escape(self._links.get(link, ""), quote=True)
-                # Color the link, and wrap its text in a <span> carrying the
-                # SAME color: Outlook's Word engine routinely strips color off
-                # the <a> itself but honors it on a child element, so the span
-                # is what actually makes the color stick. Color comes from
-                # config (Settings → Email link color; default blue).
-                opens += (f'<a href="{href}" '
-                          f'style="color:{color};text-decoration:underline;">'
-                          f'<span style="color:{color};">')
-                closes = "</span></a>" + closes
-            for t, (o, c) in (("bold", ("<b>", "</b>")),
-                              ("italic", ("<i>", "</i>")),
-                              ("underline", ("<u>", "</u>"))):
-                if t in inline:
-                    opens += o
-                    closes = c + closes
-            out.append(opens + text + closes)
-        return "".join(out)
-
-    def to_html(self) -> str:
-        blocks = []
-        last = int(self.text.index("end-1c").split(".")[0])
-        ln = 1
-        while ln <= last:
-            img_tag = self._img_tag_on_line(ln)
-            if img_tag:
-                src = self._imgs.get(img_tag, "")
-                if src:
-                    blocks.append(f'<img src="{html.escape(src, quote=True)}">')
-                ln += 1
-                continue
-            names0 = self.text.tag_names(f"{ln}.0")
-            if "ul" in names0 or "ol" in names0:
-                kind = "ul" if "ul" in names0 else "ol"
-                items = []
-                while ln <= last and kind in self.text.tag_names(f"{ln}.0"):
-                    raw = self.text.get(f"{ln}.0", f"{ln}.end")
-                    if raw.strip():
-                        inner = re.sub(r"^(?:•\s*|\d+\.\s*)", "",
-                                       self._serialize_line(ln))
-                        items.append(f"<li>{inner}</li>")
-                    ln += 1
-                if items:
-                    blocks.append(f"<{kind}>" + "".join(items) + f"</{kind}>")
-                continue
-            raw = self.text.get(f"{ln}.0", f"{ln}.end")
-            if not raw.strip():
-                ln += 1
-                continue
-            inner = self._serialize_line(ln)
-            align = ("center" if "align_center" in names0
-                     else "right" if "align_right" in names0 else "")
-            style = f' style="text-align:{align}"' if align else ""
-            if "h2" in names0:
-                blocks.append(f"<h2{style}>{inner}</h2>")
-            else:
-                blocks.append(f"<p{style}>{inner}</p>")
-            ln += 1
-        return "\n".join(blocks) + ("\n" if blocks else "")
-
-
-def prompt_html_template_editor(
-    parent,
-    path: Path,
-    custom_var_names: Optional[list[str]] = None,
-    on_image_added: Optional[Callable[[str], None]] = None,
-) -> bool:
-    """Modal HTML editor for an email body template. Returns True if
-    the file was saved (Save, Save as, or Save & Open in MS Word).
-
-    Features:
-    - Toolbar with "Insert variable" buttons grouped by category;
-      one click drops the corresponding `{{var}}` at the cursor.
-    - Font family + size dropdowns (display-only — affects the
-      editor view, not the rendered email which uses its own CSS /
-      Outlook's defaults).
-    - Ctrl+MouseWheel and Ctrl+= / Ctrl+- to zoom.
-    - Save as button for cloning a template under a new name.
-    - Save & Open in MS Word opens via COM, falls back to the OS
-      default if Word isn't installed."""
-    from tkinter import messagebox
-
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title(f"Edit template — {path.name}")
-    _restore_dialog_geometry(dialog, "html_template_editor")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-
-    # Holders so closures can mutate. `current["path"]` lets Save-as
-    # change which file subsequent Saves write to.
-    saved = {"value": False}
-    # Editor font is Segoe UI (Windows system font, readable for
-    # prose + light HTML). Not user-configurable — fewer knobs to
-    # tune. The size is configurable for accessibility / quick zoom.
-    current = {
-        "path": Path(path),
-        "font_family": "Segoe UI",
-        "font_size": font_size("editor"),  # seed from the 'editor' channel
-    }
-
-    # ---- Toolbar — insert-variable rows + font/size selectors. ----
-    toolbar = ctk.CTkFrame(dialog, fg_color="transparent")
-    toolbar.pack(fill="x", padx=8, pady=(8, 0))
-
-    # Edit mode: "rich" (WYSIWYG) or "html" (raw source). Defaults to
-    # rich for a friendly start; existing templates load into it and the
-    # user can flip to HTML for fine control.
-    mode = {"value": "rich"}
-
-    mode_row = ctk.CTkFrame(toolbar, fg_color="transparent")
-    mode_row.pack(fill="x", pady=(0, 2))
-    mode_btn = ctk.CTkButton(
-        mode_row, text="</> Edit HTML", width=130, height=26,
-        command=lambda: _toggle_mode(),
-        font=ctk.CTkFont(size=11), **SECONDARY_BTN_KWARGS,
-    )
-    mode_btn.pack(side="left")
-    ctk.CTkLabel(
-        mode_row,
-        text="  Rich editor — select text, then B / I / U, H, align, 🔗. "
-             "Switch to HTML for raw control.",
-        font=ctk.CTkFont(size=10), text_color=("gray45", "gray65"),
-    ).pack(side="left", padx=(6, 0))
-
-    def insert_var(var: str) -> None:
-        token = f"{{{{{var}}}}}"
-        if mode["value"] == "rich":
-            rich.insert_text(token)
-        else:
-            text_box.insert("insert", token)
-            text_box.focus_force()
-
-    def _make_row(label: str, items: list[tuple[str, str]],
-                  highlight: bool = False):
-        row = ctk.CTkFrame(toolbar, fg_color="transparent")
-        row.pack(fill="x", pady=2)
-        ctk.CTkLabel(
-            row, text=label, width=70, anchor="w",
-            font=ctk.CTkFont(size=11, weight="bold"),
-        ).pack(side="left", padx=(0, 4))
-        for display, var in items:
-            kwargs = dict(SECONDARY_BTN_KWARGS)
-            if highlight:
-                kwargs["fg_color"] = ("#fff3c4", "#5a4500")
-                kwargs["text_color"] = ("gray10", "gray95")
-            ctk.CTkButton(
-                row, text=display, width=92, height=24,
-                command=lambda v=var: insert_var(v),
-                font=ctk.CTkFont(size=11),
-                **kwargs,
-            ).pack(side="left", padx=2)
-
-    _make_row("Student:", _TEMPLATE_INSERT_VARS_STUDENT)
-    _make_row(
-        "Mentor:",
-        _TEMPLATE_INSERT_VARS_PM + _TEMPLATE_INSERT_VARS_USER,
-    )
-    if custom_var_names:
-        _make_row(
-            "Variables:",
-            [(v, v) for v in custom_var_names],
-            highlight=True,
-        )
-
-    # Insert-image button row. Opens the image dialog, copies the
-    # picked file into templates_dir() (if not already there), drops a
-    # `<img src="cid:STEM">` snippet at the cursor, and registers
-    # the filename on the scenario's inline_images list via the
-    # `on_image_added` callback.
-    insert_row = ctk.CTkFrame(toolbar, fg_color="transparent")
-    insert_row.pack(fill="x", pady=(6, 2))
-    ctk.CTkLabel(
-        insert_row, text="Insert:", width=70, anchor="w",
-        font=ctk.CTkFont(size=11, weight="bold"),
-    ).pack(side="left", padx=(0, 4))
-
-    def on_add_image() -> None:
-        html, filename = prompt_add_image_dialog(dialog, templates_dir())
-        if html:
-            if mode["value"] == "rich":
-                stem = Path(filename).stem if filename else ""
-                rich.insert_image(f"cid:{stem}" if stem else html)
-            else:
-                text_box.insert("insert", "\n" + html + "\n")
-                text_box.focus_force()
-            if on_image_added and filename:
-                try:
-                    on_image_added(filename)
-                except Exception:
-                    pass
-
-    ctk.CTkButton(
-        insert_row, text="🖼  Add image…", height=24,
-        command=on_add_image,
-        font=ctk.CTkFont(size=11),
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=2)
-
-    # View-size row. EDITOR VIEW ONLY — the sent email's font/size is
-    # set per-scenario in the email section of the editor (so it
-    # applies to every fire), not here.
-    size_row = ctk.CTkFrame(toolbar, fg_color="transparent")
-    size_row.pack(fill="x", pady=(6, 2))
-    ctk.CTkLabel(
-        size_row, text="View size:", width=70, anchor="w",
-        font=ctk.CTkFont(size=11, weight="bold"),
-    ).pack(side="left", padx=(0, 4))
-
-    def apply_font() -> None:
-        n = current["font_size"]
-        try:
-            text_box.configure(font=ctk.CTkFont(
-                family=current["font_family"], size=n))
-        except Exception:
-            pass
-        try:
-            rich.set_base_size(n)  # resize the rich view + its tag fonts
-        except Exception:
-            pass
-        # Drive the shared 'editor' channel (note bodies + persistence).
-        try:
-            set_font_size("editor", n)
-        except Exception:
-            pass
-
-    def on_size_change(value: str) -> None:
-        try:
-            current["font_size"] = max(8, min(40, int(value)))
-        except (ValueError, TypeError):
-            return
-        apply_font()
-
-    size_combo = ctk.CTkComboBox(
-        size_row, values=["8", "10", "11", "12", "13", "14", "16", "18", "22"],
-        width=70, command=on_size_change,
-    )
-    size_combo.set(str(current["font_size"]))
-    size_combo.pack(side="left")
-    ctk.CTkLabel(
-        size_row,
-        text="(editor view only — set the sent email's font in the "
-             "action's email section)",
-        font=ctk.CTkFont(size=10), text_color=("gray45", "gray65"),
-    ).pack(side="left", padx=(10, 0))
-
-    # ---- Action row (created + reserved at the BOTTOM now, populated
-    # later). Packing it before the editor guarantees the buttons keep
-    # their space even though the editor area expands to fill. ----
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(fill="x", padx=8, pady=(0, 8), side="bottom")
-
-    # ---- Text editor. ----
-    text_box = ctk.CTkTextbox(
-        dialog, wrap="word",
-        font=ctk.CTkFont(
-            family=current["font_family"], size=current["font_size"],
-        ),
-    )
-    text_box.pack(fill="both", expand=True, padx=8, pady=6)
-    try:
-        content = current["path"].read_text(encoding="utf-8")
-    except FileNotFoundError:
-        content = ""
-    except Exception as e:
-        content = f"<!-- failed to load: {e} -->"
-    text_box.insert("1.0", content)
-    text_box.focus_force()
-    text_box.mark_set("insert", "1.0")
-
-    # ---- Syntax highlighting. ----
-    # CTkTextbox wraps a tk.Text — its tag system handles colored
-    # ranges. We do a full re-tag on every edit (debounced ~120ms)
-    # rather than incremental scanning; for template-sized buffers
-    # this is well under a millisecond per pass and avoids tricky
-    # boundary bookkeeping when text is inserted via the variable
-    # buttons.
-    inner_text = text_box._textbox
-    highlight_after = {"id": None}
-
-    def apply_highlighting() -> None:
-        mode = ctk.get_appearance_mode()
-        colors = _HTML_HIGHLIGHT_COLORS.get(
-            mode, _HTML_HIGHLIGHT_COLORS["Light"],
-        )
-        # tag_configure is idempotent; re-applying same color is fine
-        # and lets us pick up appearance-mode changes for free.
-        inner_text.tag_configure("html_comment", foreground=colors["comment"])
-        inner_text.tag_configure("html_tag",     foreground=colors["tag"])
-        inner_text.tag_configure("html_value",   foreground=colors["value"])
-        inner_text.tag_configure(
-            "html_var",
-            foreground=colors["var_fg"], background=colors["var_bg"],
-        )
-        for tag in ("html_comment", "html_tag", "html_value", "html_var"):
-            inner_text.tag_remove(tag, "1.0", "end")
-
-        buf = inner_text.get("1.0", "end-1c")
-        if not buf:
-            return
-
-        def _idx(off: int) -> str:
-            return inner_text.index(f"1.0 + {off} chars")
-
-        # Pass 1 — comments. Done first because they can legally
-        # contain `<` / `>` / `{{` and shouldn't be re-colored by
-        # later passes.
-        comment_ranges: list[tuple[int, int]] = []
-        for m in _HTML_HIGHLIGHT_PATTERNS["comment"].finditer(buf):
-            comment_ranges.append((m.start(), m.end()))
-            inner_text.tag_add("html_comment", _idx(m.start()), _idx(m.end()))
-
-        def _in_comment(pos: int) -> bool:
-            return any(a <= pos < b for a, b in comment_ranges)
-
-        # Pass 2 — tags + their quoted attribute values. We do values
-        # nested per-tag-match so a stray `"…"` in body text doesn't
-        # get colored as if it were an attribute value.
-        for m in _HTML_HIGHLIGHT_PATTERNS["tag"].finditer(buf):
-            if _in_comment(m.start()):
-                continue
-            inner_text.tag_add("html_tag", _idx(m.start()), _idx(m.end()))
-            tag_text = m.group(0)
-            for vm in _HTML_HIGHLIGHT_PATTERNS["value"].finditer(tag_text):
-                inner_text.tag_add(
-                    "html_value",
-                    _idx(m.start() + vm.start()),
-                    _idx(m.start() + vm.end()),
-                )
-
-        # Pass 3 — template variables.
-        for m in _HTML_HIGHLIGHT_PATTERNS["var"].finditer(buf):
-            if _in_comment(m.start()):
-                continue
-            inner_text.tag_add("html_var", _idx(m.start()), _idx(m.end()))
-
-    def on_text_modified(_event=None) -> None:
-        # Tk fires <<Modified>> exactly once when the modified flag
-        # flips from False → True. Reset it here so subsequent edits
-        # fire again. Debounce so a long paste doesn't trigger N
-        # re-passes mid-paste.
-        if not inner_text.edit_modified():
-            return
-        inner_text.edit_modified(False)
-        aid = highlight_after["id"]
-        if aid is not None:
-            try: text_box.after_cancel(aid)
-            except Exception: pass
-        highlight_after["id"] = text_box.after(120, apply_highlighting)
-
-    inner_text.bind("<<Modified>>", on_text_modified)
-    # Initial pass — the loaded buffer needs coloring before the user
-    # types anything. Run after a 0ms tick so the textbox is fully
-    # laid out (tag_add can no-op against a not-yet-laid-out widget).
-    text_box.after(0, apply_highlighting)
-
-    # ---- Rich-text editor (alternate view, default). ----
-    rich = RichTextEditor(
-        dialog, base_size=current["font_size"], on_add_image=on_add_image)
-
-    def _toggle_mode() -> None:
-        if mode["value"] == "rich":
-            # Rich → HTML: serialize and show the raw editor.
-            try:
-                html_src = rich.to_html()
-            except Exception as e:
-                messagebox.showerror("Switch to HTML failed", str(e))
-                return
-            text_box.delete("1.0", "end")
-            text_box.insert("1.0", html_src)
-            rich.frame.pack_forget()
-            # Pack AFTER btn_row (already reserved at the bottom) so the
-            # expanding editor fills above it and never squeezes it out.
-            text_box.pack(fill="both", expand=True, padx=8, pady=6)
-            mode["value"] = "html"
-            mode_btn.configure(text="✏ Rich editor")
-            text_box.after(0, apply_highlighting)
-            text_box.focus_set()
-        else:
-            # HTML → Rich: parse the raw source into the rich view.
-            try:
-                rich.set_html(text_box.get("1.0", "end-1c"))
-            except Exception as e:
-                messagebox.showerror("Switch to rich editor failed", str(e))
-                return
-            text_box.pack_forget()
-            rich.frame.pack(fill="both", expand=True, padx=8, pady=6)
-            mode["value"] = "rich"
-            mode_btn.configure(text="</> Edit HTML")
-            rich.text.focus_set()
-
-    # Start in rich mode — UNLESS the template has a table (still not
-    # round-trippable), in which case open in HTML so saving can't drop it.
-    # Lists ARE supported now, so they open in rich.
-    start_rich = not re.search(r"<\s*table\b", content or "", re.IGNORECASE)
-    if start_rich:
-        try:
-            rich.set_html(content)
-            text_box.pack_forget()
-            rich.frame.pack(fill="both", expand=True, padx=8, pady=6)
-            mode_btn.configure(text="</> Edit HTML")
-        except Exception:
-            start_rich = False
-    if not start_rich:
-        # Stay in HTML mode (text_box already packed); offer rich opt-in.
-        mode["value"] = "html"
-        mode_btn.configure(text="✏ Rich editor")
-
-    def _active_html() -> str:
-        """Current template HTML from whichever view is active."""
-        if mode["value"] == "rich":
-            return rich.to_html()
-        return text_box.get("1.0", "end-1c")
-
-    # Ctrl+MouseWheel and Ctrl+= / Ctrl+- to zoom the editor view.
-    def zoom(delta: int) -> str:
-        new_size = max(8, min(40, current["font_size"] + delta))
-        if new_size != current["font_size"]:
-            current["font_size"] = new_size
-            size_combo.set(str(new_size))
-            apply_font()
-        return "break"  # prevent default scroll
-
-    text_box.bind(
-        "<Control-MouseWheel>",
-        lambda e: zoom(1 if e.delta > 0 else -1),
-    )
-    text_box.bind("<Control-plus>", lambda _e: zoom(1))
-    text_box.bind("<Control-equal>", lambda _e: zoom(1))  # Ctrl+= (no shift)
-    text_box.bind("<Control-minus>", lambda _e: zoom(-1))
-
-    # ---- Action row. ----
-    def write_to_disk(target_path: Optional[Path] = None) -> bool:
-        tgt = target_path or current["path"]
-        try:
-            tgt.parent.mkdir(parents=True, exist_ok=True)
-            tgt.write_text(_active_html(), encoding="utf-8")
-            return True
-        except Exception as e:
-            messagebox.showerror("Save failed", str(e))
-            return False
-
-    def do_save() -> None:
-        if write_to_disk():
-            saved["value"] = True
-            _save_dialog_geometry(dialog, "html_template_editor")
-            try: dialog.grab_release()
-            except Exception: pass
-            try: dialog.destroy()
-            except Exception: pass
-
-    def do_save_as() -> None:
-        sub = ctk.CTkInputDialog(
-            text="Save current content under filename (without .html):",
-            title="Save as",
-        )
-        raw = sub.get_input()
-        if not raw or not raw.strip():
-            return
-        new_name = raw.strip()
-        if not new_name.lower().endswith(".html"):
-            new_name += ".html"
-        new_path = current["path"].parent / new_name
-        if new_path.exists():
-            if not messagebox.askyesno(
-                "Overwrite?",
-                f"{new_name} already exists. Overwrite?",
-            ):
-                return
-        if not write_to_disk(new_path):
-            return
-        # Switch the editor's working file to the new path so further
-        # Saves go there too.
-        current["path"] = new_path
-        dialog.title(f"Edit template — {new_path.name}")
-        saved["value"] = True
-        messagebox.showinfo("Saved", f"Saved as {new_name}.")
-
-    def do_open_externally() -> None:
-        """Save buffer + hand the file to whatever app Windows has
-        associated with .html (VS Code if user sets it, Notepad++,
-        Sublime, etc.). Replaces the previous Word-via-COM flow,
-        which was unreliable for some users."""
-        if not write_to_disk():
-            return
-        saved["value"] = True
-        ok, msg = _open_externally(current["path"])
-        if not ok:
-            messagebox.showerror("Couldn't open file", msg)
-            return
-        _save_dialog_geometry(dialog, "html_template_editor")
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    def do_cancel() -> None:
-        _save_dialog_geometry(dialog, "html_template_editor")
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    def do_preview() -> None:
-        """Render the current buffer to a temp HTML file and open it
-        in the default browser. Read-only — for layout / styling
-        review only. `{{var}}` placeholders are swapped for human-
-        readable `<LABEL>` text so the user can see where values
-        will land. CID image references are rewritten to relative
-        filenames so the browser can load images from templates_dir()
-        (where the preview itself is written)."""
-        import webbrowser
-        import re as _re
-        buffer = _active_html()
-        rendered = email_template.render_with_placeholders(buffer)
-
-        def _fix_cid(m: _re.Match) -> str:
-            stem = m.group(1)
-            for f in sorted(templates_dir().glob(f"{stem}.*")):
-                if f.suffix.lower() != ".html":
-                    return f'src="{f.name}"'
-            return m.group(0)  # leave alone if no matching file
-
-        rendered = _re.sub(r'src="cid:([^"]+)"', _fix_cid, rendered)
-        # Light browser-side styling for the preview pane only —
-        # gives the email a readable margin instead of butting up
-        # against the viewport edge. None of this CSS ships in the
-        # actual sent email.
-        shell = (
-            '<!DOCTYPE html>\n<html><head>'
-            '<meta charset="utf-8"><title>Template preview</title>'
-            '<style>body { max-width: 720px; margin: 24px auto; '
-            'padding: 0 24px; font-family: Segoe UI, sans-serif; }'
-            '.preview-banner { background:#fff3c4; color:#5a4500; '
-            'padding:8px 12px; border-radius:6px; margin-bottom:16px; '
-            'font-size:12px; }</style></head><body>'
-            '<div class="preview-banner">Preview — read-only · '
-            '<code>{{vars}}</code> shown as <code>&lt;LABEL&gt;</code> · '
-            'cid: refs rewritten to filenames · close the tab when done.'
-            '</div>\n' + rendered + '\n</body></html>'
-        )
-        preview_path = templates_dir() / "_preview.html"
-        try:
-            templates_dir().mkdir(parents=True, exist_ok=True)
-            preview_path.write_text(shell, encoding="utf-8")
-        except Exception as e:
-            messagebox.showerror("Preview failed", str(e))
-            return
-        uri = preview_path.as_uri()
-        # Prefer Edge so the preview always lands in a known, stable
-        # renderer (matches the runtime Playwright Edge). If Edge
-        # isn't reachable, fall back to the user's default browser
-        # so the preview still appears somewhere reasonable.
-        if not _open_in_edge(uri):
-            webbrowser.open(uri, new=2)
-
-    ctk.CTkButton(
-        btn_row, text="Save", command=do_save, width=100,
-    ).pack(side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text="Save as…", command=do_save_as, width=100,
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text="Preview", command=do_preview, width=100,
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text="Save & Open externally",
-        command=do_open_externally, width=180,
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text="Cancel", command=do_cancel, width=90,
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="right", padx=4)
-
-    dialog.bind("<Escape>", lambda _e: do_cancel())
-    dialog.protocol("WM_DELETE_WINDOW", do_cancel)
-
-    parent.wait_window(dialog)
-    return saved["value"]
-
-
-def _restore_dialog_geometry(dialog, key: str) -> None:
-    geom = _DIALOG_GEOMETRY.get(key, _DIALOG_DEFAULTS.get(key, ""))
-    if geom:
-        try:
-            dialog.geometry(geom)
-        except Exception:
-            dialog.geometry(_DIALOG_DEFAULTS.get(key, "400x300"))
-
-
-def _save_dialog_geometry(dialog, key: str) -> None:
-    try:
-        _DIALOG_GEOMETRY[key] = dialog.geometry()
-    except Exception:
-        pass
-
-
-def _fit_dialog_to_content(dialog, min_w: int = 0, min_h: int = 0,
-                           near_mouse: bool = False) -> None:
-    """Grow a popup so all of its packed content is visible, then pin that as
-    the minimum size. Needed for dialogs whose height varies with optional
-    sections (e.g. the note editor's Essential Actions block, which sits at
-    the bottom and was getting clipped when a smaller geometry was restored
-    from an earlier no-EA session). Never shrinks an already-larger window,
-    and clamps to the screen so it can't open off-edge.
-
-    `near_mouse` places the (sized) window just up-left of the pointer so the
-    cursor barely travels, instead of keeping any remembered position."""
-    try:
-        dialog.update_idletasks()
-        req_w = max(int(min_w), dialog.winfo_reqwidth())
-        req_h = max(int(min_h), dialog.winfo_reqheight())
-        sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
-        # Don't exceed the screen (leave a margin for the taskbar/title bar).
-        max_w = max(req_w, sw - 40)
-        max_h = max(req_h, sh - 80)
-        req_w, req_h = min(req_w, max_w), min(req_h, max_h)
-        geo = dialog.geometry()  # "WxH+X+Y" (W/H may be the 1x1 placeholder)
-        m = re.match(r"(\d+)x(\d+)", geo)
-        cur_w = int(m.group(1)) if m else 0
-        cur_h = int(m.group(2)) if m else 0
-        new_w = min(max(cur_w, req_w), max_w)
-        new_h = min(max(cur_h, req_h), max_h)
-        dialog.minsize(req_w, req_h)
-        if near_mouse:
-            try:
-                px, py = dialog.winfo_pointerxy()
-            except Exception:
-                px, py = 0, 0
-            x = min(max(px - 30, 0), max(sw - new_w, 0))
-            y = min(max(py - 30, 0), max(sh - new_h, 0))
-            dialog.geometry(f"{new_w}x{new_h}+{x}+{y}")
-        else:
-            # Keep a remembered position; for a fresh (1x1 placeholder)
-            # dialog, set size only and let the window manager place it.
-            has_pos = cur_w > 1 and cur_h > 1 and "+" in geo
-            pos = geo[geo.index("+"):] if has_pos else ""
-            dialog.geometry(f"{new_w}x{new_h}{pos}")
-    except Exception:
-        pass
-
-
-def prompt_calendar_pick(parent, initial_date=None):
-    """Small monthly calendar picker. Click a day → returns that
-    `datetime.date`. Returns None on cancel. Built from CTk widgets
-    + Python's stdlib `calendar` module — no third-party deps.
-
-    Used by FilterRow's date operators (is before / is after / is
-    on) so users can click a date instead of typing the format."""
-    import calendar as _cal
-    from datetime import date as _date
-
-    today = _date.today()
-    base = initial_date if initial_date else today
-    state = {"year": base.year, "month": base.month, "selected": None}
-
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Pick a date")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    # Pop up near the mouse so the cursor barely travels (general practice
-    # for small popups). Offset slightly up-left so the pointer lands just
-    # inside, and clamp to the screen so it never opens off-edge.
-    _w, _h = 280, 300
-    try:
-        _px, _py = parent.winfo_pointerxy()
-        _sw, _sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
-        _x = min(max(_px - 20, 0), max(_sw - _w, 0))
-        _y = min(max(_py - 20, 0), max(_sh - _h, 0))
-        dialog.geometry(f"{_w}x{_h}+{_x}+{_y}")
-    except Exception:
-        dialog.geometry(f"{_w}x{_h}")
-    # Topmost-claw-back (same pattern as our other modals so a busy
-    # background window can't bury it).
-    dialog.lift()
-    dialog.focus_force()
-    dialog.after(120, lambda: (dialog.lift(), dialog.focus_force()))
-
-    # Header: ◀ Month Year ▶
-    header = ctk.CTkFrame(dialog, fg_color="transparent")
-    header.pack(fill="x", padx=8, pady=(8, 0))
-
-    def _change_month(delta: int) -> None:
-        m = state["month"] + delta
-        y = state["year"]
-        while m > 12:
-            m -= 12
-            y += 1
-        while m < 1:
-            m += 12
-            y -= 1
-        state["month"] = m
-        state["year"] = y
-        _refresh()
-
-    ctk.CTkButton(
-        header, text="◀", width=32, height=28,
-        command=lambda: _change_month(-1),
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left")
-    month_label = ctk.CTkLabel(
-        header, text="", font=ctk.CTkFont(size=13, weight="bold"),
-    )
-    month_label.pack(side="left", expand=True)
-    ctk.CTkButton(
-        header, text="▶", width=32, height=28,
-        command=lambda: _change_month(1),
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="right")
-
-    # Day grid
-    grid = ctk.CTkFrame(dialog, fg_color="transparent")
-    grid.pack(padx=8, pady=4)
-    # Sunday-first matches the US convention WGU students likely
-    # use. (Tk's calendar.firstweekday=6 starts on Sunday.)
-    dow_labels = ("Su", "Mo", "Tu", "We", "Th", "Fr", "Sa")
-    for i, d in enumerate(dow_labels):
-        ctk.CTkLabel(
-            grid, text=d, width=32, anchor="center",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=("gray40", "gray70"),
-        ).grid(row=0, column=i, padx=1, pady=1)
-
-    day_buttons: list[ctk.CTkButton] = []
-
-    def _select(day: int) -> None:
-        state["selected"] = _date(state["year"], state["month"], day)
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    def _refresh() -> None:
-        month_label.configure(
-            text=_date(state["year"], state["month"], 1).strftime("%B %Y")
-        )
-        for b in day_buttons:
-            try: b.destroy()
-            except Exception: pass
-        day_buttons.clear()
-        cal_iter = _cal.Calendar(firstweekday=6).monthdayscalendar(
-            state["year"], state["month"],
-        )
-        for row_idx, week in enumerate(cal_iter, start=1):
-            for col_idx, day in enumerate(week):
-                if day == 0:
-                    continue
-                btn_kwargs = dict(SECONDARY_BTN_KWARGS)
-                # Highlight today in the primary accent color so it's
-                # easy to find on the grid.
-                if (state["year"], state["month"], day) == (
-                    today.year, today.month, today.day
-                ):
-                    btn_kwargs.pop("fg_color", None)
-                    btn_kwargs.pop("text_color", None)
-                btn = ctk.CTkButton(
-                    grid, text=str(day), width=32, height=28,
-                    command=lambda d=day: _select(d),
-                    font=ctk.CTkFont(size=11),
-                    **btn_kwargs,
-                )
-                btn.grid(row=row_idx, column=col_idx, padx=1, pady=1)
-                day_buttons.append(btn)
-
-    # Bottom: jump-to-today + cancel.
-    bottom = ctk.CTkFrame(dialog, fg_color="transparent")
-    bottom.pack(fill="x", padx=8, pady=(4, 8))
-
-    def _jump_today() -> None:
-        state["year"] = today.year
-        state["month"] = today.month
-        _refresh()
-
-    ctk.CTkButton(
-        bottom, text="Today", width=70, height=26,
-        command=_jump_today, **SECONDARY_BTN_KWARGS,
-    ).pack(side="left")
-    ctk.CTkButton(
-        bottom, text="Cancel", width=70, height=26,
-        command=lambda: (
-            dialog.grab_release() if dialog.winfo_exists() else None,
-            dialog.destroy() if dialog.winfo_exists() else None,
-        ),
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="right")
-
-    dialog.bind("<Escape>", lambda _e: dialog.destroy())
-    dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
-
-    _refresh()
-    parent.wait_window(dialog)
-    return state["selected"]
-
-
-def prompt_find_and_pick(
-    parent,
-    do_search: Callable[[str], list[str]],
-) -> Optional[str]:
-    """Combined find-and-pick dialog: search entry on top, results list
-    below. Workflow: user types query → Enter → results appear below;
-    user can retype to refine, OR click a name to commit. Returns the
-    selected name, or None on cancel.
-
-    `do_search(query)` runs on the main thread but is expected to
-    block (via wait_variable inside) while the worker performs the
-    actual search. Returns the list of matching names (exact tiers
-    first, then fuzzy fallback as the worker decides).
-
-    The dialog reopens at its last on-screen size/position within the
-    session (key 'find_and_pick')."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Find student")
-    _restore_dialog_geometry(dialog, "find_and_pick")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-
-    result: dict = {"value": None}
-
-    ctk.CTkLabel(
-        dialog,
-        text="Type the student's name and press Enter. Matches appear below.",
-        justify="left",
-    ).pack(padx=12, pady=(12, 4), anchor="w")
-
-    entry = ctk.CTkEntry(dialog, placeholder_text="e.g. Joshua Jacobs")
-    entry.pack(fill="x", padx=12, pady=(0, 6))
-    entry.focus_force()
-    dialog.after(50, entry.focus_force)
-
-    results_frame = ctk.CTkScrollableFrame(dialog, label_text="Matches")
-    results_frame.pack(fill="both", expand=True, padx=12, pady=4)
-
-    current_widgets: list = []
-    searching = {"in_flight": False}
-    pending_cancel = {"value": False}
-
-    def alive() -> bool:
-        try:
-            return bool(dialog.winfo_exists())
-        except Exception:
-            return False
-
-    def clear_results() -> None:
-        for w in current_widgets:
-            try:
-                w.destroy()
-            except Exception:
-                pass
-        current_widgets.clear()
-
-    def populate(names: list[str], query: str) -> None:
-        if not alive():
-            return
-        clear_results()
-        if not names:
-            lbl = ctk.CTkLabel(
-                results_frame,
-                text=(
-                    f"No matches for {query!r}. Try a different "
-                    "spelling, or use the full name."
-                ),
-                anchor="w", justify="left",
-            )
-            lbl.pack(fill="x", padx=4, pady=8)
-            current_widgets.append(lbl)
-            return
-        for n in names:
-            btn = ctk.CTkButton(
-                results_frame, text=n, anchor="w", height=32,
-                command=lambda nm=n: finish(nm),
-            )
-            btn.pack(fill="x", pady=2)
-            current_widgets.append(btn)
-
-    def run_search(_event=None):
-        if searching["in_flight"]:
-            return
-        query = entry.get().strip()
-        if not query:
-            return
-        searching["in_flight"] = True
-        clear_results()
-        msg = ctk.CTkLabel(
-            results_frame, text=f"Searching for {query!r}…",
-            anchor="w", justify="left",
-        )
-        msg.pack(fill="x", padx=4, pady=8)
-        current_widgets.append(msg)
-        # Disable the entry so a second Enter while searching can't
-        # stack a second wait_variable on top of the first.
-        try:
-            entry.configure(state="disabled")
-        except Exception:
-            pass
-        dialog.update_idletasks()
-        try:
-            names = do_search(query)
-        finally:
-            searching["in_flight"] = False
-            if alive():
-                try:
-                    entry.configure(state="normal")
-                    entry.focus_force()
-                except Exception:
-                    pass
-        if pending_cancel["value"]:
-            finish(None)
-            return
-        populate(names, query)
-
-    def finish(name: Optional[str]) -> None:
-        result["value"] = name
-        _save_dialog_geometry(dialog, "find_and_pick")
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    def cancel(_event=None) -> None:
-        # Cancel during an in-flight search defers the close until the
-        # worker reports back — we can't kill the search mid-flight.
-        if searching["in_flight"]:
-            pending_cancel["value"] = True
-            return
-        finish(None)
-
-    entry.bind("<Return>", run_search)
-    dialog.bind("<Escape>", cancel)
-    dialog.protocol("WM_DELETE_WINDOW", cancel)
-
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(pady=(4, 10))
-    ctk.CTkButton(btn_row, text="Search", command=run_search, width=110).pack(side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text="Cancel", command=cancel, width=90,
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-
-    parent.wait_window(dialog)
-    return result["value"]
-
-
-def prompt_quick_note(parent, *, default_type: str = "Admin Note",
-                      student_name: str = "", course_code: str = "",
-                      note_templates=None, on_manage_templates=None):
-    """Quick-note dialog — mirrors the 'Note' action's core fields (interaction
-    format, type, academic activities, subject, body) so it feels familiar.
-    Files an ad-hoc note for the selected student. Returns a dict
-    {interaction_format, interaction_type, subject, body, activities} or None.
-
-    When `note_templates` is given, a 'Choose template ▾' button lets the user
-    fill a saved template into the body — the easy 'file a templated note now'
-    entry for the silent-fire paths (no configured edit-at-fire note needed)."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title(f"Quick note — {student_name}" if student_name else "Quick note")
-    dialog.geometry("520x600")
-    try:
-        dialog.transient(parent)
-        dialog.attributes("-topmost", True)
-        dialog.after(120, lambda: (dialog.lift(), dialog.focus_force()))
-    except Exception:
-        pass
-    result = {"value": None}
-
-    body_frame = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
-    body_frame.pack(fill="both", expand=True, padx=12, pady=(10, 4))
-    # Course code: always pre-filled (from the caseload row / active ACI) but
-    # editable so the user can override it for this note.
-    course_row = ctk.CTkFrame(body_frame, fg_color="transparent")
-    course_row.pack(fill="x", pady=(0, 6))
-    ctk.CTkLabel(course_row, text="Course:").pack(side="left", padx=(0, 8))
-    course_entry = ctk.CTkEntry(course_row, width=120,
-                                placeholder_text="course code")
-    course_entry.pack(side="left")
-    if course_code:
-        course_entry.insert(0, course_code)
-
-    # Optional: fill this note from a saved template (picks + fills, drops the
-    # rendered text into the body and presets the note type if the template
-    # names one). Only shown when templates exist.
-    if note_templates:
-        tpl_row = ctk.CTkFrame(body_frame, fg_color="transparent")
-        tpl_row.pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(tpl_row, text="Template:").pack(side="left", padx=(0, 8))
-
-        def _choose_template():
-            tmpl = pick_note_template(dialog, note_templates,
-                                      course_entry.get().strip(),
-                                      manage=on_manage_templates)
-            if not tmpl:
-                return
-            filled = prompt_fill_note_template(dialog, tmpl)
-            if filled is None:
-                return
-            body_box.delete("1.0", "end")
-            body_box.insert("1.0", filled)
-            if (tmpl.note_type
-                    and tmpl.note_type in types_for_format(fmt_var.get())):
-                type_var.set(tmpl.note_type)
-                _refresh()
-
-        ctk.CTkButton(tpl_row, text="Choose template ▾",
-                      command=_choose_template, width=170,
-                      **SECONDARY_BTN_KWARGS).pack(side="left")
-
-    fmt_var = ctk.StringVar(value="Single Interaction")
-    fmt_row = ctk.CTkFrame(body_frame, fg_color="transparent")
-    fmt_row.pack(fill="x", pady=(0, 6))
-    ctk.CTkLabel(fmt_row, text="Format:").pack(side="left", padx=(0, 8))
-    for f in INTERACTION_FORMATS:
-        ctk.CTkRadioButton(fmt_row, text=f, variable=fmt_var, value=f,
-                           command=lambda: _refresh()).pack(side="left", padx=6)
-
-    ctk.CTkLabel(body_frame, text="Type:").pack(anchor="w")
-    type_var = ctk.StringVar(value=default_type)
-    type_menu = ctk.CTkComboBox(body_frame, variable=type_var, width=340,
-                                state="readonly",
-                                values=types_for_format(fmt_var.get()),
-                                command=lambda _v=None: _refresh())
-    type_menu.pack(anchor="w", pady=(0, 8))
-
-    ctk.CTkLabel(body_frame, text="Academic activities:").pack(anchor="w")
-    act_frame = ctk.CTkFrame(body_frame, fg_color="transparent")
-    act_frame.pack(fill="x", pady=(0, 8))
-    activity_vars: dict = {}
-    activity_cbs: list = []
-    for lbl in ACADEMIC_ACTIVITY_LABELS:
-        v = ctk.BooleanVar(value=False)
-        cb = ctk.CTkCheckBox(act_frame, text=lbl, variable=v)
-        cb.pack(anchor="w", pady=1)
-        activity_vars[lbl] = v
-        activity_cbs.append(cb)
-
-    ctk.CTkLabel(body_frame, text="Subject (optional):").pack(anchor="w")
-    subject_entry = ctk.CTkEntry(body_frame, width=440,
-                                 placeholder_text="(defaults to the note type)")
-    subject_entry.pack(anchor="w", pady=(0, 8))
-
-    ctk.CTkLabel(body_frame, text="Note:").pack(anchor="w")
-    body_box = ctk.CTkTextbox(body_frame, height=150, wrap="word")
-    body_box.pack(fill="x", pady=(0, 4))
-
-    def _refresh(*_a):
-        types = types_for_format(fmt_var.get())
-        type_menu.configure(values=types)
-        if type_var.get() not in types:
-            type_var.set(types[0])
-        disabled = activities_disabled_for(fmt_var.get(), type_var.get())
-        for cb in activity_cbs:
-            cb.configure(state="disabled" if disabled else "normal")
-        if disabled:
-            for v in activity_vars.values():
-                v.set(False)
-    _refresh()
-
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(fill="x", padx=12, pady=(0, 12))
-
-    def _file():
-        body = body_box.get("1.0", "end").strip()
-        if not body:
-            from tkinter import messagebox
-            if not messagebox.askyesno(
-                    "Empty note", "The note body is empty. File it anyway?",
-                    parent=dialog):
-                return
-        acts = ([lbl for lbl, v in activity_vars.items() if v.get()]
-                if not activities_disabled_for(fmt_var.get(), type_var.get())
-                else [])
-        result["value"] = {
-            "interaction_format": fmt_var.get(),
-            "interaction_type": type_var.get(),
-            "course_code": course_entry.get().strip(),
-            "subject": subject_entry.get().strip(),
-            "body": body, "activities": acts,
-        }
-        try:
-            dialog.destroy()
-        except Exception:
-            pass
-
-    ctk.CTkButton(btn_row, text="File note", command=_file,
-                  fg_color=_ADD_BTN_BLUE,
-                  hover_color=_ADD_BTN_BLUE_HOVER).pack(side="left")
-    ctk.CTkButton(btn_row, text="Cancel", command=dialog.destroy,
-                  **SECONDARY_BTN_KWARGS).pack(side="left", padx=8)
-    dialog.bind("<Escape>", lambda _e: dialog.destroy())
-    body_box.bind("<Control-Return>", lambda _e: (_file(), "break"))
-    # Open near the pointer (up-left of it), clamped fully on-screen, so the
-    # popup lands where the ＋ Note button was clicked rather than screen-center.
-    _fit_dialog_to_content(dialog, min_w=520, min_h=600, near_mouse=True)
-    parent.wait_window(dialog)
-    return result["value"]
-
-
-def prompt_additional_text(parent, label: str, prefilled: str,
-                           enter_submits: bool = True,
-                           note_templates=None, course: str = "",
-                           on_manage_templates=None,
-                           default_template=None) -> Optional[str]:
-    """Blocking modal: multi-line edit of a note body, pre-filled.
-    Returns the new body (no strip), or None if cancelled. When
-    `enter_submits` (the default), Enter submits and Shift+Enter inserts a
-    newline; when False, Enter inserts a newline and only the button submits.
-    Esc always cancels.
-
-    When `note_templates` is given, a 'Choose template ▾' button appears above
-    the body — picking one opens the fill form and drops the rendered text into
-    the body (used for the batch 'fill once, apply to all' path). `course` seeds
-    the picker's course auto-suggest.
-
-    Pre-fill rule: if the body doesn't already end in whitespace, a
-    single trailing space is added so the user can start typing
-    immediately without manually inserting a separator. The cursor
-    is placed at end. Last on-screen position is remembered for the
-    rest of the session."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title(f"Edit body — {label}")
-    _restore_dialog_geometry(dialog, "additional_text")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-
-    result: dict = {"value": None}
-
-    hint = ("Enter = submit · Shift+Enter = newline · Esc = cancel"
-            if enter_submits else "Esc = cancel")
-    ctk.CTkLabel(
-        dialog,
-        text=f"{label}: edit or add to the body.  {hint}",
-        justify="left",
-    ).pack(padx=12, pady=(10, 4), anchor="w")
-
-    text_box = ctk.CTkTextbox(dialog, wrap="word")
-    text_box.pack(fill="both", expand=True, padx=12, pady=4)
-    content = prefilled
-    if content and content[-1] not in (" ", "\n", "\t"):
-        content += " "
-    text_box.insert("1.0", content)
-    text_box.focus_force()
-    dialog.after(50, text_box.focus_force)
-    text_box.mark_set("insert", "end-1c")
-
-    if note_templates or default_template is not None:
-        def _apply_template_fill(tmpl):
-            filled = prompt_fill_note_template(dialog, tmpl)
-            if filled is None:
-                return
-            text_box.delete("1.0", "end")
-            text_box.insert("1.0", filled)
-            text_box.mark_set("insert", "end-1c")
-
-    if note_templates:
-        tpl_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        tpl_row.pack(fill="x", padx=12, pady=(0, 2), before=text_box)
-        ctk.CTkLabel(tpl_row, text="Template:", anchor="w").pack(side="left")
-
-        def _choose_template():
-            tmpl = pick_note_template(dialog, note_templates, course,
-                                      manage=on_manage_templates)
-            if tmpl:
-                _apply_template_fill(tmpl)
-
-        ctk.CTkButton(
-            tpl_row, text="Choose template ▾", command=_choose_template,
-            width=170, **SECONDARY_BTN_KWARGS).pack(side="left", padx=(6, 0))
-
-    def submit(_event=None):
-        result["value"] = text_box.get("1.0", "end-1c")
-        _save_dialog_geometry(dialog, "additional_text")
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-        return "break"
-
-    def cancel(_event=None):
-        _save_dialog_geometry(dialog, "additional_text")
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-        return "break"
-
-    def insert_newline(_event):
-        text_box.insert("insert", "\n")
-        return "break"
-
-    if enter_submits:
-        text_box.bind("<Return>", submit)
-        text_box.bind("<Shift-Return>", insert_newline)
-    dialog.bind("<Escape>", cancel)
-    dialog.protocol("WM_DELETE_WINDOW", cancel)
-
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(pady=(4, 10))
-    ctk.CTkButton(btn_row, text="Submit", command=submit, width=110).pack(side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text="Cancel", command=cancel, width=90,
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-
-    # A bound default template pre-opens its fill form (Cancel it to free-type).
-    if default_template is not None:
-        dialog.after(60, lambda: _apply_template_fill(default_template))
-    parent.wait_window(dialog)
-    return result["value"]
-
-
-def pick_note_template(parent, templates, course="", manage=None):
-    """Small popup: choose a NoteTemplate to fill. Templates whose `courses` is
-    empty (apply to any course) or include `course` are SUGGESTED at the top; a
-    'Show all…' reveals the rest. Returns the chosen NoteTemplate or None.
-
-    When `manage` is given (a callable `manage(start_new: bool, parent) -> list`
-    that opens the template editor and returns the refreshed list), '＋ New' and
-    '✎ Edit…' buttons appear and the picker updates in place after editing.
-    Opens near the mouse and restores the parent's grab on close."""
-    templates = list(templates or [])
-    if not templates and manage is None:
-        return None
-    cu = (course or "").strip().upper()
-
-    def _matches(t):
-        return (not t.courses) or (cu and cu in [c.upper() for c in t.courses])
-
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Choose a note template")
-    try:
-        _px, _py = dialog.winfo_pointerxy()
-        dialog.geometry(f"+{max(_px - 30, 0)}+{max(_py - 30, 0)}")
-    except Exception:
-        pass
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    dialog.lift()
-    dialog.after(50, lambda: (dialog.lift(), dialog.focus_force()))
-    res = {"value": None}
-    state = {"show_all": False}
-
-    def _close():
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-        try: parent.grab_set()
-        except Exception: pass
-
-    def _choose(t):
-        res["value"] = t
-        _close()
-
-    header = ctk.CTkLabel(
-        dialog, text="Templates:", anchor="w",
-        font=ctk.CTkFont(size=12, weight="bold"))
-    header.pack(fill="x", padx=12, pady=(10, 2))
-
-    listframe = ctk.CTkScrollableFrame(dialog, width=360, height=260)
-    listframe.pack(fill="both", expand=True, padx=8, pady=(0, 4))
-
-    def _button(t):
-        sub = f"   ·  {t.interaction_type}" if t.interaction_type else ""
-        crs = f"   [{', '.join(t.courses)}]" if t.courses else ""
-        ctk.CTkButton(
-            listframe, text=f"{t.name}{sub}{crs}", anchor="w",
-            command=lambda tt=t: _choose(tt), **SECONDARY_BTN_KWARGS,
-        ).pack(fill="x", padx=4, pady=2)
-
-    def redraw():
-        for w in listframe.winfo_children():
-            w.destroy()
-        suggested = [t for t in templates if _matches(t)]
-        sug_ids = {id(t) for t in suggested}
-        others = [t for t in templates if id(t) not in sug_ids]
-        header.configure(text=(f"Suggested for {cu}:" if (cu and suggested)
-                               else "Templates:"))
-        if not templates:
-            ctk.CTkLabel(
-                listframe, text="No templates yet — click ＋ New below.",
-                text_color=("gray40", "gray65"),
-            ).pack(fill="x", padx=6, pady=20)
-            return
-        for t in suggested:
-            _button(t)
-        show_all = state["show_all"] or not suggested
-        if others and show_all:
-            if suggested:
-                ctk.CTkLabel(
-                    listframe, text="Other templates:", anchor="w",
-                    text_color=("gray40", "gray65"),
-                ).pack(fill="x", padx=6, pady=(6, 0))
-            for t in others:
-                _button(t)
-        elif others:
-            ctk.CTkButton(
-                listframe, text=f"Show all ({len(others)} more)…", anchor="w",
-                command=lambda: (state.update(show_all=True), redraw()),
-                **SECONDARY_BTN_KWARGS,
-            ).pack(fill="x", padx=4, pady=(6, 2))
-
-    def _manage(start_new):
-        nonlocal templates
-        try:
-            fresh = manage(bool(start_new), dialog)
-        except Exception:
-            fresh = templates
-        templates = list(fresh or [])
-        redraw()
-
-    redraw()
-
-    ctrl = ctk.CTkFrame(dialog, fg_color="transparent")
-    ctrl.pack(fill="x", padx=10, pady=(2, 10))
-    if manage is not None:
-        ctk.CTkButton(ctrl, text="＋ New", width=80,
-                      command=lambda: _manage(True),
-                      **SECONDARY_BTN_KWARGS).pack(side="left")
-        ctk.CTkButton(ctrl, text="✎ Edit…", width=80,
-                      command=lambda: _manage(False),
-                      **SECONDARY_BTN_KWARGS).pack(side="left", padx=(6, 0))
-    ctk.CTkButton(ctrl, text="Cancel", command=_close, width=90,
-                  **SECONDARY_BTN_KWARGS).pack(side="right")
-    dialog.bind("<Escape>", lambda _e: _close())
-    dialog.protocol("WM_DELETE_WINDOW", _close)
-    _fit_dialog_to_content(dialog, min_w=380, near_mouse=True)
-    parent.wait_window(dialog)
-    return res["value"]
-
-
-def prompt_fill_note_template(parent, template, prefill=None):
-    """Tab-through fill form for a NoteTemplate: each field renders as its widget
-    (text = entry, multiline = box, dropdown = editable combobox seeded with the
-    field's choices), pre-filled with its default (or `prefill[label]` when
-    given). Tab / Shift-Tab move between fields. Returns the rendered note body,
-    or None if cancelled. Restores the parent's grab on close."""
-    prefill = prefill or {}
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title(f"Fill note — {template.name}")
-    try:
-        _px, _py = dialog.winfo_pointerxy()
-        dialog.geometry(f"+{max(_px - 30, 0)}+{max(_py - 30, 0)}")
-    except Exception:
-        pass
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    dialog.lift()
-    dialog.after(50, lambda: (dialog.lift(), dialog.focus_force()))
-    res = {"value": None}
-
-    ctk.CTkLabel(
-        dialog, text="Tab between fields · Ctrl+Enter or Continue to finish · "
-        "Esc = cancel", anchor="w", text_color=("gray35", "gray70"),
-    ).pack(fill="x", padx=12, pady=(10, 2))
-
-    form = ctk.CTkScrollableFrame(dialog, width=480, height=340)
-    form.pack(fill="both", expand=True, padx=8, pady=(0, 4))
-
-    rows = []  # (field, widget, kind)
-    for f in template.fields:
-        seed = prefill.get(f.label, f.default)
-        ctk.CTkLabel(
-            form, text=f"{f.label}:", anchor="w",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).pack(fill="x", padx=6, pady=(6, 0))
-        if f.kind == "multiline":
-            w = ctk.CTkTextbox(form, wrap="word", height=70)
-            w.pack(fill="x", padx=6, pady=(0, 2))
-            if seed:
-                w.insert("1.0", seed)
-        elif f.kind == "dropdown":
-            w = ctk.CTkComboBox(form, values=list(f.choices))
-            w.pack(fill="x", padx=6, pady=(0, 2))
-            w.set(seed or "")
-        elif f.kind == "date":
-            # Editable combobox (choices = relative quick-picks like "1 week")
-            # PLUS a 📅 button that drops in a concrete MM/DD/YYYY date.
-            drow = ctk.CTkFrame(form, fg_color="transparent")
-            drow.pack(fill="x", padx=6, pady=(0, 2))
-            w = ctk.CTkComboBox(drow, values=list(f.choices))
-            w.pack(side="left", fill="x", expand=True)
-            w.set(seed or "")
-
-            def _pick_date(cb=w):
-                d = prompt_calendar_pick(dialog)
-                if d:
-                    cb.set(d.strftime("%m/%d/%Y"))
-
-            ctk.CTkButton(drow, text="📅", width=40, command=_pick_date,
-                          **SECONDARY_BTN_KWARGS).pack(side="left", padx=(4, 0))
-        else:
-            w = ctk.CTkEntry(form)
-            w.pack(fill="x", padx=6, pady=(0, 2))
-            if seed:
-                w.insert(0, seed)
-        rows.append((f, w, f.kind))
-
-    widgets = [w for (_f, w, _k) in rows]
-
-    def _focus(delta, ix):
-        if not widgets:
-            return "break"
-        j = (ix + delta) % len(widgets)
-        try:
-            widgets[j].focus_set()
-        except Exception:
-            pass
-        return "break"
-
-    for ix, w in enumerate(widgets):
-        w.bind("<Tab>", lambda _e, i=ix: _focus(1, i))
-        w.bind("<Shift-Tab>", lambda _e, i=ix: _focus(-1, i))
-
-    def _val(w, kind):
-        if kind == "multiline":
-            return w.get("1.0", "end-1c")
-        return w.get()
-
-    def _close():
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-        try: parent.grab_set()
-        except Exception: pass
-
-    def _ok(_e=None):
-        values = {f.label: _val(w, kind) for (f, w, kind) in rows}
-        res["value"] = render_note_template(template, values)
-        _close()
-
-    def _cancel(_e=None):
-        _close()
-
-    btns = ctk.CTkFrame(dialog, fg_color="transparent")
-    btns.pack(pady=(2, 10))
-    ctk.CTkButton(btns, text="Continue", command=_ok, width=110).pack(
-        side="left", padx=4)
-    ctk.CTkButton(btns, text="Cancel", command=_cancel, width=90,
-                  **SECONDARY_BTN_KWARGS).pack(side="left", padx=4)
-    dialog.bind("<Escape>", _cancel)
-    dialog.bind("<Control-Return>", _ok)
-    dialog.protocol("WM_DELETE_WINDOW", _cancel)
-    if widgets:
-        dialog.after(60, lambda: widgets[0].focus_set())
-    _fit_dialog_to_content(dialog, min_w=500, near_mouse=True)
-    parent.wait_window(dialog)
-    return res["value"]
-
-
-def prompt_edit_note(parent, label, body_prefill, course_default,
-                     activities_on, eas, enter_submits: bool = True,
-                     interaction_type: str = "",
-                     interaction_format: str = "Single Interaction",
-                     subject_default: str = "", note_templates=None,
-                     on_manage_templates=None, default_template=None):
-    """Unified fire-time note dialog: edit the body, subject, course code,
-    note type, and academic activities, and — when the student has open
-    Essential Actions — attach/close one. Returns
-    {body, subject, course, type, activities, ea} (ea = (reason, course,
-    close) or None) or None if cancelled.
-
-    The Note type dropdown defaults to the action's `interaction_type`;
-    picking a type that doesn't take academic activities (e.g. "Email to
-    Student", "Admin Note") disables the activity checkboxes.
-
-    When `enter_submits` (the default), Enter in the body submits the note
-    and Shift+Enter inserts a newline; when False, Enter inserts a newline
-    and the note is submitted only via the Continue button."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title(f"Edit note — {label}")
-    # Open near the mouse (not where it was last). The final size + on-screen
-    # clamp is applied after the content is built, keeping it near the cursor.
-    try:
-        _px, _py = dialog.winfo_pointerxy()
-        dialog.geometry(f"+{max(_px - 30, 0)}+{max(_py - 30, 0)}")
-    except Exception:
-        pass
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    dialog.lift()
-    dialog.after(50, lambda: (dialog.lift(), dialog.focus_force()))
-    res = {"value": None}
-
-    ctk.CTkLabel(
-        dialog, text="Edit this note before it's filed.  Esc = cancel.",
-        anchor="w", text_color=("gray35", "gray70"),
-    ).pack(fill="x", padx=12, pady=(10, 2))
-
-    crow = ctk.CTkFrame(dialog, fg_color="transparent")
-    crow.pack(fill="x", padx=12, pady=(2, 2))
-    ctk.CTkLabel(crow, text="Course code:", width=90, anchor="w").pack(side="left")
-    course_entry = ctk.CTkEntry(crow, width=160)
-    course_entry.pack(side="left")
-    if course_default:
-        course_entry.insert(0, course_default)
-
-    # Note type — defaults to the action's type; drives whether the academic
-    # activity checkboxes below are usable for this type.
-    fmt = interaction_format or "Single Interaction"
-    type_choices = types_for_format(fmt)
-    trow = ctk.CTkFrame(dialog, fg_color="transparent")
-    trow.pack(fill="x", padx=12, pady=(2, 2))
-    ctk.CTkLabel(trow, text="Note type:", width=90, anchor="w").pack(side="left")
-    type_var = ctk.StringVar(value=interaction_type or "")
-    type_combo = ctk.CTkComboBox(
-        trow, values=type_choices, variable=type_var, state="readonly",
-        width=260, command=lambda _v=None: _sync_activities(),
-    )
-    type_combo.pack(side="left")
-
-    # Subject — Salesforce's note Subject line.
-    srow = ctk.CTkFrame(dialog, fg_color="transparent")
-    srow.pack(fill="x", padx=12, pady=(2, 2))
-    ctk.CTkLabel(srow, text="Subject:", width=90, anchor="w").pack(side="left")
-    subject_entry = ctk.CTkEntry(srow)
-    subject_entry.pack(side="left", fill="x", expand=True)
-    if subject_default:
-        subject_entry.insert(0, subject_default)
-
-    # Optional: fill the body from a saved note template. Only shown when the
-    # user has templates; picking one opens a tab-through fill form and drops
-    # the rendered text into the body (and presets the note type if the template
-    # names one). Normal free-typing is unaffected.
-    if note_templates or default_template is not None:
-        def _apply_template_fill(tmpl):
-            filled = prompt_fill_note_template(dialog, tmpl)
-            if filled is None:
-                return
-            text_box.delete("1.0", "end")
-            text_box.insert("1.0", filled)
-            text_box.mark_set("insert", "end-1c")
-            if tmpl.note_type and tmpl.note_type in type_choices:
-                type_var.set(tmpl.note_type)
-                _sync_activities()
-
-    if note_templates:
-        tmpl_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        tmpl_row.pack(fill="x", padx=12, pady=(2, 2))
-        ctk.CTkLabel(tmpl_row, text="Template:", width=90, anchor="w").pack(
-            side="left")
-
-        def _choose_template(_e=None):
-            tmpl = pick_note_template(
-                dialog, note_templates, course_entry.get().strip(),
-                manage=on_manage_templates)
-            if tmpl:
-                _apply_template_fill(tmpl)
-
-        ctk.CTkButton(
-            tmpl_row, text="Choose template ▾", command=_choose_template,
-            width=170, **SECONDARY_BTN_KWARGS).pack(side="left")
-        ctk.CTkLabel(
-            tmpl_row, text="  fills the note body below",
-            text_color=("gray40", "gray65")).pack(side="left")
-
-    ctk.CTkLabel(dialog, text="Note body:", anchor="w").pack(
-        fill="x", padx=12, pady=(6, 0))
-    text_box = ctk.CTkTextbox(dialog, wrap="word", height=150)
-    text_box.pack(fill="both", expand=True, padx=12, pady=(0, 0))
-    c = body_prefill or ""
-    if c and c[-1] not in (" ", "\n", "\t"):
-        c += " "
-    text_box.insert("1.0", c)
-    text_box.mark_set("insert", "end-1c")
-    if enter_submits:
-        ctk.CTkLabel(
-            dialog, text="Press Shift+Enter for a new line · Enter submits",
-            anchor="w", font=ctk.CTkFont(size=11),
-            text_color=("gray40", "gray60"),
-        ).pack(fill="x", padx=12, pady=(1, 4))
-
-    act_hdr = ctk.CTkLabel(dialog, text="Academic activities:", anchor="w")
-    act_hdr.pack(fill="x", padx=12, pady=(6, 0))
-    act_frame = ctk.CTkFrame(dialog, fg_color=("gray95", "gray18"))
-    act_frame.pack(fill="x", padx=12, pady=(0, 4))
-    act_vars = {}
-    act_boxes = []
-    for lbl in ACADEMIC_ACTIVITY_LABELS:
-        v = ctk.BooleanVar(value=(lbl in (activities_on or [])))
-        act_vars[lbl] = v
-        cb = ctk.CTkCheckBox(
-            act_frame, text=lbl, variable=v, font=ctk.CTkFont(size=11),
-        )
-        cb.pack(anchor="w", padx=8, pady=1)
-        act_boxes.append(cb)
-
-    def _sync_activities(_v=None) -> None:
-        """Enable/disable the academic-activity checkboxes for the selected
-        note type — types like 'Email to Student' / 'Admin Note' don't take
-        them (matching the live Caseload form), so they're grayed + cleared."""
-        disabled = activities_disabled_for(fmt, type_var.get())
-        for cb in act_boxes:
-            try:
-                if disabled:
-                    cb.deselect()
-                    cb.configure(state="disabled")
-                else:
-                    cb.configure(state="normal")
-            except Exception:
-                pass
-        act_hdr.configure(
-            text=("Academic activities:  (not used for this note type)"
-                  if disabled else "Academic activities:"))
-
-    _sync_activities()  # apply the initial state for the action's type
-
-    ea_sel = ctk.StringVar(value="skip")
-    ea_close = ctk.BooleanVar(value=False)
-    if eas:
-        ctk.CTkLabel(
-            dialog, text=f"Essential Actions ({len(eas)} open):", anchor="w",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).pack(fill="x", padx=12, pady=(6, 0))
-        eabox = ctk.CTkFrame(dialog, fg_color=("gray95", "gray18"))
-        eabox.pack(fill="x", padx=12, pady=(0, 4))
-        ctk.CTkRadioButton(
-            eabox, text="Don't attach", variable=ea_sel, value="skip",
-        ).pack(anchor="w", padx=8, pady=1)
-        for i, ea in enumerate(eas):
-            t = ea.get("reason", "")
-            if ea.get("course"):
-                t += f"   ({ea['course']})"
-            ctk.CTkRadioButton(
-                eabox, text=t, variable=ea_sel, value=str(i),
-            ).pack(anchor="w", padx=8, pady=1)
-        ctk.CTkCheckBox(
-            dialog, text="Close the Essential Action when the note is saved",
-            variable=ea_close, font=ctk.CTkFont(size=11),
-        ).pack(anchor="w", padx=12, pady=(0, 4))
-
-    def _cont(_e=None):
-        ea_choice = None
-        v = ea_sel.get()
-        if eas and v != "skip":
-            ea = eas[int(v)]
-            ea_choice = (ea.get("reason", ""), ea.get("course", ""),
-                         bool(ea_close.get()))
-        chosen_type = type_var.get().strip()
-        # Never send activities for a type that doesn't take them.
-        acts = ([] if activities_disabled_for(fmt, chosen_type)
-                else [l for l, vv in act_vars.items() if vv.get()])
-        res["value"] = {
-            "body": text_box.get("1.0", "end-1c"),
-            "subject": subject_entry.get().strip(),
-            "course": course_entry.get().strip(),
-            "type": chosen_type,
-            "activities": acts,
-            "ea": ea_choice,
-        }
-        _close()
-
-    def _cancel(_e=None):
-        _close()
-
-    def _close():
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(pady=(2, 10))
-    ctk.CTkButton(btn_row, text="Continue", command=_cont, width=110).pack(
-        side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text="Cancel", command=_cancel, width=90,
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-    dialog.bind("<Escape>", _cancel)
-    dialog.protocol("WM_DELETE_WINDOW", _cancel)
-    # Enter in the body submits, Shift+Enter inserts a newline (default).
-    if enter_submits:
-        def _newline(_e=None):
-            text_box.insert("insert", "\n")
-            return "break"
-        text_box.bind("<Return>", lambda _e: (_cont(), "break")[1])
-        text_box.bind("<Shift-Return>", _newline)
-    # Size to fit the whole form (the Academic Activities + Essential Actions
-    # blocks and the buttons sit at the bottom and were getting clipped), and
-    # place it near the mouse.
-    _fit_dialog_to_content(dialog, min_w=480, near_mouse=True)
-    # A note with a bound default template pre-opens its fill form so the user
-    # fills it straight away (they can Cancel that to free-type instead).
-    if default_template is not None:
-        dialog.after(60, lambda: _apply_template_fill(default_template))
-    parent.wait_window(dialog)
-    return res["value"]
-
-
-def prompt_text_review(
-    parent, *, who: str, mobile: str, inbox_label: str, when_str: str,
-    body: str, char_limit: int, scheduled: bool,
-) -> Optional[str]:
-    """In-app review/edit for a single outgoing text — the texting equivalent of
-    the email previewer. Shows recipient / inbox / scheduled time and lets the
-    user edit the message. Returns the (possibly edited) body to send, or None
-    on cancel. The caller then drives Mongoose to completion (no manual clicks
-    in Mongoose)."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Review text")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    dialog.lift()
-    dialog.after(50, lambda: (dialog.lift(), dialog.focus_force()))
-    res = {"value": None}
-
-    header = "To:  " + who + (f"   ·   {mobile}" if mobile else "")
-    if inbox_label:
-        header += f"\nInbox:  {inbox_label}"
-    header += f"\n{'Schedule' if scheduled else 'Send'}:  {when_str}"
-    ctk.CTkLabel(
-        dialog, text=header, justify="left", anchor="w",
-        font=ctk.CTkFont(size=12),
-    ).pack(fill="x", padx=12, pady=(12, 6))
-
-    ctk.CTkLabel(dialog, text="Message:", anchor="w").pack(
-        fill="x", padx=12, pady=(2, 0))
-    box = ctk.CTkTextbox(dialog, wrap="word", height=150, width=460)
-    box.pack(fill="both", expand=True, padx=12, pady=(0, 2))
-    box.insert("1.0", body or "")
-    box.mark_set("insert", "end-1c")
-
-    count = ctk.CTkLabel(
-        dialog, text="", anchor="e", font=ctk.CTkFont(size=11),
-        text_color=("gray40", "gray70"))
-    count.pack(fill="x", padx=12, pady=(0, 4))
-
-    def _update_count(_e=None):
-        n = len(box.get("1.0", "end-1c"))
-        over = n - char_limit
-        count.configure(
-            text=f"{n}/{char_limit}" + (f"  ({over} over — will be trimmed)"
-                                        if over > 0 else ""),
-            text_color=("#d11" if over > 0 else ("gray40", "gray70")),
-        )
-
-    box.bind("<KeyRelease>", _update_count)
-    _update_count()
-
-    def _close():
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    def _send(_e=None):
-        res["value"] = box.get("1.0", "end-1c")
-        _close()
-
-    def _cancel(_e=None):
-        _close()
-
-    btns = ctk.CTkFrame(dialog, fg_color="transparent")
-    btns.pack(pady=(2, 10))
-    ctk.CTkButton(
-        btns, text=("Schedule" if scheduled else "Send"),
-        command=_send, width=120,
-    ).pack(side="left", padx=4)
-    ctk.CTkButton(
-        btns, text="Cancel", command=_cancel, width=90, **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-    dialog.bind("<Escape>", _cancel)
-    dialog.protocol("WM_DELETE_WINDOW", _cancel)
-    parent.wait_window(dialog)
-    return res["value"]
-
-
-def ask_yes_no_topmost(
-    parent, title: str, message: str,
-    yes_label: str = "Yes", no_label: str = "No",
-    at: Optional[tuple] = None,
-) -> bool:
-    """Topmost Yes/No modal. Use AFTER Outlook (or any other window)
-    has stolen focus — tkinter's stock messagebox.askyesno doesn't
-    have topmost / focus-force handling, so its dialog can open
-    BEHIND Outlook and look like the app hung (the user can't see
-    where the question is waiting). This variant uses the same
-    pattern as `prompt_additional_text` — CTkToplevel + topmost +
-    repeated focus_force calls — so the question always lands in
-    front of the user.
-
-    Returns True for Yes, False for No / window-close / Esc."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title(title)
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    result = {"value": False}
-
-    ctk.CTkLabel(
-        dialog, text=message, justify="left", wraplength=460,
-    ).pack(padx=16, pady=(14, 8), anchor="w")
-
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(fill="x", padx=16, pady=(4, 14))
-
-    def _close(value: bool) -> None:
-        result["value"] = value
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    yes_btn = ctk.CTkButton(
-        btn_row, text=yes_label, width=100,
-        command=lambda: _close(True),
-    )
-    yes_btn.pack(side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text=no_label, width=100,
-        command=lambda: _close(False),
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-
-    dialog.bind("<Return>", lambda _e: _close(True))
-    dialog.bind("<Escape>", lambda _e: _close(False))
-    dialog.protocol("WM_DELETE_WINDOW", lambda: _close(False))
-
-    # Optionally pop the dialog right where the action was invoked (e.g.
-    # over the caseload row-menu the user just clicked), clamped on-screen.
-    if at is not None:
-        try:
-            dialog.update_idletasks()
-            w = dialog.winfo_reqwidth()
-            h = dialog.winfo_reqheight()
-            sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
-            x = max(0, min(int(at[0]) - 20, sw - w - 8))
-            y = max(0, min(int(at[1]) - 10, sh - h - 8))
-            dialog.geometry(f"+{x}+{y}")
-        except Exception:
-            pass
-
-    # Outlook may steal focus right after compose_email returns;
-    # claw it back aggressively. The two .after() retries handle the
-    # case where Outlook fully renders ~100-500ms after Display().
-    dialog.lift()
-    dialog.focus_force()
-    yes_btn.focus_set()
-    dialog.after(100, lambda: (dialog.lift(), dialog.focus_force()))
-    dialog.after(500, lambda: (dialog.lift(), dialog.focus_force()))
-
-    parent.wait_window(dialog)
-    return result["value"]
-
-
-def prompt_mongoose_stale(parent, age_str: str) -> str:
-    """Pre-fire warning that the Mongoose text-ID export is stale. Returns
-    'update' (refresh it first), 'continue' (fire with the existing data), or
-    'cancel' (abort the fire / window close / Esc)."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Mongoose text IDs are stale")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    result = {"value": "cancel"}
-
-    ctk.CTkLabel(
-        dialog,
-        text=f"⚠  The Mongoose text-ID export is {age_str}.",
-        font=ctk.CTkFont(size=14, weight="bold"),
-        justify="left", wraplength=460,
-    ).pack(padx=18, pady=(16, 4), anchor="w")
-    ctk.CTkLabel(
-        dialog,
-        text=("Opt-in can change several times a day. If you fire now without "
-              "updating:\n"
-              "  •  students already in the export text normally;\n"
-              "  •  students enrolled since the last update fall back to their "
-              "Salesforce opt-in (flagged “unverified” in the review);\n"
-              "  •  a student who opted out since the last export could still be "
-              "texted.\n\n"
-              "Updating re-exports each course segment from Mongoose "
-              "(~a few seconds per course)."),
-        justify="left", wraplength=460, text_color=("gray25", "gray75"),
-    ).pack(padx=18, pady=(0, 12), anchor="w")
-
-    def _close(v: str) -> None:
-        result["value"] = v
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(fill="x", padx=18, pady=(0, 16))
-    upd = ctk.CTkButton(btn_row, text="🔄 Update text IDs first", width=180,
-                        command=lambda: _close("update"))
-    upd.pack(side="left", padx=4)
-    ctk.CTkButton(btn_row, text="Continue without updating", width=180,
-                  command=lambda: _close("continue"),
-                  **SECONDARY_BTN_KWARGS).pack(side="left", padx=4)
-    ctk.CTkButton(btn_row, text="Cancel", width=90,
-                  command=lambda: _close("cancel"),
-                  **SECONDARY_BTN_KWARGS).pack(side="left", padx=4)
-    dialog.bind("<Escape>", lambda _e: _close("cancel"))
-    dialog.protocol("WM_DELETE_WINDOW", lambda: _close("cancel"))
-    dialog.lift()
-    dialog.focus_force()
-    upd.focus_set()
-    dialog.after(120, lambda: (dialog.lift(), dialog.focus_force()))
-    parent.wait_window(dialog)
-    return result["value"]
-
-
-def prompt_column_picker(parent, sections, *, near=None):
-    """Searchable, grouped column picker. `sections` is an ordered list of
-    (header, items) where items is a list of (label, key) pairs. Returns the
-    chosen `key` (str), or None if cancelled. A live search box filters across
-    every section by label; empty sections hide while filtering."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Choose a column")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    dialog.geometry("460x520")
-    result = {"key": None}
-
-    search_var = tk.StringVar()
-    ctk.CTkEntry(
-        dialog, textvariable=search_var, placeholder_text="Search columns…",
-    ).pack(fill="x", padx=12, pady=(12, 6))
-
-    listwrap = ctk.CTkScrollableFrame(dialog)
-    listwrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-    listwrap.grid_columnconfigure(0, weight=1)
-
-    def _choose(key: str) -> None:
-        result["key"] = key
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    def _render() -> None:
-        for w in listwrap.winfo_children():
-            w.destroy()
-        q = search_var.get().strip().lower()
-        r = 0
-        for header, items in sections:
-            shown = [(lab, key) for (lab, key) in items
-                     if not q or q in lab.lower()]
-            if not shown:
-                continue
-            ctk.CTkLabel(
-                listwrap, text=header,
-                font=ctk.CTkFont(size=12, weight="bold"),
-                text_color=("gray35", "gray70"), anchor="w",
-            ).grid(row=r, column=0, sticky="ew", padx=6, pady=(8, 2))
-            r += 1
-            for lab, key in shown:
-                ctk.CTkButton(
-                    listwrap, text=lab, anchor="w", height=28,
-                    fg_color="transparent", text_color=("gray10", "gray90"),
-                    hover_color=("gray85", "gray28"),
-                    command=lambda k=key: _choose(k),
-                ).grid(row=r, column=0, sticky="ew", padx=6, pady=1)
-                r += 1
-        if r == 0:
-            ctk.CTkLabel(listwrap, text="No columns match.",
-                         text_color=("gray45", "gray60")).grid(
-                row=0, column=0, sticky="w", padx=8, pady=8)
-
-    search_var.trace_add("write", lambda *_a: _render())
-    _render()
-    ctk.CTkButton(dialog, text="Cancel", command=lambda: _choose(None),
-                  **SECONDARY_BTN_KWARGS).pack(pady=(0, 10))
-    dialog.bind("<Escape>", lambda _e: _choose(None))
-    if near is not None:
-        try:
-            dialog.update_idletasks()
-            sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
-            w, h = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
-            x = max(0, min(int(near[0]) - 20, sw - w - 8))
-            y = max(0, min(int(near[1]) - 10, sh - h - 8))
-            dialog.geometry(f"+{x}+{y}")
-        except Exception:
-            pass
-    dialog.lift()
-    dialog.focus_force()
-    parent.wait_window(dialog)
-    return result["key"]
-
-
-def prompt_override_selection(parent, labels, action_name):
-    """Modal listing students who DON'T meet an action's filter conditions, each
-    with a checkbox to 'fire on anyway'. `labels` is the ordered display list.
-    Returns the list of CHECKED INDICES (into `labels`) to fire anyway, or None
-    if the user cancelled the whole fire. Empty list = fire only the matches."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Some students don't match the filter")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    result = {"value": None}
-
-    ctk.CTkLabel(
-        dialog,
-        text=(f"{len(labels)} selected student(s) don't meet {action_name!r}'s "
-              "filter conditions.\nStudents who DO match will fire regardless. "
-              "Check any below to fire on\nanyway; unchecked ones are skipped."),
-        justify="left", wraplength=440,
-    ).pack(padx=16, pady=(14, 6), anchor="w")
-
-    vars_list: list = []
-    sel_all_var = ctk.BooleanVar(value=False)
-
-    def _toggle_all() -> None:
-        for v in vars_list:
-            v.set(sel_all_var.get())
-
-    ctk.CTkCheckBox(
-        dialog, text="Select all", variable=sel_all_var, command=_toggle_all,
-    ).pack(padx=16, pady=(0, 4), anchor="w")
-
-    scroll = ctk.CTkScrollableFrame(
-        dialog, width=400, height=min(320, 30 * len(labels) + 12))
-    scroll.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-    for lbl in labels:
-        v = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(scroll, text=lbl, variable=v).pack(anchor="w", pady=1)
-        vars_list.append(v)
-
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(fill="x", padx=16, pady=(4, 14))
-
-    def _close(cancel: bool) -> None:
-        result["value"] = (None if cancel else
-                           [i for i, v in enumerate(vars_list) if v.get()])
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    cont_btn = ctk.CTkButton(
-        btn_row, text="Continue", width=150, command=lambda: _close(False))
-    cont_btn.pack(side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text="Cancel fire", width=110, command=lambda: _close(True),
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-
-    dialog.bind("<Escape>", lambda _e: _close(True))
-    dialog.protocol("WM_DELETE_WINDOW", lambda: _close(True))
-    dialog.lift()
-    dialog.focus_force()
-    cont_btn.focus_set()
-    dialog.after(100, lambda: (dialog.lift(), dialog.focus_force()))
-
-    parent.wait_window(dialog)
-    return result["value"]
-
-
-def prompt_branch_unmatched(parent, labels, branch_titles, action_name):
-    """Branched-fire override: lists students who match NO branch, with a picker
-    to route the CHECKED ones into a chosen branch (or skip them all). Returns
-    (branch_index | None, [checked indices]) — a None index or no checks means
-    skip — or None if the user cancelled the whole fire."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Some students match no branch")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    result = {"value": None}
-
-    ctk.CTkLabel(
-        dialog,
-        text=(f"{len(labels)} selected student(s) don't match any branch of "
-              f"{action_name!r}.\nPick a branch to send the checked ones, or "
-              "leave “Skip” to fire only the matched students."),
-        justify="left", wraplength=460,
-    ).pack(padx=16, pady=(14, 6), anchor="w")
-
-    _SKIP = "— Skip these students —"
-    route_var = ctk.StringVar(value=_SKIP)
-    ctk.CTkLabel(dialog, text="Route checked students to:").pack(
-        padx=16, pady=(2, 0), anchor="w")
-    ctk.CTkOptionMenu(
-        dialog, values=[_SKIP] + list(branch_titles), variable=route_var,
-        width=300).pack(padx=16, pady=(0, 8), anchor="w")
-
-    vars_list: list = []
-    sel_all_var = ctk.BooleanVar(value=False)
-
-    def _toggle_all() -> None:
-        for v in vars_list:
-            v.set(sel_all_var.get())
-
-    ctk.CTkCheckBox(
-        dialog, text="Select all", variable=sel_all_var, command=_toggle_all,
-    ).pack(padx=16, pady=(0, 4), anchor="w")
-
-    scroll = ctk.CTkScrollableFrame(
-        dialog, width=420, height=min(300, 30 * len(labels) + 12))
-    scroll.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-    for lbl in labels:
-        v = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(scroll, text=lbl, variable=v).pack(anchor="w", pady=1)
-        vars_list.append(v)
-
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(fill="x", padx=16, pady=(4, 14))
-
-    def _close(cancel: bool) -> None:
-        if cancel:
-            result["value"] = None
-        else:
-            sel = route_var.get()
-            idx = branch_titles.index(sel) if sel in branch_titles else None
-            checked = [i for i, v in enumerate(vars_list) if v.get()]
-            result["value"] = (idx, checked)
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    cont_btn = ctk.CTkButton(
-        btn_row, text="Continue", width=150, command=lambda: _close(False))
-    cont_btn.pack(side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text="Cancel fire", width=110, command=lambda: _close(True),
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-
-    dialog.bind("<Escape>", lambda _e: _close(True))
-    dialog.protocol("WM_DELETE_WINDOW", lambda: _close(True))
-    dialog.lift()
-    dialog.focus_force()
-    cont_btn.focus_set()
-    dialog.after(100, lambda: (dialog.lift(), dialog.focus_force()))
-
-    parent.wait_window(dialog)
-    return result["value"]
-
-
-def attach_listbox_drag_reorder(listbox, items, refresh, on_change=None):
-    """Make a native ``tk.Listbox`` drag-reorderable, backed by the Python
-    list ``items``. During a drag a thin accent line marks the drop gap
-    between two rows; the move commits on release. ``refresh(sel=None)``
-    re-renders the listbox from ``items`` (selecting ``sel`` when given);
-    ``on_change()`` (optional) runs after a committed reorder. Shared by the
-    Choose-columns and caseload-panel-actions choosers."""
-    dark = ctk.get_appearance_mode() == "Dark"
-    accent = "#4aa3df" if dark else "#1f6aa5"
-    line = tk.Frame(listbox, height=2, bg=accent, bd=0, highlightthickness=0)
-    state = {"src": None}
-
-    def gap_index(y):
-        n = listbox.size()
-        if n == 0:
-            return 0
-        j = listbox.nearest(y)
-        bbox = listbox.bbox(j)
-        if bbox:
-            _, by, _, bh = bbox
-            if y > by + bh / 2:
-                j += 1
-        return max(0, min(j, n))
-
-    def show_line(gap):
-        n = listbox.size()
-        if n == 0:
-            line.place_forget()
-            return
-        if gap >= n:
-            bbox = listbox.bbox(n - 1)
-            y = (bbox[1] + bbox[3]) if bbox else 0
-        else:
-            bbox = listbox.bbox(gap)
-            y = bbox[1] if bbox else 0
-        line.place(x=2, y=max(0, y - 1), relwidth=1.0)
-        line.lift()
-
-    def on_press(e):
-        state["src"] = listbox.nearest(e.y)
-
-    def on_motion(e):
-        if state["src"] is None:
-            return
-        show_line(gap_index(e.y))
-        return "break"
-
-    def on_release(e):
-        src = state["src"]
-        state["src"] = None
-        line.place_forget()
-        if src is None:
-            return
-        dst = gap_index(e.y)
-        if dst > src:
-            dst -= 1
-        if 0 <= src < len(items) and dst != src:
-            items.insert(dst, items.pop(src))
-            refresh(sel=dst)
-            if on_change:
-                on_change()
-
-    listbox.bind("<ButtonPress-1>", on_press, add="+")
-    listbox.bind("<B1-Motion>", on_motion, add="+")
-    listbox.bind("<ButtonRelease-1>", on_release, add="+")
-
-
-class _HTMLToTkRenderer(HTMLParser):
-    """Render simplified HTML into a Tk Text widget using tag-based
-    formatting. Goal: legible to non-technical reviewers (FERPA), not
-    pixel-perfect. Output handles paragraphs, links, basic
-    formatting, lists, headings, and images-as-placeholders.
-
-    Highlights any `{{var}}` placeholder that survived rendering in
-    red — those are the FERPA risk (template variable referenced
-    that didn't get a value)."""
-
-    _SKIP_CONTENT = {"style", "script", "head", "title", "meta", "link"}
-
-    def __init__(self, text_widget, unresolved_var_set: Optional[set] = None):
-        super().__init__()
-        self.text = text_widget
-        # `unresolved_vars` is populated as we find any leftover
-        # `{{name}}` in the rendered HTML — caller uses it to
-        # populate the "issues" badge on the row.
-        self.unresolved_vars: set[str] = (
-            unresolved_var_set if unresolved_var_set is not None else set()
-        )
-        self._format_stack: list[str] = []
-        self._link_href = ""
-        self._list_stack: list[dict] = []
-        self._skip_depth = 0
-        self._first_block = True
-
-    def handle_starttag(self, tag, attrs):
-        if tag in self._SKIP_CONTENT:
-            self._skip_depth += 1
-            return
-        if self._skip_depth > 0:
-            return
-        d = dict(attrs)
-
-        if tag == "p":
-            self._paragraph_break()
-        elif tag == "br":
-            self.text.insert("end", "\n")
-        elif tag in ("strong", "b"):
-            self._format_stack.append("bold")
-        elif tag in ("em", "i"):
-            self._format_stack.append("italic")
-        elif tag == "u":
-            self._format_stack.append("underline")
-        elif tag == "a":
-            self._format_stack.append("link")
-            self._link_href = d.get("href", "")
-        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
-            self._paragraph_break()
-            self._format_stack.append("heading")
-        elif tag == "ol":
-            self._list_stack.append({"type": "ol", "n": 0})
-            self._paragraph_break()
-        elif tag == "ul":
-            self._list_stack.append({"type": "ul", "n": 0})
-            self._paragraph_break()
-        elif tag == "li":
-            self.text.insert("end", "\n")
-            depth = max(0, len(self._list_stack) - 1)
-            self.text.insert("end", "    " * depth)
-            if self._list_stack and self._list_stack[-1]["type"] == "ol":
-                self._list_stack[-1]["n"] += 1
-                self.text.insert("end", f"{self._list_stack[-1]['n']}. ")
-            else:
-                self.text.insert("end", "• ")
-        elif tag == "img":
-            src = d.get("src", "")
-            alt = (d.get("alt", "") or "").strip()
-            # cid:STEM is what the live email uses; show the stem
-            # so the reviewer can see the file being referenced.
-            if src.startswith("cid:"):
-                label = src[4:]
-            else:
-                label = src.rsplit("/", 1)[-1] or src
-            marker = f"[Image: {label}"
-            if alt:
-                marker += f"  ⇨  {alt}"
-            marker += "]"
-            self._paragraph_break()
-            self._insert_tagged(marker, "image")
-            self.text.insert("end", "\n")
-
-    def handle_endtag(self, tag):
-        if tag in self._SKIP_CONTENT:
-            self._skip_depth = max(0, self._skip_depth - 1)
-            return
-        if self._skip_depth > 0:
-            return
-
-        if tag in ("strong", "b"):
-            self._pop_format("bold")
-        elif tag in ("em", "i"):
-            self._pop_format("italic")
-        elif tag == "u":
-            self._pop_format("underline")
-        elif tag == "a":
-            self._pop_format("link")
-            href = self._link_href
-            self._link_href = ""
-            # Show the URL in dim text after the link so reviewers
-            # can verify what the click goes to. Trim mailto: prefix
-            # to keep it tidy.
-            if href:
-                disp = href[7:] if href.startswith("mailto:") else href
-                self._insert_tagged(f"  ({disp})", "url_hint")
-        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
-            self._pop_format("heading")
-            self.text.insert("end", "\n")
-        elif tag in ("ol", "ul"):
-            if self._list_stack:
-                self._list_stack.pop()
-            self.text.insert("end", "\n")
-
-    def handle_data(self, data):
-        if self._skip_depth > 0:
-            return
-        # Collapse runs of whitespace (HTML semantics) but preserve
-        # one separator between words.
-        collapsed = re.sub(r"\s+", " ", data)
-        if not collapsed:
-            return
-        # Detect any leftover {{var}} placeholders — these mean the
-        # template referenced a variable that didn't get a value,
-        # which is the kind of leak FERPA review needs to catch.
-        var_re = re.compile(r"\{\{\s*(\w+)\s*\}\}")
-        idx = 0
-        for m in var_re.finditer(collapsed):
-            if m.start() > idx:
-                self._insert_tagged(
-                    collapsed[idx:m.start()], *self._format_stack,
-                )
-            self._insert_tagged(m.group(0), "unresolved_var")
-            self.unresolved_vars.add(m.group(1))
-            idx = m.end()
-        if idx < len(collapsed):
-            self._insert_tagged(
-                collapsed[idx:], *self._format_stack,
-            )
-
-    def handle_entityref(self, name):
-        if self._skip_depth > 0:
-            return
-        ch = html.unescape(f"&{name};")
-        self._insert_tagged(ch, *self._format_stack)
-
-    def handle_charref(self, name):
-        if self._skip_depth > 0:
-            return
-        ch = html.unescape(f"&#{name};")
-        self._insert_tagged(ch, *self._format_stack)
-
-    def _pop_format(self, name):
-        # Pop the rightmost matching entry (handles nested tags).
-        for i in range(len(self._format_stack) - 1, -1, -1):
-            if self._format_stack[i] == name:
-                del self._format_stack[i]
-                return
-
-    def _paragraph_break(self):
-        if self._first_block:
-            self._first_block = False
-            return
-        # Avoid stacking multiple blank lines if the previous block
-        # already ended with one.
-        tail = self.text.get("end-3c", "end-1c")
-        if tail.endswith("\n\n"):
-            return
-        if tail.endswith("\n"):
-            self.text.insert("end", "\n")
-            return
-        self.text.insert("end", "\n\n")
-
-    def _insert_tagged(self, text, *tags):
-        if not text:
-            return
-        start = self.text.index("end-1c")
-        self.text.insert("end", text)
-        end = self.text.index("end-1c")
-        for tag in tags:
-            self.text.tag_add(tag, start, end)
-
-
-def _configure_email_preview_tags(text_widget) -> None:
-    """Set up the tag styles used by `_HTMLToTkRenderer`. Colors
-    adapt to the current ctk appearance mode so the preview is
-    readable on both light and dark themes."""
-    mode = ctk.get_appearance_mode()
-    is_dark = mode == "Dark"
-    text_widget.tag_configure(
-        "bold", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-    )
-    text_widget.tag_configure(
-        "italic", font=ctk.CTkFont(family="Segoe UI", size=12, slant="italic"),
-    )
-    text_widget.tag_configure("underline", underline=True)
-    text_widget.tag_configure(
-        "link",
-        foreground="#79b8ff" if is_dark else "#1a73e8",
-        underline=True,
-    )
-    text_widget.tag_configure(
-        "url_hint",
-        foreground="#888888" if is_dark else "#666666",
-        font=ctk.CTkFont(family="Segoe UI", size=10),
-    )
-    text_widget.tag_configure(
-        "heading", font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
-    )
-    text_widget.tag_configure(
-        "image",
-        foreground="#5a4500" if not is_dark else "#ffd966",
-        background="#fff3c4" if not is_dark else "#3a3520",
-        font=ctk.CTkFont(family="Segoe UI", size=11, slant="italic"),
-    )
-    text_widget.tag_configure(
-        "unresolved_var",
-        foreground="#ffffff",
-        background="#cc0000",
-        font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-    )
-
-
-def prompt_segment_setup(parent, missing: list) -> bool:
-    """Modal with step-by-step instructions to create the missing Mongoose
-    contacts segment(s) — one per caseload department that has none yet. The
-    exact segment name(s) are shown in a read-only box to copy verbatim (the
-    auto-export matches the name exactly). Returns True if the user clicked
-    'Re-check now' (the caller then re-runs the sync)."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Texting IDs — create Mongoose segment(s)")
-    dialog.geometry("640x560")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    dialog.lift()
-    dialog.after(150, lambda: (dialog.lift(), dialog.focus_force()))
-    result = {"recheck": False}
-
-    ctk.CTkLabel(
-        dialog,
-        text=f"{len(missing)} department(s) need a contacts segment",
-        font=ctk.CTkFont(size=15, weight="bold"), anchor="w",
-    ).pack(fill="x", padx=16, pady=(14, 2))
-    ctk.CTkLabel(
-        dialog, anchor="w", justify="left", wraplength=600,
-        text=("Optional but recommended. Texting already works without a "
-              "segment — each student is reached by their Salesforce Contact id "
-              "(no mobile needed) and gated by the Salesforce opt-in field. But "
-              "that field can disagree with who's actually opted in inside "
-              "Mongoose. A one-time segment per department gives VERIFIED "
-              "opt-in (and covers any student whose Contact id didn't come "
-              "through from Salesforce)."),
-        font=ctk.CTkFont(size=12),
-    ).pack(fill="x", padx=16, pady=(0, 8))
-
-    steps = (
-        "In Mongoose, for EACH department below:\n"
-        "  1.  Switch to that department (top-left department selector).\n"
-        "  2.  Tools → Segments → New Segment.\n"
-        "  3.  Add a filter:   Contact ID   →   is not empty\n"
-        "        (REQUIRED — this is what makes the list complete: every\n"
-        "         student who has a Contact id is included.)\n"
-        "  4.  Name the segment EXACTLY as shown below (copy it).\n"
-        "  5.  Save.\n"
-        "Then click “Re-check now”."
-    )
-    ctk.CTkLabel(
-        dialog, text=steps, anchor="w", justify="left",
-        font=ctk.CTkFont(size=12),
-    ).pack(fill="x", padx=16, pady=(0, 8))
-
-    ctk.CTkLabel(
-        dialog, text="Exact segment name(s) to create:", anchor="w",
-        font=ctk.CTkFont(size=12, weight="bold"),
-    ).pack(fill="x", padx=16, pady=(0, 2))
-    names = "\n".join(m["segment_name"] for m in missing)
-    name_box = ctk.CTkTextbox(dialog, height=max(40, 22 * len(missing)),
-                              wrap="none", font=ctk.CTkFont(size=13))
-    name_box.pack(fill="x", padx=16, pady=(0, 8))
-    name_box.insert("1.0", names)
-    name_box.configure(state="disabled")
-
-    # Show what each department currently has (helps spot a near-miss name).
-    have = []
-    for m in missing:
-        present = m.get("available") or []
-        have.append(f"{m['course']}: " + (", ".join(present) if present
-                                          else "(no segments yet)"))
-    ctk.CTkLabel(
-        dialog, text="Currently in each department:\n" + "\n".join(have),
-        anchor="w", justify="left", wraplength=600,
-        font=ctk.CTkFont(size=11), text_color=("gray40", "gray70"),
-    ).pack(fill="x", padx=16, pady=(0, 8))
-
-    footer = ctk.CTkFrame(dialog, fg_color="transparent")
-    footer.pack(fill="x", padx=16, pady=(0, 14))
-
-    def _close():
-        try:
-            dialog.grab_release()
-        except Exception:
-            pass
-        try:
-            dialog.destroy()
-        except Exception:
-            pass
-
-    def _recheck():
-        result["recheck"] = True
-        _close()
-
-    ctk.CTkButton(footer, text="Re-check now", command=_recheck,
-                  width=140).pack(side="right", padx=(6, 0))
-    ctk.CTkButton(footer, text="Close", command=_close, width=90,
-                  **SECONDARY_BTN_KWARGS).pack(side="right")
-    dialog.bind("<Escape>", lambda _e: _close())
-    dialog.protocol("WM_DELETE_WINDOW", _close)
-    parent.wait_window(dialog)
-    return result["recheck"]
-
-
-def prompt_batch_text_review(
-    parent,
-    scenario_name: str,
-    groups: list[dict],
-    skipped_names: "Optional[list[str]]" = None,
-    filter_summary: str = "",
-    *,
-    scheduled: bool = True,
-) -> "Optional[list[list[str]]]":
-    """Modal reviewer for batch texts. Each timezone group is a foldable section
-    with a per-student checklist (default checked; students with neither a mobile
-    nor a Contact id are shown disabled). A read-only "Skipped - not opted in"
-    section lists students who won't be texted. The right pane shows the group's
-    shared message.
-
-    `groups`: dicts with keys label, course_code, when_str, body, issues,
-    inbox_label, schedule, schedule_name, members (list of {name, mobile, term,
-    via_id}). `term` is the Mongoose search key (Contact id or mobile); a member
-    is textable iff it has one. Returns a list PARALLEL to `groups`, each element
-    the selected recipient terms for that group; or None on cancel."""
-    skipped_names = skipped_names or []
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title(f"Review texts - {scenario_name}")
-    dialog.geometry("980x680")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    dialog.lift()
-    dialog.after(150, lambda: (dialog.lift(), dialog.focus_force()))
-    result: dict = {"value": None}
-
-    # Per-group, per-member selection vars. Members with no term (no mobile and
-    # no Contact id) aren't textable -> var stays False and the checkbox is
-    # disabled.
-    member_vars: list = []
-    for g in groups:
-        member_vars.append(
-            [ctk.BooleanVar(value=bool(m.get("term")))
-             for m in g.get("members", [])])
-
-    banner = ctk.CTkFrame(dialog, fg_color=("gray92", "gray18"))
-    banner.pack(fill="x", padx=8, pady=(8, 0))
-    ctk.CTkLabel(
-        banner, text=f"Review batch texts: {scenario_name}",
-        font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
-    ).pack(fill="x", padx=10, pady=(8, 0))
-    if filter_summary:
-        ctk.CTkLabel(
-            banner, text=f"Matched by: {filter_summary}",
-            font=ctk.CTkFont(size=11), text_color=("gray40", "gray70"),
-            anchor="w",
-        ).pack(fill="x", padx=10, pady=(0, 2))
-    sel_label = ctk.CTkLabel(
-        banner, text="", font=ctk.CTkFont(size=11),
-        text_color=("gray35", "gray70"), anchor="w")
-    sel_label.pack(fill="x", padx=10, pady=(0, 8))
-
-    body = ctk.CTkFrame(dialog, fg_color="transparent")
-    body.pack(fill="both", expand=True, padx=8, pady=6)
-    # Left: native ttk.Treeview — timezone groups as parent rows, students as
-    # children, each with a ☐/☑ glyph in the 'sel' column (one Treeview is far
-    # lighter than a CTkCheckBox per member, and gives native expand/collapse).
-    left_col = ctk.CTkFrame(body, fg_color=("gray95", "gray16"))
-    left_col.pack(side="left", fill="y", padx=(0, 6))
-    tz_wrap = tk.Frame(left_col, bd=0, highlightthickness=0)
-    tz_wrap.pack(side="top", fill="both", expand=True, padx=4, pady=4)
-    tz_wrap.grid_rowconfigure(0, weight=1)
-    tz_wrap.grid_columnconfigure(0, weight=1)
-    tz_tree = ttk.Treeview(
-        tz_wrap, columns=("sel",), show="tree headings",
-        selectmode="browse", height=10, style="Caseload.Treeview",
-    )
-    tz_tree.heading("#0", text="Students by timezone")
-    tz_tree.column("#0", width=360, anchor="w")
-    tz_tree.heading("sel", text="")
-    tz_tree.column("sel", width=44, minwidth=44, stretch=False, anchor="center")
-    tz_tree.grid(row=0, column=0, sticky="nsew")
-    _tsb = ttk.Scrollbar(tz_wrap, command=tz_tree.yview)
-    _tsb.grid(row=0, column=1, sticky="ns")
-    tz_tree.configure(yscrollcommand=_tsb.set)
-    _tdark = ctk.get_appearance_mode() == "Dark"
-    tz_tree.tag_configure("issue",
-                          foreground=("#ff8a80" if _tdark else "#b00020"))
-    tz_tree.tag_configure("muted", foreground="gray55")
-
-    def _glyph(checked, textable=True):
-        if not textable:
-            return "—"
-        return "☑" if checked else "☐"
-
-    node_map: dict = {}  # iid -> ("group", i) | ("member", i, j)
-
-    def _refresh_group_glyph(i):
-        master = any(v.get() for v in member_vars[i])
-        try:
-            tz_tree.set(f"g{i}", "sel", _glyph(master))
-        except Exception:
-            pass
-
-    def _toggle_iid(iid):
-        info = node_map.get(iid)
-        if not info:
-            return
-        if info[0] == "group":
-            i = info[1]
-            members = groups[i].get("members", [])
-            gv = member_vars[i]
-            target = not any(v.get() for v in gv)
-            for j, (m, v) in enumerate(zip(members, gv)):
-                if m.get("term"):
-                    v.set(target)
-                    tz_tree.set(f"g{i}m{j}", "sel", _glyph(target))
-            _refresh_group_glyph(i)
-        else:
-            _, i, j = info
-            m = groups[i].get("members", [])[j]
-            if not m.get("term"):
-                return  # not textable — ignore
-            v = member_vars[i][j]
-            v.set(not v.get())
-            tz_tree.set(f"g{i}m{j}", "sel", _glyph(v.get()))
-            _refresh_group_glyph(i)
-        _update_sel_label()
-
-    def _on_tz_click(event):
-        iid = tz_tree.identify_row(event.y)
-        if not iid:
-            return
-        if tz_tree.identify_column(event.x) == "#1":  # the 'sel' column
-            _toggle_iid(iid)
-            return "break"  # toggle only — don't move the preview selection
-
-    def _on_tz_select(event=None):
-        info = node_map.get(tz_tree.focus())
-        if info:
-            _show(info[1])
-
-    tz_tree.bind("<Button-1>", _on_tz_click)
-    tz_tree.bind("<<TreeviewSelect>>", _on_tz_select)
-
-    right = ctk.CTkFrame(body, fg_color=("gray95", "gray16"))
-    right.pack(side="left", fill="both", expand=True)
-    preview_hdr = ctk.CTkLabel(
-        right, text="", anchor="w", justify="left", font=ctk.CTkFont(size=12))
-    preview_hdr.pack(fill="x", padx=10, pady=(10, 4))
-    preview_box = ctk.CTkTextbox(right, wrap="word")
-    preview_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-    preview_box.configure(state="disabled")
-
-    def _count():
-        return sum(1 for gv in member_vars for v in gv if v.get())
-
-    def _update_sel_label():
-        sel_label.configure(
-            text=f"{_count()} recipient(s) selected across "
-                 f"{len(groups)} timezone group(s)")
-
-    def _show(i):
-        g = groups[i]
-        names = ", ".join(m["name"] for m in g.get("members", []))
-        hdr = (f"{g['label']}\n{'Schedule' if scheduled else 'Send'}:  "
-               f"{g['when_str']}\nRecipients:  {names}")
-        if g.get("issues"):
-            hdr += f"\n⚠ {', '.join(g['issues'])}"
-        preview_hdr.configure(text=hdr)
-        preview_box.configure(state="normal")
-        preview_box.delete("1.0", "end")
-        preview_box.insert("1.0", g.get("body", ""))
-        preview_box.configure(state="disabled")
-
-    if skipped_names:
-        skip_frame = ctk.CTkFrame(left_col, fg_color=("gray90", "gray22"))
-        skip_frame.pack(side="bottom", fill="x", padx=4, pady=(0, 4))
-        ctk.CTkLabel(
-            skip_frame,
-            text=f"Skipped - not opted in ({len(skipped_names)})",
-            anchor="w", font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=("gray45", "gray65"),
-        ).pack(fill="x", padx=8, pady=(4, 0))
-        ctk.CTkLabel(
-            skip_frame, text=", ".join(skipped_names), anchor="w",
-            justify="left", wraplength=360, font=ctk.CTkFont(size=10),
-            text_color=("gray45", "gray60"),
-        ).pack(fill="x", padx=8, pady=(0, 4))
-
-    # Populate the tree: a parent row per timezone group, a child per member.
-    for i, g in enumerate(groups):
-        gv = member_vars[i]
-        members = g.get("members", [])
-        ntext = sum(1 for m in members if m.get("term"))
-        master = any(v.get() for v in gv)
-        warn = "⚠ " if g.get("issues") else ""
-        gid = f"g{i}"
-        tz_tree.insert(
-            "", "end", iid=gid, open=True,
-            text=f"{warn}{g['label']}  ·  {g['when_str']}  ·  {ntext} textable",
-            values=(_glyph(master),),
-            tags=(("issue",) if g.get("issues") else ()),
-        )
-        node_map[gid] = ("group", i)
-        for j, (m, v) in enumerate(zip(members, gv)):
-            has = bool(m.get("term"))
-            if not has:
-                suffix = "   (no mobile / Contact id)"
-            elif m.get("via_id"):
-                suffix = "   (via Contact id)"
-            else:
-                suffix = ""
-            mid = f"g{i}m{j}"
-            tz_tree.insert(
-                gid, "end", iid=mid, text="   " + m["name"] + suffix,
-                values=(_glyph(v.get(), has),),
-                tags=(() if has else ("muted",)),
-            )
-            node_map[mid] = ("member", i, j)
-
-    _update_sel_label()
-    if groups:
-        _show(0)
-        try:
-            tz_tree.selection_set("g0")
-            tz_tree.focus("g0")
-        except Exception:
-            pass
-
-    footer = ctk.CTkFrame(dialog, fg_color="transparent")
-    # Reserve the footer at the bottom BEFORE the expanding body, so the action
-    # buttons are never pushed off-screen by a tall tree (the tree scrolls to
-    # fit the space that's left).
-    footer.pack(side="bottom", fill="x", padx=8, pady=(0, 8), before=body)
-
-    def _toggle_all():
-        target = _count() == 0
-        for i, (g, gv) in enumerate(zip(groups, member_vars)):
-            for j, (m, v) in enumerate(zip(g.get("members", []), gv)):
-                if m.get("term"):
-                    v.set(target)
-                    try:
-                        tz_tree.set(f"g{i}m{j}", "sel", _glyph(target))
-                    except Exception:
-                        pass
-            _refresh_group_glyph(i)
-        _update_sel_label()
-
-    def _close():
-        try:
-            dialog.grab_release()
-        except Exception:
-            pass
-        try:
-            dialog.destroy()
-        except Exception:
-            pass
-
-    def _send():
-        out = []
-        for g, gv in zip(groups, member_vars):
-            out.append([m["term"] for m, v in zip(g.get("members", []), gv)
-                        if v.get() and m.get("term")])
-        result["value"] = out
-        _close()
-
-    ctk.CTkButton(
-        footer, text="Select all / none", command=_toggle_all, width=140,
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left")
-    ctk.CTkButton(
-        footer, text=("Schedule selected" if scheduled else "Send selected"),
-        command=_send, width=150,
-    ).pack(side="right", padx=(6, 0))
-    ctk.CTkButton(
-        footer, text="Cancel", command=_close, width=90, **SECONDARY_BTN_KWARGS,
-    ).pack(side="right")
-    dialog.bind("<Escape>", lambda _e: _close())
-    dialog.protocol("WM_DELETE_WINDOW", _close)
-    parent.wait_window(dialog)
-    return result["value"]
-
-
-def prompt_email_deselect_choice(parent, n_unchecked, n_total, other_desc):
-    """3-way modal shown when the user leaves some students UNCHECKED in the
-    email review AND the action also does something else (a note/text) for them.
-    Returns:
-      'email_only' — skip only the email for the unchecked; still do the rest.
-      'entirely'   — drop the unchecked from the action entirely.
-      'back'       — return to the email review.
-    Defaults to 'back' (Esc / window close) so no student is silently dropped."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title("Some students unchecked for email")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-    dialog.lift()
-    dialog.after(50, lambda: (dialog.lift(), dialog.focus_force()))
-    res = {"value": "back"}
-
-    ctk.CTkLabel(
-        dialog, justify="left", anchor="w", wraplength=430,
-        text=(f"{n_unchecked} of {n_total} student(s) are unchecked for "
-              f"email.\nThis action also does {other_desc} for them.\n\n"
-              f"For the unchecked student(s):"),
-    ).pack(fill="x", padx=16, pady=(16, 10))
-
-    def choose(v):
-        res["value"] = v
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-        try:
-            if parent is not None:
-                parent.grab_set()
-        except Exception: pass
-
-    btns = ctk.CTkFrame(dialog, fg_color="transparent")
-    btns.pack(fill="x", padx=16, pady=(0, 14))
-    ctk.CTkButton(
-        btns, text="Skip only the email\n(do the rest for them)",
-        command=lambda: choose("email_only"), width=210, height=46,
-    ).pack(side="left", padx=(0, 6))
-    ctk.CTkButton(
-        btns, text="Skip them\nentirely", command=lambda: choose("entirely"),
-        width=120, height=46, **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=6)
-    ctk.CTkButton(
-        btns, text="◀ Back", command=lambda: choose("back"), width=80,
-        height=46, **SECONDARY_BTN_KWARGS,
-    ).pack(side="right")
-    dialog.bind("<Escape>", lambda _e: choose("back"))
-    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("back"))
-    _fit_dialog_to_content(dialog, min_w=470, near_mouse=True)
-    parent.wait_window(dialog)
-    return res["value"]
-
-
-def prompt_batch_email_review(
-    parent,
-    scenario_name: str,
-    rendered: list[dict],
-    filter_summary: str = "",
-    *,
-    templates: Optional[list[str]] = None,
-    current_template: str = "",
-    on_template_change: Optional[Callable[[str], list[dict]]] = None,
-    allow_empty: bool = False,
-) -> tuple:
-    """Modal reviewer for batch emails. Returns
-    `(selected_indices_or_None, chosen_template)` — the indices (into
-    `rendered`) the user wants to send to (None on cancel), and the
-    template they had selected (the unchanged default unless a
-    `templates` dropdown was shown).
-
-    `allow_empty` lets the user proceed with NOBODY checked (returns `[]`
-    instead of forcing a non-empty selection). The caller passes True when the
-    action has other channels (a note/text) so "email no one" is a valid way to
-    skip just the email step; when False, proceeding needs ≥1 recipient.
-
-    When `templates` is given (the scenario opted into 'choose template
-    when fired'), a Template dropdown appears above the preview; changing
-    it calls `on_template_change(template_filename)` which must return a
-    freshly-rendered `rendered` list, and the preview refreshes live.
-
-    Each entry in `rendered` is a dict with keys:
-        name              — student display name
-        student_id        — for sub-label
-        course_code       — for sub-label
-        to                — recipient address (empty if missing)
-        cc                — CC address (empty if not CC'ing PM)
-        cc_is_self        — bool; show "(you, auto-CC'd as PM)" hint
-        subject           — rendered subject line
-        body_html         — rendered email body (full HTML)
-        issues            — list of strings; common: 'no_email',
-                            'render_error: …'
-
-    Rows with `'no_email' in issues` come up unchecked by default
-    so the FERPA reviewer has to consciously include them; other
-    rows are checked by default. Unresolved `{{var}}` placeholders
-    in the body are highlighted in red by the HTML renderer."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title(f"Review emails — {scenario_name}")
-    dialog.geometry("1100x720")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-
-    # Topmost claw-back. Same dance as ask_yes_no_topmost since the
-    # Outlook template-preview path used to lose focus to Outlook;
-    # the new flow never opens Outlook for review but staying topmost
-    # keeps the modal in front of anything else the user clicks.
-    dialog.lift()
-    dialog.focus_force()
-    dialog.after(150, lambda: (dialog.lift(), dialog.focus_force()))
-
-    selected_vars: list[ctk.BooleanVar] = []
-    # Default: every row checked, UNLESS the row has an issue (no
-    # email, render error). Those start unchecked — FERPA-friendly
-    # default since you have to consciously opt them in.
-    for entry in rendered:
-        v = ctk.BooleanVar(value=not bool(entry.get("issues")))
-        selected_vars.append(v)
-
-    state = {"current": 0}
-    # Per-student CC / BCC as edited in the review ({idx: str}); the shown value
-    # is captured when leaving a row and at send. `_addr_ready` guards the very
-    # first _show so it doesn't capture the empty initial entries.
-    cc_edits: dict = {}
-    bcc_edits: dict = {}
-    _addr_ready = {"on": False}
-
-    # ---- Top banner: filter summary + count. ----
-    banner = ctk.CTkFrame(dialog, fg_color=("gray92", "gray18"))
-    banner.pack(fill="x", padx=8, pady=(8, 0))
-    title_line = ctk.CTkLabel(
-        banner, text=f"Review batch: {scenario_name}",
-        font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
-    )
-    title_line.pack(fill="x", padx=10, pady=(8, 0))
-    if filter_summary:
-        ctk.CTkLabel(
-            banner,
-            text=f"Matched by: {filter_summary}",
-            font=ctk.CTkFont(size=11),
-            text_color=("gray40", "gray70"),
-            anchor="w",
-        ).pack(fill="x", padx=10, pady=(0, 2))
-    selection_label = ctk.CTkLabel(
-        banner, text="", font=ctk.CTkFont(size=11),
-        text_color=("gray35", "gray70"), anchor="w",
-    )
-    selection_label.pack(fill="x", padx=10, pady=(0, 8))
-
-    # Optional template picker (scenario opted into "choose template when
-    # fired"). Changing it re-renders every preview via the callback.
-    chosen_template_box = {"value": current_template}
-    if templates:
-        tpl_row = ctk.CTkFrame(banner, fg_color="transparent")
-        tpl_row.pack(fill="x", padx=10, pady=(0, 8))
-        ctk.CTkLabel(
-            tpl_row, text="Template:",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).pack(side="left")
-        tpl_combo = ctk.CTkComboBox(
-            tpl_row, values=templates, width=300, state="readonly",
-        )
-        tpl_combo.set(current_template if current_template in templates
-                      else templates[0])
-        tpl_combo.pack(side="left", padx=(6, 0))
-        chosen_template_box["value"] = tpl_combo.get()
-
-        def _on_tpl_change(choice: str) -> None:
-            chosen_template_box["value"] = choice
-            if on_template_change is None:
-                return
-            try:
-                new = on_template_change(choice)
-            except Exception:
-                new = None
-            if new:
-                for i in range(min(len(rendered), len(new))):
-                    rendered[i] = new[i]
-                edits.clear()  # template re-render discards per-body edits
-                _show(state["current"])
-
-        tpl_combo.configure(command=_on_tpl_change)
-
-    # ---- Main split: student list (left) + preview (right). ----
-    body = ctk.CTkFrame(dialog, fg_color="transparent")
-    body.pack(fill="both", expand=True, padx=8, pady=8)
-    body.grid_columnconfigure(0, weight=0, minsize=300)
-    body.grid_columnconfigure(1, weight=1)
-    body.grid_rowconfigure(0, weight=1)
-
-    # Left: native ttk.Treeview list with a leading checkbox column. One
-    # Treeview is far lighter than a CTkCheckBox + CTkButton per student
-    # (which lagged on big batches) and gives free keyboard navigation.
-    list_col = ctk.CTkFrame(body, fg_color=("gray95", "gray16"),
-                            corner_radius=6)
-    list_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-    list_col.grid_rowconfigure(1, weight=1)
-    list_col.grid_columnconfigure(0, weight=1)
-    ctk.CTkLabel(
-        list_col, text=f"Students ({len(rendered)})", anchor="w",
-        font=ctk.CTkFont(size=12, weight="bold"),
-    ).grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
-
-    _chk_un, _chk_ch = _build_checkbox_images()
-    dialog._chk_imgs = (_chk_un, _chk_ch)  # keep refs (else Tk GCs them)
-
-    def _chk_img(checked):
-        return _chk_ch if checked else _chk_un
-
-    tree_wrap = tk.Frame(list_col, bd=0, highlightthickness=0)
-    tree_wrap.grid(row=1, column=0, sticky="nsew", padx=(6, 2), pady=(0, 4))
-    tree_wrap.grid_rowconfigure(0, weight=1)
-    tree_wrap.grid_columnconfigure(0, weight=1)
-    review_tree = ttk.Treeview(
-        tree_wrap, columns=("student",), show="tree headings",
-        selectmode="browse", style="Caseload.Treeview",
-    )
-    review_tree.heading("#0", text="")
-    review_tree.column("#0", width=32, minwidth=32, stretch=False,
-                       anchor="center")
-    review_tree.heading("student", text="Student")
-    review_tree.column("student", width=250, anchor="w")
-    review_tree.grid(row=0, column=0, sticky="nsew")
-    _rsb = ttk.Scrollbar(tree_wrap, command=review_tree.yview)
-    _rsb.grid(row=0, column=1, sticky="ns")
-    review_tree.configure(yscrollcommand=_rsb.set)
-    _rdark = ctk.get_appearance_mode() == "Dark"
-    review_tree.tag_configure(
-        "issue", foreground=("#ff8a80" if _rdark else "#b00020"))
-
-    _syncing = {"on": False}
-
-    def _select_in_tree(idx: int) -> None:
-        iid = str(idx)
-        if not review_tree.exists(iid):
-            return
-        _syncing["on"] = True
-        try:
-            review_tree.selection_set(iid)
-            review_tree.focus(iid)
-            review_tree.see(iid)
-        finally:
-            _syncing["on"] = False
-
-    def _set_checked(idx: int, val: bool) -> None:
-        selected_vars[idx].set(val)
-        iid = str(idx)
-        if review_tree.exists(iid):
-            review_tree.item(iid, image=_chk_img(val))
-
-    def _on_review_click(event):
-        iid = review_tree.identify_row(event.y)
-        if not iid:
-            return
-        if review_tree.identify_column(event.x) == "#0":
-            idx = int(iid)
-            _set_checked(idx, not selected_vars[idx].get())
-            _update_selection_label()
-            return "break"  # toggle only — don't move the preview selection
-
-    def _on_tree_select(event=None):
-        if _syncing["on"]:
-            return
-        iid = review_tree.focus()
-        if not iid:
-            return
-        idx = int(iid)
-        # Already showing this row → do nothing. This breaks the feedback loop:
-        # _show() calls _select_in_tree() which can fire a *queued*
-        # <<TreeviewSelect>> after _syncing has reset, which would re-enter
-        # _show() and spin the event loop forever.
-        if idx == state["current"]:
-            return
-        _show(idx)
-
-    review_tree.bind("<Button-1>", _on_review_click)
-    review_tree.bind("<<TreeviewSelect>>", _on_tree_select)
-
-    # Select all / none footer.
-    list_actions = ctk.CTkFrame(list_col, fg_color="transparent")
-    list_actions.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
-
-    def _select_all() -> None:
-        for i in range(len(rendered)):
-            _set_checked(i, True)
-        _update_selection_label()
-
-    def _select_none() -> None:
-        for i in range(len(rendered)):
-            _set_checked(i, False)
-        _update_selection_label()
-
-    ctk.CTkButton(
-        list_actions, text="Select all", height=24, command=_select_all,
-        font=ctk.CTkFont(size=11), **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=2)
-    ctk.CTkButton(
-        list_actions, text="None", height=24, command=_select_none,
-        font=ctk.CTkFont(size=11), **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=2)
-
-    # Right: preview pane.
-    preview_frame = ctk.CTkFrame(body, fg_color=("gray95", "gray16"), corner_radius=6)
-    preview_frame.grid(row=0, column=1, sticky="nsew")
-    preview_frame.grid_columnconfigure(0, weight=1)
-    preview_frame.grid_rowconfigure(2, weight=1)
-
-    # Header area (issue banner + To/Cc/Subject lines).
-    issue_banner = ctk.CTkLabel(
-        preview_frame, text="", anchor="w", justify="left",
-        font=ctk.CTkFont(size=11, weight="bold"),
-        text_color=("#990000", "#ffcccc"),
-        fg_color=("#ffe0e0", "#4a1a1a"), corner_radius=4,
-    )
-    # Pack/forget toggled per-row when issues exist.
-    header_block = ctk.CTkFrame(preview_frame, fg_color="transparent")
-    header_block.grid(row=1, column=0, sticky="ew", padx=8, pady=(8, 4))
-    header_block.grid_columnconfigure(1, weight=1)
-    to_label = ctk.CTkLabel(header_block, text="To:", width=64, anchor="w",
-                             font=ctk.CTkFont(size=12, weight="bold"))
-    to_label.grid(row=0, column=0, sticky="w")
-    to_value = ctk.CTkLabel(header_block, text="", anchor="w", justify="left")
-    to_value.grid(row=0, column=1, sticky="ew", padx=(2, 0))
-    # Cc / Bcc are EDITABLE (per-student) — the shown value is what sends.
-    cc_label = ctk.CTkLabel(header_block, text="Cc:", width=64, anchor="w",
-                             font=ctk.CTkFont(size=12, weight="bold"))
-    cc_label.grid(row=1, column=0, sticky="w")
-    cc_entry = ctk.CTkEntry(header_block, height=26,
-                            placeholder_text="add CC address(es), ; separated")
-    cc_entry.grid(row=1, column=1, sticky="ew", padx=(2, 0), pady=1)
-    bcc_label = ctk.CTkLabel(header_block, text="Bcc:", width=64, anchor="w",
-                             font=ctk.CTkFont(size=12, weight="bold"))
-    bcc_label.grid(row=2, column=0, sticky="w")
-    bcc_entry = ctk.CTkEntry(header_block, height=26,
-                             placeholder_text="add BCC address(es), ; separated")
-    bcc_entry.grid(row=2, column=1, sticky="ew", padx=(2, 0), pady=1)
-    cc_hint = ctk.CTkLabel(header_block, text="", anchor="w",
-                           font=ctk.CTkFont(size=10),
-                           text_color=("gray45", "gray60"))
-    cc_hint.grid(row=3, column=1, sticky="w", padx=(2, 0))
-    subj_label = ctk.CTkLabel(header_block, text="Subject:", width=64, anchor="w",
-                               font=ctk.CTkFont(size=12, weight="bold"))
-    subj_label.grid(row=4, column=0, sticky="w")
-    subj_value = ctk.CTkLabel(header_block, text="", anchor="w", justify="left",
-                               font=ctk.CTkFont(size=12, weight="bold"))
-    subj_value.grid(row=4, column=1, sticky="ew", padx=(2, 0))
-
-    # Separator + body text.
-    sep = ctk.CTkFrame(preview_frame, height=1, fg_color=("gray70", "gray35"))
-    sep.grid(row=2, column=0, sticky="new", padx=8, pady=(2, 4))
-    body_text = ctk.CTkTextbox(
-        preview_frame, wrap="word",
-        font=ctk.CTkFont(family="Segoe UI", size=12),
-    )
-    body_text.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 8))
-    preview_frame.grid_rowconfigure(3, weight=1)
-    _configure_email_preview_tags(body_text._textbox)
-    register_font_box("email", body_text)  # adjustable + Ctrl +/- zoom
-    # Disable typing — preview is read-only.
-    body_text.configure(state="disabled")
-
-    def _row_label(entry: dict, idx: int) -> str:
-        parts = [entry["name"]]
-        sub = []
-        sid = entry.get("student_id", "")
-        cc = entry.get("course_code", "")
-        if sid:
-            sub.append(sid)
-        if cc:
-            sub.append(cc)
-        if sub:
-            parts.append("  " + " · ".join(sub))
-        if entry.get("issues"):
-            parts.append("  (!)")
-        return "".join(parts)
-
-    def _update_selection_label() -> None:
-        n_checked = sum(1 for v in selected_vars if v.get())
-        selection_label.configure(
-            text=f"{n_checked} of {len(rendered)} selected · "
-                 f"showing {state['current'] + 1} of {len(rendered)}"
-        )
-        if n_checked > 0:
-            send_btn.configure(
-                text=(f"Send to {n_checked} students" if n_checked != 1
-                      else "Send to 1 student"),
-                state="normal")
-        else:
-            # Zero checked: only proceed-able when the action has other channels
-            # (email no one, still do the note/text). Otherwise stay disabled.
-            send_btn.configure(
-                text="Continue — email no one",
-                state=("normal" if allow_empty else "disabled"))
-
-    def _capture_addrs() -> None:
-        """Save the CC/BCC entry text for the currently-shown row."""
-        if not _addr_ready["on"]:
-            return
-        i = state["current"]
-        if 0 <= i < len(rendered):
-            cc_edits[i] = cc_entry.get().strip()
-            bcc_edits[i] = bcc_entry.get().strip()
-
-    def _show(idx: int) -> None:
-        if not (0 <= idx < len(rendered)):
-            return
-        _capture_addrs()   # remember edits on the row we're leaving
-        state["current"] = idx
-        entry = rendered[idx]
-        # Keep the list selection in sync with the previewed student.
-        _select_in_tree(idx)
-        # Issue banner.
-        issues = entry.get("issues", [])
-        if issues:
-            issue_banner.configure(
-                text="⚠  " + "  ·  ".join(issues),
-            )
-            issue_banner.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
-        else:
-            issue_banner.grid_remove()
-        # To.
-        to = entry.get("to", "") or "(missing — will be looked up at send)"
-        to_value.configure(
-            text=to,
-            text_color=(("gray45", "gray60") if not entry.get("to")
-                        else ("gray10", "gray90")),
-        )
-        # Cc / Bcc — editable. Pre-fill CC from the user's edit (if any) else the
-        # computed CC; BCC from the user's edit else blank.
-        cc_entry.delete(0, "end")
-        cc_entry.insert(0, cc_edits.get(idx, entry.get("cc", "") or ""))
-        bcc_entry.delete(0, "end")
-        bcc_entry.insert(0, bcc_edits.get(idx, entry.get("bcc", "") or ""))
-        cc_hint.configure(
-            text="(you, auto-CC'd as PM)" if entry.get("cc_is_self") else "")
-        _addr_ready["on"] = True
-        # Subject (+ an edited marker when this body was hand-edited).
-        edited_tag = "   ✏ edited" if state["current"] in edits else ""
-        subj_value.configure(text=entry.get("subject", "") + edited_tag)
-        # Body render.
-        body_text.configure(state="normal")
-        body_text.delete("1.0", "end")
-        if entry.get("render_error"):
-            body_text.insert("1.0", f"Render error:\n\n{entry['render_error']}")
-        else:
-            try:
-                renderer = _HTMLToTkRenderer(body_text._textbox)
-                renderer.feed(entry.get("body_html", ""))
-                renderer.close()
-            except Exception as e:
-                body_text.insert("1.0", f"(Preview render failed: {e})\n\n")
-                body_text.insert("end", entry.get("body_html", ""))
-        body_text.configure(state="disabled")
-        _update_selection_label()
-
-    # Populate the student list. The leading (#0) column shows the checkbox
-    # image (toggled on click); the 'student' column shows name · id · course
-    # with a trailing (!) and red tint for rows with issues.
-    for i, entry in enumerate(rendered):
-        review_tree.insert(
-            "", "end", iid=str(i),
-            image=_chk_img(selected_vars[i].get()),
-            values=(_row_label(entry, i),),
-            tags=(("issue",) if entry.get("issues") else ()),
-        )
-
-    # ---- Bottom action row: prev/next, edge, send, cancel. ----
-    bottom = ctk.CTkFrame(dialog, fg_color="transparent")
-    # Reserve the action row at the bottom before the expanding body so it's
-    # never pushed off-screen.
-    bottom.pack(side="bottom", fill="x", padx=8, pady=(0, 8), before=body)
-
-    def _prev() -> None:
-        if state["current"] > 0:
-            _show(state["current"] - 1)
-
-    def _next() -> None:
-        if state["current"] < len(rendered) - 1:
-            _show(state["current"] + 1)
-
-    def _skip_and_next() -> None:
-        # Uncheck current + advance.
-        selected_vars[state["current"]].set(False)
-        _update_selection_label()
-        _next()
-
-    def _view_current_in_edge() -> None:
-        # Reuse the same _preview.html mechanism as the template
-        # editor's Preview button so we don't keep accumulating
-        # temp files. cid: references get rewritten to local
-        # filenames so the browser can resolve them.
-        entry = rendered[state["current"]]
-        body_html = entry.get("body_html", "")
-
-        def _fix_cid(m):
-            stem = m.group(1)
-            for f in sorted(templates_dir().glob(f"{stem}.*")):
-                if f.suffix.lower() != ".html":
-                    return f'src="{f.name}"'
-            return m.group(0)
-        body_html = re.sub(r'src="cid:([^"]+)"', _fix_cid, body_html)
-
-        shell = (
-            '<!DOCTYPE html>\n<html><head>'
-            '<meta charset="utf-8"><title>Email preview</title>'
-            '<style>body { max-width: 720px; margin: 24px auto; '
-            'padding: 0 24px; font-family: Segoe UI, sans-serif; }'
-            '.preview-banner { background:#fff3c4; color:#5a4500; '
-            'padding:8px 12px; border-radius:6px; margin-bottom:16px; '
-            'font-size:12px; }</style></head><body>'
-            '<div class="preview-banner">Email preview for '
-            f'<b>{html.escape(entry.get("name", ""))}</b> · To: '
-            f'{html.escape(entry.get("to") or "(missing)")} · Cc: '
-            f'{html.escape(entry.get("cc") or "(none)")} · Subject: '
-            f'{html.escape(entry.get("subject", ""))}</div>\n'
-            + body_html + '\n</body></html>'
-        )
-        preview_path = templates_dir() / "_preview.html"
-        try:
-            templates_dir().mkdir(parents=True, exist_ok=True)
-            preview_path.write_text(shell, encoding="utf-8")
-        except Exception:
-            return
-        uri = preview_path.as_uri()
-        # Module-level _open_in_edge — explicit reference to avoid
-        # shadowing by this closure's earlier name (which I renamed
-        # to _view_current_in_edge).
-        if not _open_in_edge(uri):
-            import webbrowser
-            webbrowser.open(uri, new=2)
-
-    # Per-student body edits the user makes via "Edit body" — {idx: html}.
-    # Returned to the caller so the edited body is what actually sends.
-    edits: dict = {}
-
-    def _edit_current_body() -> None:
-        """One-off: edit THIS student's email body in the rich-text editor.
-        The edit applies only to this send, not the saved template."""
-        idx = state["current"]
-        entry = rendered[idx]
-        if entry.get("render_error"):
-            return
-        tmp = templates_dir() / "_oneoff_edit.html"
-        try:
-            templates_dir().mkdir(parents=True, exist_ok=True)
-            tmp.write_text(entry.get("body_html", ""), encoding="utf-8")
-        except Exception:
-            return
-        saved = prompt_html_template_editor(dialog, tmp)
-        if saved:
-            try:
-                new_html = tmp.read_text(encoding="utf-8")
-            except Exception:
-                new_html = None
-            if new_html is not None:
-                rendered[idx]["body_html"] = new_html
-                edits[idx] = new_html
-                _show(idx)
-        try:
-            tmp.unlink()
-        except Exception:
-            pass
-
-    nav_l = ctk.CTkFrame(bottom, fg_color="transparent")
-    nav_l.pack(side="left")
-    ctk.CTkButton(nav_l, text="◀ Prev", width=80, command=_prev,
-                   **SECONDARY_BTN_KWARGS).pack(side="left", padx=2)
-    ctk.CTkButton(nav_l, text="Next ▶", width=80, command=_next,
-                   **SECONDARY_BTN_KWARGS).pack(side="left", padx=2)
-    ctk.CTkButton(nav_l, text="Skip & next", width=110,
-                   command=_skip_and_next,
-                   **SECONDARY_BTN_KWARGS).pack(side="left", padx=8)
-    ctk.CTkButton(nav_l, text="✏ Edit body", width=110,
-                   command=_edit_current_body,
-                   **SECONDARY_BTN_KWARGS).pack(side="left", padx=2)
-    ctk.CTkButton(nav_l, text="Open in Edge", width=120,
-                   command=_view_current_in_edge,
-                   **SECONDARY_BTN_KWARGS).pack(side="left", padx=2)
-
-    nav_r = ctk.CTkFrame(bottom, fg_color="transparent")
-    nav_r.pack(side="right")
-    result_box = {"value": None}
-
-    def _do_send() -> None:
-        _capture_addrs()   # capture the currently-shown row's CC/BCC
-        selected = [i for i, v in enumerate(selected_vars) if v.get()]
-        # An empty selection is only reachable when allow_empty (the button is
-        # disabled otherwise); it's a valid "email no one" signal — the caller
-        # decides what that means for the action's other channels.
-        if not selected and not allow_empty:
-            return
-        result_box["value"] = selected   # may be [] when allow_empty
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    def _do_cancel() -> None:
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    send_btn = ctk.CTkButton(
-        nav_r, text="Send", width=180, command=_do_send,
-    )
-    ctk.CTkButton(
-        nav_r, text="Cancel", width=90, command=_do_cancel,
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="right", padx=2)
-    send_btn.pack(side="right", padx=2)
-
-    dialog.bind("<Escape>", lambda _e: _do_cancel())
-    dialog.bind("<Left>",   lambda _e: _prev())
-    dialog.bind("<Right>",  lambda _e: _next())
-    dialog.protocol("WM_DELETE_WINDOW", _do_cancel)
-
-    # Initial display.
-    if rendered:
-        _show(0)
-
-    parent.wait_window(dialog)
-    return (result_box["value"], chosen_template_box["value"], edits,
-            cc_edits, bcc_edits)
-
-
-def _build_checkbox_images():
-    """Build (unchecked, checked) 16px checkbox PhotoImages in the CTk
-    style — an outlined box, and a filled blue box with a white tick. The
-    CALLER must keep a reference (else Tk GCs them and they render blank).
-    Needs a live Tk root. Shared by the caseload viewer's select-all header
-    and the batch-review popup so both look identical."""
-    from PIL import Image, ImageDraw, ImageTk
-    dark = ctk.get_appearance_mode() == "Dark"
-    blue = "#1f6aa5" if dark else "#3a7ebf"
-    border = "#6b6e70" if dark else "#979da2"
-    size, scale = 16, 4  # supersample then downscale for smooth edges
-    S = size * scale
-    pad, rad, bw = 1 * scale, 4 * scale, 2 * scale
-    un = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    ImageDraw.Draw(un).rounded_rectangle(
-        [pad, pad, S - pad, S - pad], radius=rad, outline=border, width=bw)
-    ch = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(ch)
-    d.rounded_rectangle(
-        [pad, pad, S - pad, S - pad], radius=rad, fill=blue, outline=blue)
-    d.line(
-        [(S * 0.27, S * 0.52), (S * 0.44, S * 0.69), (S * 0.74, S * 0.32)],
-        fill="white", width=bw, joint="curve")
-    return (ImageTk.PhotoImage(un.resize((size, size), Image.LANCZOS)),
-            ImageTk.PhotoImage(ch.resize((size, size), Image.LANCZOS)))
-
-
-def prompt_batch_review(
-    parent,
-    scenario_name: str,
-    rows: list[dict],
-    display_columns: list[str],
-) -> Optional[list[dict]]:
-    """Show matched students before a batch fires. Returns the subset
-    the user kept checked + confirmed, or None on cancel.
-
-    `display_columns` is the in-order list of fields shown per row;
-    the first column is usually 'Name' so the student is easy to
-    identify, followed by whatever fields the scenario filtered on."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title(f"Batch: {scenario_name}")
-    _restore_dialog_geometry(dialog, "batch_review")
-    dialog.transient(parent)
-    dialog.attributes("-topmost", True)
-    dialog.grab_set()
-
-    result: dict = {"value": None}
-
-    header_label = ctk.CTkLabel(
-        dialog,
-        text=(
-            f"{len(rows)} students matched. Uncheck anyone to skip, "
-            "then click Confirm to start."
-        ),
-        anchor="w", justify="left",
-    )
-    header_label.pack(fill="x", padx=12, pady=(12, 4))
-
-    cols_label = ctk.CTkLabel(
-        dialog,
-        text=" · ".join(display_columns),
-        anchor="w", justify="left",
-        font=ctk.CTkFont(size=12, weight="bold"),
-    )
-    cols_label.pack(fill="x", padx=12, pady=(0, 4))
-
-    # Master select-all box: the SAME little checkbox the caseload viewer
-    # uses in its header, sitting to the LEFT of a gray "Student (N)" tag.
-    # Click toggles all rows — or clears them if they're already all
-    # selected — mirroring the viewer's _toggle_select_all. The image refs
-    # are kept on the dialog so Tk doesn't GC them (→ blank).
-    _chk_un, _chk_ch = _build_checkbox_images()
-    dialog._batch_chk_imgs = (_chk_un, _chk_ch)
-
-    sel_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    sel_row.pack(fill="x", padx=12, pady=(0, 4))
-    sel_all_box = ctk.CTkLabel(sel_row, text="", image=_chk_ch, cursor="hand2")
-    sel_all_box.pack(side="left", padx=(4, 8))
-    ctk.CTkLabel(
-        sel_row, text=f"Student ({len(rows)})",
-        fg_color=("gray85", "gray25"), corner_radius=6,
-    ).pack(side="left", ipadx=8, ipady=2)
-
-    scroll = ctk.CTkScrollableFrame(dialog)
-    scroll.pack(fill="both", expand=True, padx=12, pady=4)
-
-    checked_vars: list[ctk.BooleanVar] = []
-
-    def update_count_label() -> None:
-        n = sum(1 for v in checked_vars if v.get())
-        confirm_btn.configure(text=f"Confirm {n}")
-        # Master box reflects the rows: filled only when ALL are checked.
-        all_on = bool(checked_vars) and n == len(checked_vars)
-        try:
-            sel_all_box.configure(image=_chk_ch if all_on else _chk_un)
-        except Exception:
-            pass
-
-    def toggle_all(_event=None) -> None:
-        # Select all, or clear if already all selected (mirrors the viewer).
-        new = not (bool(checked_vars) and all(v.get() for v in checked_vars))
-        for v in checked_vars:
-            v.set(new)
-        update_count_label()
-
-    sel_all_box.bind("<Button-1>", toggle_all)
-
-    for row in rows:
-        v = ctk.BooleanVar(value=True)
-        checked_vars.append(v)
-        text = " · ".join(
-            (row.get(c, "") or "")[:60] for c in display_columns
-        )
-        cb = ctk.CTkCheckBox(
-            scroll, text=text, variable=v, command=update_count_label,
-        )
-        cb.pack(fill="x", padx=4, pady=1, anchor="w")
-
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(pady=(4, 12))
-
-    def confirm(_event=None) -> None:
-        selected = [rows[i] for i, v in enumerate(checked_vars) if v.get()]
-        result["value"] = selected
-        _save_dialog_geometry(dialog, "batch_review")
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    def cancel(_event=None) -> None:
-        _save_dialog_geometry(dialog, "batch_review")
-        try: dialog.grab_release()
-        except Exception: pass
-        try: dialog.destroy()
-        except Exception: pass
-
-    confirm_btn = ctk.CTkButton(
-        btn_row, text=f"Confirm {len(rows)}", command=confirm, width=140,
-    )
-    confirm_btn.pack(side="left", padx=4)
-    ctk.CTkButton(
-        btn_row, text="Cancel", command=cancel, width=90,
-        **SECONDARY_BTN_KWARGS,
-    ).pack(side="left", padx=4)
-
-    dialog.bind("<Escape>", cancel)
-    dialog.protocol("WM_DELETE_WINDOW", cancel)
-
-    parent.wait_window(dialog)
-    return result["value"]
 
 
 # ============================================================
@@ -11740,10 +6592,6 @@ def _option_checkbox(parent, text, variable=None, command=None, **kw):
 # Left indent (px) for a sub-option so it sits under its major part.
 _OPT_INDENT = 8
 
-# Vivid blue for the "+ Add …" affordance buttons in the editor, so the
-# add-a-thing actions stand out from other controls. (light, dark) tuples.
-_ADD_BTN_BLUE = ("#2f6fed", "#2f6fed")
-_ADD_BTN_BLUE_HOVER = ("#2558c8", "#2558c8")
 # Branch tab-strip colors: the active tab is the same vivid blue as the
 # "+ Add" affordances; inactive tabs are a muted slate so the selected
 # branch reads clearly.
@@ -12165,65 +7013,6 @@ class NoteEditor:
         if subject:
             out["subject"] = subject
         return out
-
-
-# ============================================================
-# Branch (BranchConfig) <-> plain-dict converters. The editor stores each
-# branch as a serialized dict in the SAME shape the top-level channels use
-# (so a branch round-trips straight to YAML), and swaps that dict in/out of
-# the shared email/text/notes widgets as the user switches branch tabs.
-# ============================================================
-
-def _email_cfg_to_dict(e: Optional[EmailConfig]) -> Optional[dict]:
-    if e is None:
-        return None
-    return {
-        "subject": e.subject, "body_html_file": e.body_html_file, "to": e.to,
-        "signature_file": e.signature_file,
-        "inline_images": list(e.inline_images or []),
-        "cc_pm": e.cc_pm, "pick_template": e.pick_template,
-        "font_family": e.font_family, "font_size": e.font_size,
-    }
-
-
-def _text_cfg_to_dict(t) -> Optional[dict]:
-    if t is None:
-        return None
-    return {
-        "body": t.body, "body_file": t.body_file, "schedule": True,
-        "window_start_hour": t.window_start_hour,
-        "window_end_hour": t.window_end_hour,
-        "inbox_label": t.inbox_label, "commit": t.commit,
-    }
-
-
-def _note_cfg_to_dict(n) -> dict:
-    d = {
-        "interaction_format": n.interaction_format,
-        "interaction_type": n.interaction_type,
-        "body": n.body,
-        "academic_activities": list(n.academic_activities or []),
-        "submit": n.submit,
-        "append_clipboard": n.append_clipboard,
-        "enter_additional_text": n.enter_additional_text,
-    }
-    if getattr(n, "course_code_override", ""):
-        d["course_code_override"] = n.course_code_override
-    if n.subject:
-        d["subject"] = n.subject
-    return d
-
-
-def _branch_cfg_to_dict(bc) -> dict:
-    """One BranchConfig -> the editor's in-memory branch dict."""
-    return {
-        "title": bc.title or "",
-        "conditions": list(bc.conditions or []),
-        "email": _email_cfg_to_dict(bc.email),
-        "text": _text_cfg_to_dict(bc.text),
-        "notes": [_note_cfg_to_dict(n) for n in (bc.notes or [])],
-        "color": getattr(bc, "color", "") or "",
-    }
 
 
 # ============================================================
@@ -14018,7 +8807,7 @@ class ScenarioEditor:
         if branches:
             self.batch_mode_var.set(False)
             self.filter_single_var.set(False)
-            self.branches = [_branch_cfg_to_dict(bc) for bc in branches]
+            self.branches = [_branch_to_dict(bc) for bc in branches]
             self._active_branch = None  # cleared so _load_branch won't snapshot
             self._load_branch(0)
         else:
@@ -16003,7 +10792,7 @@ class CaseloadPanel:
             d = days_until(val)
             if val and d is not None:
                 suffix = (f"{d}d" if d >= 0 else f"{-d}d ago")
-                val = f"{val}  ({suffix})"
+                val = f"{fmt_date_short(val)}  ({suffix})"
                 color = ("#b00020", "#ff7b72") if d <= 14 else \
                         ("#9a6700", "#ffd166") if d <= 30 else None
             if not self._cell(row, key):
@@ -16112,7 +10901,7 @@ class CaseloadPanel:
             # emailed/noted this student (logged in note_log.csv, injected as
             # _pm_email_logged). Fall back to the PM's NAME, which Outlook
             # resolves against the WGU directory just like typing it.
-            pm_cc = _first_present_value(row, _CSV_PM_EMAIL_COLS)
+            pm_cc = caseload_csv.first_present_value(row, caseload_csv.PM_EMAIL_COLS)
             if not pm_cc:
                 pm_cc = self._cell(row, "_pm_email_logged")
             if not pm_cc:
@@ -16158,7 +10947,7 @@ class CaseloadPanel:
         self._qv_status_sid = sid
         badges: dict[str, tuple] = {}
         for i in (1, 2, 3):
-            state, date, attempts = parse_task_status(
+            state, date, attempts = caseload_csv.parse_task_status(
                 self._cell(row, f"Task{i}"))
             badge = ctk.CTkLabel(
                 bar, text=f"T{i}", corner_radius=6,
@@ -16196,7 +10985,7 @@ class CaseloadPanel:
         label = status_text or default_label
         note = f"Task {i}: {label}"
         if date:
-            note += f"  ({date})"
+            note += f"  ({fmt_date_short(date)})"
         if attempts:
             note += f"  ·  {attempts} attempt" + ("s" if attempts != 1 else "")
         # Always clickable — even a task with no recorded status. Caseload data
@@ -16540,7 +11329,7 @@ class CaseloadPanel:
             save_settings(self.app.settings)
         except Exception:
             pass
-        body_html = _note_body_to_html(data["body"])
+        body_html = note_body_to_html(data["body"])
         self.app._append_log(
             f"Filing quick note ({data['interaction_type']}) for {name}…")
 
@@ -17236,7 +12025,7 @@ class CaseloadPanel:
         if not rows:
             return []
         return [caseload_csv.display_for_column(h) for h in rows[0].keys()
-                if not _is_task_facet_col(h)]
+                if not caseload_filter.is_task_facet_col(h)]
 
     def _toggle_filters(self) -> None:
         if self._filters_open:
@@ -17334,7 +12123,7 @@ class CaseloadPanel:
             return list(rows)
         headers = list(rows[0].keys())
         filters = [
-            _rewrite_task_filter(_resolve_filter_columns(f, headers))
+            caseload_filter.rewrite_task_filter(caseload_filter.resolve_filter_columns(f, headers))
             for f in self._active_filters
         ]
         try:
@@ -17372,7 +12161,7 @@ class CaseloadPanel:
         if not rows:
             return []
         return [h for h in rows[0].keys()
-                if not _is_task_facet_col(h) and not str(h).startswith("sp:")]
+                if not caseload_filter.is_task_facet_col(h) and not str(h).startswith("sp:")]
 
     def _capture_current_view(self, name: str) -> dict:
         """Snapshot the current columns (order + shown/hidden) and filters."""
@@ -17983,7 +12772,7 @@ class CaseloadPanel:
         # in displaycolumns, which the tree doesn't define → ttk error → the
         # whole show/hide silently no-ops.
         headers = [h for h in rows[0].keys()
-                   if not _is_task_facet_col(h) and not h.startswith("_")]
+                   if not caseload_filter.is_task_facet_col(h) and not h.startswith("_")]
         # Capture any drag-resizes done since load so they aren't lost.
         self.persist_column_state()
         prefs = self._load_col_prefs()
@@ -18212,7 +13001,7 @@ class CaseloadPanel:
         live status hasn't been scraped yet shows ⚪ ("not loaded"). Non-task
         columns and empty cells pass through unchanged. Only the DISPLAY is
         decorated — sort/filter/search still run on the raw CSV dict."""
-        raw = r.get(header, "")
+        raw = fmt_date_short(r.get(header, ""))
         tnum = task_cols.get(header)
         if not tnum or not raw:
             return raw
@@ -18249,7 +13038,7 @@ class CaseloadPanel:
         # helpers behind the single visible "Task N" column — keep them out
         # of the grid (the Task1/2/3 columns already show date+count+glyph).
         headers = [h for h in rows[0].keys()
-                   if not _is_task_facet_col(h) and not h.startswith("_")]
+                   if not caseload_filter.is_task_facet_col(h) and not h.startswith("_")]
         if tuple(self.tree["columns"]) != tuple(headers):
             # Reset displaycolumns to "#all" BEFORE swapping the column set.
             # ttk validates the existing displaycolumns against the new
@@ -22955,14 +17744,14 @@ class App:
             if not sc.hotkey:
                 continue
             try:
-                hk_string = to_pynput_hotkey_string(sc.hotkey)
+                hk_string = hotkeys.to_pynput_hotkey_string(sc.hotkey)
                 parsed = keyboard.HotKey.parse(hk_string)
             except Exception as e:
                 self._post_status(f"Skipped hotkey {sc.hotkey!r}: {e}")
                 continue
             cb = (lambda s=sc: self._fire_from_hotkey(s))
             self._hotkeys.append(keyboard.HotKey(parsed, cb))
-            vk = _standalone_fkey_vk(sc.hotkey)
+            vk = hotkeys.standalone_fkey_vk(sc.hotkey)
             if vk is not None:
                 self._suppress_vks.add(vk)
 
@@ -22970,10 +17759,10 @@ class App:
         qn_hk = (getattr(self.settings, "quick_note_hotkey", "") or "").strip()
         if qn_hk:
             try:
-                parsed = keyboard.HotKey.parse(to_pynput_hotkey_string(qn_hk))
+                parsed = keyboard.HotKey.parse(hotkeys.to_pynput_hotkey_string(qn_hk))
                 self._hotkeys.append(keyboard.HotKey(
                     parsed, lambda: self._fire_quick_note_hotkey()))
-                vk = _standalone_fkey_vk(qn_hk)
+                vk = hotkeys.standalone_fkey_vk(qn_hk)
                 if vk is not None:
                     self._suppress_vks.add(vk)
             except Exception as e:
@@ -25297,9 +20086,22 @@ class App:
             self.root.wait_variable(done_var)
         if not holder["ok"]:
             self._append_log(
-                "Salesforce isn't signed in (SSO likely timed out) — brought "
-                "the browser forward. Sign in to Salesforce, then re-fire the "
-                "action. (Texts/emails/notes were NOT run.)", error=True)
+                "Couldn't find a signed-in Salesforce page — brought the "
+                "browser forward. Sign in to Salesforce (SSO may have timed "
+                "out), then re-fire the action. (Texts/emails/notes were NOT "
+                "run.)", error=True)
+            # A common first-run cause: the user's own Edge is open, so our
+            # Edge never got its own session. Add the actionable hint.
+            try:
+                if self.worker.has_foreign_edge_window() and \
+                        self.worker._locate_browser_hwnd() is None:
+                    self._append_log(
+                        "  ↳ It looks like your personal Microsoft Edge is "
+                        "open. This app runs its OWN Edge — close ALL your "
+                        "Edge windows, then fully close and reopen the app.",
+                        error=True)
+            except Exception:
+                pass
         return holder["ok"]
 
     def _open_mongoose_clicked(self) -> None:
@@ -25723,7 +20525,7 @@ class App:
         # entries pass through unchanged.
         csv_headers = list(rows[0].keys()) if rows else []
         filters = [
-            _resolve_filter_columns(f, csv_headers)
+            caseload_filter.resolve_filter_columns(f, csv_headers)
             for f in scenario.batch.filters
         ]
 
@@ -25759,7 +20561,7 @@ class App:
         # Route any "Task N" filter to its date/count/status facet by op (the
         # original `filters` keep the visible "Task N" column for the safety
         # check above + the review display below; only evaluation is routed).
-        eval_filters = [_rewrite_task_filter(f) for f in filters]
+        eval_filters = [caseload_filter.rewrite_task_filter(f) for f in filters]
         matched = caseload_filter.apply_filters(eval_filters, rows)
         if not matched:
             messagebox.showinfo(
@@ -25794,7 +20596,7 @@ class App:
         # Resolved filters (for the review dialog's display columns).
         csv_headers = list(matched[0].keys()) if matched else []
         filters = [
-            _resolve_filter_columns(f, csv_headers)
+            caseload_filter.resolve_filter_columns(f, csv_headers)
             for f in scenario.batch.filters
         ]
         # Scope the caseload viewer to the review set — the two-step arm already
@@ -26050,7 +20852,7 @@ class App:
             if not conds:
                 compiled.append(None)
                 continue
-            filters = [_resolve_filter_columns(f, headers) for f in conds]
+            filters = [caseload_filter.resolve_filter_columns(f, headers) for f in conds]
             missing = [f.get("column", "") for f in filters
                        if f.get("column") and f.get("column") not in headers]
             if missing:
@@ -26061,7 +20863,7 @@ class App:
                     "branch.", error=True)
                 compiled.append(False)
                 continue
-            compiled.append([_rewrite_task_filter(f) for f in filters])
+            compiled.append([caseload_filter.rewrite_task_filter(f) for f in filters])
         per_row: dict = {}
         overlaps: dict = {}
         unmatched: list = []
@@ -26351,7 +21153,7 @@ class App:
 
         # Filter (same engine + safety check as the note/email batch).
         csv_headers = list(rows[0].keys()) if rows else []
-        filters = [_resolve_filter_columns(f, csv_headers)
+        filters = [caseload_filter.resolve_filter_columns(f, csv_headers)
                    for f in scenario.batch.filters]
         missing = [f.get("column", "") for f in filters
                    if f.get("column") and f.get("column") not in csv_headers]
@@ -26365,7 +21167,7 @@ class App:
                 "export:\n\n  • " + "\n  • ".join(missing) +
                 "\n\nAdd them to your list view, click ↻ Caseload, and retry.")
             return
-        eval_filters = [_rewrite_task_filter(f) for f in filters]
+        eval_filters = [caseload_filter.rewrite_task_filter(f) for f in filters]
         matched = caseload_filter.apply_filters(eval_filters, rows)
         if not matched:
             messagebox.showinfo(
@@ -26563,10 +21365,11 @@ class App:
         if not any(selected):
             self._append_log("Batch text: 0 recipients selected; skipping texts.")
             self._text_outcome = {"scheduled_recipients": 0, "groups": 0,
-                                  "failed": 0}
+                                  "failed": 0, "skipped_recipients": 0}
             return True
         self._lock_browser_for_run()
         sent = 0
+        skipped_recipients = 0  # recipients the API couldn't add (not in Mongoose)
         groups_sent = 0
         failed = 0  # groups that were attempted but didn't schedule
         stopped = False
@@ -26635,24 +21438,46 @@ class App:
                             f"  text failed [{grp['label']}]: {err}", error=True)
                         failed += 1
                 else:
-                    sent += len(mobiles)
+                    # Count what the API actually SCHEDULED, not how many we
+                    # tried to add. The API silently skips recipients who aren't
+                    # in Mongoose / haven't opted in, so using the input count
+                    # would report a text that never went out as "scheduled".
+                    # The DOM/modal fallback doesn't return a per-recipient
+                    # count, so fall back to len(mobiles) there.
+                    api_sent = res.get("sent") if res else None
+                    n = api_sent if api_sent is not None else len(mobiles)
+                    n_skip = len(res.get("skipped_recipients") or []) if res else 0
+                    sent += n
+                    skipped_recipients += n_skip
+                    if n == 0:
+                        # Everyone in this group was skipped — nothing actually
+                        # scheduled, so don't count it as a scheduled group.
+                        groups_sent -= 1
+                        self._append_log(
+                            f"  text: {grp['label']} — 0 scheduled"
+                            + (f" ({n_skip} not in Mongoose / not opted in)"
+                               if n_skip else "") + "; skipped.")
         finally:
             self._unlock_browser_after_run()
         # Record the outcome so the per-action summary can roll texts in, and
         # report it clearly: green when every attempted group scheduled, a loud
         # red ⚠ when any failed (so a partial failure isn't lost in the log).
         self._text_outcome = {"scheduled_recipients": sent,
-                              "groups": groups_sent, "failed": failed}
+                              "groups": groups_sent, "failed": failed,
+                              "skipped_recipients": skipped_recipients}
         verb = "scheduled" if scheduled else "sent"
+        skip_note = (f"; {skipped_recipients} skipped (not in Mongoose / not "
+                     "opted in)" if skipped_recipients else "")
         if failed:
             self._append_log(
                 f"⚠ Texts: {groups_sent - failed} of {groups_sent} group(s) "
-                f"{verb} ({sent} recipient(s)); {failed} FAILED — see the red "
-                "lines above.", error=True)
+                f"{verb} ({sent} recipient(s)){skip_note}; {failed} FAILED — "
+                "see the red lines above.", error=True)
         else:
             self._append_log(
-                f"Texts: {sent} recipient(s) in {groups_sent} group(s) {verb}.",
-                success=(groups_sent > 0))
+                f"Texts: {sent} recipient(s) in {groups_sent} group(s) "
+                f"{verb}{skip_note}.",
+                success=(sent > 0))
         # Returning False on STOP makes a combined action abort before its
         # email/note phase (same contract as a cancelled review).
         return not stopped
@@ -26702,7 +21527,7 @@ class App:
         if not raw or not rows:
             return rows, [], False
         headers = list(rows[0].keys())
-        filters = [_resolve_filter_columns(f, headers) for f in raw]
+        filters = [caseload_filter.resolve_filter_columns(f, headers) for f in raw]
         missing = [f.get("column", "") for f in filters
                    if f.get("column") and f.get("column") not in headers]
         if missing:
@@ -26711,7 +21536,7 @@ class App:
                 f"({', '.join(repr(c) for c in missing)}) — not firing. Add "
                 "them to your Caseload view + ↻ Caseload.", error=True)
             return [], [], True
-        eval_filters = [_rewrite_task_filter(f) for f in filters]
+        eval_filters = [caseload_filter.rewrite_task_filter(f) for f in filters]
         keep, skipped = [], []
         for r in rows:
             if caseload_filter.apply_filters(eval_filters, [r]):
@@ -26735,7 +21560,7 @@ class App:
             conds = list(b.conditions or [])
             if not conds:
                 return b, i  # catch-all
-            filters = [_resolve_filter_columns(f, headers) for f in conds]
+            filters = [caseload_filter.resolve_filter_columns(f, headers) for f in conds]
             missing = [f.get("column", "") for f in filters
                        if f.get("column") and f.get("column") not in headers]
             if missing:
@@ -26745,7 +21570,7 @@ class App:
                     f"({', '.join(repr(c) for c in missing)}) — skipping this "
                     "branch.", error=True)
                 continue
-            eval_filters = [_rewrite_task_filter(f) for f in filters]
+            eval_filters = [caseload_filter.rewrite_task_filter(f) for f in filters]
             if caseload_filter.apply_filters(eval_filters, [row]):
                 return b, i
         return None, -1
@@ -26955,7 +21780,7 @@ class App:
                     if (not ctx_info["student_email"]
                             and not self._email_diag_logged):
                         self._email_diag_logged = True
-                        present = _email_columns_present(row)
+                        present = caseload_csv.email_columns_present(row)
                         if present:
                             self._append_log(
                                 "CSV email columns found but not recognized: "
@@ -27027,8 +21852,10 @@ class App:
                     "scheduled ⚠")
                 text_failed = True
             else:
+                sk = to.get("skipped_recipients") or 0
                 parts.append(
-                    f"texts {to['scheduled_recipients']} scheduled")
+                    f"texts {to['scheduled_recipients']} scheduled"
+                    + (f" ({sk} skipped)" if sk else ""))
         self._text_outcome = None  # consume — don't leak into the next action
         ok = (len(skipped) == 0 and not text_failed)
         self._append_log(
@@ -27481,6 +22308,7 @@ class App:
           DaysSinceLastContact  — today − 'Last Assigned CI Contact'
           DaysSinceCourseStart  — today − Course Start Date
           DaysUntilTermEnd      — Term End Date − today (negative if past)
+          EffectiveEndDate      — IC end date if present, else Term End Date
           LastActionType        — action name of the latest note we logged
           DaysSinceLastAction   — today − that note's date
           TaskStalledDays       — days the task status has been unchanged
@@ -27507,6 +22335,12 @@ class App:
                 days_since(str(r.get("CourseStartDate", "") or "")))
             r["DaysUntilTermEnd"] = _num(
                 days_until(str(r.get("TermEndDate", "") or "")))
+            # Effective end = the IC (incomplete/extension) date when present,
+            # else the term end. An IC is the operative deadline, so it
+            # overrides term end (which may be later).
+            _ic = str(r.get("Icenddate", "") or "").strip()
+            r["EffectiveEndDate"] = _ic or str(
+                r.get("TermEndDate", "") or "").strip()
             ent = by_key.get((sid, course)) or by_sid.get(sid)
             if ent:
                 r["LastActionType"] = ent[1]
@@ -27548,7 +22382,7 @@ class App:
             sample = rows[:40]
             refs = []
             for h in headers:
-                if _is_task_facet_col(h) or h == sel:
+                if caseload_filter.is_task_facet_col(h) or h == sel:
                     continue
                 ctype = caseload_filter.sniff_column_type(
                     [str(r.get(h, "") or "") for r in sample])
@@ -27618,7 +22452,7 @@ class App:
         """Inject HIDDEN per-task facet columns into each cached caseload row
         so a single visible 'Task N' column can be filtered by date, by
         submission count, OR by status (the operator picks which — see
-        _rewrite_task_filter). For each task number N present:
+        caseload_filter.rewrite_task_filter). For each task number N present:
           Task{N}Date   — YYYY-MM-DD from the CSV Task cell (always there)
           Task{N}Count  — submission count from the CSV Task cell
           Task{N}Status — Passed/Returned/In Process from the live scrape
@@ -27644,7 +22478,8 @@ class App:
             tasks = cache.get(sid) or {}
             for n in tnums:
                 # Date + count from the CSV Task cell (e.g. "2026-09-13 (1)").
-                _, date, attempts = parse_task_status(r.get(f"Task{n}", ""))
+                _, date, attempts = caseload_csv.parse_task_status(
+                    r.get(f"Task{n}", ""))
                 r[f"Task{n}Date"] = date
                 r[f"Task{n}Count"] = str(attempts) if date else ""
                 # Status from the live cache (blank until the scrape lands).
@@ -28187,7 +23022,7 @@ class App:
         Tries each catalogued column name (DISPLAY_TO_CSV pairs +
         common display labels) and falls back to "" for any field
         that isn't present. Emails go through the longer alias list
-        in `_CSV_STUDENT_EMAIL_COLS` / `_CSV_PM_EMAIL_COLS` since
+        in `caseload_csv.STUDENT_EMAIL_COLS` / `caseload_csv.PM_EMAIL_COLS` since
         their names vary the most across user-configured views.
         `user_name` / `user_email` are NOT set here — _send_scenario_
         email tops those up from Outlook's CurrentUser."""
@@ -28210,13 +23045,13 @@ class App:
                 "stuprename", "Student Preferred Name",
                 "PreferredName", "Preferred Name") or first),
             "last_name": _capitalize_name(last),
-            "student_email": _first_present_value(
-                row, _CSV_STUDENT_EMAIL_COLS,
+            "student_email": caseload_csv.first_present_value(
+                row, caseload_csv.STUDENT_EMAIL_COLS,
             ),
             "student_id": _first("StudentID", "Student ID"),
             "course_code": _first("CourseCode", "Course Code"),
             "pm_name": _capitalize_name(_first("MentorName", "Program Mentor")),
-            "pm_email": _first_present_value(row, _CSV_PM_EMAIL_COLS),
+            "pm_email": caseload_csv.first_present_value(row, caseload_csv.PM_EMAIL_COLS),
             "program_name": _first("ProgramName", "Program Name"),
         }
 
@@ -28799,6 +23634,9 @@ class App:
             self._splash_step("Launching browser + signing in…", 0.08)
             self.root.after(500, self._poll_worker_then_auto_download)
             return
+        # Browser is up — if the user's own Edge blocked us from getting our own
+        # session, tell them (once the windows have settled).
+        self.root.after(1500, self._maybe_edge_conflict_notice)
         self._set_busy("Auto-refreshing caseload + Essential Actions…")
         self._append_log("Auto-refreshing caseload CSV...")
         self._splash_step("Downloading caseload…", 0.25)
@@ -31001,6 +25839,16 @@ class App:
              "your course who are assigned to another instructor."),
         ])
 
+        _card("If Salesforce won't sign in", [
+            ("🌐",
+             "This app runs its OWN Microsoft Edge to reach Salesforce. If your "
+             "personal Edge is already open, Windows makes them share one "
+             "session and the app may not be able to sign in. Close ALL your "
+             "Edge windows, then fully close and reopen the app — it opens its "
+             "own Edge. (Chrome / Vivaldi / other browsers are fine; only Edge "
+             "conflicts.)"),
+        ])
+
         _card("Before you send email", [
             ("📧",
              "Sending email needs Outlook Classic — the installed desktop "
@@ -31871,7 +26719,7 @@ class App:
         return [
             caseload_csv.display_for_column(h)
             for h in self._caseload_rows[0].keys()
-            if not _is_task_facet_col(h) and not str(h).startswith("sp:")
+            if not caseload_filter.is_task_facet_col(h) and not str(h).startswith("sp:")
         ]
 
     def _viewer_shown_columns(self) -> list:
@@ -31889,7 +26737,7 @@ class App:
             else:
                 cols = list(dc)
             return [caseload_csv.display_for_column(c) for c in cols
-                    if not _is_task_facet_col(c) and not str(c).startswith("sp:")]
+                    if not caseload_filter.is_task_facet_col(c) and not str(c).startswith("sp:")]
         except Exception:
             return []
 
@@ -32741,7 +27589,7 @@ class App:
         self._refresh_contact_ids(rows, silent=silent)
         # Cache whether the rows carry a student-email column so the pre-batch
         # warning + Settings status line don't have to scan rows again.
-        self._csv_has_student_email = _csv_has_student_email_column(rows)
+        self._csv_has_student_email = caseload_csv.has_student_email_column(rows)
         if not silent:
             age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
             self._append_log(
@@ -33414,12 +28262,11 @@ class App:
         self.worker.submit_fetch_task_status(sid, on_done)
 
     def _sync_name_cap_mode(self) -> None:
-        """Push the user's name-capitalization preference into the module
-        global the name-variable builders read (the BrowserWorker one has no
-        settings access). Call at startup + after the setting changes."""
-        global _NAME_CAP_MODE
-        _NAME_CAP_MODE = (getattr(self.settings, "name_capitalization",
-                                  "standard") or "standard")
+        """Push the user's name-capitalization preference into src/names so the
+        name-variable builders (incl. the BrowserWorker one, no settings access)
+        share it. Call at startup + after the setting changes."""
+        _set_name_cap_mode(getattr(self.settings, "name_capitalization",
+                                   "standard") or "standard")
 
     def _close_splash(self) -> None:
         """Dismiss the startup splash if it's up (idempotent)."""
@@ -33464,6 +28311,63 @@ class App:
             return False
         self.root.wait_variable(done_var)
         return holder["ok"]
+
+    def _maybe_edge_conflict_notice(self) -> None:
+        """One-time notice when the user's own Microsoft Edge is blocking us. We
+        drive Edge (channel msedge); if the user already has Edge open, Edge's
+        single-instance behaviour can stop our Playwright Edge from getting its
+        own session — the tell is a foreign Edge window present while we can't
+        find a browser window of our own. That precise pairing keeps it from
+        nagging Edge-daily users whose session came up fine. Dismissible."""
+        if getattr(self.settings, "edge_conflict_notice_dismissed", False):
+            return
+        try:
+            if not self.worker.has_foreign_edge_window():
+                return
+            if self.worker._locate_browser_hwnd() is not None:
+                return  # we DID find our own window → no conflict
+        except Exception:
+            return
+
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("Close your other Edge windows")
+        dlg.transient(self.root)
+        try:
+            dlg.attributes("-topmost", True)
+        except Exception:
+            pass
+        frm = ctk.CTkFrame(dlg, fg_color="transparent")
+        frm.pack(fill="both", expand=True, padx=16, pady=14)
+        ctk.CTkLabel(
+            frm, text="⚠  Microsoft Edge is already open",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", pady=(0, 8))
+        ctk.CTkLabel(
+            frm, text=(
+                "This app runs its OWN Microsoft Edge to reach Salesforce. "
+                "When your personal Edge is already open, Windows makes them "
+                "share one session — which can stop the app from signing in "
+                "(you'll see \"Salesforce isn't signed in\").\n\n"
+                "Fix: close ALL your Edge windows, then fully close and reopen "
+                "this app. The app will open its own Edge."),
+            justify="left", wraplength=460,
+        ).pack(anchor="w")
+        dont = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(frm, text="Don't show this again",
+                        variable=dont).pack(anchor="w", pady=(12, 10))
+
+        def _close() -> None:
+            if dont.get():
+                self.settings.edge_conflict_notice_dismissed = True
+                try:
+                    save_settings(self.settings)
+                except Exception:
+                    pass
+            dlg.destroy()
+
+        ctk.CTkButton(frm, text="OK", width=90, command=_close).pack(anchor="e")
+        dlg.protocol("WM_DELETE_WINDOW", _close)
+        _fit_dialog_to_content(dlg, min_w=500)
 
     def _maybe_outlook_classic_notice(self) -> None:
         """One-time startup heads-up when Outlook Classic isn't registered on
