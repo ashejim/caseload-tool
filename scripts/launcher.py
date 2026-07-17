@@ -21365,10 +21365,11 @@ class App:
         if not any(selected):
             self._append_log("Batch text: 0 recipients selected; skipping texts.")
             self._text_outcome = {"scheduled_recipients": 0, "groups": 0,
-                                  "failed": 0}
+                                  "failed": 0, "skipped_recipients": 0}
             return True
         self._lock_browser_for_run()
         sent = 0
+        skipped_recipients = 0  # recipients the API couldn't add (not in Mongoose)
         groups_sent = 0
         failed = 0  # groups that were attempted but didn't schedule
         stopped = False
@@ -21437,24 +21438,46 @@ class App:
                             f"  text failed [{grp['label']}]: {err}", error=True)
                         failed += 1
                 else:
-                    sent += len(mobiles)
+                    # Count what the API actually SCHEDULED, not how many we
+                    # tried to add. The API silently skips recipients who aren't
+                    # in Mongoose / haven't opted in, so using the input count
+                    # would report a text that never went out as "scheduled".
+                    # The DOM/modal fallback doesn't return a per-recipient
+                    # count, so fall back to len(mobiles) there.
+                    api_sent = res.get("sent") if res else None
+                    n = api_sent if api_sent is not None else len(mobiles)
+                    n_skip = len(res.get("skipped_recipients") or []) if res else 0
+                    sent += n
+                    skipped_recipients += n_skip
+                    if n == 0:
+                        # Everyone in this group was skipped — nothing actually
+                        # scheduled, so don't count it as a scheduled group.
+                        groups_sent -= 1
+                        self._append_log(
+                            f"  text: {grp['label']} — 0 scheduled"
+                            + (f" ({n_skip} not in Mongoose / not opted in)"
+                               if n_skip else "") + "; skipped.")
         finally:
             self._unlock_browser_after_run()
         # Record the outcome so the per-action summary can roll texts in, and
         # report it clearly: green when every attempted group scheduled, a loud
         # red ⚠ when any failed (so a partial failure isn't lost in the log).
         self._text_outcome = {"scheduled_recipients": sent,
-                              "groups": groups_sent, "failed": failed}
+                              "groups": groups_sent, "failed": failed,
+                              "skipped_recipients": skipped_recipients}
         verb = "scheduled" if scheduled else "sent"
+        skip_note = (f"; {skipped_recipients} skipped (not in Mongoose / not "
+                     "opted in)" if skipped_recipients else "")
         if failed:
             self._append_log(
                 f"⚠ Texts: {groups_sent - failed} of {groups_sent} group(s) "
-                f"{verb} ({sent} recipient(s)); {failed} FAILED — see the red "
-                "lines above.", error=True)
+                f"{verb} ({sent} recipient(s)){skip_note}; {failed} FAILED — "
+                "see the red lines above.", error=True)
         else:
             self._append_log(
-                f"Texts: {sent} recipient(s) in {groups_sent} group(s) {verb}.",
-                success=(groups_sent > 0))
+                f"Texts: {sent} recipient(s) in {groups_sent} group(s) "
+                f"{verb}{skip_note}.",
+                success=(sent > 0))
         # Returning False on STOP makes a combined action abort before its
         # email/note phase (same contract as a cancelled review).
         return not stopped
@@ -21829,8 +21852,10 @@ class App:
                     "scheduled ⚠")
                 text_failed = True
             else:
+                sk = to.get("skipped_recipients") or 0
                 parts.append(
-                    f"texts {to['scheduled_recipients']} scheduled")
+                    f"texts {to['scheduled_recipients']} scheduled"
+                    + (f" ({sk} skipped)" if sk else ""))
         self._text_outcome = None  # consume — don't leak into the next action
         ok = (len(skipped) == 0 and not text_failed)
         self._append_log(
