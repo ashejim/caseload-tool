@@ -10929,6 +10929,50 @@ class CaseloadPanel:
         except Exception as e:
             self.app._append_log(f"Couldn't open mail app: {e}", error=True)
 
+    @staticmethod
+    def _mail_name_fix(s: str) -> str:
+        """'Last, First' → 'First Last' so a mail client doesn't read the comma
+        as a recipient separator. Real emails (with '@') pass through."""
+        s = (s or "").strip()
+        if "@" in s or "," not in s:
+            return s
+        bits = [b.strip() for b in s.split(",", 1)]
+        return f"{bits[1]} {bits[0]}" if len(bits) == 2 and all(bits) else s
+
+    def _open_offcaseload_mailto(self, email: str) -> None:
+        """Open the mail app to an OFF-caseload student, CC'ing their Program
+        Mentor and (when Settings ‘CC the ACI’ is on) the Assigned Course
+        Instructor — mirroring the on-caseload email-click for a student on
+        someone else's caseload. Each CC prefers a real scraped/directory email,
+        falling back to the name (Outlook resolves it against the directory).
+        Needs the profile fetched (⤓ Get info) for the CCs; without it the
+        compose still opens, just to the student alone."""
+        from urllib.parse import quote, urlencode
+        addr = (email or "").strip()
+        ctx = self.app._offcaseload_open_context() or {}
+        ccs = []
+        pm = self._mail_name_fix(ctx.get("pm_email") or ctx.get("pm_name") or "")
+        if pm:
+            ccs.append(pm)
+        if getattr(self.app.settings, "cc_aci_offcaseload", True):
+            aci_name = (ctx.get("aci_name") or "").strip()
+            if aci_name:
+                aci = self.app._resolve_aci_email(aci_name) or aci_name
+                ccs.append(self._mail_name_fix(aci))
+        params = {}
+        course = (ctx.get("course_code") or "").strip()
+        if course:
+            params["subject"] = course
+        if ccs:
+            params["cc"] = ",".join(ccs)
+        url = f"mailto:{addr}"
+        if params:
+            url += "?" + urlencode(params, quote_via=quote)
+        try:
+            os.startfile(url)
+        except Exception as e:
+            self.app._append_log(f"Couldn't open mail app: {e}", error=True)
+
     def _open_tel(self, phone: str) -> None:
         digits = re.sub(r"[^\d+]", "", phone or "")
         if not digits:
@@ -12545,7 +12589,8 @@ class CaseloadPanel:
 
         wrap = 300 if not getattr(self, "_narrow", False) else 180
 
-        def line(rr: int, label: str, value: str, *, copy=False, tel=False):
+        def line(rr: int, label: str, value: str, *, copy=False, tel=False,
+                 email=False):
             value = str(value or "").strip()
             if not value:
                 return rr
@@ -12558,20 +12603,26 @@ class CaseloadPanel:
             vf.grid(row=rr, column=1, sticky="ew", pady=1)
             vf.grid_columnconfigure(2, weight=1)
             kw = ({"text_color": ("#1f6feb", "#58a6ff"), "cursor": "hand2"}
-                  if tel else {})
+                  if (tel or email) else {})
             v = ctk.CTkLabel(vf, text=value, anchor="w", justify="left",
                              wraplength=wrap, font=ctk.CTkFont(size=12), **kw)
             v.grid(row=0, column=0, sticky="w")
             if tel:
                 v.bind("<Button-1>", lambda e, m=value: self._open_tel(m))
+            elif email:
+                # Click a student email → compose to them, CC'ing PM + ACI.
+                v.bind("<Button-1>",
+                       lambda e, m=value: self._open_offcaseload_mailto(m))
             if copy:
                 self._copy_icon_btn(vf, value).grid(row=0, column=1, padx=(4, 0))
             return rr + 1
 
         r = line(r, "Student ID", profile.get("student_id", ""), copy=True)
         r = line(r, "Mobile", profile.get("mobile", ""), copy=True, tel=True)
-        r = line(r, "WGU Email", profile.get("wgu_email", ""), copy=True)
-        r = line(r, "Other Email", profile.get("other_email", ""), copy=True)
+        r = line(r, "WGU Email", profile.get("wgu_email", ""),
+                 copy=True, email=True)
+        r = line(r, "Other Email", profile.get("other_email", ""),
+                 copy=True, email=True)
         r = line(r, "PM (Mentor)", profile.get("mentor", ""))
         r = line(r, "PM email", profile.get("mentor_email", ""), copy=True)
         # ACI — the assigned course instructor(s), prominent.
