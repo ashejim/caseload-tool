@@ -12345,29 +12345,73 @@ class CaseloadPanel:
             pass
 
     # ---- Off-caseload mode (students NOT assigned to us) -----------------
-    def _enter_offcaseload_mode(self, matches: list, query: str = "") -> None:
+    # Columns shown for off-caseload rows. Beyond Name + Contact id these fill
+    # in once a student's profile is scraped (⤓ Get info), so the grid carries
+    # enough to identify + search a student (e.g. by phone/email) — not just
+    # their name. Blank until enriched.
+    _OFFCASELOAD_COLS = ("Name", "Student ID", "Course Code", "Mobile",
+                         "WGU Email", "Timezone", "PM (Mentor)", "Contact id")
+
+    def _offcaseload_row(self, cid: str, name: str, profile: dict = None) -> dict:
+        """Build one off-caseload grid row from a Contact id + name, filling the
+        richer columns from a scraped profile when one is available (else blank).
+        Display + search only — firing uses the scraped `_qv_offcaseload_profile`,
+        not these cells."""
+        p = profile or {}
+        active = [a for a in (p.get("aci") or []) if a.get("active")]
+        return {
+            "Name": name or "(unknown)",
+            "Student ID": p.get("student_id", ""),
+            "Course Code": active[0]["course"] if active else "",
+            "Mobile": p.get("mobile", ""),
+            "WGU Email": p.get("wgu_email", ""),
+            "Timezone": p.get("timezone", ""),
+            "PM (Mentor)": p.get("mentor", ""),
+            "Contact id": cid,         # display + used to open the record
+            "_offcaseload": True,      # internal flag (kept out of columns)
+        }
+
+    def _upsert_offcaseload_row(self, cid: str, name: str, profile: dict) -> None:
+        """Merge a freshly-scraped profile into the matching off-caseload grid
+        row (by Contact id) and re-render, so the row gains phone/email/etc. once
+        ⤓ Get info runs. No-op outside off-caseload mode / when the row is gone."""
+        if not getattr(self, "_offcaseload_mode", False):
+            return
+        cid = str(cid or "").strip()
+        rows = self._offcaseload_rows or []
+        for i, r in enumerate(rows):
+            if str(r.get("Contact id") or "").strip() == cid:
+                rows[i] = self._offcaseload_row(cid, name or r.get("Name"),
+                                                profile)
+                self.populate()
+                return
+
+    def _enter_offcaseload_mode(self, matches: list, query: str = "",
+                                auto_open: bool = True) -> None:
         """Show off-caseload search matches as rows IN the viewer (instead of a
         popup), so the user picks a student the familiar way. Rows carry name +
-        Contact id; opening one opens their Salesforce record. Stage 3 enriches
-        the row with the scraped profile + ACI. Visually distinct (red banner)
-        so it's obvious these aren't the user's students."""
+        Contact id, plus phone/email/etc. once a profile has been scraped (from
+        this session's cache, or filled in by ⤓ Get info). Visually distinct
+        (red banner) so it's obvious these aren't the user's students.
+
+        `auto_open=False` skips the single-match auto-open — used when the caller
+        has already opened the record (a unique email/phone/ID search) and just
+        needs the student to appear in the grid so it can be fired on."""
+        cache = getattr(self.app, "_oc_profile_cache", None) or {}
         rows = []
         for m in (matches or []):
             cid = str(m.get("contact_id") or "").strip()
             if not cid:
                 continue
-            rows.append({
-                "Name": m.get("name") or "(unknown)",
-                "Contact id": cid,         # display + used to open the record
-                "_offcaseload": True,      # internal flag (kept out of columns)
-            })
+            rows.append(self._offcaseload_row(
+                cid, m.get("name"), cache.get(cid)))
         self._offcaseload_rows = rows
         self._offcaseload_mode = True
         self._archived_mode = False        # mutually exclusive
         self._show_offcaseload_banner()
         self.populate()
         self._refresh_view_menu()
-        if len(rows) == 1:
+        if auto_open and len(rows) == 1:
             # Exactly one hit → open it straight away so the profile + ‘Get
             # info’ button (or cached info) appear without a second click.
             self.app._append_log(
@@ -12431,6 +12475,9 @@ class CaseloadPanel:
         }
         self._qv_offcaseload_profile = dict(profile)
         self._qv_offcaseload_enriched = bool(enriched)
+        # Push what we know into the matching off-caseload grid row so the list
+        # shows more than name (phone/email/etc.) and can be searched by it.
+        self._upsert_offcaseload_row(contact_id, name, profile)
         # This student isn't on the caseload — clear the caseload-only panels.
         for w in self.qv_body.winfo_children():
             w.destroy()
@@ -17244,28 +17291,39 @@ class App:
                 if res and res.get("ok"):
                     panel = getattr(self, "caseload_panel", None)
                     cid = str(res.get("contact_id") or "").strip()
+                    nm = res.get("name") or query
+                    # Also show the student IN the viewer grid — a unique
+                    # email/phone/ID match used to open the quick-view only,
+                    # leaving the grid blank so there was no row to select and
+                    # fire on. Enter off-caseload mode with this one row
+                    # (auto_open=False — the record is already open below).
+                    if panel is not None and cid:
+                        try:
+                            panel._enter_offcaseload_mode(
+                                [{"contact_id": cid, "name": nm}], query,
+                                auto_open=False)
+                        except Exception:
+                            pass
                     cached = self._oc_profile_cache.get(cid) if cid else None
                     if cached is not None:
                         self._append_log(
-                            f"Opened {res.get('name') or query} (off-caseload) "
-                            "— info from this session (↻ Refresh to re-read).")
+                            f"Opened {nm} (off-caseload) — info from this "
+                            "session (↻ Refresh to re-read).")
                         if panel is not None:
                             try:
                                 panel.show_offcaseload_quick_view(
-                                    cid, res.get("name") or query, cached,
-                                    enriched=True)
+                                    cid, nm, cached, enriched=True)
                             except Exception:
                                 pass
                     else:
                         self._append_log(
-                            f"Opened {res.get('name') or query} (off-caseload) "
-                            "— click ‘⤓ Get info + ACI’ (or press Enter on the "
-                            "student) to load the profile + ACI; then fire.")
+                            f"Opened {nm} (off-caseload) — click ‘⤓ Get info + "
+                            "ACI’ (or press Enter on the student) to load the "
+                            "profile + ACI; then fire.")
                         if panel is not None and cid:
                             try:
                                 panel.show_offcaseload_quick_view(
-                                    cid, res.get("name") or query, {},
-                                    enriched=False)
+                                    cid, nm, {}, enriched=False)
                             except Exception:
                                 pass
                 elif res and res.get("matches"):
