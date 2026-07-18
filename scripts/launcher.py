@@ -12409,6 +12409,15 @@ class CaseloadPanel:
         self._offcaseload_mode = True
         self._archived_mode = False        # mutually exclusive
         self._show_offcaseload_banner()
+        # Clear the search box: these rows ARE the search result, so re-filtering
+        # them by the query that produced them would wrongly hide a match whose
+        # value isn't stored on the row (e.g. a phone/email — the search returns
+        # only name + id, and Mobile is blank until ⤓ Get info).
+        self._query = ""
+        try:
+            self.search_var.set("")
+        except Exception:
+            pass
         self.populate()
         self._refresh_view_menu()
         if auto_open and len(rows) == 1:
