@@ -1361,3 +1361,57 @@ def find_and_click_student(
     priority, row, name, name_idx = matches[0]
     diag(f"  [search] match: {name!r} (priority {priority})")
     return name if click_caseload_row(row, name, name_idx, on_status) else None
+
+
+def wait_grid_settled(page, max_ms: int = 1500) -> None:
+    """After typing into the caseload row-filter, wait until the grid has
+    settled — no visible loading spinner and the row count stable across two
+    polls — BOUNDED by max_ms. Replaces a blind sleep: returns as soon as
+    the filter has applied (often a few hundred ms), never later than the
+    old fixed wait."""
+    import time as _t
+    deadline = _t.monotonic() + max_ms / 1000.0
+    try:
+        page.wait_for_timeout(120)  # let a spinner appear before polling
+    except Exception:
+        return
+    last, stable = -1, 0
+    while _t.monotonic() < deadline:
+        try:
+            spinner = page.locator(
+                ".slds-spinner_container").filter(visible=True).count()
+        except Exception:
+            spinner = 0
+        try:
+            cnt = page.locator("table tr").count()
+        except Exception:
+            cnt = -1
+        if spinner == 0 and cnt >= 0 and cnt == last:
+            stable += 1
+            if stable >= 2:
+                return
+        else:
+            stable = 0
+        last = cnt
+        try:
+            page.wait_for_timeout(120)
+        except Exception:
+            return
+
+
+def wait_record_ready(page, max_ms: int = 2000) -> None:
+    """After navigating to a record, return as soon as it's ready (the
+    active student name resolves) — BOUNDED by max_ms. Replaces a blind
+    post-navigation sleep."""
+    import time as _t
+    deadline = _t.monotonic() + max_ms / 1000.0
+    while _t.monotonic() < deadline:
+        try:
+            if get_active_student_name(page):
+                return
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(150)
+        except Exception:
+            return
