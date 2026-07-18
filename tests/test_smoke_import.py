@@ -31,6 +31,7 @@ SRC_MODULES = [
     "src.hotkeys",
     "src.ui_common",
     "src.os_open",
+    "src.splash",
     "src.rich_text",
     "src.dialogs",
     "src.ema_links",
