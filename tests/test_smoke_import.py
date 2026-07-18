@@ -32,6 +32,7 @@ SRC_MODULES = [
     "src.ui_common",
     "src.os_open",
     "src.splash",
+    "src.queue_panel",
     "src.rich_text",
     "src.dialogs",
     "src.ema_links",
