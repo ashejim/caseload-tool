@@ -3,6 +3,31 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.20.1 — 2026-07-20
+
+- **Success Path steps no longer get stuck "blocked."** A step condition that
+  checks a task's pass/fail (e.g. *Task 1 is Passed*) now evaluates the same way
+  it does in batch filters, so a student who has actually passed a task advances
+  the path instead of showing every step blocked.
+- **Fired actions reliably mark their Success Path step done.** When an action
+  files a note for a student opened via the fast deep-link path, the app now
+  recovers the student's ID from your caseload (by name + course) — so the bound
+  Success Path step flips to **Done**, and the `note_log` feed the texting app
+  reads gets the ID too. The *"Backfill success-path completions from history"*
+  tool now recovers those past fires as well.
+- **Success Path steps show their history on hover.** Hover a step in the student
+  view to see when its status was last set and what set it — e.g. *Completed by
+  "welcome-C769-batch" · Jul 17, 2026*, *Completed manually*, or *Auto-skipped —
+  matches this step's skip rule*.
+- **Fire on the student you've selected.** A main-window action button or a
+  hotkey now acts on the student(s) you've picked in the caseload panel — with
+  the Essential Action offer and email/text variables pre-filled, just like
+  firing from the panel — instead of only whatever record is open. (A button
+  uses your checkbox selection; a hotkey uses the highlighted row.)
+- **Under the hood:** continued the `launcher.py` decomposition — the Playwright
+  browser worker and several panels moved into focused `src/` modules. No
+  behavior change intended.
+
 ## 0.20.0 — 2026-07-17
 
 - **Compact dates in the views.** Dates now show as **7/2** instead of
