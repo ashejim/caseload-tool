@@ -284,10 +284,22 @@ def compute_steps(steps, row, events, fields=None, *, today=None) -> list:
     if fields:
         ctx.update(fields)
     events = events or {}
+    headers = list((row or {}).keys())
+
+    def _route(pred: dict) -> dict:
+        # Route a gate/skip_when predicate the SAME way the batch + caseload
+        # filter engines do: resolve a display-name column to its CSV header,
+        # then send a "Task N" column to the right hidden facet
+        # (Task{N}Status/Date/Count) by operator/value. Without this a condition
+        # like "Task 1 is Passed" looks up a non-existent "Task 1" key, never
+        # matches, and the step never auto-Skips — stranding the whole (linear)
+        # path as Blocked for a student who has actually passed the task.
+        return cf.rewrite_task_filter(cf.resolve_filter_columns(pred, headers))
 
     def _all(preds) -> bool:
         try:
-            return all(cf.evaluate_filter(p, ctx, today=today) for p in preds)
+            return all(
+                cf.evaluate_filter(_route(p), ctx, today=today) for p in preds)
         except Exception:
             return False
 
