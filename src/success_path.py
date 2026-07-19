@@ -257,6 +257,76 @@ def all_step_status(*, db_path=SUCCESS_PATH_DB) -> dict:
         conn.close()
 
 
+def step_status_detail(student_id: str, course_code: str,
+                       *, db_path=SUCCESS_PATH_DB) -> dict:
+    """Like :func:`step_status`, but the FULL latest event per step —
+    ``{step_id: {"event", "occurred_at", "source"}}`` — so callers can show
+    WHEN a step's status was last set and WHAT set it (an action name,
+    ``manual``, or a ``backfill``). Latest wins by row id (see step_status)."""
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT step_id, event, occurred_at, source FROM step_log WHERE "
+            "id IN (SELECT MAX(id) FROM step_log WHERE student_id = ? AND "
+            "course_code = ? GROUP BY step_id)",
+            (student_id, course_code),
+        ).fetchall()
+        return {r["step_id"]: {"event": r["event"],
+                               "occurred_at": r["occurred_at"],
+                               "source": r["source"]} for r in rows}
+    finally:
+        conn.close()
+
+
+# ----------------------------------------------------------------------
+# Human phrasing for a logged step event — "what set this, and when".
+# ----------------------------------------------------------------------
+_EVENT_VERB = {EVENT_COMPLETED: "Completed", EVENT_DISMISSED: "Skipped",
+               EVENT_RESET: "Reset"}
+
+
+def describe_source(source: str) -> str:
+    """Readable phrasing for a step event's ``source`` (what set the status):
+    ``action:welcome-C769-batch`` -> ``by "welcome-C769-batch"``,
+    ``backfill:welcome-C769`` -> ``(backfilled from "welcome-C769")``,
+    ``manual`` / empty -> ``manually``. Unknown prefixes pass through."""
+    source = (source or "").strip()
+    if not source or source == "manual":
+        return "manually"
+    kind, _, name = source.partition(":")
+    if kind == "action" and name:
+        return f"by “{name}”"
+    if kind == "backfill" and name:
+        return f"(backfilled from “{name}”)"
+    return source
+
+
+def _fmt_when(occurred_at: str) -> str:
+    """ISO timestamp -> ``Jul 17, 2026 10:20 AM`` (raw string if unparseable)."""
+    s = (occurred_at or "").strip()
+    if not s:
+        return ""
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return s
+    return f"{dt.strftime('%b %d, %Y')} {dt.strftime('%I:%M %p').lstrip('0')}"
+
+
+def event_summary(detail: Optional[dict]) -> str:
+    """One-line 'what/when' for a step's latest event, e.g.
+    ``Completed by "welcome-C769-batch" · Jul 17, 2026 10:20 AM``. Returns
+    ``""`` when there's no usable event (so callers can fall back)."""
+    if not detail:
+        return ""
+    verb = _EVENT_VERB.get(detail.get("event"), (detail.get("event") or ""))
+    if not verb:
+        return ""
+    head = f"{verb} {describe_source(detail.get('source'))}".strip()
+    when = _fmt_when(detail.get("occurred_at"))
+    return f"{head} · {when}" if when else head
+
+
 def compute_steps(steps, row, events, fields=None, *, today=None) -> list:
     """Compute each step's live DISPLAY status for one student on a course.
 

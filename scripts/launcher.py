@@ -4838,10 +4838,11 @@ class CaseloadPanel:
             return
         from src import success_path as sp
         try:
-            events = sp.step_status(sid, course) if sid else {}
+            details = sp.step_status_detail(sid, course) if sid else {}
+            events = {k: v["event"] for k, v in details.items()}
             fields = sp.get_fields(sid, course) if sid else {}
         except Exception:
-            events, fields = {}, {}
+            details, events, fields = {}, {}, {}
         try:
             computed = sp.compute_steps(path.steps, row, events, fields)
         except Exception:
@@ -4891,11 +4892,34 @@ class CaseloadPanel:
                 rowf, text="✎", width=16, text_color=("gray45", "gray60"),
                 font=ctk.CTkFont(size=12), cursor="hand2")
             ed.grid(row=0, column=2, sticky="e", padx=(0, 6), pady=1)
+            tip = self._sp_step_tooltip(st, details.get(st["id"]))
             for w in (rowf, gl, tl, ed):
                 w.configure(cursor="hand2")
                 w.bind("<Button-1>",
                        lambda e, s=st: self._open_step_menu(s, e))
+                if tip:
+                    _attach_tooltip(w, tip)
         frame.grid()
+
+    def _sp_step_tooltip(self, st: dict, detail) -> str:
+        """Hover text for a Success Path step: when its status was last set and
+        what set it (an action / manual tick / backfill), from the step_log
+        event; or a short reason for a live-computed Due / Blocked / auto-skip
+        status (which has no logged event)."""
+        from src import success_path as sp
+        summary = sp.event_summary(detail)
+        if summary:
+            return summary
+        status = st.get("status")
+        if status == sp.STATUS_SKIPPED and st.get("auto_skipped"):
+            return "Auto-skipped — matches this step's skip rule"
+        return {
+            sp.STATUS_DUE: ("Recommended next action" if st.get("is_next")
+                            else "Due — ready to act"),
+            sp.STATUS_BLOCKED: "Blocked — an earlier step isn't done yet",
+            sp.STATUS_DONE: "Done",
+            sp.STATUS_SKIPPED: "Skipped",
+        }.get(status, "")
 
     def _open_step_menu(self, st: dict, event) -> None:
         """Per-step edit menu (Mark done / Skip / Reset). Writes the chosen
