@@ -34,6 +34,7 @@ SRC_MODULES = [
     "src.splash",
     "src.data_panel",
     "src.note_log",
+    "src.browser_worker",
     "src.queue_panel",
     "src.rich_text",
     "src.dialogs",
