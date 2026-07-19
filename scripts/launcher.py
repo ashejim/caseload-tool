@@ -128,7 +128,7 @@ from src.scenarios import (
     _branch_to_dict,
 )
 from src.data_panel import DataPanel
-from src.note_log import NoteLogEntry
+from src.note_log import NoteLogEntry, resolve_student_id
 from src.browser_worker import BrowserWorker
 from src.os_open import _open_externally
 from src.queue_panel import QueuePanel
@@ -22217,12 +22217,30 @@ class App:
 
     # ----- Note log (tabs + CSV) -----
 
+    def _resolve_student_id(self, name: str, course_code: str) -> str:
+        """StudentID for a note-log entry whose worker-side id is empty (the
+        deep-link fire path has no on-page Caseload table to scrape). Matches the
+        student NAME against the loaded caseload, preferring a same-course row;
+        returns '' unless exactly one id matches. Reused by the history backfill."""
+        return resolve_student_id(
+            self._caseload_rows or [], name, course_code,
+            norm_course=self._norm_course_code,
+            names_match=_names_loosely_match)
+
     def _post_note_filed(self, entry: NoteLogEntry) -> None:
         """Called from the worker thread when a scenario completes
         successfully. Bounces onto the Tk main thread to update UI."""
         self.root.after(0, lambda: self._record_note(entry))
 
     def _record_note(self, entry: NoteLogEntry) -> None:
+        # The worker scrapes student_id from the on-page Caseload table, which
+        # the deep-link fast path (a record opened by Contact id) doesn't have —
+        # so ~a quarter of entries arrive with no id. Recover it from the loaded
+        # caseload by name+course so BOTH note_log.csv (the texting feed) and the
+        # Success Path step-completion below get the key they need.
+        if not (entry.student_id or "").strip():
+            entry.student_id = self._resolve_student_id(
+                entry.student, entry.course_code)
         self.note_log_entries.append(entry)
         self._append_to_csv(entry)
         self._ensure_action_section(entry)
