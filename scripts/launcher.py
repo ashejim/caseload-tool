@@ -20154,6 +20154,21 @@ class App:
             self._append_log(f"Backfill: couldn't read note_log ({e}).",
                              error=True)
             return
+        # Deep-link fires wrote no student_id (no on-page Caseload table to
+        # scrape). Recover it from the caseload by name+course so those past
+        # completions can be attributed + backfilled instead of silently dropped.
+        recovered = 0
+        for r in note_log_rows:
+            if not (r.get("student_id") or "").strip():
+                rid = self._resolve_student_id(
+                    r.get("student", ""), r.get("course_code", ""))
+                if rid:
+                    r["student_id"] = rid
+                    recovered += 1
+        if recovered:
+            self._append_log(
+                f"Backfill: recovered StudentID for {recovered} history row(s) "
+                "from the caseload (by name + course).")
         caseload_by_course: dict = {}
         for r in rows:
             nc = self._norm_course(r.get("CourseCode") or "")
