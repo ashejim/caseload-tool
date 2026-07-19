@@ -11071,7 +11071,7 @@ class App:
             hk.release(canonical)
 
     def _fire_from_hotkey(self, scenario: ScenarioConfig) -> None:
-        self.root.after(0, lambda: self._fire(scenario))
+        self.root.after(0, lambda: self._fire(scenario, from_hotkey=True))
 
     def _fire_quick_note_hotkey(self) -> None:
         """Quick-note hotkey → open the quick-note dialog for the selected
@@ -11726,7 +11726,8 @@ class App:
             yes_label="Send anyway", no_label="Cancel",
         )
 
-    def _fire(self, scenario: ScenarioConfig) -> None:
+    def _fire(self, scenario: ScenarioConfig, *,
+              from_hotkey: bool = False) -> None:
         # A batch selection is armed (the viewer is showing a batch's matched
         # students with a Start/Cancel bar) — finish that before anything else.
         if getattr(self, "_armed_batch", None) is not None:
@@ -11758,6 +11759,19 @@ class App:
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
             return
+        # Honor the caseload panel's selection so a main-window button or hotkey
+        # fires on the student(s) you've picked in the viewer — with the EA offer
+        # + email/text variables pre-filled, exactly like firing from the panel —
+        # instead of only whatever record happens to be open. A button prefers
+        # the CHECKBOX set (then the highlighted row); a hotkey uses ONLY the
+        # highlighted row, which matches the student-info window, so an eyes-free
+        # fire never lands on a stale checkbox set. Non-batch only — batch actions
+        # keep their own whole-caseload selection flow (handled below).
+        if scenario.batch is None:
+            sel_rows = self._panel_fire_rows(from_hotkey=from_hotkey)
+            if sel_rows:
+                self._fire_on_selected(scenario, sel_rows)
+                return
         # Guard: bundled sample emails ship a placeholder address. Don't
         # let one go out without the user swapping in their own email.
         if not self._confirm_no_placeholder_email(scenario):
@@ -15131,6 +15145,24 @@ class App:
         # row done/error from this); immediate fires ignore it.
         return {"ok": ok, "processed": processed, "total": total,
                 "skipped": skipped, "text_failed": text_failed}
+
+    def _panel_fire_rows(self, *, from_hotkey: bool) -> list[dict]:
+        """Caseload-panel selection to fire a main-window/hotkey action on, so
+        it acts on the student(s) you've picked (with the EA offer + email/text
+        variables) rather than just the open record. A button prefers the
+        CHECKBOX set, then the highlighted row; a hotkey uses ONLY the
+        highlighted row — which matches the student-info window — so an eyes-free
+        fire never lands on a stale checkbox set. Empty list => no panel
+        selection; the caller falls back to the find-first / open-record path."""
+        panel = getattr(self, "caseload_panel", None)
+        if panel is None:
+            return []
+        if not from_hotkey:
+            checked = panel._checked_rows()
+            if checked:
+                return checked
+        row = panel._focused_row()
+        return [row] if row else []
 
     def _fire_on_selected(
         self, scenario: ScenarioConfig, rows: list[dict],
