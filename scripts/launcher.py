@@ -22,7 +22,6 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
@@ -129,6 +128,7 @@ from src.scenarios import (
     _branch_to_dict,
 )
 from src.data_panel import DataPanel
+from src.note_log import NoteLogEntry
 from src.os_open import _open_externally
 from src.queue_panel import QueuePanel
 from src.splash import SplashScreen
@@ -184,38 +184,6 @@ SP_OFF_PATH = "off-path"
 # popup. Texting keys opt-in off Mongoose membership, so stale data silently
 # skips newly-enrolled students — hence the aggressive freshness policy.
 MONGOOSE_STALE_HOURS = 24
-
-
-@dataclass
-class NoteLogEntry:
-    """One filed note. Used both for the in-session tabs and the
-    persistent CSV that feeds downstream tools (e.g. the texting app).
-
-    `submitted` is False when any note in the scenario opted out of
-    auto-submit (the form was filled but the user is reviewing it).
-    `student_id`, `student_email`, `pm_name`, `pm_email` come from the
-    Caseload table row when available; the 'Email Student' link has
-    the PM as primary (so `pm_email`) and the student as CC.
-    """
-    timestamp: datetime
-    scenario: str
-    course_code: str
-    student: str
-    student_id: str = ""
-    student_email: str = ""
-    pm_name: str = ""
-    pm_email: str = ""
-    submitted: bool = True
-
-    @property
-    def tab_key(self) -> str:
-        return f"{self.course_code} {self.scenario}"
-
-    @property
-    def display(self) -> str:
-        flag = "" if self.submitted else "  (not submitted)"
-        id_suffix = f"  [{self.student_id}]" if self.student_id else ""
-        return f"{self.timestamp:%H:%M:%S}  {self.student}{id_suffix}{flag}"
 
 
 CSV_HEADER = [

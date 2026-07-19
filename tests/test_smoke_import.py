@@ -33,6 +33,7 @@ SRC_MODULES = [
     "src.os_open",
     "src.splash",
     "src.data_panel",
+    "src.note_log",
     "src.queue_panel",
     "src.rich_text",
     "src.dialogs",
