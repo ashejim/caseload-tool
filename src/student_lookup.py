@@ -354,6 +354,50 @@ def _parse_task_cell(cls: str, title: str):
                   "date": date, "attempts": attempts}
 
 
+# Fallback task-status extraction for a grid cell with no usable hover-tooltip.
+# The grid's TaskN cell carries a status GLYPH (e.g. '2026-07-17✓ (1)') and a
+# separate TaskNStatus word; either is authoritative, so a task shouldn't be
+# dropped just because its display tooltip is missing/unparseable.
+_TASK_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4}")
+_TASK_ATTEMPTS_RE = re.compile(r"\((\d+)\)")
+_TASK_PASS_GLYPHS = "✓✔"   # ✓ ✔  → passed
+_TASK_WAIT_GLYPHS = "⌛⏳"   # ⌛ ⏳  → in process / pending
+_TASK_STATUS_STATE = {
+    "passed": "passed",
+    "returned": "returned", "revisions needed": "returned", "not passed": "returned",
+    "task submitted": "submitted", "submitted": "submitted",
+    "pending": "pending", "in progress": "pending", "in process": "pending",
+}
+
+
+def task_info_from_grid(status_word: str, cell: str):
+    """Derive a task's ``{state, status, date, attempts}`` from the authoritative
+    ``TaskNStatus`` word and/or the ``TaskN`` grid cell (its status glyph + date
+    + attempt count) — the fallback for when ``TaskNhoverText`` is missing or
+    unparseable. Returns ``None`` when the cell records no task at all (no
+    status, no glyph, no date), so the caller can skip it.
+
+    State precedence: the status word wins (it's unambiguous), else the cell
+    glyph (✓ = passed, ⌛ = in process); a dated cell with neither still counts
+    as ``submitted`` (there IS an attempt, status just unknown)."""
+    status_word = (status_word or "").strip()
+    cell = str(cell or "").strip()
+    state = _TASK_STATUS_STATE.get(status_word.lower(), "")
+    if not state:
+        if any(g in cell for g in _TASK_PASS_GLYPHS):
+            state = "passed"
+        elif any(g in cell for g in _TASK_WAIT_GLYPHS):
+            state = "pending"
+    m = _TASK_DATE_RE.search(cell)
+    date = m.group(0) if m else ""
+    am = _TASK_ATTEMPTS_RE.search(cell)
+    attempts = int(am.group(1)) if am else 0
+    if not (state or date):
+        return None
+    return {"state": state or "submitted", "status": status_word,
+            "date": date, "attempts": attempts}
+
+
 def read_loaded_task_status(table) -> dict:
     """Bulk per-task pass/fail for the WHOLE caseload, keyed by Student ID.
 

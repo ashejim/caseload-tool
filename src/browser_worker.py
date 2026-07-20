@@ -2794,7 +2794,7 @@ class BrowserWorker:
         TaskNhoverText (title) with a color class synthesized from TaskNStatus.
         Downstream (badges, _apply_task_status_to_rows) can't tell the data came
         from the API vs the scrape."""
-        from src.student_lookup import _parse_task_cell
+        from src.student_lookup import _parse_task_cell, task_info_from_grid
         status_to_cls = {
             "passed": "cellColorGreen",
             "returned": "cellColorRed", "revisions needed": "cellColorRed",
@@ -2813,13 +2813,22 @@ class BrowserWorker:
             statuses: dict = {}
             for n in range(1, 16):
                 title = (row.get(f"Task{n}hoverText") or "").strip()
-                if not title:
-                    continue
-                st = (row.get(f"Task{n}Status") or "").strip().lower()
-                parsed = _parse_task_cell(status_to_cls.get(st, ""), title)
-                if parsed:
-                    tnum, info = parsed
-                    statuses[tnum] = info
+                if title:
+                    st = (row.get(f"Task{n}Status") or "").strip().lower()
+                    parsed = _parse_task_cell(status_to_cls.get(st, ""), title)
+                    if parsed:
+                        tnum, info = parsed
+                        statuses[tnum] = info
+                        continue
+                # No usable tooltip — don't drop the task. Recover its outcome
+                # from the authoritative TaskNStatus word and/or the TaskN cell's
+                # status glyph (a passed task whose tooltip is missing used to be
+                # dropped, stranding the student out of the pass/fail scan and so
+                # out of their Success Path).
+                info = task_info_from_grid(
+                    row.get(f"Task{n}Status", ""), row.get(f"Task{n}", ""))
+                if info:
+                    statuses[str(n)] = info
             if statuses:
                 by_sid[sid] = statuses
         return by_sid
