@@ -170,25 +170,67 @@ class ActionPanel:
             tabkeys = [s["key"] for s in tabs]
             if self._active_tab not in tabkeys:
                 self._active_tab = tabkeys[0]
-            self._tab_specs = tabs
-            self._tab_strip = ctk.CTkFrame(self.frame, fg_color="transparent")
-            self._tab_strip.grid(row=row, column=0, sticky="ew",
-                                  padx=4, pady=(8, 2))
-            self._tab_strip.grid_columnconfigure(0, weight=1)
-            self._tab_strip.bind("<Configure>", self._on_strip_configure)
-            row += 1
-            self._layout_tabs()
-
             active = next(s for s in tabs if s["key"] == self._active_tab)
-            content = ctk.CTkFrame(
-                self.frame, fg_color="transparent", border_width=2,
-                border_color=active["color"], corner_radius=8)
-            content.grid(row=row, column=0, sticky="ew", padx=4, pady=(2, 6))
+            inactive = [s for s in tabs if s["key"] != self._active_tab]
+            # Inactive tabs: a wrapping strip of plain labels above the active
+            # box. Controls (+/⚙/pin) appear only on the SELECTED tab — i.e. in
+            # its content-box header — so the strip stays uncluttered.
+            if inactive:
+                self._tab_specs = inactive
+                self._tab_strip = ctk.CTkFrame(self.frame, fg_color="transparent")
+                self._tab_strip.grid(row=row, column=0, sticky="ew",
+                                      padx=4, pady=(8, 0))
+                self._tab_strip.grid_columnconfigure(0, weight=1)
+                self._tab_strip.bind("<Configure>", self._on_strip_configure)
+                row += 1
+                self._layout_tabs()
+            # Active tab + its actions render as ONE color-outlined box whose
+            # header IS the selected tab — so tab and content read as connected.
+            self._render_active_box(active, row)
             row += 1
-            end = self._grid_buttons(content, active, 0)
-            ctk.CTkFrame(content, fg_color="transparent", height=4).grid(
-                row=end, column=0, columnspan=2)
         self._reapply_queue_affordance()
+
+    def _render_active_box(self, sec: dict, row: int) -> None:
+        app = self.app
+        color = sec["color"]
+        box = ctk.CTkFrame(
+            self.frame, fg_color="transparent", border_width=2,
+            border_color=color, corner_radius=8)
+        box.grid(row=row, column=0, sticky="ew", padx=4, pady=(0, 6))
+        box.grid_columnconfigure(0, weight=1)
+        box.grid_columnconfigure(1, weight=1)
+        # Header = the selected tab: a group-color bar carrying the label + the
+        # only copy of the +/⚙/pin controls.
+        hdr = ctk.CTkFrame(box, fg_color=color, corner_radius=6)
+        hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=3, pady=(3, 3))
+        hdr.grid_columnconfigure(0, weight=1)
+        tc = _text_color_for_bg(color)
+        ctk.CTkLabel(
+            hdr, text=sec["short"] or sec["label"], anchor="w", text_color=tc,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=0, column=0, sticky="ew", padx=(10, 4), pady=3)
+        col = 1
+        if sec["group"] is not None:
+            g = sec["group"]
+            ctk.CTkButton(
+                hdr, text="+", width=26, height=26,
+                command=lambda gn=g.name: app._new_scenario_in_group(gn),
+                **SECONDARY_BTN_KWARGS).grid(row=0, column=col, padx=2, pady=3)
+            col += 1
+            ctk.CTkButton(
+                hdr, text="⚙", width=26, height=26,
+                command=lambda gg=g: app._edit_group(gg),
+                **SECONDARY_BTN_KWARGS).grid(row=0, column=col, padx=2, pady=3)
+            col += 1
+        pin = ctk.CTkButton(
+            hdr, text="📌", width=26, height=26,
+            command=lambda k=sec["key"]: self._toggle_pin(k),
+            **SECONDARY_BTN_KWARGS)
+        pin.grid(row=0, column=col, padx=(2, 6), pady=3)
+        _attach_tooltip(pin, "Pin — show above the tabs")
+        end = self._grid_buttons(box, sec, 1)
+        ctk.CTkFrame(box, fg_color="transparent", height=4).grid(
+            row=end, column=0, columnspan=2)
 
     def _render_pinned_box(self, sec: dict, row: int) -> None:
         app = self.app
@@ -237,39 +279,18 @@ class ActionPanel:
             row=end, column=0, columnspan=2)
 
     # ------------------------------------------------------------- tab strip
-    def _make_tab(self, parent, sec: dict) -> ctk.CTkFrame:
-        app = self.app
-        key = sec["key"]
+    def _make_tab(self, parent, sec: dict) -> ctk.CTkButton:
+        """An INACTIVE tab: a plain outlined label chip. Clicking it selects the
+        group (which then renders as the active box below, with its controls).
+        The selected tab is not in this strip — it's the active box's header."""
         color = sec["color"]
-        active = (key == self._active_tab)
-        chip = ctk.CTkFrame(parent, fg_color="transparent")
-        label = sec["short"] or sec["label"]
-        ctk.CTkButton(
-            chip, text=label, height=28,
-            fg_color=color if active else "transparent",
-            text_color=(_text_color_for_bg(color) if active
-                        else ("gray10", "gray90")),
+        return ctk.CTkButton(
+            parent, text=sec["short"] or sec["label"], height=28,
+            fg_color="transparent", text_color=("gray15", "gray85"),
             hover_color=_hover_color_for(color),
-            border_width=0 if active else 2, border_color=color,
-            font=ctk.CTkFont(size=12, weight="bold" if active else "normal"),
-            command=lambda k=key: self._select_tab(k),
-        ).pack(side="left")
-        if sec["group"] is not None:
-            g = sec["group"]
-            ctk.CTkButton(
-                chip, text="+", width=24, height=28,
-                command=lambda gn=g.name: app._new_scenario_in_group(gn),
-                **SECONDARY_BTN_KWARGS).pack(side="left", padx=(2, 0))
-            ctk.CTkButton(
-                chip, text="⚙", width=24, height=28,
-                command=lambda gg=g: app._edit_group(gg),
-                **SECONDARY_BTN_KWARGS).pack(side="left", padx=(2, 0))
-        pin = ctk.CTkButton(
-            chip, text="📌", width=24, height=28,
-            command=lambda k=key: self._toggle_pin(k), **SECONDARY_BTN_KWARGS)
-        pin.pack(side="left", padx=(2, 0))
-        _attach_tooltip(pin, "Pin — show above the tabs")
-        return chip
+            border_width=2, border_color=color,
+            font=ctk.CTkFont(size=12),
+            command=lambda k=sec["key"]: self._select_tab(k))
 
     def _layout_tabs(self) -> None:
         """(Re)flow the tab chips into rows, wrapping when they run out of
