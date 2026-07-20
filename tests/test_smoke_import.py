@@ -32,6 +32,7 @@ SRC_MODULES = [
     "src.ui_common",
     "src.os_open",
     "src.splash",
+    "src.action_panel",
     "src.data_panel",
     "src.note_log",
     "src.browser_worker",

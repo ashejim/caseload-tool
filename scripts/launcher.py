@@ -127,6 +127,7 @@ from src.scenarios import (
     render_note_template, run_scenario, success_path_to_dict, _note_from_dict,
     _branch_to_dict,
 )
+from src.action_panel import ActionPanel
 from src.data_panel import DataPanel
 from src.note_log import NoteLogEntry, resolve_student_id
 from src.browser_worker import BrowserWorker
@@ -8289,10 +8290,14 @@ class App:
         # "" and fall through to auto-detect or the per-note override.
         self.course_var = ctk.StringVar(value="")
 
-        # Scenario buttons
-        self.button_frame = ctk.CTkFrame(pane)
-        self.button_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=4)
-        self.scenario_buttons: dict[str, ctk.CTkButton] = {}
+        # Scenario buttons (the action pane — see src/action_panel.py).
+        self.action_panel = ActionPanel(self, pane)
+        self.action_panel.frame.grid(row=3, column=0, sticky="ew", padx=8, pady=4)
+        # Back-compat aliases so existing call sites (queue-add affordance,
+        # window sizing) and the _rebuild_scenario_buttons delegator stay
+        # unchanged — same objects the panel owns.
+        self.button_frame = self.action_panel.frame
+        self.scenario_buttons = self.action_panel.buttons
         self._rebuild_scenario_buttons()
 
         # Editor toggle row (also hosts the caseload-cache refresh).
@@ -8807,138 +8812,10 @@ class App:
                 pass
 
     def _rebuild_scenario_buttons(self) -> None:
-        """Render the scenario button list. Layout depends on whether
-        the user has defined any groups:
-
-        - No groups: flat 2-column grid (legacy behavior).
-        - With groups: Ungrouped section at top (only if non-empty),
-          followed by each group as a collapsible color-coded
-          section. Plus "+ Add group" button at the bottom."""
-        for w in self.button_frame.winfo_children():
-            w.destroy()
-        self.scenario_buttons.clear()
-        self.button_frame.grid_columnconfigure(0, weight=1)
-        self.button_frame.grid_columnconfigure(1, weight=1)
-
-        # Track collapse state per group across rebuilds.
-        if not hasattr(self, "_group_collapsed"):
-            self._group_collapsed: dict[str, bool] = {}
-
-        def _scenario_btn(parent, name: str, sc: ScenarioConfig,
-                          color: Optional[str] = None) -> ctk.CTkButton:
-            label = self._action_display_name(sc) + (
-                f"  ({sc.hotkey})" if sc.hotkey else "")
-            kwargs: dict = dict(
-                text=label, command=lambda s=sc: self._fire(s),
-                width=160, height=36,
-            )
-            if color:
-                kwargs["fg_color"] = color
-                kwargs["text_color"] = _text_color_for_bg(color)
-                kwargs["hover_color"] = _hover_color_for(color)
-            btn = ctk.CTkButton(parent, **kwargs)
-            self.scenario_buttons[name] = btn
-            return btn
-
-        # No groups → flat grid (original behavior preserved), still
-        # offering "+ Add group" so the first group can be created.
-        if not self.groups:
-            scenario_items = list(self.scenarios.items())
-            for i, (name, sc) in enumerate(scenario_items):
-                btn = _scenario_btn(self.button_frame, name, sc)
-                btn.grid(row=i // 2, column=i % 2, padx=6, pady=6, sticky="ew")
-            return
-
-        # With groups → sectioned layout.
-        row = 0
-        grouped_names: set[str] = set()
-        for g in self.groups:
-            grouped_names.update(s for s in g.scenarios if s in self.scenarios)
-        ungrouped = [n for n in self.scenarios if n not in grouped_names]
-
-        if ungrouped:
-            ctk.CTkLabel(
-                self.button_frame, text="Ungrouped",
-                font=ctk.CTkFont(size=11, weight="bold"),
-                text_color=("gray40", "gray70"),
-                anchor="w",
-            ).grid(row=row, column=0, columnspan=2,
-                   sticky="ew", padx=6, pady=(4, 2))
-            row += 1
-            for i, name in enumerate(ungrouped):
-                btn = _scenario_btn(self.button_frame, name, self.scenarios[name])
-                btn.grid(row=row + i // 2, column=i % 2,
-                         padx=6, pady=4, sticky="ew")
-            row += (len(ungrouped) + 1) // 2
-
-        for group in self.groups:
-            collapsed = self._group_collapsed.get(group.name, False)
-            # Each group is a box outlined in its own color. The header
-            # mirrors the note-editor dropdown (transparent fill, bold
-            # text, ▼/▶ arrow) so it reads as a section title rather
-            # than another scenario button; member buttons sit indented
-            # inside the box.
-            box = ctk.CTkFrame(
-                self.button_frame, fg_color="transparent",
-                border_width=2, border_color=group.color, corner_radius=8,
-            )
-            box.grid(row=row, column=0, columnspan=2,
-                     sticky="ew", padx=4, pady=(8, 2))
-            box.grid_columnconfigure(0, weight=1)
-            box.grid_columnconfigure(1, weight=1)
-            row += 1
-
-            header = ctk.CTkFrame(box, fg_color="transparent")
-            header.grid(row=0, column=0, columnspan=2,
-                        sticky="ew", padx=6, pady=(4, 2))
-            header.grid_columnconfigure(0, weight=1)
-            arrow = "▶" if collapsed else "▼"
-            ctk.CTkButton(
-                header, text=f"{arrow}  {group.name}",
-                anchor="w", height=28,
-                fg_color="transparent",
-                text_color=("gray10", "gray90"),
-                hover_color=("gray85", "gray25"),
-                font=ctk.CTkFont(size=13, weight="bold"),
-                command=lambda gn=group.name: self._toggle_group(gn),
-            ).grid(row=0, column=0, sticky="ew")
-            # '+' adds a new action directly into this group.
-            ctk.CTkButton(
-                header, text="+", width=32, height=28,
-                command=lambda gn=group.name: self._new_scenario_in_group(gn),
-                **SECONDARY_BTN_KWARGS,
-            ).grid(row=0, column=1, padx=(4, 0))
-            ctk.CTkButton(
-                header, text="⚙", width=32, height=28,
-                command=lambda g=group: self._edit_group(g),
-                **SECONDARY_BTN_KWARGS,
-            ).grid(row=0, column=2, padx=(4, 0))
-            if collapsed:
-                continue
-            valid = [s for s in group.scenarios if s in self.scenarios]
-            for i, name in enumerate(valid):
-                btn = _scenario_btn(
-                    box, name, self.scenarios[name], color=group.color,
-                )
-                # Extra left/right inset so buttons read as indented
-                # children of the group rather than full-width rows.
-                btn.grid(row=1 + i // 2, column=i % 2,
-                         padx=((14, 6) if i % 2 == 0 else (6, 14)),
-                         pady=4, sticky="ew")
-            # Trailing inner pad so the last row doesn't touch the border.
-            ctk.CTkFrame(box, fg_color="transparent", height=4).grid(
-                row=1 + (len(valid) + 1) // 2, column=0, columnspan=2)
-        # ("+ Add group" now lives in the Edit-actions toolbar row.)
-
-    def _toggle_group(self, group_name: str) -> None:
-        """Flip a group's collapsed flag and re-render the button
-        list. Collapse state is per-session (not persisted)."""
-        if not hasattr(self, "_group_collapsed"):
-            self._group_collapsed = {}
-        self._group_collapsed[group_name] = (
-            not self._group_collapsed.get(group_name, False)
-        )
-        self._rebuild_scenario_buttons()
+        """Re-render the action pane. Delegates to ActionPanel (see
+        src/action_panel.py); kept as a thin method so the many call sites
+        around the App stay unchanged."""
+        self.action_panel.rebuild()
 
     def _add_group(self) -> None:
         """Open the group dialog with empty fields. On Save, appends
