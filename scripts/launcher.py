@@ -8869,6 +8869,26 @@ class App:
         if not is_new:
             name_entry.insert(0, group.name)
 
+        # --- Short name (optional): shown on the group's tab when the tab strip
+        # is too narrow for the full name.
+        ctk.CTkLabel(
+            dialog, text="Short name (optional)",
+            font=ctk.CTkFont(size=12, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(4, 0))
+        ctk.CTkLabel(
+            dialog,
+            text="Shown on the tab when space is tight; "
+                 "blank = shorten the full name.",
+            font=ctk.CTkFont(size=10), text_color=("gray45", "gray60"),
+            anchor="w", justify="left",
+        ).pack(fill="x", padx=20, pady=(0, 0))
+        short_name_entry = ctk.CTkEntry(
+            dialog, placeholder_text="e.g. Welcome", width=320,
+        )
+        short_name_entry.pack(fill="x", padx=20, pady=(2, 8))
+        if not is_new:
+            short_name_entry.insert(0, group.short_name)
+
         # --- Color picker: palette + custom hex.
         ctk.CTkLabel(
             dialog, text="Color", font=ctk.CTkFont(size=12, weight="bold"),
@@ -9001,6 +9021,7 @@ class App:
             if not new_name:
                 self._append_log("Group save aborted: name is required.")
                 return
+            new_short = (short_name_entry.get() or "").strip()
             # Reject duplicate names (except when editing the same one).
             for g in self.groups:
                 if g is group:
@@ -9019,11 +9040,13 @@ class App:
             if is_new:
                 self.groups.append(Group(
                     name=new_name,
+                    short_name=new_short,
                     color=color_state["value"],
                     scenarios=picked,
                 ))
             else:
                 group.name = new_name
+                group.short_name = new_short
                 group.color = color_state["value"]
                 group.scenarios = picked
             self._save_yaml()
@@ -10789,6 +10812,7 @@ class App:
             new_doc["groups"] = [
                 {
                     "name": g.name,
+                    **({"short_name": g.short_name} if g.short_name else {}),
                     "color": g.color,
                     "scenarios": [
                         s for s in g.scenarios if s in saved_names

@@ -205,8 +205,12 @@ class Group:
 
     Stored in scenarios.yaml under a top-level `groups:` block parallel
     to `scenarios:`. Order matters — groups display top-to-bottom
-    in the order they appear in the list."""
+    in the order they appear in the list.
+
+    `short_name` is an optional abbreviated label shown on the group's tab when
+    horizontal space is tight; empty means fall back to (an ellipsized) `name`."""
     name: str
+    short_name: str = ""
     color: str = "#7a7a7a"
     scenarios: list[str] = field(default_factory=list)
 
@@ -369,6 +373,7 @@ def _groups_from_list(items: Optional[list]) -> list[Group]:
             continue
         out.append(Group(
             name=name,
+            short_name=str(d.get("short_name", "") or "").strip(),
             color=(str(d.get("color", "") or "#7a7a7a").strip()
                    or "#7a7a7a"),
             scenarios=[

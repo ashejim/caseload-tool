@@ -8,10 +8,30 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.scenarios import (  # noqa: E402
-    EmailConfig, TextConfig, BranchConfig,
+    EmailConfig, TextConfig, BranchConfig, Group,
     _email_from_dict, _text_from_dict, _note_from_dict, _branches_from_list,
     _email_to_dict, _text_to_dict, _note_to_dict, _branch_to_dict,
+    _groups_from_list,
 )
+
+
+def test_group_short_name_parsed_and_defaults():
+    groups = _groups_from_list([
+        {"name": "Welcome emails", "short_name": "Welcome", "color": "#123456",
+         "scenarios": ["a", "b"]},
+        {"name": "No short name"},  # short_name absent -> ""
+    ])
+    assert groups[0].name == "Welcome emails"
+    assert groups[0].short_name == "Welcome"
+    assert groups[0].scenarios == ["a", "b"]
+    assert groups[1].short_name == ""      # default
+    # Model default is empty too.
+    assert Group(name="x").short_name == ""
+
+
+def test_group_short_name_whitespace_stripped():
+    g = _groups_from_list([{"name": "G", "short_name": "  W  "}])[0]
+    assert g.short_name == "W"
 
 
 def test_email_to_dict_none_passthrough():
