@@ -375,6 +375,11 @@ class Settings:
     # {"name", "visible": [...], "hidden": [...], "filters": [...]}.
     caseload_views: str = ""
     caseload_current_view: str = ""   # last-applied view name (for the dropdown)
+    # Action pane layout: which groups are pinned (shown as collapsible boxes
+    # above the group tabs) as a JSON list of group names; "" = not set yet =
+    # default (Ungrouped pinned). And the selected group tab among the unpinned.
+    action_pinned_groups: str = ""
+    action_active_tab: str = ""
     # Warn (red activity-log line) before a batch/selection fire when the
     # cached caseload CSV is older than this many MINUTES. 0 = never warn.
     caseload_stale_minutes: int = 720  # 12 h
