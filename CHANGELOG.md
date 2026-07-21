@@ -3,6 +3,29 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.21.0 — 2026-07-21
+
+- **Reorganized the action buttons into tabs.** Groups now show as a **tab
+  strip** that **wraps onto more rows** when the window is narrow, instead of
+  stacked collapsible blocks that ate vertical space. Selecting a group shows it
+  as one **color-outlined box** whose header is the tab — so the tab and its
+  action buttons read as connected — and the group's **`+` (new action), `⚙`
+  (edit group), and `📌` (pin)** controls appear only on the selected tab, so the
+  strip stays uncluttered.
+- **Pin your go-to groups.** Click a tab's **📌** to pin its group as a
+  collapsible box above the tabs (pin as many as you like). Pinned groups and the
+  selected tab are **remembered across restarts**. "Ungrouped" is pinned by
+  default; unpin it once you've sorted your actions into groups.
+- **Short group names.** A group can carry an optional **short name** (set in the
+  new/edit-group dialog) shown on its tab when horizontal space is tight.
+- **Fixed: passed tasks no longer stranded as "blocked" in the Success Path.**
+  The live task pass/fail scan was dropping a task when its grid tooltip was
+  missing, even though the task had actually been passed — which left that
+  student's Success Path unable to advance. It now falls back to the
+  authoritative task status, so those students are picked up correctly.
+- **Under the hood:** the action pane moved into its own `src/action_panel.py`
+  module (continued `launcher.py` decomposition).
+
 ## 0.20.1 — 2026-07-20
 
 - **Success Path steps no longer get stuck "blocked."** A step condition that
