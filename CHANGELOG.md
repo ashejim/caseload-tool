@@ -3,6 +3,36 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.26.0 — 2026-09-27
+
+- **Bot Drafts — review AI-generated reply drafts (chatbot interface).** A new
+  in-app tab for the human-in-the-loop side of the reply-bot pipeline: the bot
+  backend drafts replies to routine course questions and files them in an
+  Outlook folder; you review each here — the student's question on the left, the
+  editable bot reply on the right — then grade it and either send it in your own
+  voice (edited) or send it unedited, labeled as an automated reply. Captures
+  grading feedback, pops out into its own window, offers "Preview in Outlook"
+  (the source of truth for rendering), and a note step on send. Sending always
+  goes through an explicit confirm. Configure under **Settings → Bot drafts**.
+- **Quick text — send a single text to a student from the student view.** A new
+  **💬 Text** button under Contact opens a composer for a one-off Mongoose text:
+  the course auto-fills, a course-code subject is prefixed into the message the
+  student sees, and you choose a schedule — a student-local send window
+  (defaulted from Settings) or **Send now**. *New and not yet thoroughly tested;
+  verify the first real send in the Mongoose review before relying on it.*
+- **Default text-send window (Settings).** A global student-local window
+  (default 10 AM–4 PM) that pre-fills the quick-text composer.
+- **Non-passer / term-end pass-rate report.** A read-only report
+  (`scripts/non_passer_report.py`) that classifies pass / not-passed-at-term-end
+  / early-exit from the local snapshot history — reproducing the official
+  term-end pass rate where the "last 30 days" archive under-counts non-passers.
+- **Fix: caseload columns self-heal after a rough startup.** If the app starts
+  before Salesforce is reachable (not signed in yet, or a cold-start Edge
+  crash), the caseload could get stuck on the view-dependent CSV — showing only
+  the columns your Salesforce list view happens to have. It now silently
+  re-sources from the complete grid feed the moment that feed is healthy, so
+  your full column set appears without a manual refresh.
+
 ## 0.25.0 — 2026-09-06
 
 - **Inbox labeler.** While the app is open, a background pass tags mail in the

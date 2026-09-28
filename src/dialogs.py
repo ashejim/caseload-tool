@@ -1522,6 +1522,179 @@ def prompt_text_review(
     return res["value"]
 
 
+# 12-hour labels for the ad-hoc text schedule-window pickers (student-local),
+# mapped to the 24-hour hour numbers stored in Settings. Mirrors the launcher's
+# _HOUR_LABELS so the two window pickers read identically.
+_TEXT_HOUR_LABELS = [
+    "6 AM", "7 AM", "8 AM", "9 AM", "10 AM", "11 AM", "12 PM", "1 PM",
+    "2 PM", "3 PM", "4 PM", "5 PM", "6 PM", "7 PM", "8 PM", "9 PM",
+]
+
+
+def _hour_label(h) -> str:
+    try:
+        h = int(h) % 24
+    except (TypeError, ValueError):
+        h = 10
+    return f"{h % 12 or 12} {'AM' if h < 12 else 'PM'}"
+
+
+def _label_hour(label: str) -> int:
+    m = re.match(r"\s*(\d{1,2})\s*(AM|PM)", (label or "").strip(), re.I)
+    if not m:
+        return 10
+    h = int(m.group(1)) % 12
+    return h + 12 if m.group(2).upper() == "PM" else h
+
+
+def prompt_single_text(
+    parent, *, who: str, mobile: str, course: str, subject: str, body: str,
+    char_limit: int, default_window_start: int = 10,
+    default_window_end: int = 16,
+) -> Optional[dict]:
+    """Compose one ad-hoc text to a student (student view → Contact ▸ Text).
+
+    Unlike prompt_text_review (body only), this lets the user set the course
+    (which Mongoose inbox), a course-code SUBJECT that is prefixed into the
+    message the student actually receives (e.g. "C769: …"; clear to omit), the
+    message, and the schedule — a student-local send WINDOW (pre-filled from
+    Settings) or SEND NOW. The character count reflects the prefixed body.
+
+    Returns {course, subject, body, send_now, window_start_hour,
+    window_end_hour} or None on cancel."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Text student")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.lift()
+    dialog.after(50, lambda: (dialog.lift(), dialog.focus_force()))
+    res = {"value": None}
+
+    header = "To:  " + who + (f"   ·   {mobile}" if mobile else "")
+    ctk.CTkLabel(
+        dialog, text=header, justify="left", anchor="w",
+        font=ctk.CTkFont(size=12),
+    ).pack(fill="x", padx=12, pady=(12, 4))
+
+    # Course (Mongoose inbox) + Subject (prefixed into the body) on one row.
+    fields = ctk.CTkFrame(dialog, fg_color="transparent")
+    fields.pack(fill="x", padx=12, pady=(0, 2))
+    ctk.CTkLabel(fields, text="Course:", width=56, anchor="w").grid(
+        row=0, column=0, sticky="w", pady=2)
+    course_var = ctk.StringVar(value=(course or "").strip())
+    ctk.CTkEntry(fields, textvariable=course_var, width=90).grid(
+        row=0, column=1, sticky="w", padx=(4, 16), pady=2)
+    ctk.CTkLabel(fields, text="Subject:", width=56, anchor="w").grid(
+        row=0, column=2, sticky="w", pady=2)
+    subject_var = ctk.StringVar(value=(subject or "").strip())
+    ctk.CTkEntry(fields, textvariable=subject_var, width=120).grid(
+        row=0, column=3, sticky="w", padx=(4, 0), pady=2)
+    ctk.CTkLabel(
+        dialog,
+        text="Subject is prefixed into the message the student sees "
+             "(e.g. \"C769: …\"). Clear it to send no prefix.",
+        justify="left", anchor="w", font=ctk.CTkFont(size=11),
+        text_color=("gray45", "gray60"),
+    ).pack(fill="x", padx=12, pady=(0, 4))
+
+    ctk.CTkLabel(dialog, text="Message:", anchor="w").pack(
+        fill="x", padx=12, pady=(2, 0))
+    box = ctk.CTkTextbox(dialog, wrap="word", height=130, width=470)
+    spellcheck.attach(box)
+    box.pack(fill="both", expand=True, padx=12, pady=(0, 2))
+    box.insert("1.0", body or "")
+    box.mark_set("insert", "end-1c")
+
+    count = ctk.CTkLabel(
+        dialog, text="", anchor="e", font=ctk.CTkFont(size=11),
+        text_color=("gray40", "gray70"))
+    count.pack(fill="x", padx=12, pady=(0, 4))
+
+    def _effective_len() -> int:
+        msg = box.get("1.0", "end-1c")
+        subj = subject_var.get().strip()
+        return len(f"{subj}: {msg}" if subj else msg)
+
+    def _update_count(_e=None):
+        n = _effective_len()
+        over = n - char_limit
+        count.configure(
+            text=f"{n}/{char_limit}" + (f"  ({over} over — will be trimmed)"
+                                        if over > 0 else "")
+            + ("   (incl. subject prefix)" if subject_var.get().strip() else ""),
+            text_color=("#d11" if over > 0 else ("gray40", "gray70")),
+        )
+
+    box.bind("<KeyRelease>", _update_count)
+    subject_var.trace_add("write", lambda *_: _update_count())
+
+    # Schedule: a student-local send window (default from Settings) or Send now.
+    mode_var = ctk.StringVar(value="window")
+    sched = ctk.CTkFrame(dialog, fg_color=("gray92", "gray16"))
+    sched.pack(fill="x", padx=12, pady=(2, 4))
+    win_row = ctk.CTkFrame(sched, fg_color="transparent")
+    win_row.pack(fill="x", padx=8, pady=(6, 2))
+    ctk.CTkRadioButton(
+        win_row, text="Send between", variable=mode_var, value="window",
+        width=110).pack(side="left")
+    start_combo = ctk.CTkComboBox(win_row, values=_TEXT_HOUR_LABELS, width=88)
+    start_combo.set(_hour_label(default_window_start))
+    start_combo.pack(side="left", padx=(6, 2))
+    ctk.CTkLabel(win_row, text="–").pack(side="left")
+    end_combo = ctk.CTkComboBox(win_row, values=_TEXT_HOUR_LABELS, width=88)
+    end_combo.set(_hour_label(default_window_end))
+    end_combo.pack(side="left", padx=(2, 6))
+    ctk.CTkLabel(
+        win_row, text="(student's local time — sends ASAP in the window)",
+        font=ctk.CTkFont(size=11), text_color=("gray45", "gray60")).pack(
+        side="left")
+    now_row = ctk.CTkFrame(sched, fg_color="transparent")
+    now_row.pack(fill="x", padx=8, pady=(0, 6))
+    ctk.CTkRadioButton(
+        now_row, text="Send now", variable=mode_var, value="now").pack(
+        side="left")
+
+    def _close():
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    def _send(_e=None):
+        res["value"] = {
+            "course": course_var.get().strip(),
+            "subject": subject_var.get().strip(),
+            "body": box.get("1.0", "end-1c"),
+            "send_now": mode_var.get() == "now",
+            "window_start_hour": _label_hour(start_combo.get()),
+            "window_end_hour": _label_hour(end_combo.get()),
+        }
+        _close()
+
+    def _cancel(_e=None):
+        _close()
+
+    btns = ctk.CTkFrame(dialog, fg_color="transparent")
+    btns.pack(pady=(2, 10))
+    send_btn = ctk.CTkButton(btns, text="Schedule", command=_send, width=130)
+    send_btn.pack(side="left", padx=4)
+    ctk.CTkButton(
+        btns, text="Cancel", command=_cancel, width=90, **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=4)
+
+    def _sync_btn(*_):
+        send_btn.configure(
+            text="Send now" if mode_var.get() == "now" else "Schedule")
+    mode_var.trace_add("write", _sync_btn)
+
+    _update_count()
+    dialog.bind("<Escape>", _cancel)
+    dialog.protocol("WM_DELETE_WINDOW", _cancel)
+    parent.wait_window(dialog)
+    return res["value"]
+
+
 def ask_yes_no_topmost(
     parent, title: str, message: str,
     yes_label: str = "Yes", no_label: str = "No",

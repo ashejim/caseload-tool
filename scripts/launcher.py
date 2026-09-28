@@ -134,6 +134,8 @@ from src.note_log import NoteLogEntry, resolve_student_id
 from src.browser_worker import BrowserWorker
 from src.os_open import _open_externally
 from src.queue_panel import QueuePanel
+from src import bot_drafts
+from src.bot_drafts_panel import BotDraftsPanel
 from src.splash import SplashScreen
 from src.student_lookup import (
     click_caseload_row,
@@ -4794,6 +4796,8 @@ class CaseloadPanel:
         # shown in the contact column, below the reachable channels.
         self._qv_grid = right
         rR = self._qv_contact_pref_row(rR, row)
+        # A "Text" button under the contact info → single-text composer.
+        rR = self._qv_text_button(rR, row)
         # Editable follow-up date (writes back to Salesforce) — full width.
         self._qv_grid = full
         rF = self._qv_followup_editor(rF, row)
@@ -4924,6 +4928,24 @@ class CaseloadPanel:
             vf, text=cap, anchor="w", font=ctk.CTkFont(size=11),
             text_color=col,
         ).grid(row=0, column=1, sticky="w", padx=(6, 0))
+        return r + 1
+
+    def _qv_text_button(self, r, row) -> int:
+        """A '💬 Text' button in the Contact column that opens the single-text
+        composer for this student (Mongoose). Shown only when a recipient is
+        resolvable (a mobile on the row or a known Contact id); a click still
+        re-checks opt-in and reports clearly if it can't send."""
+        sid = (self._cell(row, "StudentID") or "").strip()
+        has_mobile = bool(
+            (self._cell(row, "MobilePhone") or self._phone_value(row) or "").strip())
+        has_cid = bool(sid and self.app._contact_ids.get(sid))
+        if not (has_mobile or has_cid):
+            return r
+        ctk.CTkButton(
+            self._qv_grid, text="💬 Text", width=90, height=26,
+            command=lambda rw=row: self.app._compose_single_text(rw),
+            **SECONDARY_BTN_KWARGS,
+        ).grid(row=r, column=0, columnspan=2, sticky="w", pady=(4, 0))
         return r + 1
 
     def _set_contact_pref(self, sid, choice, row=None) -> None:
@@ -8586,6 +8608,12 @@ class App:
         # offline demo (no browser / no Salesforce to download from).
         if not self._offline:
             self.root.after(500, self._poll_worker_then_auto_download)
+            # Safety net: if that startup download can't reach Salesforce (not
+            # signed in yet, or a cold-start Edge crash burns the retries), the
+            # session is left on the view-dependent CSV fallback. This heals it
+            # to the full grid-JSON column set on its own as soon as the feed is
+            # healthy — so the user never has to click ↻ to get their columns.
+            self.root.after(15_000, self._heal_caseload_source_tick)
 
         # One-time heads-up if this machine has no Outlook Classic (email
         # sending needs it — "new Outlook"/web can't be automated).
@@ -8890,6 +8918,17 @@ class App:
         self._queue_tab.grid_rowconfigure(0, weight=1)
         self.queue_panel = QueuePanel(self)
         self.queue_panel.attach(self._queue_tab)
+        # Bot Drafts tab (Phase B): review/grade/edit/send AI reply drafts.
+        # GATED — only shown when the user has enabled the feature (an
+        # instructor without a bot-supported course never sees it). Enabling
+        # takes effect on the next launch, like other tabs. See src.bot_drafts.
+        self.bot_drafts_panel = None
+        if bot_drafts.feature_enabled(self.settings):
+            self._bot_drafts_tab = self.log_tabview.add("Bot Drafts")
+            self._bot_drafts_tab.grid_columnconfigure(0, weight=1)
+            self._bot_drafts_tab.grid_rowconfigure(0, weight=1)
+            self.bot_drafts_panel = BotDraftsPanel(self)
+            self.bot_drafts_panel.attach(self._bot_drafts_tab)
         # Action log tab: ONE permanent home for every fired action's results
         # (single fires + batches). Each action+course is a collapsible section
         # (newest on top) with its own ✕, plus a Clear all — so completed runs
@@ -14149,6 +14188,101 @@ class App:
             f"Text: {'scheduled' if scheduled else 'sent'} in Mongoose "
             f"for {who}.")
         return True
+
+    def _compose_single_text(self, row: dict) -> None:
+        """Compose + send one ad-hoc text to a student from the student view's
+        Contact ▸ Text button. Resolves the recipient (Contact id / mobile),
+        opens the compose dialog (course + course-code subject prefix + message
+        + a student-local send window or Send now), then drives Mongoose to
+        completion via _send_text_payload. Front-loads ALL input before any
+        browser navigation (the dialog is shown first, then the send runs)."""
+        from src import text_message as tm
+        from src.dialogs import prompt_single_text
+        if not row:
+            return
+        if getattr(self, "_is_busy", False):
+            self._append_log(
+                "Busy — wait for the current task to finish before texting.")
+            return
+        if not getattr(self, "_offline", False) and \
+                not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        variables = self._text_vars_from_row(row)
+        who = (variables.get("full_name") or variables.get("student_id")
+               or "this student")
+        # Opt-in gate (the API re-checks authoritatively at send time).
+        if not self._texting_optin_status(row):
+            self._append_log(
+                f"Text: {who} isn't opted in to texting — can't send.",
+                error=True)
+            return
+        mobile_raw = (row.get("MobilePhone") or "").strip()
+        term = self._text_term_for(variables.get("student_id", ""), mobile_raw)
+        if not term:
+            self._append_log(
+                f"Text: no Mobile Phone and no Contact id for {who}; can't "
+                "send.", error=True)
+            return
+        mobile = tm.normalize_phone(mobile_raw)
+        ws = int(getattr(self.settings,
+                         "text_default_window_start_hour", 10) or 10)
+        we = int(getattr(self.settings,
+                         "text_default_window_end_hour", 16) or 16)
+        course0 = variables.get("course_code", "")
+        result = prompt_single_text(
+            self.root, who=who, mobile=(mobile or "Contact id"),
+            course=course0, subject=course0, body="",
+            char_limit=tm.MAX_SMS_LEN,
+            default_window_start=ws, default_window_end=we)
+        if result is None:
+            self._append_log("Text compose cancelled.")
+            return
+        course = (result.get("course") or "").strip()
+        subject = (result.get("subject") or "").strip()
+        raw_body = result.get("body") or ""
+        body = f"{subject}: {raw_body}" if subject else raw_body
+        body = body[:tm.MAX_SMS_LEN]
+        if not body.strip():
+            self._append_log("Text: empty message — nothing sent.")
+            return
+        inbox_label = f"{course} Inbox" if course else ""
+        scheduled = not result.get("send_now")
+        sch_payload = None
+        if scheduled:
+            raw_tz = (row.get("Timezone") or "")
+            tzc = tm.effective_tz(raw_tz)
+            if raw_tz.strip() not in tm.TZ_ABBR_TO_IANA:
+                self._append_log(
+                    f"Text: no timezone for {who} — scheduling as MT.")
+            slot = tm.compute_schedule_slot(
+                tzc, self.TEAM_IANA,
+                window_start_hour=result.get("window_start_hour", ws),
+                window_end_hour=result.get("window_end_hour", we))
+            if slot is None:
+                self._append_log(
+                    f"Text: couldn't compute a schedule time for {who}; not "
+                    "sent.", error=True)
+                return
+            sch_payload = {
+                "date_str": slot.date_str, "hour12": slot.hour12,
+                "minute": slot.minute, "ampm": slot.ampm,
+                "student_local_str": slot.student_local_str,
+                "day_label": slot.day_label, "team_str": slot.team_str,
+            }
+        payload = {
+            "body": body, "recipients": [term], "inbox_label": inbox_label,
+            "schedule": sch_payload,
+            "schedule_name": (
+                f"{course} {variables.get('first_name', '')}".strip() or "Text"),
+            "course": course, "commit": True,
+            "_who": who, "_scheduled": scheduled,
+        }
+        self._set_busy(f"Texting {who}…")
+        try:
+            self._send_text_payload(payload)
+        finally:
+            self._set_idle()
 
     def _fire_text(self, scenario: ScenarioConfig, chosen_name: str,
                    prompt_vars: Optional[dict], *,
@@ -19485,6 +19619,39 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        # Default send window for ad-hoc texts (student view → Contact ▸ Text).
+        # Hour helpers live in src.dialogs (module-level) — NOT on App — so import
+        # them here; imported into _open_settings' scope so the nested save
+        # closure below can reach _txt_lbl_hr too.
+        from src.dialogs import (
+            _TEXT_HOUR_LABELS as _TXT_HRS, _hour_label as _txt_hr_lbl,
+            _label_hour as _txt_lbl_hr)
+        tw_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        tw_row.pack(fill="x", padx=20, pady=(4, 0))
+        ctk.CTkLabel(
+            tw_row, text="Default text send window:",
+            font=ctk.CTkFont(size=13),
+        ).pack(side="left")
+        text_win_start_combo = ctk.CTkComboBox(
+            tw_row, values=_TXT_HRS, width=88)
+        text_win_start_combo.set(_txt_hr_lbl(
+            getattr(self.settings, "text_default_window_start_hour", 10)))
+        text_win_start_combo.pack(side="left", padx=(8, 2))
+        ctk.CTkLabel(tw_row, text="–").pack(side="left")
+        text_win_end_combo = ctk.CTkComboBox(
+            tw_row, values=_TXT_HRS, width=88)
+        text_win_end_combo.set(_txt_hr_lbl(
+            getattr(self.settings, "text_default_window_end_hour", 16)))
+        text_win_end_combo.pack(side="left", padx=(2, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("The student-local window a one-off text (student view → "
+                  "Contact ▸ Text) is pre-filled to schedule within. You can "
+                  "override it per text, or choose Send now."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
         # Off-caseload emails: CC the ACI (assigned course instructor) + PM.
         cc_aci_var = ctk.BooleanVar(
             value=getattr(self.settings, "cc_aci_offcaseload", True))
@@ -19664,6 +19831,59 @@ class App:
             dialog, text=_lb_info, wraplength=510, justify="left",
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(2, 10))
+
+        # ---- Bot Drafts review (Phase B) ----
+        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
+            fill="x", padx=20, pady=(2, 8))
+        bot_drafts_var = ctk.BooleanVar(
+            value=getattr(self.settings, "bot_drafts_enabled", False))
+        ctk.CTkCheckBox(
+            dialog, text="Show the Bot Drafts review tab",
+            variable=bot_drafts_var, font=ctk.CTkFont(size=13),
+        ).pack(anchor="w", padx=20, pady=(6, 0))
+        ctk.CTkLabel(
+            dialog,
+            text="⚠ Relaunch the app after changing this — the tab is "
+                 "added or removed on the NEXT launch, not immediately.",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("#b45309", "#f0a020"),  # amber; visible in both themes
+            wraplength=510, justify="left", anchor="w",
+        ).pack(fill="x", padx=44, pady=(2, 4))
+        ctk.CTkLabel(
+            dialog,
+            text=("Adds a tab for reviewing AI-generated reply drafts the "
+                  "course bot files into an Outlook Drafts subfolder: read "
+                  "the student's question beside the draft, grade it, edit if "
+                  "needed, and send it — in your name, or unedited as a "
+                  "clearly-labeled automated reply. Nothing is ever sent "
+                  "without your click."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 6))
+        bd_f_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        bd_f_row.pack(fill="x", padx=44, pady=(0, 2))
+        ctk.CTkLabel(bd_f_row, text="Drafts subfolder:").pack(side="left")
+        bot_drafts_folder_var = ctk.StringVar(value=(
+            getattr(self.settings, "bot_drafts_folder", "")
+            or bot_drafts.DEFAULT_WATCH_FOLDER))
+        ctk.CTkEntry(bd_f_row, textvariable=bot_drafts_folder_var,
+                     width=200).pack(side="left", padx=(8, 0))
+        bd_m_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        bd_m_row.pack(fill="x", padx=44, pady=(0, 2))
+        ctk.CTkLabel(bd_m_row, text="Mailbox (blank = yours):").pack(
+            side="left")
+        bot_drafts_mailbox_var = ctk.StringVar(
+            value=getattr(self.settings, "bot_drafts_mailbox", ""))
+        ctk.CTkEntry(bd_m_row, textvariable=bot_drafts_mailbox_var,
+                     width=220).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("The folder sits under Drafts. Leave the mailbox blank for "
+                  "your own; set a shared mailbox's SMTP address for a team "
+                  "box."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
 
         dialog = tab_security
         # Data-at-rest encryption: how often the app password is required.
@@ -19881,6 +20101,12 @@ class App:
             # Hide/show the manual '⬇ Texting IDs' export button to match: the
             # segment export is only needed for the DOM texting fallback.
             self._update_texting_ids_btn()
+            # Default send window for ad-hoc texts (student view Contact ▸ Text).
+            # _txt_lbl_hr is imported above in _open_settings' scope (closure).
+            self.settings.text_default_window_start_hour = _txt_lbl_hr(
+                text_win_start_combo.get())
+            self.settings.text_default_window_end_hour = _txt_lbl_hr(
+                text_win_end_combo.get())
             # Off-caseload email CC (ACI + PM).
             self.settings.cc_aci_offcaseload = bool(cc_aci_var.get())
             # Quick-note hotkey — re-register the global hotkeys if it changed.
@@ -19917,6 +20143,12 @@ class App:
                 t = getattr(self, "_labeler_thread", None)
                 if t is not None:
                     t.run_now()
+            # Bot Drafts review (Phase B): persist; the tab appears/disappears
+            # on the next launch (adding/removing a tab live is fiddly).
+            self.settings.bot_drafts_enabled = bool(bot_drafts_var.get())
+            self.settings.bot_drafts_folder = bot_drafts_folder_var.get().strip()
+            self.settings.bot_drafts_mailbox = \
+                bot_drafts_mailbox_var.get().strip()
             # Per-area font sizes already persist live via set_font_size.
             save_settings(self.settings)
             if qn_hk_changed:
@@ -22226,6 +22458,40 @@ class App:
         # remind, once per session, when that data has gone stale.
         self._auto_ingest_outcomes_archive()
         return True
+
+    def _heal_caseload_source_tick(self) -> None:
+        """Self-limiting background check that heals a caseload stuck on the
+        view-dependent CSV fallback WITHOUT the user having to click ↻.
+
+        A rough startup (not signed in yet, or a cold-start Edge crash burning
+        the download retries) makes the auto-download give up, leaving the
+        session sourced from the last CSV — which carries ONLY the columns the
+        user's Salesforce list view happened to show. The live grid JSON is a
+        view-independent superset, and it gets captured passively by ANY later
+        caseload load, EA scrape, or task-status API replay. So once the feed
+        is healthy, re-source from it silently and the full column set appears
+        on its own. Pure in-memory re-source (reads the existing CSV + the
+        already-captured grid) — never drives the browser. Stops rescheduling
+        the moment the caseload is grid-backed, so a normal (grid-sourced)
+        startup pays essentially nothing."""
+        try:
+            if (not getattr(self, "_caseload_from_json", False)
+                    and not getattr(self, "_is_busy", False)
+                    and self.worker.ready_event.is_set()):
+                if self._grid_feed_health().get("ok"):
+                    self._reload_caseload_cache(silent=True)
+                    if getattr(self, "_caseload_from_json", False):
+                        self._append_log(
+                            "✓ Caseload columns restored from the live grid "
+                            "feed (no refresh needed).", success=True)
+        except Exception:
+            pass
+        # Keep polling until grid-backed, then stop (self-limiting).
+        if not getattr(self, "_caseload_from_json", False):
+            try:
+                self.root.after(15_000, self._heal_caseload_source_tick)
+            except Exception:
+                pass
 
     def _auto_ingest_outcomes_archive(self) -> None:
         """Ingest a newly-downloaded 'passed in last 30 days' archive if one is

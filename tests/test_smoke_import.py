@@ -56,6 +56,8 @@ SRC_MODULES = [
     "src.email_template",
     "src.outlook_email",
     "src.action_queue",
+    "src.bot_drafts",
+    "src.bot_drafts_panel",
 ]
 
 

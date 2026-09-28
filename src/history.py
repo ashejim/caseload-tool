@@ -1467,6 +1467,154 @@ def all_outcomes(*, db_path=HISTORY_DB) -> list[dict]:
         conn.close()
 
 
+def _effective_end_from_extra(ej: dict):
+    """Effective end date from a snapshot's extra_json: the IC (incomplete /
+    extension) date when present, else the term end. Parsed date or None."""
+    return _parse_date((ej.get("Icenddate") or "").strip()
+                       or (ej.get("TermEndDate") or "").strip())
+
+
+def term_end_outcomes(*, db_path=HISTORY_DB, date_from=None, date_to=None,
+                      courses=None, depart_cutoff_days=14, term_grace_days=21,
+                      now: Optional[datetime] = None) -> dict:
+    """Course pass / non-pass resolution built from the SNAPSHOT history rather
+    than the "passed in the last 30 days" archive.
+
+    WHY snapshots, not the archive: the archive captures passers well but badly
+    under-captures non-passers (they don't cleanly "resolve" — most get an IC
+    extension, roll to a new term, or just term-end quietly and stay on the
+    caseload), so an archive-only pass rate is inflated. The snapshot history
+    keeps every student we ever saw, so it can classify the non-passers the
+    archive drops.
+
+    Each (student, course) is classified and DATED BY WHEN IT RESOLVED:
+
+      passed            authoritative pass on record (outcomes); dated pass_date.
+      notpass_term_end  reached their effective end (IC else term end) without a
+                        pass on record; dated by that effective end.
+      early_exit        fell off the caseload well before their term end
+                        (>``term_grace_days`` early), or an archived non-pass
+                        whose term end is still in the future; dated by last-seen.
+                        AMBIGUOUS — this can be a true dropout, a reassignment to
+                        another CI, or a pass we simply failed to capture. It is
+                        reported SEPARATELY and kept OUT of the headline term-end
+                        rate, because snapshots alone can't tell those apart and
+                        folding them in would over-count non-passers.
+      in_progress       still enrolled, term end not yet reached; excluded.
+
+    ``date_from``/``date_to`` bound the window by RESOLUTION date. ``courses``
+    (a set/list) restricts the cohort; None = all. The two tuning knobs let a
+    caller widen/narrow what counts as "reached term end" vs "left early".
+
+    Returns ``{asof, date_from, date_to, passed, notpass_term_end, early_exit,
+    in_progress_excluded, term_end_rate, rate_incl_early, students:{...},
+    courses:[…]}``. ``students`` holds per-category detail dicts (student_id,
+    course_code, name, resolved_on, effective_end, last_seen, momentum,
+    latest_task_status) — the caller owns any PII handling.
+    """
+    from datetime import timedelta
+    lo = _parse_date(date_from) if date_from else None
+    hi = _parse_date(date_to) if date_to else None
+    sel = set(courses) if courses else None
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT MAX(collected_date) m FROM snapshots").fetchone()
+        asof = _parse_date(row["m"]) if row and row["m"] else (
+            (now or datetime.now()).date())
+        oc = {}
+        for r in conn.execute("SELECT student_id, course_code, outcome, "
+                              "pass_date, name FROM outcomes"):
+            oc[(r["student_id"], r["course_code"])] = dict(r)
+        latest = {}
+        for r in conn.execute(
+                "SELECT s.student_id, s.course_code, s.name, s.momentum, "
+                "s.latest_task_status, s.collected_date, s.extra_json "
+                "FROM snapshots s JOIN (SELECT student_id, course_code, "
+                "MAX(collected_date) md FROM snapshots GROUP BY student_id, "
+                "course_code) m ON s.student_id = m.student_id AND "
+                "s.course_code = m.course_code AND s.collected_date = m.md"):
+            try:
+                ej = json.loads(r["extra_json"] or "{}")
+            except Exception:
+                ej = {}
+            latest[(r["student_id"], r["course_code"])] = {
+                "name": r["name"], "momentum": r["momentum"],
+                "latest_task_status": r["latest_task_status"],
+                "last_seen": _parse_date(r["collected_date"]),
+                "effective_end": _effective_end_from_extra(ej)}
+    finally:
+        conn.close()
+
+    def _classify(key):
+        o = oc.get(key)
+        snap = latest.get(key, {})
+        eff = snap.get("effective_end")
+        ls = snap.get("last_seen")
+        departed = ls is not None and (asof - ls).days > depart_cutoff_days
+        if o and o["outcome"] == "passed":
+            return "passed", _parse_date(o.get("pass_date"))
+        if o and o["outcome"] == "not_passed":
+            if eff and ls and ls < eff - timedelta(days=term_grace_days):
+                return "early_exit", ls
+            return "notpass_term_end", (eff if eff and eff <= asof else ls)
+        if eff and eff <= asof:
+            if ls is not None and ls < eff - timedelta(days=term_grace_days):
+                return "early_exit", ls
+            return "notpass_term_end", eff
+        if departed:
+            return "early_exit", ls
+        return "in_progress", None
+
+    def _detail(key, resolved_on):
+        snap = latest.get(key, {})
+        o = oc.get(key, {})
+        return {
+            "student_id": key[0], "course_code": key[1],
+            "name": snap.get("name") or o.get("name") or "",
+            "resolved_on": resolved_on.isoformat() if resolved_on else "",
+            "effective_end": (snap.get("effective_end").isoformat()
+                              if snap.get("effective_end") else ""),
+            "last_seen": (snap.get("last_seen").isoformat()
+                          if snap.get("last_seen") else ""),
+            "momentum": snap.get("momentum") or "",
+            "latest_task_status": snap.get("latest_task_status") or ""}
+
+    buckets = {"passed": [], "notpass_term_end": [], "early_exit": []}
+    in_progress = 0
+    present_courses = set()
+    for key in set(latest) | set(oc):
+        if sel is not None and key[1] not in sel:
+            continue
+        cat, resolved_on = _classify(key)
+        if cat == "in_progress":
+            in_progress += 1
+            continue
+        if resolved_on is None:
+            continue
+        if (lo is not None and resolved_on < lo) or (
+                hi is not None and resolved_on > hi):
+            continue
+        buckets[cat].append(_detail(key, resolved_on))
+        present_courses.add(key[1])
+
+    n_pass = len(buckets["passed"])
+    n_nt = len(buckets["notpass_term_end"])
+    n_ex = len(buckets["early_exit"])
+    term_rate = (100.0 * n_pass / (n_pass + n_nt)) if (n_pass + n_nt) else None
+    rate_incl = (100.0 * n_pass / (n_pass + n_nt + n_ex)) if (
+        n_pass + n_nt + n_ex) else None
+    for cat in buckets:
+        buckets[cat].sort(key=lambda d: (d["course_code"], d["resolved_on"]))
+    return {
+        "asof": asof.isoformat(),
+        "date_from": lo.isoformat() if lo else None,
+        "date_to": hi.isoformat() if hi else None,
+        "passed": n_pass, "notpass_term_end": n_nt, "early_exit": n_ex,
+        "in_progress_excluded": in_progress,
+        "term_end_rate": term_rate, "rate_incl_early": rate_incl,
+        "students": buckets, "courses": sorted(present_courses)}
+
+
 def _to_int(x):
     try:
         return int(float(x))

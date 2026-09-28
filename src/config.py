@@ -461,6 +461,12 @@ class Settings:
     # stop getting the "text-ID export is stale" prompt; a user who then toggles
     # it back off stays off (the migration runs once). Toggle off to drive the modal.
     text_send_via_api: bool = True
+    # Default acceptable send window (student-local, 24h hour numbers) for an
+    # ad-hoc text composed from the student view's Contact ▸ Text button. The
+    # compose dialog pre-fills these; each send can override the window or pick
+    # "Send now". Mirrors a per-action TextConfig window but for one-off texts.
+    text_default_window_start_hour: int = 10   # 10 AM
+    text_default_window_end_hour: int = 16     # 4 PM
     # Source the caseload from the live grid JSON (getCaseLoadMainGridData) when
     # that feed is healthy, overlaying any CSV-only columns from the downloaded
     # CSV — so the caseload is complete regardless of how the Salesforce list
@@ -546,6 +552,20 @@ class Settings:
     # month, so a stale roster steadily grows the Unidentified pile.
     # 0 = never auto-refresh (manual 'rosterscan:' / button only).
     inbox_labeler_roster_max_age_hours: int = 24
+    # Phase B — Bot Drafts review (src/bot_drafts.py + bot_drafts_panel).
+    # A faculty member reviews AI-generated reply drafts, grades/edits them,
+    # and sends (as themselves, or unedited "as the bot"). OFF by default so
+    # instructors without a bot-supported course never see the tab — turning
+    # it on is the whole gate (course-agnostic: the panel serves whatever
+    # course each draft declares). No auto-send: a person always clicks send.
+    bot_drafts_enabled: bool = False
+    # Drafts SUBFOLDER the bot files its reply drafts into (the backend
+    # machine drafts there). Empty = the built-in default ("BOT drafts",
+    # matching the email agent's --draft-folder).
+    bot_drafts_folder: str = ""
+    # Mailbox SMTP whose Drafts hold the bot drafts. Empty = the personal
+    # mailbox. A shared/team mailbox is resolved best-effort (later phase).
+    bot_drafts_mailbox: str = ""
 
 
 def load_settings() -> Settings:
