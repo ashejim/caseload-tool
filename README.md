@@ -4,13 +4,19 @@
 
 # CaseloadNotes — Caseload automation for WGU Course Instructors
 
-(Note automation)+(Text scheduler/automation)+(Mail merge)+(EA dashboard)+(Caseload)+(Data organization)...
+(Note automation)+(Text scheduler/automation)+(Mail merge)+(EA dashboard)+(Caseload)+(Data collection + outcome tracking)+(Analytics)...
 = caseload-tool
 
 A Windows desktop tool that organizes and automates the repetitive Salesforce/Outlook/Mongoose
 work of running a WGU course caseload — filing notes, sending emails and texts,
 and seeing at a glance who needs attention. It runs client-side under your own
 login, so **no Salesforce admin permissions are required**.
+
+It also quietly builds a **longitudinal local record of your caseload** — daily
+snapshots, student outcomes, and every contact you make — that WGU doesn't
+report back to instructors. That record powers trend, engagement, and pass-rate
+analytics (including predicted-vs-actual Momentum calibration) you otherwise
+couldn't get, and it stays on your machine, encrypted at rest.
 
 Press a hotkey (or click a student in the built-in viewer) and a pre-defined
 note is filled and submitted on the active student — no typing through fields,
@@ -39,8 +45,20 @@ and UI changes.
   course who are on another instructor's caseload.
 - **Success paths** — per-course step checklists that surface the recommended
   next action per student.
-- **Extras** — an action queue, conditional action branching, caseload history +
-  departures, Momentum calibration, and at-rest encryption of local student data.
+- **Local data collection + tracking** — WGU doesn't report historical outcomes
+  back to instructors, so the app keeps its own longitudinal record: automatic
+  **daily caseload snapshots** (Momentum, task pass/fail, follow-ups, key dates),
+  a **contact-note history** (your outreach *and* inbound replies, captured from
+  Salesforce), and an ingested **passed-outcomes archive** — all in a local,
+  encrypted database, with a **CSV backup/export** and recovery guide.
+- **Data & analytics tab** — turns that record into insight: Momentum
+  **calibration** (predicted vs. actual pass rate by band), **momentum-risk**
+  targeting of in-progress students, **throughput** and **completion** by month,
+  **departures**, and a snapshot-based **term-end pass-rate report** that
+  reproduces the official rate the 30-day archive under-counts (with a companion
+  command-line report for deeper analysis).
+- **Extras** — an action queue, conditional action branching, and at-rest
+  encryption of local student data.
 
 ## What it saves you
 
