@@ -3,6 +3,27 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.26.1 — 2026-10-01
+
+- **Fix: texts with quotes or "smart" punctuation now send.** Mongoose's SMS API
+  rejected certain message content with "HTTP 400: Invalid message content",
+  silently dropping the text: a plain straight **double-quote** (confirmed), plus
+  non-GSM "smart" quotes / dashes / ellipsis pasted from Outlook or Word.
+  Outgoing text is now sanitized before sending — smart punctuation → plain GSM
+  (curly quotes → straight, dashes → hyphen, ellipsis → "..."), and the
+  Mongoose-rejected double-quote → an apostrophe it accepts — so a message like
+  `… look for "Bookmark the link…"` goes out as written.
+- **Fix: a Mongoose content rejection now says what to do.** When a scheduled API
+  send was refused, the log said only "API send didn't apply (None)". It now logs
+  the HTTP status and Mongoose's response, and on a "400: Invalid message
+  content" tells you to remove special characters and re-fire — instead of a
+  cryptic failure behind the compose-modal fallback.
+- **More resilient compose-modal fallback.** A left-open compose-modal overlay
+  could intercept pointer events and make the department switch hang 30s per
+  group. `close_compose` now retries and accepts a "discard draft?" confirmation,
+  and the department switch clears any leftover overlay first and fails fast
+  (improved, though a stubborn overlay can still require a Mongoose refresh).
+
 ## 0.26.0 — 2026-09-27
 
 - **Bot Drafts — review AI-generated reply drafts (chatbot interface).** A new

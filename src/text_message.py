@@ -58,14 +58,56 @@ DEFAULT_LEAD_MINUTES = 10
 EARLIEST_TEAM_HOUR = 8
 
 
+# Non-GSM punctuation → plain GSM equivalents. "Smart" quotes/dashes/ellipsis
+# (pasted from Outlook/Word/email subjects) are a classic cause of Mongoose's
+# "HTTP 400: Invalid message content" rejection — the SMS content validator
+# rejects the non-GSM characters. We normalize them so the body stays plain,
+# GSM-safe text that sends (instead of silently failing the way it did when a
+# message contained a curly double-quote).
+_GSM_NORMALIZE = {
+    "‘": "'", "’": "'", "‚": "'", "′": "'",   # single quotes
+    "“": '"', "”": '"', "„": '"', "″": '"',   # double quotes
+    "–": "-", "—": "-", "−": "-",                   # en/em/minus
+    "…": "...",                                               # ellipsis
+    " ": " ", " ": " ", " ": " ",                   # nbsp/thin sp
+    "•": "*",                                                 # bullet
+}
+_GSM_TABLE = {ord(k): v for k, v in _GSM_NORMALIZE.items()}
+
+# Mongoose's SMS API rejects a plain straight double-quote in the body with
+# "HTTP 400: Invalid message content" (confirmed live 2026-10-01), even though it
+# is a valid GSM character — likely its own content sanitization. An apostrophe
+# sends fine, so swap " -> ' to keep quoted messages deliverable. Extend this map
+# if the character-isolation test turns up other plain-ASCII rejects.
+_MONGOOSE_REJECT_SWAP = {ord('"'): "'"}
+
+
+def normalize_gsm(text: str) -> str:
+    """Replace common non-GSM 'smart' punctuation with plain GSM equivalents
+    (curly quotes → straight, en/em dash → hyphen, ellipsis → '...', nbsp →
+    space). Mongoose's SMS content validation rejects non-GSM characters with
+    'Invalid message content', so this keeps a pasted message sendable."""
+    return (text or "").translate(_GSM_TABLE)
+
+
+def sanitize_sms(text: str) -> str:
+    """Make a body actually deliverable through Mongoose: GSM-normalize pasted
+    'smart' punctuation (normalize_gsm) AND swap the straight double-quote
+    Mongoose refuses (_MONGOOSE_REJECT_SWAP) for an apostrophe it accepts."""
+    return normalize_gsm(text).translate(_MONGOOSE_REJECT_SWAP)
+
+
 def render_message(template_text: str, variables: dict) -> str:
     """Render {{var}} placeholders into a plain-text SMS body.
 
     Reuses the email template engine's plain-text path (no HTML escaping),
     so texting shares the exact variable set as email
     (first_name/preferred_name/course_code/...). Unknown placeholders are left
-    in place so a typo is visible rather than silently dropped."""
-    return email_template.render_plain(template_text or "", variables or {})
+    in place so a typo is visible rather than silently dropped. The result is
+    run through sanitize_sms so 'smart' punctuation and the Mongoose-rejected
+    double-quote don't make the send fail."""
+    return sanitize_sms(
+        email_template.render_plain(template_text or "", variables or {}))
 
 
 def over_length(body: str) -> int:
@@ -282,13 +324,22 @@ def switch_department(page: Page, course: str, *, timeout_ms: int = 10_000) -> N
         page.bring_to_front()
     except Exception:
         pass
+    # A leftover compose modal's overlay intercepts pointer events and would make
+    # the department-dropdown click below time out (30s), cascading across a
+    # batch's groups. Clear it before touching the sidebar.
+    try:
+        close_compose(page)
+    except Exception:
+        pass
     if current_department(page).lower() == course.lower():
         return
     # Open the department switcher (the sidebar box showing the current dept).
     trigger = page.locator(
         ".department-name.department-dropdown").filter(visible=True).first
     trigger.wait_for(state="visible", timeout=timeout_ms)
-    trigger.click()
+    # Bounded click: if the overlay is somehow still up, fail in timeout_ms (10s)
+    # rather than the 30s default, so a wedge doesn't burn 30s per group.
+    trigger.click(timeout=timeout_ms)
     # Pick the team whose aria-label starts with the course code
     # (e.g. "C769, 1 unread message" / "C964, Current team" / "D502").
     item = page.locator(
@@ -352,32 +403,63 @@ def _click_button(page: Page, name: str, *, timeout_ms: int = 10_000) -> None:
         raise last
 
 
-def close_compose(page: Page, *, timeout_ms: int = 5_000) -> None:
-    """Close the compose modal if one is open. A left-open modal (e.g. from a
-    failed previous group) makes the Compose button `inert` and its overlay
-    intercepts clicks — so we reset to a clean slate before each compose."""
-    overlay = page.locator(".compose-modal-overlay").filter(visible=True)
-    try:
-        if overlay.count() == 0:
-            return
-    except Exception:
-        return
-    try:
-        btn = page.get_by_role(
-            "button", name="Close Compose Modal").filter(visible=True)
-        if btn.count() > 0:
-            btn.first.click(timeout=timeout_ms)
-        else:
-            page.keyboard.press("Escape")
-    except Exception:
+def close_compose(page: Page, *, timeout_ms: int = 5_000) -> bool:
+    """Close the compose modal if one is open; return True once no overlay
+    remains. A left-open modal's `.compose-modal-overlay` intercepts pointer
+    events, which wedges the NEXT action — e.g. clicking the department dropdown
+    then times out 30s ("compose-modal-overlay intercepts pointer events"), which
+    cascades across every group in a batch.
+
+    Mongoose can ignore a single Escape when the compose has content (it may pop a
+    "discard draft?" confirm instead), so a one-shot close often leaves the overlay
+    up. Retry: Close button → Escape → accept a discard/confirm → Escape again, a
+    few passes, re-querying the overlay each time so we actually verify it's gone."""
+    def _overlay_up() -> bool:
         try:
-            page.keyboard.press("Escape")
+            return page.locator(
+                ".compose-modal-overlay").filter(visible=True).count() > 0
+        except Exception:
+            return False
+
+    if not _overlay_up():
+        return True
+    for _ in range(4):
+        try:
+            btn = page.get_by_role(
+                "button", name="Close Compose Modal").filter(visible=True)
+            if btn.count() > 0:
+                btn.first.click(timeout=2_000)
+            else:
+                page.keyboard.press("Escape")
+        except Exception:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+        # A "discard draft?" confirmation can appear over the modal — accept it so
+        # the overlay actually detaches rather than staying up behind the prompt.
+        try:
+            for _name in ("Discard", "Yes", "Delete", "Confirm", "OK"):
+                c = page.get_by_role(
+                    "button", name=_name).filter(visible=True)
+                if c.count() > 0:
+                    c.first.click(timeout=1_500)
+                    break
         except Exception:
             pass
-    try:
-        overlay.first.wait_for(state="hidden", timeout=timeout_ms)
-    except Exception:
-        pass
+        try:
+            page.locator(".compose-modal-overlay").first.wait_for(
+                state="hidden", timeout=2_000)
+        except Exception:
+            pass
+        if not _overlay_up():
+            return True
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
+    return not _overlay_up()
 
 
 def open_compose(page: Page, *, timeout_ms: int = 15_000) -> None:

@@ -129,6 +129,37 @@ def test_schedule_clamps_for_western_team():
     assert slot.clamped is True
 
 
+def test_normalize_gsm_smart_punctuation():
+    # Curly quotes / dashes / ellipsis (pasted from Word/Outlook) → plain GSM,
+    # so Mongoose doesn't reject the body with "Invalid message content".
+    raw = ("Look for the subject “Bookmark the link— Critical "
+           "Resources”… it’s important")
+    out = tm.normalize_gsm(raw)
+    assert "“" not in out and "”" not in out, out
+    assert "—" not in out and "…" not in out and "’" not in out
+    assert out == ('Look for the subject "Bookmark the link- Critical '
+                   'Resources"... it\'s important'), out
+    # Already-plain text is unchanged.
+    plain = 'Hi! It is "D413" - reply if you need help.'
+    assert tm.normalize_gsm(plain) == plain
+
+
+def test_sanitize_sms_swaps_mongoose_rejected_double_quote():
+    # Straight double-quote (Mongoose rejects it) -> apostrophe; smart quotes
+    # normalize first, then also swap. Apostrophes are left as-is (Mongoose OK).
+    assert tm.sanitize_sms('say "hi" there') == "say 'hi' there"
+    assert tm.sanitize_sms("it's “fine”") == "it's 'fine'"
+    assert tm.sanitize_sms("no specials here") == "no specials here"
+
+
+def test_render_message_sanitizes_for_sms():
+    # render_message runs the full sanitizer end-to-end: smart quotes + em dash
+    # normalized, straight double-quotes swapped to apostrophes.
+    out = tm.render_message("Hi {{first_name}} — see the \"guide\"",
+                            {"first_name": "Sam"})
+    assert out == "Hi Sam - see the 'guide'", out
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

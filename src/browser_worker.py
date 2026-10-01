@@ -5900,8 +5900,25 @@ class BrowserWorker:
                        "Mongoose)" if skipped else "") + ".")
                 return {"ok": True, "via": "api", "sent": sent,
                         "skipped_recipients": skipped}
+            # Surface WHY the API send didn't apply. On an HTTP rejection
+            # api['error'] is None but api carries the status + response body —
+            # log those so a refused scheduled send (bad schedule date, null
+            # messageType, Message-Name constraint, token scope, …) is diagnosable
+            # instead of a cryptic "(None)".
+            _why = api.get("error")
+            if not _why:
+                _status = api.get("status")
+                _body = (api.get("resp") or "(empty body)")[:200]
+                _why = f"HTTP {_status}: {_body}"
+                # Mongoose refuses certain message content (e.g. a straight
+                # double-quote) — the common ones are auto-fixed before send, but
+                # if one slips through, say what to do rather than leave a cryptic
+                # 400 behind a flaky modal fallback.
+                if _status == 400 and "content" in str(_body).lower():
+                    _why += (" — Mongoose rejected the message TEXT; remove "
+                             "special characters (e.g. double-quotes) and re-fire")
             self.on_status(
-                f"  text: API send didn't apply ({api.get('error')}) — falling "
+                f"  text: API send didn't apply ({_why}) — falling "
                 "back to the compose modal.")
         # The first compose of a session is flaky (cold renderer); warm it once
         # with a throwaway open/search/close so the first real group goes through.
