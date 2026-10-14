@@ -906,8 +906,45 @@ class DataPanel:
             f"the blue line is {metric_lbl} that month (right axis). 'Last 30d' "
             "is a rolling recent-volume bar (excluded from the average). A student "
             "in two courses counts once per course; contacts course-attribution "
-            "is best-effort."))
+            "is best-effort." + self._contacts_freshness_caption()))
         self._draw_throughput()
+
+    def _contacts_freshness_caption(self) -> str:
+        """Trailing note for the throughput status line: how current the
+        contact-note data is. The blue contacts LINE reads history.notes, which
+        is captured ONLY by manual sweeps ('sweepnotes:' / Settings → Refresh
+        contact notes), never automatically — so a stale table makes recent
+        months read 0 contacts, which looks like 'no outreach' rather than 'no
+        data captured'. Warn (⚠) when the last sweep is >7 days old; a quiet '•'
+        note otherwise; '' if the table is empty (nothing to caption)."""
+        try:
+            fresh = history.notes_freshness()
+        except Exception:
+            return ""
+        swept = (fresh.get("last_swept") or "")[:10]
+        newest = (fresh.get("newest_note") or "")[:10]
+        if not swept and not newest:
+            return ("   ⚠ No contact notes captured yet — the blue contacts "
+                    "line reads 0 until you run 'sweepnotes:' (Settings → "
+                    "Refresh contact notes).")
+        from datetime import datetime
+
+        def _age(s):
+            try:
+                return (datetime.now().date()
+                        - datetime.strptime(s, "%Y-%m-%d").date()).days
+            except Exception:
+                return None
+
+        days = _age(swept)
+        horizon = f" (data through {newest})" if newest else ""
+        if days is not None and days > 7:
+            return (f"   ⚠ Contact notes last swept {swept} ({days}d ago)"
+                    f"{horizon} — months after that under-report; run "
+                    "'sweepnotes:' (Settings → Refresh contact notes) to update.")
+        if swept:
+            return f"   •  Contact notes last updated {swept}{horizon}."
+        return ""
 
     def _draw_throughput(self) -> None:
         c = self.canvas
