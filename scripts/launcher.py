@@ -11935,6 +11935,13 @@ class App:
             cids = _mc.load_contact_ids()
         except Exception:
             cids = {}
+        if dry:
+            try:
+                n = history.stage_l360_notes(res.get("by_student") or {})
+                self._append_log(f"  [l360notes] staged {n} notes for offline "
+                                 "analysis (encrypted history DB).")
+            except Exception as e:
+                self._append_log(f"  [l360notes] staging failed: {e}")
         st = history.persist_l360_notes(res.get("by_student") or {},
                                         contact_ids=cids, dry=dry)
         if dry:

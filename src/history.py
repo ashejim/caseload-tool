@@ -277,6 +277,27 @@ CREATE TABLE IF NOT EXISTS l360_ids (
     pidm       TEXT,
     updated_at TEXT
 );
+
+-- Last `l360notes: dry` pull, kept for offline analysis of the import's
+-- de-dup rules (replaced on every dry run; same at-rest encryption as the
+-- rest of this DB). Not read by any view.
+CREATE TABLE IF NOT EXISTS l360_notes_staging (
+    student_id  TEXT,
+    l360_id     TEXT,
+    created_at  TEXT,
+    created_src TEXT,
+    modified_at TEXT,
+    type        TEXT,
+    course_code TEXT,
+    author      TEXT,
+    author_is_ci INTEGER,
+    author_is_pm INTEGER,
+    from_sms    INTEGER,
+    subject     TEXT,
+    body        TEXT,
+    staged_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_l360_staging ON l360_notes_staging(student_id, created_at);
 """
 
 
@@ -981,6 +1002,7 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
     # repeated texts / templated emails all collapse onto the first match.
     claimed: set = set()
     seen_ids: set = set()
+    seen_events: set = set()
     conn = _connect(db_path)
     try:
         with conn:
@@ -998,6 +1020,11 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                         f"{sid}|{created}|{body[:80]}".encode("utf-8", "ignore")
                     ).hexdigest()[:16]
                     nid = "l360:" + lid
+                    ev = (sid, created[:19], _norm_body(body))
+                    if ev[2] and ev in seen_events:
+                        st["dup_in_360"] += 1       # same event, another key
+                        continue
+                    seen_events.add(ev)
                     if nid in seen_ids:
                         st["dup_in_360"] += 1       # same note listed twice
                         continue
@@ -1074,6 +1101,32 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
     out["fuzzy_offset_hours"] = dict(sorted(offsets.items()))
     out["new_by_month"] = dict(sorted(new_months.items()))
     return out
+
+
+def stage_l360_notes(by_student: dict, *, db_path=HISTORY_DB,
+                     now: Optional[datetime] = None) -> int:
+    """Replace l360_notes_staging with this dry run's parsed notes (for
+    offline de-dup analysis without re-pulling from Learner360). Returns rows."""
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute("DELETE FROM l360_notes_staging")
+            rows = [(sid, n.get("l360_id"), n.get("created_at"),
+                     n.get("created_src"), n.get("modified_at"), n.get("type"),
+                     n.get("course"), n.get("author"),
+                     int(bool(n.get("author_is_ci"))),
+                     int(bool(n.get("author_is_pm"))),
+                     int(bool(n.get("from_sms"))), n.get("subject"),
+                     n.get("body"), ts)
+                    for sid, notes in (by_student or {}).items()
+                    for n in notes or []]
+            conn.executemany(
+                "INSERT INTO l360_notes_staging VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        return len(rows)
+    finally:
+        conn.close()
 
 
 def l360_notes_last_import(*, db_path=HISTORY_DB) -> Optional[str]:

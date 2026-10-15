@@ -279,7 +279,7 @@ def parse_notes(resp) -> list:
         if not isinstance(n, dict):
             continue
         _, nid = _pick(n, _NOTE_FIELDS["id"])
-        _, created = _pick(n, _NOTE_FIELDS["created"])
+        created_src, created = _pick(n, _NOTE_FIELDS["created"])
         _, typ = _pick(n, _NOTE_FIELDS["type"])
         typ = sf_type_label(str(typ or ""))
         _, body = _pick(n, _NOTE_FIELDS["body"])
@@ -294,6 +294,8 @@ def parse_notes(resp) -> list:
             "author_is_ci": bool(n.get("authorIsCI") or n.get("authorIsCi")),
             "author_is_pm": bool(n.get("authorIsPM") or n.get("authorIsPm")),
             "from_sms": bool(n.get("createdFromSms")),
+            "modified_at": iso_utc(n.get("lastModifiedDate")),
+            "created_src": created_src,
         })
     return out
 
@@ -360,8 +362,15 @@ _GET_BATCH_JS = """async ([base, headers, ids, conc]) => {
   const run = async () => {
     while (i < ids.length) {
       const id = ids[i++];
-      try { const r = await fetch(base + id, {headers: h}); out[id] = {status: r.status, body: await r.text()}; }
-      catch (e) { out[id] = {status: 'fetch-error', body: String(e)}; }
+      // Notes responses are large and the gateway 503s under load: retry
+      // overload statuses with backoff (2s, 5s, 10s) before giving up.
+      for (let a = 0; a < 4; a++) {
+        try { const r = await fetch(base + id, {headers: h});
+              out[id] = {status: r.status, body: await r.text()};
+              if (![429, 502, 503, 504].includes(r.status)) break; }
+        catch (e) { out[id] = {status: 'fetch-error', body: String(e)}; }
+        if (a < 3) await new Promise(res => setTimeout(res, [2000, 5000, 10000][a]));
+      }
     }
   };
   await Promise.all(Array.from({length: conc}, run));
@@ -370,7 +379,7 @@ _GET_BATCH_JS = """async ([base, headers, ids, conc]) => {
 
 
 def fetch_notes_batch(page, headers: dict, wgu_ids: list,
-                      concurrency: int = 5) -> dict:
+                      concurrency: int = 3) -> dict:
     """GET studentNotes for many learners, in-page. → {wgu_id: {status, body}}."""
     return page.evaluate(_GET_BATCH_JS,
                          [GATEWAY + NOTES_PATH, headers, list(wgu_ids),

@@ -70,6 +70,16 @@ uniqueness `present/distinct` → pick the truly unique id).
 Concern for auto-import: 4 min of `_set_busy` blocks the UI — consider a
 non-blocking background mode or a weekly cadence.
 
+**Dry run #2:** `compositeKey` is unique (32793/32793; `noteNumber` is not);
+1:1 matching now sane (7,276 matched for 129 learners). New problems: 77/206
+learners got HTTP **503** (gateway overload; run took 10 min) → fetch now uses
+concurrency 3 + retry/backoff on 429/5xx. **4,728 same-event repeats** inside
+Learner360 lists (same second + same text, different key) → deduped as
+`dup_in_360`. **Suspicious 2026-09 spike** (6,620 "new" vs ~1,600/month) —
+possibly migration copies dated by migration time. Dry runs now STAGE parsed
+notes into `history.db` table `l360_notes_staging` so the spike / leftover
+mismatches can be analyzed offline (aggregates only) without re-pulling.
+
 **Next steps:**
 1. Run the app → type `l360notes: dry` in the caseload search box. On a fresh
    machine first run `l360momi:` (needs Learner360 ids; sign in to Learner360

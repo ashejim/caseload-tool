@@ -209,9 +209,16 @@ def test_l360_matching_is_one_to_one():
              "type": "instant_message_text", "text": "Outgoing: reminder"}
             for i in range(3)] + [
             {"compositeKey": "k0", "createdDate": "2026-10-01T10:00:00Z",
-             "type": "instant_message_text", "text": "Outgoing: reminder"}])
+             "type": "instant_message_text", "text": "Outgoing: reminder"},
+            {"compositeKey": "k9", "createdDate": "2026-10-01T11:00:00Z",
+             "type": "instant_message_text", "text": "Outgoing:  Reminder"}])
         r = history.persist_l360_notes({"S1": sends}, dry=True, db_path=path)
-        assert (r["exact"], r["fuzzy"], r["new"], r["dup_in_360"]) == (1, 0, 2, 1), r
+        assert (r["exact"], r["fuzzy"], r["new"], r["dup_in_360"]) == (1, 0, 2, 2), r
+        assert history.stage_l360_notes({"S1": sends}, db_path=path) == 5
+        assert history.stage_l360_notes({"S1": sends[:2]}, db_path=path) == 2
+        conn = sqlite3.connect(path)
+        assert conn.execute("SELECT COUNT(*) FROM l360_notes_staging").fetchone()[0] == 2
+        conn.close()
     finally:
         os.remove(path)
 
