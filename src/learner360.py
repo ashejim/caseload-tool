@@ -151,6 +151,22 @@ def parse_momi(resp: dict) -> dict:
             "weekly": weekly, "factors": factors}
 
 
+def momi_capture_due(last_captured: Optional[str], days: int,
+                     now: Optional[datetime] = None) -> bool:
+    """Should the background auto-capture run? ``last_captured`` is the ISO
+    timestamp of the newest stored MOMI capture (history.momi_capture_status),
+    None if never. ``days`` <= 0 = auto-capture off."""
+    if days <= 0:
+        return False
+    if not last_captured:
+        return True
+    try:
+        last = datetime.fromisoformat(str(last_captured)[:19])
+    except ValueError:
+        return True
+    return ((now or datetime.now()) - last).total_seconds() >= days * 86400
+
+
 # ---------------------------------------------------------- change watch
 # REQUIRED fields per endpoint — what our parsers depend on. A missing one is a
 # breaking change (logged loudly; data from that endpoint can't be trusted).

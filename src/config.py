@@ -393,6 +393,12 @@ class Settings:
     # place. 24 = once a day (the data changes ~daily); lower (e.g. 6/8) samples
     # more often. Departure detection stays day-grained regardless.
     history_capture_interval_hours: int = 24
+    # Learner360 weekly MOMI history (src/learner360.py): auto-capture in the
+    # background when the stored history is older than this many DAYS — checked
+    # ~3 min after startup and every 6 h while the app is open. MOMI updates
+    # weekly, so 7 is plenty. 0 = off (use the `l360momi:` keyword manually).
+    # Each capture also runs the Learner360 change watch.
+    l360_auto_momi_days: int = 7
     # Overall UI scale (CustomTkinter widget scaling); 1.0 = 100%.
     ui_scale: float = 1.0
     # Per-area text sizes (pt). 0 = use the built-in default for that area.

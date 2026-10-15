@@ -413,10 +413,13 @@ class BrowserWorker:
         """Send/schedule a text via the Mongoose REST API replay (not the modal)."""
         self.q.put(("SEND_TEXT_API", payload, on_done))
 
-    def submit_l360_momi_capture(self, on_done: Callable[[dict], None]) -> None:
+    def submit_l360_momi_capture(self, on_done: Callable[[dict], None],
+                                 surface: bool = True) -> None:
         """READ-ONLY: pull weekly MOMI history + factors for the Learner360
-        caseload (see _l360_momi_capture). on_done(result) on the worker thread."""
-        self.q.put(("L360_MOMI", on_done))
+        caseload (see _l360_momi_capture). ``surface`` False (background
+        auto-run) = never pop the browser forward for a sign-in. on_done(result)
+        on the worker thread."""
+        self.q.put(("L360_MOMI", on_done, surface))
 
     def submit_export_segments(
         self, courses: list, on_done: Callable[[dict], None],
@@ -996,10 +999,10 @@ class BrowserWorker:
             finally:
                 on_done(res)
         elif cmd[0] == "L360_MOMI":
-            _, on_done = cmd
+            _, on_done, surface = cmd
             res = {}
             try:
-                res = self._l360_momi_capture(ctx)
+                res = self._l360_momi_capture(ctx, surface=surface)
             except Exception as e:
                 res = {"error": f"Learner360 capture crashed: {e}"}
             finally:
@@ -2745,7 +2748,7 @@ class BrowserWorker:
                 continue
         return None
 
-    def _l360_momi_capture(self, ctx) -> dict:
+    def _l360_momi_capture(self, ctx, surface: bool = True) -> dict:
         """READ-ONLY: pull weekly MOMI history + factor breakdowns for the whole
         Learner360 caseload. Opens (or reloads) Learner360 so the app fires fresh
         authenticated calls, harvests its gateway auth, pages caseloads/search,
@@ -2779,10 +2782,11 @@ class BrowserWorker:
         auth = self._l360_auth or {}
         if not auth.get("headers"):
             if l3.looks_like_login(page.url or ""):
-                try:
-                    self._bring_browser_forward(page)
-                except Exception:
-                    pass
+                if surface:
+                    try:
+                        self._bring_browser_forward(page)
+                    except Exception:
+                        pass
                 return {"error": "Learner360 isn't signed in — sign in in the "
                         "browser window, then run l360momi: again.",
                         "not_logged_in": True}

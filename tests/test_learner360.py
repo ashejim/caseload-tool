@@ -112,6 +112,15 @@ def test_looks_like_login():
     assert not l3.looks_like_login("https://learner360.wgu.edu/caseload")
 
 
+def test_momi_capture_due():
+    now = datetime(2026, 10, 22, 9, 0)
+    assert l3.momi_capture_due(None, 7, now)                    # never captured
+    assert l3.momi_capture_due("2026-10-15T09:00:00", 7, now)   # exactly 7 days
+    assert not l3.momi_capture_due("2026-10-16 09:00:00", 7, now)
+    assert not l3.momi_capture_due(None, 0, now)                # off
+    assert l3.momi_capture_due("garbage", 7, now)               # unreadable -> due
+
+
 def _tmpdb():
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)

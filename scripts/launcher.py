@@ -8636,6 +8636,9 @@ class App:
             # roster automatically when it's stale. Deferred a minute so the
             # scan queues behind the startup caseload/EA/task work.
             self.root.after(60_000, self._maybe_auto_roster_refresh)
+            # Learner360 weekly MOMI history + change watch, when due. After
+            # the startup caseload/EA/task scans settle; re-arms itself.
+            self.root.after(180_000, self._maybe_auto_l360_momi)
 
     # ----- Main (left) pane -----
 
@@ -11819,36 +11822,81 @@ class App:
     # ---- Learner360 (src/learner360.py) — read-only MOMI history ----------
     _L360_WATCH_FILE = "learner360_watch.json"
 
-    def _l360_momi_capture(self) -> None:
+    def _l360_momi_capture(self, auto: bool = False) -> bool:
         """`l360momi:` — READ-ONLY pull of weekly NUMERIC MOMI history + MOMI's
         factor breakdown for the whole Learner360 caseload into history.db
         (momi_weekly / momi_factors). Every run also checks Learner360 for
         changes (contract drift, new/removed fields, a new release, flipped
         feature flags) and logs them — see _l360_watch_update."""
+        # ``auto`` = the background refresh (_maybe_auto_l360_momi): quiet
+        # about busy/not-ready (it just retries) and never pops the browser.
+        # Returns True if a capture was started.
         if getattr(self, "_offline", False):
-            self._append_log("🔌 Demo: Learner360 capture isn't available offline.")
-            return
+            if not auto:
+                self._append_log(
+                    "🔌 Demo: Learner360 capture isn't available offline.")
+            return False
         if getattr(self, "_is_busy", False):
-            self._append_log("Busy — wait for the current task to finish.")
-            return
+            if not auto:
+                self._append_log("Busy — wait for the current task to finish.")
+            return False
         if not self.worker.ready_event.is_set():
-            self._append_log("Browser not ready yet — wait and try again.")
-            return
+            if not auto:
+                self._append_log("Browser not ready yet — wait and try again.")
+            return False
         self._set_busy("Reading MOMI history from Learner360…")
-        self._append_log("Learner360: reading weekly MOMI history for your "
-                         "caseload (read-only)…")
+        self._append_log(
+            "Learner360: weekly MOMI history is due — refreshing in the "
+            "background (about a minute, read-only)…" if auto else
+            "Learner360: reading weekly MOMI history for your caseload "
+            "(read-only)…")
 
         def on_done(res):
             try:
-                self.root.after(0, lambda: self._l360_momi_done(res))
+                self.root.after(0, lambda: self._l360_momi_done(res, auto))
             except Exception:
-                self._l360_momi_done(res)
+                self._l360_momi_done(res, auto)
 
-        self.worker.submit_l360_momi_capture(on_done)
+        self.worker.submit_l360_momi_capture(on_done, surface=not auto)
+        return True
 
-    def _l360_momi_done(self, res) -> None:
+    def _maybe_auto_l360_momi(self) -> None:
+        """Background Learner360 refresh: capture weekly MOMI history (and run
+        the change watch) when the stored history is older than
+        settings.l360_auto_momi_days (default 7; 0 = off). First check ~3 min
+        after startup, then RE-ARMS every 6 h so a long-running session keeps
+        it current too (a one-shot startup check would go stale). Busy/not
+        ready → retry in 5 min. Never raises."""
+        retry_ms, rearm_ms = 5 * 60_000, 6 * 3600_000
+        try:
+            if getattr(self, "_offline", False):
+                return
+            days = int(getattr(self.settings, "l360_auto_momi_days", 7) or 0)
+            if days <= 0:
+                return                       # off — and don't re-arm
+            from src import learner360 as l3
+            last = history.momi_capture_status().get("last_captured")
+            if not l3.momi_capture_due(last, days):
+                self.root.after(rearm_ms, self._maybe_auto_l360_momi)
+                return
+            started = self._l360_momi_capture(auto=True)
+            self.root.after(rearm_ms if started else retry_ms,
+                            self._maybe_auto_l360_momi)
+        except Exception:
+            try:
+                self.root.after(rearm_ms, self._maybe_auto_l360_momi)
+            except Exception:
+                pass
+
+    def _l360_momi_done(self, res, auto: bool = False) -> None:
         self._set_idle()
         res = res or {}
+        if auto and res.get("not_logged_in"):
+            self._append_log(
+                "Learner360 isn't signed in, so the background MOMI refresh was "
+                "skipped — sign in to Learner360 and run l360momi: (or it will "
+                "retry later).")
+            return
         # Change watch runs even on failure: a refused/changed endpoint IS news.
         self._l360_watch_update(res.get("watch"), res.get("drift") or [])
         if res.get("error"):
@@ -19632,6 +19680,21 @@ class App:
             values=list(_HIST_LABELS.keys()),
         ).pack(side="left", padx=(8, 0))
 
+        # Learner360 weekly MOMI history auto-refresh (src/learner360.py).
+        l3_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        l3_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkLabel(l3_row, text="Learner360 MOMI history refresh:").pack(
+            side="left")
+        _L3_LABELS = {"Off": 0, "Every 3 days": 3, "Weekly": 7,
+                      "Every 2 weeks": 14}
+        _L3_TO_LABEL = {v: k for k, v in _L3_LABELS.items()}
+        cur_l3 = int(getattr(self.settings, "l360_auto_momi_days", 7) or 0)
+        l3_var = ctk.StringVar(value=_L3_TO_LABEL.get(cur_l3, "Weekly"))
+        ctk.CTkComboBox(
+            l3_row, width=130, variable=l3_var, state="readonly",
+            values=list(_L3_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+
         dialog = tab_general
         # Name capitalization — how student/PM names are cased in template
         # variables (papers over CSV data-entry casing errors).
@@ -20170,6 +20233,9 @@ class App:
             # Caseload history snapshot interval (Off=0 / 6 / 8 / 12 / 24 h).
             self.settings.history_capture_interval_hours = _HIST_LABELS.get(
                 hist_var.get().strip(), 24)
+            # Learner360 MOMI auto-refresh interval in days (0 = off).
+            self.settings.l360_auto_momi_days = _L3_LABELS.get(
+                l3_var.get().strip(), 7)
             # Name capitalization mode (off / lower / standard).
             self.settings.name_capitalization = _NC_MODE_LABELS.get(
                 nc_var.get().strip(), "standard")
