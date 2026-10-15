@@ -58,6 +58,7 @@ SRC_MODULES = [
     "src.action_queue",
     "src.bot_drafts",
     "src.bot_drafts_panel",
+    "src.learner360",
 ]
 
 

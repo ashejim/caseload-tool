@@ -140,6 +140,10 @@ class BrowserWorker:
         # (the first compose of a cold/backgrounded tab is flaky). Reset whenever
         # a fresh Mongoose tab is opened.
         self._mongoose_warmed = False
+        # Learner360 gateway auth, harvested from the Learner360 app's OWN calls
+        # to faculty-api-gateway.wgu.edu (see _harvest_l360_auth): {headers:
+        # {authorization, x-*}, user: <caller's WGU uuid>, ts}. Read-only replay.
+        self._l360_auth: Optional[dict] = None
         # `textapi:` capture: a persistent request/response recorder attached to
         # the Mongoose tab (captures BOTH tool-driven and MANUAL compose sends),
         # dumped to text_send_probe.txt for building an API-replay send. `sink`
@@ -408,6 +412,11 @@ class BrowserWorker:
     ) -> None:
         """Send/schedule a text via the Mongoose REST API replay (not the modal)."""
         self.q.put(("SEND_TEXT_API", payload, on_done))
+
+    def submit_l360_momi_capture(self, on_done: Callable[[dict], None]) -> None:
+        """READ-ONLY: pull weekly MOMI history + factors for the Learner360
+        caseload (see _l360_momi_capture). on_done(result) on the worker thread."""
+        self.q.put(("L360_MOMI", on_done))
 
     def submit_export_segments(
         self, courses: list, on_done: Callable[[dict], None],
@@ -984,6 +993,15 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._send_text_via_api(ctx, payload)
+            finally:
+                on_done(res)
+        elif cmd[0] == "L360_MOMI":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._l360_momi_capture(ctx)
+            except Exception as e:
+                res = {"error": f"Learner360 capture crashed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "EXPORT_SEGMENTS":
@@ -2496,6 +2514,10 @@ class BrowserWorker:
         # sms-api.mongooseresearch.com request) — for replaying the text-send API.
         if "sms-api.mongooseresearch.com" in url:
             self._harvest_mongoose_token(request)
+        # Always-on: harvest the Learner360 gateway bearer (+ x-* headers) from
+        # the Learner360 app's own calls — for read-only MOMI/notes replay.
+        if "faculty-api-gateway.wgu.edu" in url:
+            self._harvest_l360_auth(request)
         if not self._capture_active:
             return
         if method.upper() not in ("POST", "PATCH", "PUT"):
@@ -2683,6 +2705,173 @@ class BrowserWorker:
             return
         if auth[:7].lower() == "bearer " and len(auth) > 40:
             self._mongoose_token = {"token": auth[7:], "ts": time.time()}
+
+    def _harvest_l360_auth(self, request) -> None:
+        """Keep the freshest Learner360 gateway auth: the OAuth Bearer plus any
+        x-* headers the app sends (an API gateway may require a key header), and
+        the caller's WGU uuid from a caseloads/search `?user=`. Replayed only
+        for read-only GETs/searches. Best-effort; silent."""
+        try:
+            hdrs = request.headers or {}
+            auth = hdrs.get("authorization", "")
+        except Exception:
+            return
+        if auth[:7].lower() != "bearer " or len(auth) < 40:
+            return
+        keep = {"authorization": auth}
+        for k, v in hdrs.items():
+            kl = k.lower()
+            if kl.startswith("x-") and not kl.startswith(("x-dynatrace", "x-dtpc",
+                                                          "x-dtreferer")):
+                keep[k] = v
+        user = (self._l360_auth or {}).get("user", "")
+        # The caller's WGU uuid rides on caseloads/search (?user=) AND on the
+        # /users/<uuid>/permissions call the app makes on EVERY load — so a
+        # first-load SSO pass that hasn't fired the search yet still yields it.
+        m = (re.search(r"[?&]user=([0-9a-fA-F-]{36})", request.url or "")
+             or re.search(r"/users/([0-9a-fA-F-]{36})/permissions",
+                          request.url or ""))
+        if m:
+            user = m.group(1)
+        self._l360_auth = {"headers": keep, "user": user, "ts": time.time()}
+
+    def _learner360_page(self, ctx):
+        """The open Learner360 tab in the launcher's context, or None."""
+        for page in ctx.pages:
+            try:
+                if not page.is_closed() and "learner360.wgu.edu" in (page.url or ""):
+                    return page
+            except Exception:
+                continue
+        return None
+
+    def _l360_momi_capture(self, ctx) -> dict:
+        """READ-ONLY: pull weekly MOMI history + factor breakdowns for the whole
+        Learner360 caseload. Opens (or reloads) Learner360 so the app fires fresh
+        authenticated calls, harvests its gateway auth, pages caseloads/search,
+        then GETs momentum-indicator per learner (5 concurrent, in-page). Also
+        gathers the change-watch snapshot (release fingerprint, feature flags,
+        response field sets) + contract-check drift. Persisting is the caller's
+        job. Returns {ok, students, caseload_count, momi_failed, fail_statuses,
+        watch, drift} or {error[, not_logged_in]}."""
+        import json as _json
+        from collections import Counter
+        from src import learner360 as l3
+        page = self._learner360_page(ctx)
+        self._l360_auth = None  # require a FRESH harvest from this load
+        try:
+            if page is None:
+                self.on_status("  [l360] opening Learner360…")
+                page = ctx.new_page()
+            page.goto(l3.APP_URL, wait_until="domcontentloaded", timeout=30_000)
+        except Exception as e:
+            return {"error": f"couldn't open Learner360: {e}"}
+        # Wait for the app's own caseload call (carries the bearer). SSO may
+        # pass through access.wgu.edu first — keep waiting while it redirects.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if (self._l360_auth or {}).get("user"):
+                break
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                break
+        auth = self._l360_auth or {}
+        if not auth.get("headers"):
+            if l3.looks_like_login(page.url or ""):
+                try:
+                    self._bring_browser_forward(page)
+                except Exception:
+                    pass
+                return {"error": "Learner360 isn't signed in — sign in in the "
+                        "browser window, then run l360momi: again.",
+                        "not_logged_in": True}
+            return {"error": "Learner360 loaded but no authenticated gateway "
+                    "call was seen (the app may have changed)."}
+        try:
+            snap = page.evaluate(l3.SNAPSHOT_JS) or {}
+        except Exception:
+            snap = {}
+        user = auth.get("user") or snap.get("wguId") or ""
+        if not user:
+            return {"error": "couldn't determine your Learner360 user id."}
+        headers = auth["headers"]
+        drift, keys = [], {}
+        # Robust paging: start at 0 and de-dupe by Student ID, so it works
+        # whether the gateway's pages are 0- or 1-based (a 1-based server may
+        # reject or repeat page 0; a 0-based one's last page is total_pages-1,
+        # and the extra page we ask for comes back empty).
+        by_sid: dict = {}
+        server_total, pages_read, no_id, checked_search = None, 0, 0, False
+        for pg in range(0, 60):
+            r = l3.api(page, headers, "POST",
+                       f"{l3.CASELOAD_SEARCH}?user={user}", l3.caseload_query(pg))
+            if r["status"] != 200 or not isinstance(r["json"], dict):
+                if pg == 0:
+                    continue          # 1-based server rejecting page 0 — fine
+                return {"error": f"caseload search HTTP {r['status']} on page "
+                        f"{pg}: {(r['text'] or '')[:150]}",
+                        "drift": [f"caseloads/search returned HTTP {r['status']}"]}
+            meta = l3.page_meta(r["json"])
+            if not checked_search:
+                drift += l3.check_contract("caseloads/search", r["json"])
+                keys["caseloads/search"] = l3.observed_keys(
+                    "caseloads/search", r["json"])
+                checked_search = True
+            pages_read += 1
+            server_total = meta["total_elements"]
+            no_id += meta["no_id"]
+            got, total_pages = l3.parse_caseload_page(r["json"])
+            for row in got:
+                by_sid.setdefault(row["student_id"], row)
+            if meta["content"] == 0 and pg > 0:
+                break
+            if pg >= total_pages:
+                break
+        rows = list(by_sid.values())
+        self.on_status(
+            f"  [l360] caseload: {len(rows)} learners (Learner360 reports "
+            f"{server_total}; {pages_read} page(s); {no_id} row(s) without a "
+            "Learner360 id) — reading MOMI…")
+        # Chunked so the log shows progress (one batch for the whole caseload ran
+        # several silent minutes) and a slow/stalled tail is visible, not a hang.
+        ids = [x["wgu_id"] for x in rows]
+        res, t0, chunk = {}, time.time(), 40
+        for i in range(0, len(ids), chunk):
+            res.update(l3.fetch_momi_batch(page, headers, ids[i:i + chunk]))
+            self.on_status(f"  [l360] MOMI {min(i + chunk, len(ids))}/{len(ids)} "
+                           f"({time.time() - t0:.0f}s)")
+        students, statuses, checked = [], Counter(), False
+        for row in rows:
+            rr = res.get(row["wgu_id"]) or {}
+            statuses[str(rr.get("status"))] += 1
+            if rr.get("status") != 200:
+                continue
+            try:
+                data = _json.loads(rr.get("body") or "")
+            except ValueError:
+                statuses["bad-json"] += 1
+                continue
+            if not checked:
+                drift += l3.check_contract("momentum-indicator", data)
+                keys["momentum-indicator"] = l3.observed_keys(
+                    "momentum-indicator", data)
+                checked = True
+            students.append(dict(row, momi=l3.parse_momi(data)))
+        failed = len(rows) - len(students)
+        if rows and not students:
+            sample = next((v.get("body") for v in res.values()
+                           if v.get("status") != 200), "") or ""
+            return {"error": "every MOMI request failed "
+                    f"({dict(statuses)}): {sample[:160]}",
+                    "drift": drift + ["momentum-indicator returned "
+                                      f"{dict(statuses)} for every learner"]}
+        return {"ok": True, "students": students, "caseload_count": len(rows),
+                "momi_failed": failed,
+                "fail_statuses": {k: v for k, v in statuses.items() if k != "200"},
+                "watch": {"bundles": snap.get("bundles") or [],
+                          "flags": snap.get("flags") or {}, "keys": keys},
+                "drift": drift}
 
     def _ensure_mongoose_token(self, page, timeout_ms: int = 6000) -> bool:
         """Make sure a Mongoose API Bearer token has been harvested so the API

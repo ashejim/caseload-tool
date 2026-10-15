@@ -1,0 +1,189 @@
+"""Tests for src/learner360.py (parsing, contract check, change-watch diff) and
+history.persist_momi. Synthetic responses mirror the field shapes captured live
+from Learner360 on 2026-10-14 (no real student data).
+
+Run: python tests/test_learner360.py
+"""
+import os
+import sqlite3
+import sys
+import tempfile
+from datetime import datetime
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+from src import history, learner360 as l3  # noqa: E402
+
+CASELOAD = {
+    "content": [
+        {"studentWguId": "uuid-a", "studentPidm": 111, "studentId": "000000001",
+         "firstName": "A", "lastName": "Z", "momentum": "High",
+         "courses": ["C769"]},
+        {"studentWguId": "uuid-b", "studentPidm": 222, "studentId": "000000002",
+         "momentum": "Low", "courses": ["D413", "C769"]},
+        {"studentWguId": "", "studentId": "000000003"},   # no uuid -> skipped
+    ],
+    "page": {"number": 1, "size": 100, "totalElements": 3, "totalPages": 2},
+    "filterOptions": {},
+}
+
+MOMI = {
+    "currentMomentum": "Med High",
+    "weekOverWeekDifference": -2.5,
+    "fromTermStartDifference": 7.0,
+    "weeklyMomiScores": [
+        {"date": "2026-04-06T00:00:00", "momentum": "High", "momentumScore": 81.2,
+         "weekOverWeekDifference": 0, "fromTermStartDifference": 0},
+        {"date": "04/13/2026", "momentum": "Med High", "momentumScore": 74,
+         "weekOverWeekDifference": -7.2, "fromTermStartDifference": -7.2},
+    ],
+    "factorBreakdowns": [
+        {"category": "Assessment Progress", "impactScore": 0.42},
+        {"category": "Engagement", "impactScore": -0.13},
+    ],
+}
+
+
+def test_caseload_query_matches_ui():
+    q = l3.caseload_query(2, 50)
+    assert q["page"] == 2 and q["size"] == 50 and q["filters"] == []
+    assert "momentum" in q["facetFields"]
+
+
+def test_parse_caseload_page():
+    rows, total = l3.parse_caseload_page(CASELOAD)
+    assert total == 2
+    assert [r["student_id"] for r in rows] == ["000000001", "000000002"]
+    assert rows[0]["wgu_id"] == "uuid-a" and rows[0]["pidm"] == "111"
+    assert rows[1]["courses"] == ["D413", "C769"]
+
+
+def test_page_meta():
+    m = l3.page_meta(CASELOAD)
+    assert m == {"content": 3, "total_elements": 3, "total_pages": 2,
+                 "number": 1, "no_id": 1}, m
+    assert l3.page_meta({})["content"] == 0
+
+
+def test_parse_momi_and_dates():
+    m = l3.parse_momi(MOMI)
+    assert m["current"] == "Med High"
+    assert [w["week_date"] for w in m["weekly"]] == ["2026-04-06", "2026-04-13"]
+    assert m["weekly"][1]["score"] == 74.0 and m["weekly"][1]["wow"] == -7.2
+    assert m["factors"][1] == {"category": "Engagement", "impact": -0.13}
+    assert l3.norm_date("04-15-2026") == "2026-04-15"   # what L360 sends
+    assert l3.norm_date("") == "" and l3.norm_date("weird") == "weird"
+
+
+def test_contract_clean_and_breaking():
+    assert l3.check_contract("caseloads/search", CASELOAD) == []
+    assert l3.check_contract("momentum-indicator", MOMI) == []
+    broken = dict(MOMI, weeklyMomiScores=[{"date": "2026-04-06", "momentum": "High"}])
+    msgs = l3.check_contract("momentum-indicator", broken)
+    assert msgs and "momentumScore" in msgs[0], msgs
+    gone = {k: v for k, v in MOMI.items() if k != "factorBreakdowns"}
+    assert any("factorBreakdowns" in m for m in l3.check_contract("momentum-indicator", gone))
+    # An empty factor list (student with no data) is NOT drift.
+    assert l3.check_contract("momentum-indicator", dict(MOMI, factorBreakdowns=[])) == []
+    assert l3.check_contract("momentum-indicator", "html error page")
+
+
+def test_diff_watch():
+    keys = {"momentum-indicator": l3.observed_keys("momentum-indicator", MOMI)}
+    old = {"checked_at": "2026-10-14", "bundles": ["main-aaa.js"],
+           "flags": {"use-new-caseload-endpoint": "false", "x": "1"}, "keys": keys}
+    assert l3.diff_watch(None, old) == ["baseline recorded (first Learner360 check)"]
+    assert l3.diff_watch(old, dict(old)) == []
+    newkeys = {"momentum-indicator": dict(keys["momentum-indicator"],
+                                          weeklyMomiScores=keys["momentum-indicator"]["weeklyMomiScores"] + ["percentile"])}
+    new = {"bundles": ["main-bbb.js"],
+           "flags": {"use-new-caseload-endpoint": "true", "ea-dashboard": "true"},
+           "keys": newkeys}
+    msgs = " | ".join(l3.diff_watch(old, new))
+    assert "new version" in msgs
+    assert "ea-dashboard" in msgs and "removed: x" in msgs
+    assert "'use-new-caseload-endpoint' changed: false → true" in msgs
+    assert "new field(s) percentile" in msgs
+
+
+def test_looks_like_login():
+    assert l3.looks_like_login("https://access.wgu.edu/pingfed/as/authorization.oauth2?x")
+    assert not l3.looks_like_login("https://learner360.wgu.edu/caseload")
+
+
+def _tmpdb():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    return path
+
+
+def test_persist_momi_idempotent():
+    path = _tmpdb()
+    try:
+        rows, _ = l3.parse_caseload_page(CASELOAD)
+        students = [dict(rows[0], momi=l3.parse_momi(MOMI))]
+        t1 = datetime(2026, 10, 14, 9, 0)
+        r1 = history.persist_momi(students, db_path=path, now=t1)
+        assert r1 == {"students": 1, "weeks_new": 2, "weeks_updated": 0,
+                      "factor_rows": 2}, r1
+        # Re-run: same weeks are updates, not duplicates; a new week is new.
+        more = l3.parse_momi(dict(MOMI, weeklyMomiScores=MOMI["weeklyMomiScores"] + [
+            {"date": "2026-04-20", "momentum": "Med", "momentumScore": 60}]))
+        r2 = history.persist_momi([dict(rows[0], momi=more)], db_path=path,
+                                  now=datetime(2026, 10, 21, 9, 0))
+        assert r2["weeks_new"] == 1 and r2["weeks_updated"] == 2, r2
+        hist = history.momi_weekly_for("000000001", db_path=path)
+        assert [h["week_date"] for h in hist] == ["2026-04-06", "2026-04-13", "2026-04-20"]
+        assert hist[0]["momentum_score"] == 81.2
+        st = history.momi_capture_status(db_path=path)
+        assert st["students"] == 1 and st["weeks"] == 3
+        # Factors are kept per capture day.
+        conn = sqlite3.connect(path)
+        days = {r[0] for r in conn.execute("SELECT captured_date FROM momi_factors")}
+        conn.close()
+        assert days == {"2026-10-14", "2026-10-21"}
+    finally:
+        os.remove(path)
+
+
+def test_schema_v4_db_upgrades_in_place():
+    # An existing v4 DB (no Learner360 tables) gains them on next connect.
+    path = _tmpdb()
+    try:
+        conn = sqlite3.connect(path)
+        conn.executescript(history._SCHEMA_DDL.split("-- Learner360 weekly")[0])
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit(); conn.close()
+        assert history.momi_capture_status(db_path=path)["weeks"] == 0
+        conn = sqlite3.connect(path)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        conn.close()
+    finally:
+        os.remove(path)
+
+
+def test_old_mmddyyyy_weeks_fixed_in_place():
+    path = _tmpdb()
+    try:
+        history.momi_capture_status(db_path=path)          # create schema
+        conn = sqlite3.connect(path)
+        conn.execute("INSERT INTO momi_weekly (student_id, week_date) "
+                     "VALUES ('1', '04-15-2026'), ('1', '10-01-2026')")
+        conn.commit(); conn.close()
+        hist = history.momi_weekly_for("1", db_path=path)  # reconnect -> fix-up
+        assert [h["week_date"] for h in hist] == ["2026-04-15", "2026-10-01"], hist
+    finally:
+        os.remove(path)
+
+
+def main():
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    for t in tests:
+        t()
+        print(f"  ok  {t.__name__}")
+    print(f"All {len(tests)} tests passed.")
+
+
+if __name__ == "__main__":
+    main()

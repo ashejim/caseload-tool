@@ -6340,6 +6340,12 @@ class CaseloadPanel:
         # history DB (change-gated). Modifiers (space-separated): "departed"
         # sweeps resolved/departed students instead of the live caseload; "force"
         # re-scrapes everyone; "cancel" stops. Drives the browser — run while away.
+        # Learner360: "l360momi:" pulls weekly numeric MOMI history + factor
+        # breakdowns for the caseload into history.db (read-only) and checks
+        # Learner360 for changes (release / flags / fields).
+        if q.lower().startswith(("l360momi", "1360momi")):  # l vs 1 typo
+            self.app._l360_momi_capture()
+            return "break"
         if q.lower().startswith("sweepnotes"):
             rest = q.split(":", 1)[1].strip().lower() if ":" in q else ""
             parts = rest.split()
@@ -11809,6 +11815,90 @@ class App:
                 show()
 
         self.worker.submit_probe_mongoose_api(on_done)
+
+    # ---- Learner360 (src/learner360.py) — read-only MOMI history ----------
+    _L360_WATCH_FILE = "learner360_watch.json"
+
+    def _l360_momi_capture(self) -> None:
+        """`l360momi:` — READ-ONLY pull of weekly NUMERIC MOMI history + MOMI's
+        factor breakdown for the whole Learner360 caseload into history.db
+        (momi_weekly / momi_factors). Every run also checks Learner360 for
+        changes (contract drift, new/removed fields, a new release, flipped
+        feature flags) and logs them — see _l360_watch_update."""
+        if getattr(self, "_offline", False):
+            self._append_log("🔌 Demo: Learner360 capture isn't available offline.")
+            return
+        if getattr(self, "_is_busy", False):
+            self._append_log("Busy — wait for the current task to finish.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._set_busy("Reading MOMI history from Learner360…")
+        self._append_log("Learner360: reading weekly MOMI history for your "
+                         "caseload (read-only)…")
+
+        def on_done(res):
+            try:
+                self.root.after(0, lambda: self._l360_momi_done(res))
+            except Exception:
+                self._l360_momi_done(res)
+
+        self.worker.submit_l360_momi_capture(on_done)
+
+    def _l360_momi_done(self, res) -> None:
+        self._set_idle()
+        res = res or {}
+        # Change watch runs even on failure: a refused/changed endpoint IS news.
+        self._l360_watch_update(res.get("watch"), res.get("drift") or [])
+        if res.get("error"):
+            self._append_log(f"Learner360 MOMI capture failed: {res['error']}",
+                             error=True)
+            return
+        try:
+            summary = history.persist_momi(res.get("students") or [])
+        except Exception as e:
+            self._append_log(f"Learner360: couldn't save MOMI history: {e}",
+                             error=True)
+            return
+        msg = (f"✓ Learner360 MOMI: {summary['students']} student(s) — "
+               f"{summary['weeks_new']} new week(s), {summary['weeks_updated']} "
+               f"refreshed, {summary['factor_rows']} factor score(s) saved.")
+        self._append_log(msg, success=True)
+        if res.get("momi_failed"):
+            self._append_log(
+                f"  ↳ {res['momi_failed']} of {res.get('caseload_count')} "
+                f"learner(s) had no MOMI ({res.get('fail_statuses')}).")
+
+    def _l360_watch_update(self, watch, drift) -> None:
+        """Diff this run's Learner360 snapshot (release fingerprint, feature
+        flags, response field sets) against the last one saved in
+        learner360_watch.json, log what changed, and save the new snapshot.
+        Contract drift (a field we depend on disappeared) is logged as an
+        error — the data from that endpoint can't be trusted until fixed."""
+        import json as _json
+        from src import learner360 as l3
+        for d in drift or []:
+            self._append_log(f"⚠ Learner360 check: {d} — the MOMI capture may "
+                             "need an update.", error=True)
+        if not watch:
+            return
+        path = USER_CONFIG_DIR / self._L360_WATCH_FILE
+        try:
+            old = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            old = None
+        new = dict(watch, checked_at=datetime.now().strftime("%Y-%m-%d %H:%M"))
+        # Keep endpoint field sets from the last run for endpoints not seen now.
+        if old:
+            new["keys"] = dict(old.get("keys") or {}, **(new.get("keys") or {}))
+        for c in l3.diff_watch(old, new):
+            self._append_log(f"Learner360: {c}")
+        try:
+            path.write_text(_json.dumps(new, indent=1, sort_keys=True),
+                            encoding="utf-8")
+        except Exception as e:
+            self._append_log(f"Learner360: couldn't save change-watch state: {e}")
 
     def _test_api_send(self) -> None:
         """TEST (textapisend:): SCHEDULE a test text (~1h out, team-local) to the

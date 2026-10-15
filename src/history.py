@@ -39,7 +39,7 @@ from typing import Optional
 from src import caseload_csv
 from src.config import HISTORY_DB
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 # Ordinal Momentum scale as it appears in the WGU export. Unknown / blank
 # values map to NULL rank (they still store the raw label).
@@ -239,6 +239,43 @@ CREATE TABLE IF NOT EXISTS chase_list (
     resolved_at     TEXT,
     PRIMARY KEY (student_id, course_code)
 );
+
+-- Learner360 weekly MOMI history (src/learner360.py). One row per student per
+-- MOMI week: the 5-band label AND the NUMERIC score Salesforce never exposed,
+-- plus Learner360's week-over-week / since-term-start deltas. Upserted on every
+-- capture, so history accumulates across terms (first_seen_at = when we first
+-- recorded that week). MOMI is student-level, not per course.
+CREATE TABLE IF NOT EXISTS momi_weekly (
+    student_id      TEXT NOT NULL,
+    week_date       TEXT NOT NULL,
+    momentum        TEXT,
+    momentum_score  REAL,
+    wow_diff        REAL,
+    term_start_diff REAL,
+    first_seen_at   TEXT,
+    last_seen_at    TEXT,
+    PRIMARY KEY (student_id, week_date)
+);
+CREATE INDEX IF NOT EXISTS ix_momi_weekly_date ON momi_weekly(week_date);
+
+-- MOMI's own factor breakdown ("Feature Category by Impact Score") as of each
+-- capture day — what is pushing the score up/down.
+CREATE TABLE IF NOT EXISTS momi_factors (
+    student_id    TEXT NOT NULL,
+    captured_date TEXT NOT NULL,
+    category      TEXT NOT NULL,
+    impact_score  REAL,
+    PRIMARY KEY (student_id, captured_date, category)
+);
+
+-- Salesforce StudentID ↔ Learner360 learner UUID (+ PIDM), so later reads can
+-- address a student directly without a caseload search.
+CREATE TABLE IF NOT EXISTS l360_ids (
+    student_id TEXT PRIMARY KEY,
+    wgu_id     TEXT,
+    pidm       TEXT,
+    updated_at TEXT
+);
 """
 
 
@@ -249,7 +286,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     ).fetchone() is not None
     # Upgrade an EXISTING older schema first (so the DDL below, which indexes
     # the new 'bucket' column, doesn't run against a pre-bucket table). v2->v3
-    # (meta, outcomes) and v3->v4 (student_flags, chase_list) only ADD tables,
+    # (meta, outcomes), v3->v4 (student_flags, chase_list) and v4->v5 (momi_weekly,
+    # momi_factors, l360_ids — Learner360) only ADD tables,
     # which the IF NOT EXISTS DDL handles — no data migration needed, so only
     # the v1->v2 rebuild is gated here.
     if has_tables and v < 2:
@@ -257,6 +295,13 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_DDL)  # create from scratch / fill in any gaps
     _ensure_outcome_columns(conn)    # additive columns on an existing outcomes
     _ensure_student_flag_columns(conn)  # additive columns on existing flags
+    # Learner360 MOMI weeks first stored as MM-DD-YYYY (before norm_date knew
+    # that format) -> ISO YYYY-MM-DD so they sort/range-query correctly.
+    # Idempotent: only rows still in the old shape match.
+    conn.execute(
+        "UPDATE OR IGNORE momi_weekly SET week_date = substr(week_date,7,4) || '-' "
+        "|| substr(week_date,1,2) || '-' || substr(week_date,4,2) "
+        "WHERE week_date GLOB '[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]'")
     conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     conn.commit()
 
@@ -2831,5 +2876,100 @@ def export_to_csv(dest_path, *, db_path=HISTORY_DB) -> int:
                 w.writerow([r[c] for c in header])
                 n += 1
         return n
+    finally:
+        conn.close()
+
+
+# ----------------------------------------------------------------------
+# Learner360 MOMI history (src/learner360.py)
+# ----------------------------------------------------------------------
+def persist_momi(students, *, db_path=HISTORY_DB,
+                 now: Optional[datetime] = None) -> dict:
+    """Upsert a Learner360 MOMI capture. ``students``: [{student_id, wgu_id,
+    pidm, momi: {weekly: [{week_date, momentum, score, wow, term_start}],
+    factors: [{category, impact}]}}] (learner360.parse_momi shape).
+
+    Weekly rows upsert on (student_id, week_date) keeping first_seen_at, so a
+    re-run is idempotent and history grows as new weeks appear. Factors are
+    stored per capture DAY (they move week to week). Returns {students,
+    weeks_new, weeks_updated, factor_rows}. Never raises past a DB error."""
+    now = now or datetime.now()
+    ts = now.isoformat(timespec="seconds")
+    day = now.strftime("%Y-%m-%d")
+    out = {"students": 0, "weeks_new": 0, "weeks_updated": 0, "factor_rows": 0}
+    conn = _connect(db_path)
+    try:
+        for s in students or []:
+            sid = str(s.get("student_id") or "").strip()
+            if not sid:
+                continue
+            out["students"] += 1
+            conn.execute(
+                "INSERT INTO l360_ids (student_id, wgu_id, pidm, updated_at) "
+                "VALUES (?,?,?,?) ON CONFLICT(student_id) DO UPDATE SET "
+                "wgu_id=excluded.wgu_id, pidm=excluded.pidm, "
+                "updated_at=excluded.updated_at",
+                (sid, s.get("wgu_id") or "", s.get("pidm") or "", ts))
+            momi = s.get("momi") or {}
+            have = {r[0] for r in conn.execute(
+                "SELECT week_date FROM momi_weekly WHERE student_id = ?", (sid,))}
+            for w in momi.get("weekly") or []:
+                wd = w.get("week_date") or ""
+                if not wd:
+                    continue
+                conn.execute(
+                    "INSERT INTO momi_weekly (student_id, week_date, momentum, "
+                    "momentum_score, wow_diff, term_start_diff, first_seen_at, "
+                    "last_seen_at) VALUES (?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(student_id, week_date) DO UPDATE SET "
+                    "momentum=excluded.momentum, "
+                    "momentum_score=excluded.momentum_score, "
+                    "wow_diff=excluded.wow_diff, "
+                    "term_start_diff=excluded.term_start_diff, "
+                    "last_seen_at=excluded.last_seen_at",
+                    (sid, wd, w.get("momentum") or "", w.get("score"),
+                     w.get("wow"), w.get("term_start"), ts, ts))
+                if wd in have:
+                    out["weeks_updated"] += 1
+                else:
+                    out["weeks_new"] += 1
+                    have.add(wd)
+            for f in momi.get("factors") or []:
+                if not f.get("category"):
+                    continue
+                conn.execute(
+                    "INSERT INTO momi_factors (student_id, captured_date, "
+                    "category, impact_score) VALUES (?,?,?,?) "
+                    "ON CONFLICT(student_id, captured_date, category) DO UPDATE "
+                    "SET impact_score=excluded.impact_score",
+                    (sid, day, f["category"], f.get("impact")))
+                out["factor_rows"] += 1
+        conn.commit()
+        return out
+    finally:
+        conn.close()
+
+
+def momi_weekly_for(student_id: str, *, db_path=HISTORY_DB) -> list[dict]:
+    """A student's stored weekly MOMI history, oldest week first."""
+    conn = _connect(db_path)
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT week_date, momentum, momentum_score, wow_diff, "
+            "term_start_diff FROM momi_weekly WHERE student_id = ? "
+            "ORDER BY week_date", ((student_id or "").strip(),))]
+    finally:
+        conn.close()
+
+
+def momi_capture_status(*, db_path=HISTORY_DB) -> dict:
+    """{students, weeks, last_captured (ISO or None)} — for staleness nudges."""
+    conn = _connect(db_path)
+    try:
+        r = conn.execute(
+            "SELECT COUNT(DISTINCT student_id) s, COUNT(*) w, "
+            "MAX(last_seen_at) last FROM momi_weekly").fetchone()
+        return {"students": r["s"] or 0, "weeks": r["w"] or 0,
+                "last_captured": r["last"] or None}
     finally:
         conn.close()
