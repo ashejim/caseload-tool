@@ -69,7 +69,7 @@ scenarios:
     panel_action: true
     notes:
     - interaction_format: Single Interaction
-      interaction_type: Email to Student
+      interaction_type: Admin Note
       body: Reached out to the student about their progress.
       academic_activities: []
       submit: false
@@ -170,6 +170,108 @@ scenarios:
         value: YOUR_COURSE
       preview: true
 
+  # BATCH (note + email + text): TRIAGE — check in with students who are losing
+  # momentum. Filters on the caseload's Momentum signal (Low / Med Low), so it
+  # targets exactly who needs a nudge, not everyone. Edit YOUR_COURSE. Preview
+  # is ON — review the recipient list before anything sends.
+  Sample - low-momentum check-in (batch):
+    hotkey: ''
+    close_tab_after: false
+    find_first: false
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: Checked in with a low-momentum student to re-engage them.
+      academic_activities: []
+      submit: true
+      append_clipboard: false
+      enter_additional_text: false
+    email:
+      subject: Checking in on {{course_code}}, {{first_name}}
+      body_html_file: sample_momentum_checkin.html
+      to: ''
+      signature_file: ''
+      inline_images: []
+      cc_pm: false
+    text:
+      body: Hi {{first_name}}, it's {{user_name}} from {{course_code}}. Just checking
+        in - how are things going? Reply any time, I'm happy to help you get moving.
+      body_file: ''
+      schedule: true
+      window_start_hour: 10
+      window_end_hour: 16
+      inbox_label: ''
+      commit: false
+    batch:
+      filters:
+      - column: Course Code
+        op: is
+        value: YOUR_COURSE
+      - column: Momentum
+        op: is any of
+        value: Low, Med Low
+      preview: true
+
+  # BATCH (note + email): TRIAGE — reach the students whose Follow-up Date has
+  # arrived. Filters Follow-up Date "is on or before today" (the special value
+  # `today` resolves at fire time), so it catches everyone you flagged for a
+  # check-in that's now due. Preview is ON.
+  Sample - follow-up due (batch):
+    hotkey: ''
+    close_tab_after: false
+    find_first: false
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: Sent a scheduled follow-up to the student.
+      academic_activities: []
+      submit: true
+      append_clipboard: false
+      enter_additional_text: false
+    email:
+      subject: Following up, {{first_name}}
+      body_html_file: sample_followup_due.html
+      to: ''
+      signature_file: ''
+      inline_images: []
+      cc_pm: false
+    batch:
+      filters:
+      - column: Followup Date
+        op: is on or before
+        value: today
+      preview: true
+
+  # PANEL (text + note): pick a student in the viewer, then fire this to send a
+  # quick Mongoose text AND log a note - no email, no batch. A low-stakes way to
+  # try texting. Text scheduling is ON (sends within the 10am-4pm window in the
+  # student's timezone); set schedule to false to send immediately. The note is
+  # typed "Instant Message (IM) / Text" and left with submit OFF, so it fills the
+  # note form for you to add any Academic Activity and submit yourself - flip
+  # submit to true once you've got the note the way you want it.
+  Sample - quick text:
+    hotkey: ''
+    close_tab_after: false
+    find_first: false
+    panel_action: true
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Instant Message (IM) / Text
+      body: Sent a quick text to the student.
+      academic_activities: []
+      submit: false
+      append_clipboard: false
+      enter_additional_text: false
+    text:
+      body: Hi {{first_name}}, it's {{user_name}}, your {{course_code}} instructor.
+        Just reaching out - let me know if there's anything I can help with!
+      body_file: ''
+      schedule: true
+      window_start_hour: 10
+      window_end_hour: 16
+      inbox_label: ''
+      commit: false
+
 groups:
 - name: Sample single actions (edit or delete me)
   color: '#2f75c9'
@@ -177,12 +279,15 @@ groups:
   - Try me - file a test note
   - Sample - quick note
   - Sample - follow-up email
+  - Sample - quick text
 - name: Sample batch actions (edit or delete me)
   color: '#2f9e44'
   scenarios:
   - Try me - welcome email (batch)
   - Sample - welcome (batch)
   - Sample - Task 1 passed (batch)
+  - Sample - low-momentum check-in (batch)
+  - Sample - follow-up due (batch)
 
 # Reusable note templates — fill-in forms you tab through at fire time. Manage
 # them in Settings -> Note templates, or bind one to a note as its default
