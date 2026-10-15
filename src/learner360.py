@@ -175,9 +175,12 @@ def momi_capture_due(last_captured: Optional[str], days: int,
 NOTES_PATH = "/studentNotes/v1/notes/"
 
 _NOTE_FIELDS = {
-    "id": ("id", "noteId", "salesforceId", "sfId", "externalId"),
+    # Live 2026-10-15: no plain 'id'; candidates seen = compositeKey, newId,
+    # oldId, noteNumber, interactionId (which is unique is checked by dry run).
+    "id": ("compositeKey", "newId", "oldId", "noteNumber", "id", "noteId"),
+    # ~3% of notes lack createdDate → fall back to lastModifiedDate.
     "created": ("wguCreationDateTime", "createdDate", "createdAt",
-                "creationDate", "noteDate", "date"),
+                "creationDate", "noteDate", "date", "lastModifiedDate"),
     "type": ("type", "noteType"),
     "subtype": ("subType", "subtype", "noteSubType"),
     "course": ("courseCode", "course"),
@@ -225,6 +228,28 @@ def iso_utc(s) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+# Learner360 sends a mix of SF labels ("Live Call and Email to Student") and
+# snake_case codes ("email_from_student"). Codes are mapped to the SF label so
+# the SF-tuned channel/direction classifiers and the cross-source type match
+# work unchanged.
+_TYPE_LABELS = {
+    "instant_message_text": "Instant Message (IM) / Text",
+}
+_SMALL_WORDS = {"to", "from", "with", "and", "or", "of", "on", "in"}
+
+
+def sf_type_label(t: str) -> str:
+    """'email_from_student' → 'Email from Student'; SF-style labels pass."""
+    t = (t or "").strip()
+    if not t or "_" not in t:
+        return t
+    if t.lower() in _TYPE_LABELS:
+        return _TYPE_LABELS[t.lower()]
+    words = t.lower().split("_")
+    return " ".join(w if (i and w in _SMALL_WORDS) else w.capitalize()
+                    for i, w in enumerate(words))
+
+
 def _author_text(v) -> str:
     if isinstance(v, dict):
         return str(v.get("name") or " ".join(
@@ -246,9 +271,9 @@ def notes_list(resp) -> list:
 def parse_notes(resp) -> list:
     """Normalize one learner's notes → [{l360_id, created_at, type, course,
     author, subject, body, author_is_ci, author_is_pm, from_sms}]. ``type``
-    carries the SF-style label (e.g. 'Email to Student') so the existing
-    channel/direction classifiers apply; a separate subtype is appended only
-    when the type alone isn't SF-style."""
+    is the SF-style label (sf_type_label) so the existing channel/direction
+    classifiers apply; subType (a topic like 'Goals and Tasks') is not merged
+    in — SF's Type__c doesn't carry it either."""
     out = []
     for n in notes_list(resp):
         if not isinstance(n, dict):
@@ -256,10 +281,7 @@ def parse_notes(resp) -> list:
         _, nid = _pick(n, _NOTE_FIELDS["id"])
         _, created = _pick(n, _NOTE_FIELDS["created"])
         _, typ = _pick(n, _NOTE_FIELDS["type"])
-        _, sub = _pick(n, _NOTE_FIELDS["subtype"])
-        typ, sub = str(typ or ""), str(sub or "")
-        if sub and sub.lower() not in typ.lower():
-            typ = f"{typ} {sub}".strip() if typ else sub
+        typ = sf_type_label(str(typ or ""))
         _, body = _pick(n, _NOTE_FIELDS["body"])
         out.append({
             "l360_id": str(nid or ""),
@@ -289,14 +311,25 @@ def notes_shape(resps: list) -> dict:
     from collections import Counter
     keys, picked, ids, dates, types = (Counter() for _ in range(5))
     wrappers = Counter()
+    id_vals = {f: [] for f in _NOTE_FIELDS["id"]}
+    dup_same_event = 0
     for resp in resps:
         wrappers["list" if isinstance(resp, list) else
                  ("dict:" + ",".join(sorted(resp)[:6]) if isinstance(resp, dict)
                   else type(resp).__name__)] += 1
+        seen_events = set()
         for n in notes_list(resp):
             if not isinstance(n, dict):
                 continue
             keys.update(n.keys())
+            for f in id_vals:
+                if n.get(f) not in (None, ""):
+                    id_vals[f].append(str(n[f]))
+            ev = (str(_pick(n, _NOTE_FIELDS["created"])[1] or ""),
+                  " ".join(str(_pick(n, _NOTE_FIELDS["body"])[1] or "").split())[:60])
+            if ev[0] and ev in seen_events:
+                dup_same_event += 1
+            seen_events.add(ev)
             for role, names in _NOTE_FIELDS.items():
                 name, v = _pick(n, names)
                 if name:
@@ -310,6 +343,11 @@ def notes_shape(resps: list) -> dict:
             types[f"{t} | {s}" if s else t] += 1
     return {"wrappers": dict(wrappers), "keys": dict(keys.most_common()),
             "picked": dict(picked.most_common()),
+            # {field: "present/distinct pattern"} — which id is truly unique.
+            "id_uniqueness": {f: f"{len(v)}/{len(set(v))} "
+                              f"{_mask(v[0]) if v else ''}"
+                              for f, v in id_vals.items() if v},
+            "dup_same_event": dup_same_event,
             "id_patterns": dict(ids.most_common(3)),
             "date_patterns": dict(dates.most_common(3)),
             "types": dict(types.most_common(25))}

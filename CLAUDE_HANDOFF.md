@@ -54,6 +54,22 @@ Pieces:
   `App._l360_notes_import(dry, auto)` / `_l360_notes_done`.
 - `tests/test_learner360.py` 13/13 (incl. dedupe both directions).
 
+**Dry run #1 (desktop, 2026-10-15)** — 206 learners, 241 s, **122,436 notes**
+(full history back to 2019, all authors/courses) vs 13,999 SF-scraped notes
+stored for them. Real fields: no `id` → `compositeKey`/`newId`/`oldId`/
+`noteNumber`/`interactionId`; `createdDate` (Z or `.000+0000`; ~3% missing →
+`lastModifiedDate` fallback); `type` mixes SF labels and snake_case codes
+(`email_to_student`, `instant_message_text`, `email_from_student`…) →
+`sf_type_label` maps codes to SF labels (fixes inbound detection); `subType` is
+a topic, no longer merged into type. BUG found + fixed: matching wasn't 1:1
+(24,169 "matches" for 13,999 stored notes) → now one stored note per incoming
+note (`claimed`), and duplicate ids inside Learner360's own lists are skipped
+(`dup_in_360`). Fuzzy clock offsets were spread +6…+16 h and −6/−7 h (unclear —
+re-check after the 1:1 fix). **Needs dry run #2** (log now also prints id-field
+uniqueness `present/distinct` → pick the truly unique id).
+Concern for auto-import: 4 min of `_set_busy` blocks the UI — consider a
+non-blocking background mode or a weekly cadence.
+
 **Next steps:**
 1. Run the app → type `l360notes: dry` in the caseload search box. On a fresh
    machine first run `l360momi:` (needs Learner360 ids; sign in to Learner360

@@ -703,10 +703,11 @@ def _norm_body(body: str, n: int = 60) -> str:
 
 
 def _find_same_note(conn, student_id: str, contact_id: str, created_at: str,
-                    ntype: str, body: str) -> Optional[str]:
+                    ntype: str, body: str, exclude=()) -> Optional[str]:
     """note_id of an already-stored note that is the SAME event as this one,
     seen through another source (SF scrape ↔ Learner360): same student, same
-    created_at to the second, and the same type or body prefix. None if none."""
+    created_at to the second, and the same type or body prefix. None if none.
+    ``exclude`` = note_ids already claimed this run (keeps matching 1:1)."""
     sec = (created_at or "")[:19]
     if len(sec) < 19 or not (student_id or contact_id):
         return None
@@ -717,6 +718,8 @@ def _find_same_note(conn, student_id: str, contact_id: str, created_at: str,
          contact_id or "", contact_id or "")).fetchall()
     nb = _norm_body(body)
     for r in rows:
+        if r["note_id"] in exclude:
+            continue
         if (ntype and r["type"] == ntype) or (nb and _norm_body(r["body"]) == nb):
             return r["note_id"]
     return None
@@ -974,6 +977,10 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
     cids = contact_ids or {}
     st = Counter()
     offsets, new_months = Counter(), Counter()
+    # Each stored note may be claimed by ONE incoming note (1:1) — otherwise
+    # repeated texts / templated emails all collapse onto the first match.
+    claimed: set = set()
+    seen_ids: set = set()
     conn = _connect(db_path)
     try:
         with conn:
@@ -991,6 +998,10 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                         f"{sid}|{created}|{body[:80]}".encode("utf-8", "ignore")
                     ).hexdigest()[:16]
                     nid = "l360:" + lid
+                    if nid in seen_ids:
+                        st["dup_in_360"] += 1       # same note listed twice
+                        continue
+                    seen_ids.add(nid)
                     if conn.execute("SELECT 1 FROM notes WHERE note_id = ?",
                                     (nid,)).fetchone():
                         st["already"] += 1
@@ -998,7 +1009,8 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                             conn.execute("UPDATE notes SET last_seen_at = ? "
                                          "WHERE note_id = ?", (now_iso, nid))
                         continue
-                    same = _find_same_note(conn, sid, cid, created, ntype, body)
+                    same = _find_same_note(conn, sid, cid, created, ntype,
+                                           body, exclude=claimed)
                     kind = "exact" if same else ""
                     if not same:
                         nb = _norm_body(body)
@@ -1017,7 +1029,8 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                                         "created_at BETWEEN ? AND ? AND "
                                         "note_id NOT LIKE 'l360:%'",
                                         (sid, lo, hi)):
-                                    if _norm_body(r["body"]) == nb:
+                                    if (r["note_id"] not in claimed
+                                            and _norm_body(r["body"]) == nb):
                                         same, kind = r["note_id"], "fuzzy"
                                         try:
                                             d = (datetime.fromisoformat(
@@ -1028,6 +1041,7 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                                             pass
                                         break
                     if same:
+                        claimed.add(same)
                         st[kind] += 1
                         if not dry:
                             conn.execute(
@@ -1056,7 +1070,7 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
     finally:
         conn.close()
     out = {k: st.get(k, 0) for k in ("students", "notes", "already", "exact",
-                                     "fuzzy", "new", "no_time")}
+                                     "fuzzy", "new", "no_time", "dup_in_360")}
     out["fuzzy_offset_hours"] = dict(sorted(offsets.items()))
     out["new_by_month"] = dict(sorted(new_months.items()))
     return out

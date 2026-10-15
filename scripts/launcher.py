@@ -11926,6 +11926,10 @@ class App:
                              f"{shape.get('id_patterns')} / "
                              f"{shape.get('date_patterns')}")
             self._append_log(f"  [l360notes] type labels: {shape.get('types')}")
+            self._append_log(f"  [l360notes] id fields present/distinct: "
+                             f"{shape.get('id_uniqueness')}; same-event repeats "
+                             f"inside Learner360 lists: "
+                             f"{shape.get('dup_same_event')}")
         try:
             from src import mongoose_contacts as _mc
             cids = _mc.load_contact_ids()
@@ -11948,6 +11952,7 @@ class App:
             f"{st.get('already', 0)} imported earlier, "
             f"{st.get('new', 0)} {'would be ' if dry else ''}new"
             f"{', ' + str(st['no_time']) + ' without a date' if st.get('no_time') else ''}"
+            f"{', ' + str(st['dup_in_360']) + ' listed twice by Learner360' if st.get('dup_in_360') else ''}"
             f"{fail}." + (" Paste this log to Claude." if dry else ""))
 
     def _maybe_auto_l360_momi(self) -> None:
