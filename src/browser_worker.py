@@ -2748,17 +2748,10 @@ class BrowserWorker:
                 continue
         return None
 
-    def _l360_momi_capture(self, ctx, surface: bool = True) -> dict:
-        """READ-ONLY: pull weekly MOMI history + factor breakdowns for the whole
-        Learner360 caseload. Opens (or reloads) Learner360 so the app fires fresh
-        authenticated calls, harvests its gateway auth, pages caseloads/search,
-        then GETs momentum-indicator per learner (5 concurrent, in-page). Also
-        gathers the change-watch snapshot (release fingerprint, feature flags,
-        response field sets) + contract-check drift. Persisting is the caller's
-        job. Returns {ok, students, caseload_count, momi_failed, fail_statuses,
-        watch, drift} or {error[, not_logged_in]}."""
-        import json as _json
-        from collections import Counter
+    def _l360_session(self, ctx, surface: bool = True):
+        """Open (or reload) Learner360 so the app fires fresh authenticated
+        calls, and harvest its gateway auth. Returns (page, headers, user, snap)
+        or an {error[, not_logged_in]} dict."""
         from src import learner360 as l3
         page = self._learner360_page(ctx)
         self._l360_auth = None  # require a FRESH harvest from this load
@@ -2799,7 +2792,24 @@ class BrowserWorker:
         user = auth.get("user") or snap.get("wguId") or ""
         if not user:
             return {"error": "couldn't determine your Learner360 user id."}
-        headers = auth["headers"]
+        return page, auth["headers"], user, snap
+
+    def _l360_momi_capture(self, ctx, surface: bool = True) -> dict:
+        """READ-ONLY: pull weekly MOMI history + factor breakdowns for the whole
+        Learner360 caseload. Opens (or reloads) Learner360 so the app fires fresh
+        authenticated calls, harvests its gateway auth, pages caseloads/search,
+        then GETs momentum-indicator per learner (5 concurrent, in-page). Also
+        gathers the change-watch snapshot (release fingerprint, feature flags,
+        response field sets) + contract-check drift. Persisting is the caller's
+        job. Returns {ok, students, caseload_count, momi_failed, fail_statuses,
+        watch, drift} or {error[, not_logged_in]}."""
+        import json as _json
+        from collections import Counter
+        from src import learner360 as l3
+        sess = self._l360_session(ctx, surface=surface)
+        if isinstance(sess, dict):
+            return sess
+        page, headers, user, snap = sess
         drift, keys = [], {}
         # Robust paging: start at 0 and de-dupe by Student ID, so it works
         # whether the gateway's pages are 0- or 1-based (a 1-based server may
