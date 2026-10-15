@@ -8,6 +8,7 @@ from tkinter import ttk
 import customtkinter as ctk
 
 from src import history
+from src import decision_tree
 from src.config import save_settings
 from src.ui_common import SECONDARY_BTN_KWARGS
 
@@ -25,15 +26,19 @@ class DataPanel:
               "Momentum trajectory": "trajectory",
               "Pass rate over time": "overtime",
               "Completion by month": "completion",
-              "Throughput by month": "throughput"}
+              "Throughput by month": "throughput",
+              "Action tree": "actiontree"}
     # Short labels for the on-screen view switcher (segmented button — must stay
     # compact so all fit the narrow docked pane).
     _VIEW_LABELS = {"Calibration": "calibration", "Risk": "atrisk",
                     "Trajectory": "trajectory", "Over time": "overtime",
-                    "Completion": "completion", "Throughput": "throughput"}
+                    "Completion": "completion", "Throughput": "throughput",
+                    "Action tree": "actiontree"}
     # Contacts-line metric for the throughput view (label -> history key).
     _CONTACTS_METRICS = {"Outreach sent": "sent",
                          "Unique contacted": "unique", "All notes": "all"}
+    # Views gated behind Settings → advanced mode (hidden for basic users).
+    _ADVANCED_VIEWS = {"actiontree"}
     # Completion-view month axis (label -> history.completion_by_month `by`).
     _COMPL_BY = {"By course start": "start", "By resolution": "resolution"}
     # Which Momentum reading drives the predicted line (entry vs at-outcome).
@@ -103,8 +108,8 @@ class DataPanel:
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
         self.status = ctk.CTkLabel(
-            parent, text="", font=ctk.CTkFont(size=10), justify="left",
-            anchor="w", text_color=("gray40", "gray65"), wraplength=560)
+            parent, text="", font=ctk.CTkFont(size=12), justify="left",
+            anchor="w", text_color=("gray25", "gray80"), wraplength=560)
         self.status.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 4))
         self._build_view()
 
@@ -118,10 +123,15 @@ class DataPanel:
         self.canvas = None
         # View selector — always first in the controls row.
         ctk.CTkLabel(self.ctrls, text="View:").pack(side="left", padx=(0, 4))
-        view_label = next((k for k, v in self._VIEW_LABELS.items()
-                           if v == self.view), list(self._VIEW_LABELS)[0])
+        # Hide advanced-only views unless the user has turned on advanced mode.
+        advanced = getattr(getattr(self.app, "settings", None),
+                           "advanced_mode", False)
+        labels = {k: v for k, v in self._VIEW_LABELS.items()
+                  if advanced or v not in self._ADVANCED_VIEWS}
+        view_label = next((k for k, v in labels.items()
+                           if v == self.view), list(labels)[0])
         vm = ctk.CTkOptionMenu(
-            self.ctrls, width=120, values=list(self._VIEW_LABELS),
+            self.ctrls, width=120, values=list(labels),
             command=lambda v: self._select_view(
                 self._VIEW_LABELS.get(v, "calibration")))
         vm.set(view_label)
@@ -147,6 +157,9 @@ class DataPanel:
         elif v == "throughput":
             self._build_throughput_controls(self.ctrls)
             self._view_throughput(self.content)
+        elif v == "actiontree":
+            self._build_actiontree_controls(self.ctrls)
+            self._view_actiontree(self.content)
         else:
             self._build_calibration_controls(self.ctrls)
             self._view_calibration(self.content)
@@ -1069,6 +1082,205 @@ class DataPanel:
     # Momentum-trajectory window (label -> weeks; None = all history).
     _AR_WINDOWS = {"All history": None, "8 weeks": 8, "6 weeks": 6,
                    "4 weeks": 4}
+
+    # ---- view: action tree (advanced) -----------------------------------
+    # Depth / min-leaf presets for the interpretable tree explorer.
+    _AT_DEPTHS = {"Depth 2": 2, "Depth 3": 3, "Depth 4": 4}
+    _AT_LEAVES = {"Min leaf 8": 8, "Min leaf 12": 12, "Min leaf 15": 15}
+    _AT_COLS = [("rule", "If…", 300, "w"), ("risk", "Not-pass", 70, "center"),
+                ("n", "n", 44, "center"), ("lift", "Lift", 52, "center"),
+                ("action", "→ Suggested action", 300, "w")]
+
+    def _build_actiontree_controls(self, parent) -> None:
+        """Depth + min-leaf selectors for the tree explorer. Shallower / larger
+        leaves = fewer, more trustworthy rules (guards the ~23-non-passer overfit)."""
+        depth = getattr(self, "_at_depth", 3)
+        leaf = getattr(self, "_at_min_leaf", 8)
+        ctk.CTkLabel(parent, text="Tree:").pack(side="left", padx=(6, 4))
+        dm = ctk.CTkOptionMenu(
+            parent, width=92, values=list(self._AT_DEPTHS),
+            command=self._at_set_depth)
+        dm.set(next((k for k, v in self._AT_DEPTHS.items() if v == depth),
+                    "Depth 3"))
+        dm.pack(side="left", padx=(0, 6))
+        lm = ctk.CTkOptionMenu(
+            parent, width=104, values=list(self._AT_LEAVES),
+            command=self._at_set_leaf)
+        lm.set(next((k for k, v in self._AT_LEAVES.items() if v == leaf),
+                    "Min leaf 8"))
+        lm.pack(side="left")
+
+    def _at_set_depth(self, label) -> None:
+        self._at_depth = self._AT_DEPTHS.get(label, 3)
+        self._at_refresh()
+
+    def _at_set_leaf(self, label) -> None:
+        self._at_min_leaf = self._AT_LEAVES.get(label, 8)
+        self._at_refresh()
+
+    def _view_actiontree(self, parent) -> None:
+        dark = ctk.get_appearance_mode() == "Dark"
+        style = ttk.Style()
+        style.configure(
+            "ActTree.Treeview", rowheight=40,
+            background=("#1d1e1e" if dark else "#ffffff"),
+            fieldbackground=("#1d1e1e" if dark else "#ffffff"),
+            foreground=("#dce4ee" if dark else "#1a1a1a"))
+        tree = ttk.Treeview(parent, style="ActTree.Treeview", show="headings",
+                            columns=[c[0] for c in self._AT_COLS])
+        self._at_tree = tree
+        for key, title, w, anchor in self._AT_COLS:
+            tree.heading(key, text=title)
+            tree.column(key, width=w, anchor=anchor,
+                        stretch=(key in ("rule", "action")))
+        tree.tag_configure("hot", foreground="#e0524f")
+        tree.tag_configure("warm", foreground="#d99a2b")
+        tree.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=sb.set)
+        # Double-click a rule → scope the caseload viewer to the LIVE students it
+        # matches (actionable). Right-click → inspect the RESOLVED students it was
+        # learned from (who mostly departed, so a popup, not the live viewer).
+        tree.bind("<Double-1>", self._at_show_live)
+        tree.bind("<Button-3>", self._at_show_resolved)
+        self._at_leaf_by_item = {}
+        self._at_refresh()
+
+    def _at_refresh(self) -> None:
+        """Train the interpretable tree on the local outcomes and fill the leaves
+        table + an HONEST status line (it's advisory, not the ranker)."""
+        tree = getattr(self, "_at_tree", None)
+        if tree is None:
+            return
+        for i in tree.get_children():
+            tree.delete(i)
+        depth = getattr(self, "_at_depth", 3)
+        min_leaf = getattr(self, "_at_min_leaf", 8)
+        try:
+            rows, labels = decision_tree.training_examples()
+        except Exception as e:
+            self.status.configure(text=f"Action tree unavailable: {e}")
+            return
+        npos = sum(labels)
+        if len(labels) < 2 * min_leaf or npos < 2 or npos == len(labels):
+            self.status.configure(text=(
+                "Not enough resolved outcomes yet to learn action rules "
+                f"({len(labels)} resolved, {npos} not-passers). Ingest the "
+                "outcomes archive (Departures → ⤓ Update archive) and revisit."))
+            return
+        model = decision_tree.DecisionTree(max_depth=depth, min_leaf=min_leaf)
+        model.fit(rows, labels)
+        self._at_model = model
+        self._at_leaf_by_item = {}
+        base = model.base_rate
+        for lf in sorted(model.leaves(), key=lambda n: -n.prob):
+            risk = lf.prob
+            tag = "hot" if risk >= 0.20 else ("warm" if risk >= 0.08 else "")
+            lift = f"{(risk / base):.1f}×" if base else "—"
+            item = tree.insert("", "end", tags=(tag,), values=(
+                decision_tree.rule_text(lf), f"{risk * 100:.0f}%",
+                f"{lf.pos}/{lf.n}", lift,
+                decision_tree.suggested_action(lf, base)))
+            self._at_leaf_by_item[item] = lf
+        cv = decision_tree.cross_val_auc(rows, labels, max_depth=depth,
+                                         min_leaf=min_leaf)
+        ta = "—" if cv["tree_auc"] is None else f"{cv['tree_auc']:.3f}"
+        ia = "—" if cv["isotonic_auc"] is None else f"{cv['isotonic_auc']:.3f}"
+        self.status.configure(text=(
+            f"Interpretable not-pass rules from {len(labels)} resolved outcomes "
+            f"({npos} not-passers), base rate {model.base_rate * 100:.0f}%. Each "
+            "leaf → a suggested faculty action; 'Lift' = how many× the base rate. "
+            f"ADVISORY, not the ranker: out-of-sample AUC tree={ta} vs the momentum "
+            f"risk score {ia} — it ties (its apparent edge is the near-tautological "
+            "'never attempted' signal, already handled by the Risk list). Use the "
+            "ACTIONS, not for ranking. Shallower depth / bigger min-leaf = fewer, "
+            "sturdier rules.  ▸ Double-click a rule → its LIVE students in the "
+            "caseload viewer; right-click → the resolved students it was learned "
+            "from."))
+
+    def _at_focused_leaf(self, event=None):
+        """The leaf node for the focused/clicked row (selecting the row under the
+        cursor first when invoked from a right-click)."""
+        tree = getattr(self, "_at_tree", None)
+        if tree is None:
+            return None
+        if event is not None:
+            iid = tree.identify_row(event.y)
+            if iid:
+                tree.selection_set(iid)
+                tree.focus(iid)
+        item = tree.focus()
+        return getattr(self, "_at_leaf_by_item", {}).get(item) if item else None
+
+    def _at_show_live(self, _event=None) -> None:
+        """Double-click: scope the caseload viewer to the LIVE in-progress students
+        matching this rule — an actionable worklist."""
+        lf = self._at_focused_leaf()
+        model = getattr(self, "_at_model", None)
+        if lf is None or model is None:
+            return
+        try:
+            pool = decision_tree.live_examples()
+        except Exception as e:
+            self.app._append_log(f"Action tree: {e}")
+            return
+        match = [x for x in pool
+                 if decision_tree.path_matches(lf, x["feats"], model.medians)]
+        rule = decision_tree.rule_text(lf)
+        if not match:
+            self.app._append_log(f"No live students currently match — {rule}")
+            return
+        rows = [{"StudentID": x["student_id"]} for x in match]
+        self.app._set_viewer_batch_scope(rows, f"Rule: {rule}"[:56], color=None)
+
+    def _at_show_resolved(self, event=None) -> None:
+        """Right-click: read-only list of the RESOLVED students this rule was
+        learned from, with their actual pass/not-pass outcome (they've mostly
+        departed, so a popup rather than the live viewer)."""
+        lf = self._at_focused_leaf(event)
+        model = getattr(self, "_at_model", None)
+        if lf is None or model is None:
+            return
+        try:
+            pool = decision_tree.resolved_examples()
+        except Exception as e:
+            self.app._append_log(f"Action tree: {e}")
+            return
+        match = [x for x in pool
+                 if decision_tree.path_matches(lf, x["feats"], model.medians)]
+        self._at_resolved_popup(decision_tree.rule_text(lf), match)
+
+    def _at_resolved_popup(self, rule: str, students: list) -> None:
+        """Small inspector: who were the resolved students behind a rule."""
+        win = ctk.CTkToplevel(self.app.root)
+        win.title("Students behind this rule")
+        win.geometry("560x360")
+        win.transient(self.app.root)
+        npass = sum(1 for s in students if s["label"] == 1)
+        ctk.CTkLabel(
+            win, justify="left", anchor="w", wraplength=520,
+            font=ctk.CTkFont(size=12),
+            text=(f"IF {rule}\n{len(students)} resolved students — "
+                  f"{npass} not-passed, {len(students) - npass} passed. These are "
+                  "the historical students the rule was learned from (mostly "
+                  "departed).")).pack(fill="x", padx=10, pady=(10, 6))
+        cols = [("name", "Name", 180, "w"), ("outcome", "Outcome", 90, "center"),
+                ("avg", "Avg MI", 64, "center"),
+                ("cr", "Compl. ratio", 90, "center")]
+        tv = ttk.Treeview(win, show="headings", columns=[c[0] for c in cols])
+        for k, t, w, a in cols:
+            tv.heading(k, text=t)
+            tv.column(k, width=w, anchor=a, stretch=(k == "name"))
+        tv.tag_configure("np", foreground="#e0524f")
+        for s in sorted(students, key=lambda x: -x["label"]):
+            f = s["feats"]
+            cr = f.get("completion_ratio")
+            tv.insert("", "end", tags=(("np",) if s["label"] == 1 else ()), values=(
+                s["name"] or s["student_id"],
+                "not-passed" if s["label"] == 1 else "passed",
+                f"{f['avg_rank']:.1f}", "—" if cr is None else f"{cr:.2f}"))
+        tv.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
     def _build_atrisk_controls(self, parent) -> None:
         """Risk-list options: momentum-trajectory WINDOW selector + a 'Show
