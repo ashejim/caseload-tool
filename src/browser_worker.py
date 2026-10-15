@@ -421,6 +421,12 @@ class BrowserWorker:
         on the worker thread."""
         self.q.put(("L360_MOMI", on_done, surface))
 
+    def submit_l360_notes_fetch(self, targets: list,
+                                on_done: Callable[[dict], None],
+                                surface: bool = True) -> None:
+        """READ-ONLY: pull Learner360 note histories (see _l360_notes_fetch)."""
+        self.q.put(("L360_NOTES", targets, on_done, surface))
+
     def submit_export_segments(
         self, courses: list, on_done: Callable[[dict], None],
     ) -> None:
@@ -1005,6 +1011,15 @@ class BrowserWorker:
                 res = self._l360_momi_capture(ctx, surface=surface)
             except Exception as e:
                 res = {"error": f"Learner360 capture crashed: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "L360_NOTES":
+            _, targets, on_done, surface = cmd
+            res = {}
+            try:
+                res = self._l360_notes_fetch(ctx, targets, surface=surface)
+            except Exception as e:
+                res = {"error": f"Learner360 notes fetch crashed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "EXPORT_SEGMENTS":
@@ -2793,6 +2808,50 @@ class BrowserWorker:
         if not user:
             return {"error": "couldn't determine your Learner360 user id."}
         return page, auth["headers"], user, snap
+
+    def _l360_notes_fetch(self, ctx, targets: list,
+                          surface: bool = True) -> dict:
+        """READ-ONLY: GET each learner's full note history from Learner360.
+        ``targets`` = [(wgu_id, student_id)]. Parses here (learner360.
+        parse_notes) and summarizes the raw shape (notes_shape — field names
+        and labels only) for the dry-run log. Persisting is the caller's job.
+        Returns {ok, by_student, shape, fetched, failed, fail_statuses} or
+        {error[, not_logged_in]}."""
+        import json as _json
+        from collections import Counter
+        from src import learner360 as l3
+        sess = self._l360_session(ctx, surface=surface)
+        if isinstance(sess, dict):
+            return sess
+        page, headers, _user, _snap = sess
+        sid_by = {w: s for w, s in targets if w and s}
+        ids = list(sid_by)
+        by_student, raws, fails = {}, [], Counter()
+        t0, chunk = time.time(), 40
+        for i in range(0, len(ids), chunk):
+            part = ids[i:i + chunk]
+            got = l3.fetch_notes_batch(page, headers, part)
+            for w in part:
+                r = got.get(w) or {}
+                if r.get("status") != 200:
+                    fails[str(r.get("status"))] += 1
+                    continue
+                try:
+                    data = _json.loads(r.get("body") or "null")
+                except ValueError:
+                    fails["bad-json"] += 1
+                    continue
+                if len(raws) < 60:
+                    raws.append(data)
+                by_student[sid_by[w]] = l3.parse_notes(data)
+            self.on_status(f"  [l360] notes {min(i + chunk, len(ids))}/"
+                           f"{len(ids)} ({time.time() - t0:.0f}s)")
+        if ids and not by_student:
+            return {"error": "every notes request failed "
+                    f"({dict(fails)}) — Learner360 may have changed."}
+        return {"ok": True, "by_student": by_student,
+                "shape": l3.notes_shape(raws), "fetched": len(by_student),
+                "failed": sum(fails.values()), "fail_statuses": dict(fails)}
 
     def _l360_momi_capture(self, ctx, surface: bool = True) -> dict:
         """READ-ONLY: pull weekly MOMI history + factor breakdowns for the whole

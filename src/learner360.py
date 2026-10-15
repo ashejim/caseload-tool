@@ -167,6 +167,178 @@ def momi_capture_due(last_captured: Optional[str], days: int,
     return ((now or datetime.now()) - last).total_seconds() >= days * 86400
 
 
+# ---------------------------------------------------------- student notes
+# GET /studentNotes/v1/notes/<learner uuid> → the learner's FULL note history
+# (all authors / courses — like SF's Notes History). Field names below are
+# candidates; the first `l360notes: dry` run reports which ones are really used
+# (notes_shape) so the mapping can be pinned down.
+NOTES_PATH = "/studentNotes/v1/notes/"
+
+_NOTE_FIELDS = {
+    "id": ("id", "noteId", "salesforceId", "sfId", "externalId"),
+    "created": ("wguCreationDateTime", "createdDate", "createdAt",
+                "creationDate", "noteDate", "date"),
+    "type": ("type", "noteType"),
+    "subtype": ("subType", "subtype", "noteSubType"),
+    "course": ("courseCode", "course"),
+    "author": ("authorName", "createdByName", "author", "createdBy"),
+    "subject": ("subject", "title"),
+    "body": ("text", "body", "noteText", "description", "shortText"),
+}
+
+
+def _pick(d: dict, names) -> tuple:
+    """(field name, value) of the first candidate present & non-empty."""
+    for n in names:
+        v = d.get(n)
+        if v not in (None, "", [], {}):
+            return n, v
+    return "", None
+
+
+def iso_utc(s) -> str:
+    """Normalize a timestamp to the stored notes format
+    'YYYY-MM-DDTHH:MM:SS.000Z' (UTC). Naive values are taken as UTC (the
+    gateway's convention); unparseable → ''."""
+    from datetime import timezone
+    t = str(s or "").strip()
+    if not t:
+        return ""
+    if t.isdigit() and len(t) >= 12:            # epoch millis
+        dt = datetime.fromtimestamp(int(t) / 1000, tz=timezone.utc)
+    else:
+        try:
+            dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        except ValueError:
+            dt = None
+            for fmt in ("%m-%d-%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S",
+                        "%m-%d-%Y %I:%M %p", "%m/%d/%Y %I:%M %p"):
+                try:
+                    dt = datetime.strptime(t, fmt)
+                    break
+                except ValueError:
+                    continue
+            if dt is None:
+                return ""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _author_text(v) -> str:
+    if isinstance(v, dict):
+        return str(v.get("name") or " ".join(
+            x for x in (v.get("firstName"), v.get("lastName")) if x) or "")
+    return str(v or "")
+
+
+def notes_list(resp) -> list:
+    """The note items in a notes response (a bare list or wrapped)."""
+    if isinstance(resp, list):
+        return resp
+    if isinstance(resp, dict):
+        for k in ("content", "notes", "items", "data", "results"):
+            if isinstance(resp.get(k), list):
+                return resp[k]
+    return []
+
+
+def parse_notes(resp) -> list:
+    """Normalize one learner's notes → [{l360_id, created_at, type, course,
+    author, subject, body, author_is_ci, author_is_pm, from_sms}]. ``type``
+    carries the SF-style label (e.g. 'Email to Student') so the existing
+    channel/direction classifiers apply; a separate subtype is appended only
+    when the type alone isn't SF-style."""
+    out = []
+    for n in notes_list(resp):
+        if not isinstance(n, dict):
+            continue
+        _, nid = _pick(n, _NOTE_FIELDS["id"])
+        _, created = _pick(n, _NOTE_FIELDS["created"])
+        _, typ = _pick(n, _NOTE_FIELDS["type"])
+        _, sub = _pick(n, _NOTE_FIELDS["subtype"])
+        typ, sub = str(typ or ""), str(sub or "")
+        if sub and sub.lower() not in typ.lower():
+            typ = f"{typ} {sub}".strip() if typ else sub
+        _, body = _pick(n, _NOTE_FIELDS["body"])
+        out.append({
+            "l360_id": str(nid or ""),
+            "created_at": iso_utc(created),
+            "type": typ,
+            "course": str(_pick(n, _NOTE_FIELDS["course"])[1] or ""),
+            "author": _author_text(_pick(n, _NOTE_FIELDS["author"])[1]),
+            "subject": str(_pick(n, _NOTE_FIELDS["subject"])[1] or ""),
+            "body": str(body or ""),
+            "author_is_ci": bool(n.get("authorIsCI") or n.get("authorIsCi")),
+            "author_is_pm": bool(n.get("authorIsPM") or n.get("authorIsPm")),
+            "from_sms": bool(n.get("createdFromSms")),
+        })
+    return out
+
+
+def _mask(v) -> str:
+    """Shape of a value without its content: digits→9, letters→a."""
+    return re.sub(r"[A-Za-z]", "a", re.sub(r"\d", "9", str(v)))[:40]
+
+
+def notes_shape(resps: list) -> dict:
+    """FERPA-safe summary of raw notes responses for the dry-run log: field
+    names (with how many notes carry each), which candidate the parser picked
+    per role, masked id/date patterns, and the type / subType LABELS (category
+    names, not student content)."""
+    from collections import Counter
+    keys, picked, ids, dates, types = (Counter() for _ in range(5))
+    wrappers = Counter()
+    for resp in resps:
+        wrappers["list" if isinstance(resp, list) else
+                 ("dict:" + ",".join(sorted(resp)[:6]) if isinstance(resp, dict)
+                  else type(resp).__name__)] += 1
+        for n in notes_list(resp):
+            if not isinstance(n, dict):
+                continue
+            keys.update(n.keys())
+            for role, names in _NOTE_FIELDS.items():
+                name, v = _pick(n, names)
+                if name:
+                    picked[f"{role}<-{name}"] += 1
+                    if role == "id":
+                        ids[_mask(v)] += 1
+                    elif role == "created":
+                        dates[_mask(v)] += 1
+            t = str(_pick(n, _NOTE_FIELDS["type"])[1] or "")
+            s = str(_pick(n, _NOTE_FIELDS["subtype"])[1] or "")
+            types[f"{t} | {s}" if s else t] += 1
+    return {"wrappers": dict(wrappers), "keys": dict(keys.most_common()),
+            "picked": dict(picked.most_common()),
+            "id_patterns": dict(ids.most_common(3)),
+            "date_patterns": dict(dates.most_common(3)),
+            "types": dict(types.most_common(25))}
+
+
+_GET_BATCH_JS = """async ([base, headers, ids, conc]) => {
+  const out = {}; let i = 0;
+  const h = Object.assign(
+    {'Accept': 'application/json', 'Content-Type': 'application/json'}, headers);
+  const run = async () => {
+    while (i < ids.length) {
+      const id = ids[i++];
+      try { const r = await fetch(base + id, {headers: h}); out[id] = {status: r.status, body: await r.text()}; }
+      catch (e) { out[id] = {status: 'fetch-error', body: String(e)}; }
+    }
+  };
+  await Promise.all(Array.from({length: conc}, run));
+  return out;
+}"""
+
+
+def fetch_notes_batch(page, headers: dict, wgu_ids: list,
+                      concurrency: int = 5) -> dict:
+    """GET studentNotes for many learners, in-page. → {wgu_id: {status, body}}."""
+    return page.evaluate(_GET_BATCH_JS,
+                         [GATEWAY + NOTES_PATH, headers, list(wgu_ids),
+                          max(1, int(concurrency))]) or {}
+
+
 # ---------------------------------------------------------- change watch
 # REQUIRED fields per endpoint — what our parsers depend on. A missing one is a
 # breaking change (logged loudly; data from that endpoint can't be trusted).

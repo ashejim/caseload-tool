@@ -31,6 +31,7 @@ path must never break because history couldn't be written).
 """
 import csv
 import json
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -693,6 +694,34 @@ def reclassify_notes(*, db_path=HISTORY_DB) -> int:
         conn.close()
 
 
+def _norm_body(body: str, n: int = 60) -> str:
+    """Comparable body prefix across sources: tags stripped, entities decoded,
+    whitespace collapsed, lowercased (SF scrape vs Learner360 API text)."""
+    import html as _html
+    t = _html.unescape(re.sub(r"<[^>]+>", " ", body or ""))
+    return " ".join(t.split()).lower()[:n]
+
+
+def _find_same_note(conn, student_id: str, contact_id: str, created_at: str,
+                    ntype: str, body: str) -> Optional[str]:
+    """note_id of an already-stored note that is the SAME event as this one,
+    seen through another source (SF scrape ↔ Learner360): same student, same
+    created_at to the second, and the same type or body prefix. None if none."""
+    sec = (created_at or "")[:19]
+    if len(sec) < 19 or not (student_id or contact_id):
+        return None
+    rows = conn.execute(
+        "SELECT note_id, type, body FROM notes WHERE created_at LIKE ? AND "
+        "((? != '' AND student_id = ?) OR (? != '' AND contact_id = ?))",
+        (sec + "%", student_id or "", student_id or "",
+         contact_id or "", contact_id or "")).fetchall()
+    nb = _norm_body(body)
+    for r in rows:
+        if (ntype and r["type"] == ntype) or (nb and _norm_body(r["body"]) == nb):
+            return r["note_id"]
+    return None
+
+
 def persist_notes(notes, *, student_id: str = "", contact_id: str = "",
                   course_code: str = "", db_path=HISTORY_DB,
                   now: Optional[datetime] = None) -> dict:
@@ -735,6 +764,14 @@ def persist_notes(notes, *, student_id: str = "", contact_id: str = "",
                         continue
                     exists = conn.execute(
                         "SELECT 1 FROM notes WHERE note_id = ?", (nid,)).fetchone()
+                    if not exists:
+                        # Same note already imported from Learner360 (different
+                        # id scheme)? Upsert THAT row instead of double-counting.
+                        same = _find_same_note(
+                            conn, vals["student_id"], vals["contact_id"],
+                            vals["created_at"], ntype, body)
+                        if same:
+                            nid, exists = same, True
                     if exists:
                         # Don't blank a known student_id/contact_id if this scrape
                         # didn't carry one (COALESCE(NULLIF(...))).
@@ -909,6 +946,143 @@ def notes_freshness(*, db_path=HISTORY_DB) -> dict:
             "FROM notes").fetchone()
         return {"count": r["c"] or 0, "last_swept": r["ls"] or None,
                 "newest_note": r["nc"] or None}
+    finally:
+        conn.close()
+
+
+def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
+                       dry: bool = False, db_path=HISTORY_DB,
+                       now: Optional[datetime] = None) -> dict:
+    """Import Learner360 notes (learner360.parse_notes output) into ``notes``,
+    de-duplicated against what the SF scrape already stored.
+
+    ``by_student`` = {student_id: [note, …]}. Per note, in order:
+      already  — this Learner360 note was imported before (id 'l360:<id>');
+      exact    — the SF scrape has it (same student + second + type/body);
+      fuzzy    — same student, same body prefix, within ±36 h (a timestamp
+                 skew between sources; the offsets are reported so a dry run
+                 shows whether the clocks differ systematically);
+      new      — inserted as 'l360:<id>' (channel/direction from the same
+                 classifiers as SF notes).
+    Matched rows only gain a missing course code + a fresh last_seen_at; the SF
+    copy's text stays. ``dry`` computes the same counts and writes NOTHING.
+    Returns {students, notes, already, exact, fuzzy, new, no_time,
+    fuzzy_offset_hours:{h: n}, new_by_month:{YYYY-MM: n}}."""
+    from collections import Counter
+    import hashlib
+    now_iso = (now or datetime.now()).isoformat(timespec="seconds")
+    cids = contact_ids or {}
+    st = Counter()
+    offsets, new_months = Counter(), Counter()
+    conn = _connect(db_path)
+    try:
+        with conn:
+            for sid, notes in (by_student or {}).items():
+                st["students"] += 1
+                cid = cids.get(sid, "") or ""
+                for n in notes or []:
+                    st["notes"] += 1
+                    created, body = n.get("created_at") or "", n.get("body") or ""
+                    ntype = n.get("type") or ""
+                    if not created:
+                        st["no_time"] += 1
+                        continue
+                    lid = n.get("l360_id") or hashlib.sha1(
+                        f"{sid}|{created}|{body[:80]}".encode("utf-8", "ignore")
+                    ).hexdigest()[:16]
+                    nid = "l360:" + lid
+                    if conn.execute("SELECT 1 FROM notes WHERE note_id = ?",
+                                    (nid,)).fetchone():
+                        st["already"] += 1
+                        if not dry:
+                            conn.execute("UPDATE notes SET last_seen_at = ? "
+                                         "WHERE note_id = ?", (now_iso, nid))
+                        continue
+                    same = _find_same_note(conn, sid, cid, created, ntype, body)
+                    kind = "exact" if same else ""
+                    if not same:
+                        nb = _norm_body(body)
+                        if nb:
+                            try:
+                                c0 = datetime.fromisoformat(created[:19])
+                            except ValueError:
+                                c0 = None
+                            if c0 is not None:
+                                from datetime import timedelta
+                                lo = (c0 - timedelta(hours=36)).isoformat()
+                                hi = (c0 + timedelta(hours=36)).isoformat()
+                                for r in conn.execute(
+                                        "SELECT note_id, created_at, body FROM "
+                                        "notes WHERE student_id = ? AND "
+                                        "created_at BETWEEN ? AND ? AND "
+                                        "note_id NOT LIKE 'l360:%'",
+                                        (sid, lo, hi)):
+                                    if _norm_body(r["body"]) == nb:
+                                        same, kind = r["note_id"], "fuzzy"
+                                        try:
+                                            d = (datetime.fromisoformat(
+                                                r["created_at"][:19]) - c0)
+                                            offsets[round(d.total_seconds()
+                                                          / 3600)] += 1
+                                        except ValueError:
+                                            pass
+                                        break
+                    if same:
+                        st[kind] += 1
+                        if not dry:
+                            conn.execute(
+                                "UPDATE notes SET course_code = CASE WHEN "
+                                "COALESCE(course_code,'') = '' THEN ? ELSE "
+                                "course_code END, last_seen_at = ? "
+                                "WHERE note_id = ?",
+                                (n.get("course") or "", now_iso, same))
+                        continue
+                    st["new"] += 1
+                    new_months[created[:7]] += 1
+                    if not dry:
+                        conn.execute(
+                            "INSERT INTO notes (note_id, student_id, contact_id, "
+                            "course_code, type, channel, direction, created_at, "
+                            "author, subject, body, url, first_seen_at, "
+                            "last_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (nid, sid, cid, n.get("course") or "", ntype,
+                             classify_note_channel(ntype),
+                             classify_note_direction(ntype, body), created,
+                             n.get("author") or "", n.get("subject") or "",
+                             body, "", now_iso, now_iso))
+            if not dry:
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) "
+                             "VALUES ('l360_notes_last_import', ?)", (now_iso,))
+    finally:
+        conn.close()
+    out = {k: st.get(k, 0) for k in ("students", "notes", "already", "exact",
+                                     "fuzzy", "new", "no_time")}
+    out["fuzzy_offset_hours"] = dict(sorted(offsets.items()))
+    out["new_by_month"] = dict(sorted(new_months.items()))
+    return out
+
+
+def l360_notes_last_import(*, db_path=HISTORY_DB) -> Optional[str]:
+    """ISO time of the last (non-dry) Learner360 notes import, or None."""
+    conn = _connect(db_path)
+    try:
+        return _meta_get(conn, "l360_notes_last_import")
+    finally:
+        conn.close()
+
+
+def l360_note_targets(*, max_age_days: int = 30, db_path=HISTORY_DB) -> list:
+    """[(wgu_id, student_id)] for the Learner360 notes import: learners whose
+    360 id the MOMI capture refreshed within ``max_age_days`` (≈ the current
+    caseload)."""
+    from datetime import timedelta
+    cut = (datetime.now() - timedelta(days=max_age_days)).isoformat(
+        timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        return [(r["wgu_id"], r["student_id"]) for r in conn.execute(
+            "SELECT wgu_id, student_id FROM l360_ids WHERE "
+            "COALESCE(wgu_id,'') != '' AND updated_at >= ?", (cut,))]
     finally:
         conn.close()
 

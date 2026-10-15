@@ -6346,6 +6346,13 @@ class CaseloadPanel:
         if q.lower().startswith(("l360momi", "1360momi")):  # l vs 1 typo
             self.app._l360_momi_capture()
             return "break"
+        # "l360notes:" imports full note histories from Learner360 into the
+        # contact-history DB, de-duplicated against SF-scraped notes (keeps
+        # Throughput's contacts current). "l360notes: dry" = report only.
+        if q.lower().startswith(("l360notes", "1360notes")):
+            rest = q.split(":", 1)[1].strip().lower() if ":" in q else ""
+            self.app._l360_notes_import(dry="dry" in rest.split())
+            return "break"
         if q.lower().startswith("sweepnotes"):
             rest = q.split(":", 1)[1].strip().lower() if ":" in q else ""
             parts = rest.split()
@@ -11859,6 +11866,89 @@ class App:
 
         self.worker.submit_l360_momi_capture(on_done, surface=not auto)
         return True
+
+    def _l360_notes_import(self, dry: bool = False, auto: bool = False) -> bool:
+        """`l360notes:` — READ-ONLY pull of each caseload learner's full note
+        history from Learner360, imported into history.notes de-duplicated
+        against the SF-scraped copies (history.persist_l360_notes). ``dry``
+        reports the response shape + match counts and writes nothing. Needs
+        the Learner360 ids from a MOMI capture (l360momi:). True if started."""
+        if getattr(self, "_offline", False):
+            if not auto:
+                self._append_log("🔌 Demo: Learner360 isn't available offline.")
+            return False
+        if getattr(self, "_is_busy", False):
+            if not auto:
+                self._append_log("Busy — wait for the current task to finish.")
+            return False
+        if not self.worker.ready_event.is_set():
+            if not auto:
+                self._append_log("Browser not ready yet — wait and try again.")
+            return False
+        targets = history.l360_note_targets()
+        if not targets:
+            if not auto:
+                self._append_log("Learner360 notes: no Learner360 ids yet — run "
+                                 "l360momi: first.")
+            return False
+        self._set_busy("Reading notes from Learner360…")
+        self._append_log(
+            f"Learner360 notes{' (DRY RUN — nothing will be saved)' if dry else ''}"
+            f": reading note history for {len(targets)} learners (read-only)…")
+
+        def on_done(res):
+            try:
+                self.root.after(0, lambda: self._l360_notes_done(res, dry, auto))
+            except Exception:
+                self._l360_notes_done(res, dry, auto)
+
+        self.worker.submit_l360_notes_fetch(targets, on_done, surface=not auto)
+        return True
+
+    def _l360_notes_done(self, res, dry: bool = False, auto: bool = False) -> None:
+        self._set_idle()
+        res = res or {}
+        if res.get("error"):
+            if auto and res.get("not_logged_in"):
+                self._append_log("Learner360 isn't signed in, so the background "
+                                 "notes import was skipped.")
+            else:
+                self._append_log(f"✗ Learner360 notes: {res['error']}",
+                                 error=True)
+            return
+        shape = res.get("shape") or {}
+        if dry:
+            # Field names + labels only (no student content) — for tuning.
+            self._append_log(f"  [l360notes] wrappers: {shape.get('wrappers')}")
+            self._append_log(f"  [l360notes] fields: {shape.get('keys')}")
+            self._append_log(f"  [l360notes] parser picked: {shape.get('picked')}")
+            self._append_log(f"  [l360notes] id/date patterns: "
+                             f"{shape.get('id_patterns')} / "
+                             f"{shape.get('date_patterns')}")
+            self._append_log(f"  [l360notes] type labels: {shape.get('types')}")
+        try:
+            from src import mongoose_contacts as _mc
+            cids = _mc.load_contact_ids()
+        except Exception:
+            cids = {}
+        st = history.persist_l360_notes(res.get("by_student") or {},
+                                        contact_ids=cids, dry=dry)
+        if dry:
+            self._append_log(f"  [l360notes] fuzzy-match clock offsets (h): "
+                             f"{st.get('fuzzy_offset_hours')}")
+            self._append_log(f"  [l360notes] new notes by month: "
+                             f"{st.get('new_by_month')}")
+        fail = (f"; {res.get('failed')} learner(s) failed "
+                f"{res.get('fail_statuses')}" if res.get("failed") else "")
+        self._append_log(
+            f"{'Learner360 notes DRY RUN' if dry else '✓ Learner360 notes'}: "
+            f"{st.get('notes', 0)} notes for {st.get('students', 0)} learners — "
+            f"{st.get('exact', 0)} already in SF scrape (exact), "
+            f"{st.get('fuzzy', 0)} matched loosely, "
+            f"{st.get('already', 0)} imported earlier, "
+            f"{st.get('new', 0)} {'would be ' if dry else ''}new"
+            f"{', ' + str(st['no_time']) + ' without a date' if st.get('no_time') else ''}"
+            f"{fail}." + (" Paste this log to Claude." if dry else ""))
 
     def _maybe_auto_l360_momi(self) -> None:
         """Background Learner360 refresh: capture weekly MOMI history (and run

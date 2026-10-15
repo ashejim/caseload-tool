@@ -121,6 +121,73 @@ def test_momi_capture_due():
     assert l3.momi_capture_due("garbage", 7, now)               # unreadable -> due
 
 
+NOTES = [
+    {"id": "n1", "createdDate": "2026-10-01T15:30:00Z", "type": "Email to Student",
+     "courseCode": "C769", "authorName": "CI Person", "subject": "Hi",
+     "text": "<p>Checking   in on Task 2</p>", "authorIsCI": True},
+    {"id": "n2", "createdDate": "2026-10-02T09:00:00.000+00:00",
+     "type": "Instant Message (IM) / Text", "text": "Outgoing: hello there"},
+    {"id": "n3", "createdDate": "", "type": "Admin Note", "text": "no date"},
+]
+
+
+def test_iso_utc_and_parse_notes():
+    assert l3.iso_utc("2026-10-01T15:30:00Z") == "2026-10-01T15:30:00.000Z"
+    assert l3.iso_utc("2026-10-01T09:30:00-06:00") == "2026-10-01T15:30:00.000Z"
+    assert l3.iso_utc("1759332600000") == "2025-10-01T15:30:00.000Z"
+    assert l3.iso_utc("junk") == ""
+    rows = l3.parse_notes({"content": NOTES})
+    assert [r["l360_id"] for r in rows] == ["n1", "n2", "n3"]
+    assert rows[0]["created_at"] == "2026-10-01T15:30:00.000Z"
+    assert rows[0]["author_is_ci"] and rows[0]["course"] == "C769"
+    assert rows[2]["created_at"] == ""
+    sh = l3.notes_shape([NOTES])
+    assert sh["picked"]["created<-createdDate"] == 2
+    assert "Email to Student" in sh["types"]
+    assert all("Checking" not in str(v) for v in sh.values())   # no content
+
+
+def test_l360_notes_dedupe_against_sf_scrape():
+    path = _tmpdb()
+    try:
+        # SF scrape already holds n1 (same second, SF-style body) and n2 two
+        # hours off (clock skew between sources).
+        history.persist_notes([
+            {"type": "Email to Student", "course": "", "subject": "Hi",
+             "text": "Checking in on Task 2", "date": "2026-10-01T15:30:00.000Z"},
+            {"type": "Instant Message (IM) / Text", "text": "Outgoing: hello there",
+             "date": "2026-10-02T11:00:00.000Z"},
+        ], student_id="S1", db_path=path)
+        notes = l3.parse_notes(NOTES)
+        dry = history.persist_l360_notes({"S1": notes}, dry=True, db_path=path)
+        assert (dry["exact"], dry["fuzzy"], dry["new"], dry["no_time"]) == (1, 1, 0, 1), dry
+        assert dry["fuzzy_offset_hours"] == {2: 1}
+        assert history.notes_count(db_path=path) == 2          # dry wrote nothing
+        assert history.l360_notes_last_import(db_path=path) is None
+        # A genuinely new note is inserted once; a re-run sees it as 'already'.
+        more = notes + l3.parse_notes([{"id": "n4", "createdDate":
+                                        "2026-10-05T12:00:00Z",
+                                        "type": "Email from Student",
+                                        "text": "question"}])
+        r1 = history.persist_l360_notes({"S1": more}, db_path=path)
+        assert r1["new"] == 1 and r1["exact"] == 1, r1
+        r2 = history.persist_l360_notes({"S1": more}, db_path=path)
+        assert r2["new"] == 0 and r2["already"] == 1, r2
+        assert history.notes_count(db_path=path) == 3
+        # The SF sweep later scraping n4 must UPSERT the l360 row, not add one.
+        history.persist_notes([{"type": "Email from Student", "text": "question",
+                                "date": "2026-10-05T12:00:00.000Z"}],
+                              student_id="S1", db_path=path)
+        assert history.notes_count(db_path=path) == 3
+        conn = sqlite3.connect(path)
+        ch, di = conn.execute("SELECT channel, direction FROM notes WHERE "
+                              "note_id = 'l360:n4'").fetchone()
+        conn.close()
+        assert (ch, di) == ("email", "inbound")
+    finally:
+        os.remove(path)
+
+
 def _tmpdb():
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
