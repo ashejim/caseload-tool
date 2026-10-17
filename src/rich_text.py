@@ -15,7 +15,7 @@ live in ``src.dialogs``.
 import html
 import re
 from html.parser import HTMLParser
-from typing import Optional
+from typing import Callable, Optional
 
 import customtkinter as ctk
 import tkinter as tk

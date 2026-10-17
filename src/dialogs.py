@@ -9,7 +9,7 @@ Note: the two rich-text dialogs (the HTML template editor and batch email
 review) still live in launcher.py — they depend on the RichTextEditor widget,
 which moves out in a later step.
 """
-from typing import Callable
+from typing import Callable, Optional
 import html
 import re
 from pathlib import Path

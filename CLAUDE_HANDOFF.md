@@ -30,7 +30,16 @@ NOT yet run live, NOT committed on desktop `main` (see "Getting the code" below)
   `l360momi:` (fills `l360_ids`), then `l360notes: dry`. The dedupe numbers
   will differ from the desktop's (fewer SF-scraped notes on the laptop).
 - Claude's memory (`~/.claude/projects/D--salesforce-automation/memory/`) is
-  desktop-only; this file carries the essentials.
+  desktop-only; this file carries the essentials. (The laptop keeps its own
+  index under its own project key.)
+
+**Done on the laptop (2026-10-17), on `wip/l360-notes` — pull before resuming on
+the desktop:** rebuilt `.venv` for 3.13 (see Dev setup), fixed the three missing
+annotation imports that 3.14 had masked, and fixed the **Queue tab's playlist bar
+collapsing to zero height** (the launcher gives every log tab's row 0 a stretch
+weight; `QueuePanel.mount` now zeroes rows 0–1 so only the row list absorbs a
+height squeeze — the 🎵 Playlist bar had become invisible in the docked layout).
+No Learner360 work has been run on the laptop yet.
 
 Goal: keep Data > Throughput's contacts line current automatically by pulling
 each learner's FULL note history from Learner360
@@ -148,8 +157,20 @@ switched out of auto mode to allow the PIDM probe. Shape-only discovery
 
 ## Dev setup
 
-- Python **3.14** via the project venv at `.venv/`. Always use
-  `.venv/Scripts/python.exe` (the system Python lacks the deps).
+- Python **3.14** on the desktop, **3.13.7** on the laptop. Always use the
+  machine's own `.venv/Scripts/python.exe` (the system Python lacks the deps).
+- **A `.venv/` is not portable.** Copying the project folder between machines
+  brings a venv pinned to the other machine's interpreter path, which fails with
+  `did not find executable at ...pythoncore-3.14-64\python.exe`. Rebuild it:
+  `python -m venv .venv` → `.venv\Scripts\python -m pip install -r requirements.txt`
+  → `.venv\Scripts\python -m playwright install chromium`. Prefer `git` over
+  folder copies for syncing — a re-copy also silently reverts local fixes.
+- **3.13 vs 3.14 annotations.** 3.14 evaluates annotations lazily (PEP 649), so a
+  name used only in an annotation but never imported is silent there and a hard
+  `NameError` at import time on 3.13. Three such latent bugs were caught on the
+  laptop (missing `QueueItem` / `Callable` / `Optional` imports in
+  `src/queue_panel.py`, `src/rich_text.py`, `src/dialogs.py`). Keep annotation
+  imports explicit; `py_compile` will NOT catch this class of bug.
 - Deps include: customtkinter, playwright (1.60), pillow, pyinstaller (6.20).
   `pytest` is **not** installed.
 - Platform is Windows 11; shell is PowerShell (a Git Bash tool is also

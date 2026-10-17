@@ -4,7 +4,7 @@ state + execution live on the App (passed in as `app`).
 """
 import customtkinter as ctk
 
-from src.action_queue import QueueStatus
+from src.action_queue import QueueItem, QueueStatus
 from src.ui_common import SECONDARY_BTN_KWARGS, _attach_tooltip
 
 
@@ -51,6 +51,11 @@ class QueuePanel:
         for w in parent.winfo_children():
             w.destroy()
         parent.grid_columnconfigure(0, weight=1)
+        # Only the row list (row 2) may stretch/shrink. The tab container may
+        # arrive with weight on row 0 (the launcher's generic one-widget tab
+        # setup) — clear it, or a height squeeze collapses the playlist bar.
+        parent.grid_rowconfigure(0, weight=0)
+        parent.grid_rowconfigure(1, weight=0)
         parent.grid_rowconfigure(2, weight=1)
 
         # Playlist bar: pick a saved playlist and load its actions into the
