@@ -11846,6 +11846,12 @@ class App:
                 self._append_log(
                     "🔌 Demo: Learner360 capture isn't available offline.")
             return False
+        if getattr(self, "_l360_mbg", None):
+            if not auto:
+                self._append_log("Learner360 MOMI: the weekly refresh is already "
+                                 "running in the background — it'll log when "
+                                 "done.")
+            return False
         if getattr(self, "_is_busy", False):
             if not auto:
                 self._append_log("Busy — wait for the current task to finish.")
@@ -12116,8 +12122,9 @@ class App:
         the change watch) when the stored history is older than
         settings.l360_auto_momi_days (default 7; 0 = off). First check ~3 min
         after startup, then RE-ARMS every 6 h so a long-running session keeps
-        it current too (a one-shot startup check would go stale). Busy/not
-        ready → retry in 5 min. Never raises."""
+        it current too (a one-shot startup check would go stale). Runs as
+        small background batches (_l360_mbg_step) that yield to the user.
+        Never raises."""
         retry_ms, rearm_ms = 5 * 60_000, 6 * 3600_000
         try:
             if getattr(self, "_offline", False):
@@ -12130,7 +12137,7 @@ class App:
             if not l3.momi_capture_due(last, days):
                 self.root.after(rearm_ms, self._maybe_auto_l360_momi)
                 return
-            started = self._l360_momi_capture(auto=True)
+            started = self._start_l360_momi_bg()
             self.root.after(rearm_ms if started else retry_ms,
                             self._maybe_auto_l360_momi)
         except Exception:
@@ -12139,8 +12146,104 @@ class App:
             except Exception:
                 pass
 
-    def _l360_momi_done(self, res, auto: bool = False) -> None:
-        self._set_idle()
+    _L360_MOMI_BATCH = 20      # learners per background MOMI batch
+
+    def _start_l360_momi_bg(self) -> bool:
+        """Start the scheduled MOMI refresh as small worker steps: the caseload
+        list, then MOMI for _L360_MOMI_BATCH learners at a time, each step
+        waiting while the user's own task runs. Results are kept in memory and
+        saved once at the end (_l360_momi_done), so an interrupted run isn't
+        mistaken for a finished one. True if started."""
+        from collections import Counter
+        if getattr(self, "_offline", False) or getattr(self, "_l360_mbg", None):
+            return False
+        if not self.worker.ready_event.is_set():
+            return False
+        self._l360_mbg = {"rows": None, "i": 0, "students": [],
+                          "statuses": Counter(), "keys": {}, "drift": [],
+                          "watch": None, "t0": time.time()}
+        self._append_log(
+            "Learner360: weekly MOMI history is due — refreshing in the "
+            f"background, {self._L360_MOMI_BATCH} learners at a time (anything "
+            "you do goes first).")
+        self._l360_mbg_step()
+        return True
+
+    def _l360_mbg_step(self) -> None:
+        st = getattr(self, "_l360_mbg", None)
+        if not st:
+            return
+        if (getattr(self, "_is_busy", False)
+                or not self.worker.ready_event.is_set()):
+            self.root.after(30_000, self._l360_mbg_step)
+            return
+        if st["rows"] is not None and st["i"] >= len(st["rows"]):
+            self._l360_mbg_finish()
+            return
+        if st["rows"] is None:
+            step, arg, n = "caseload", None, 0
+        else:
+            arg = st["rows"][st["i"]:st["i"] + self._L360_MOMI_BATCH]
+            step, n = "batch", len(arg)
+
+        def on_done(res):
+            try:
+                self.root.after(0, lambda: self._l360_mbg_got(step, n, res))
+            except Exception:
+                pass
+
+        self.worker.submit_l360_momi_step(step, arg, on_done)
+
+    def _l360_mbg_got(self, step: str, n: int, res) -> None:
+        st = getattr(self, "_l360_mbg", None)
+        if not st:
+            return
+        res = res or {}
+        if res.get("error"):
+            self._l360_mbg = None
+            # Hand the failure to the normal handler (change watch + message),
+            # without touching the busy state the user may be in.
+            self._l360_momi_done(dict(res, watch=res.get("watch") or st["watch"],
+                                      drift=st["drift"] + (res.get("drift") or [])),
+                                 auto=True, idle=False)
+            return
+        if step == "caseload":
+            st["rows"], st["watch"] = res.get("rows") or [], res.get("watch")
+            st["drift"] += res.get("drift") or []
+        else:
+            st["students"] += res.get("students") or []
+            st["statuses"].update(res.get("statuses") or {})
+            st["drift"] += [d for d in (res.get("drift") or [])
+                            if d not in st["drift"]]
+            if not st["keys"]:
+                st["keys"] = res.get("keys") or {}
+            st["i"] += n
+        self.root.after(1500, self._l360_mbg_step)
+
+    def _l360_mbg_finish(self) -> None:
+        st, self._l360_mbg = self._l360_mbg, None
+        rows, students = st["rows"] or [], st["students"]
+        watch = st["watch"] or {"bundles": [], "flags": {}, "keys": {}}
+        watch.setdefault("keys", {}).update(st["keys"])
+        statuses = dict(st["statuses"])
+        if rows and not students:
+            res = {"error": f"every MOMI request failed ({statuses})",
+                   "drift": st["drift"] + ["momentum-indicator returned "
+                                           f"{statuses} for every learner"],
+                   "watch": watch}
+        else:
+            res = {"ok": True, "students": students,
+                   "caseload_count": len(rows),
+                   "momi_failed": len(rows) - len(students),
+                   "fail_statuses": {k: v for k, v in statuses.items()
+                                     if k != "200"},
+                   "watch": watch, "drift": st["drift"]}
+        self._l360_momi_done(res, auto=True, idle=False)
+
+    def _l360_momi_done(self, res, auto: bool = False, idle: bool = True) -> None:
+        # ``idle`` False = from the background batches, which never set busy.
+        if idle:
+            self._set_idle()
         res = res or {}
         if auto and res.get("not_logged_in"):
             self._append_log(

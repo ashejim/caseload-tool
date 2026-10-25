@@ -110,9 +110,14 @@ startup, re-arms 6 h; batches of 10 via `_l360_bg_step` that yield while
 the end via `mark_l360_notes_imported`; worker reuses the Learner360 session
 <10 min). Setting: Settings > Caseload & Data > "Learner360 notes import".
 DB connect timeout raised to 30 s. Test: tests/test_l360_notes_bg.py.
-Remaining: the weekly MOMI auto-capture still uses `_set_busy` (~5 min now
-that the server is slower) — consider batching it the same way. Then merge
-`wip/l360-notes` → main + release.
+**Weekly MOMI refresh now batched too** (2026-10-25): worker split into
+`_l360_momi_caseload` + `_l360_momi_fetch` (cmd `L360_MOMI_STEP`); launcher
+`_start_l360_momi_bg` → `_l360_mbg_step` (caseload, then 20 learners/step,
+yields while `_is_busy`) → `_l360_mbg_finish` saves ONCE at the end via
+`_l360_momi_done(idle=False)` (so an interrupted run stays "due"). Manual
+`l360momi:` unchanged. Test: tests/test_l360_notes_bg.py (2 tests).
+NEXT: live-verify both background jobs (MOMI due ~Nov 1, notes ~Nov 1), then
+merge `wip/l360-notes` → main + release.
 
 **Next steps (historical):**
 1. Run the app → type `l360notes: dry` in the caseload search box. On a fresh

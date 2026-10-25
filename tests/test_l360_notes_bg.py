@@ -79,7 +79,7 @@ def _app(db):
     a.root, a.worker = FakeRoot(), FakeWorker()
     a.settings = types.SimpleNamespace(l360_auto_notes_days=7)
     a._offline, a._is_busy, a.logs = False, False, []
-    a._append_log = lambda msg, error=None: a.logs.append(msg)
+    a._append_log = lambda msg, error=None, **kw: a.logs.append(msg)
     return a
 
 
@@ -127,6 +127,60 @@ def test_background_import_batches_and_stamps_once():
         (history.persist_l360_notes, history.mark_l360_notes_imported,
          history.l360_notes_last_import, history.l360_note_targets) = real
         os.remove(db)
+
+
+class FakeMomiWorker(FakeWorker):
+    def __init__(self, n):
+        super().__init__()
+        self.n, self.steps = n, []
+
+    def submit_l360_momi_step(self, step, arg, on_done):
+        if step == "caseload":
+            self.steps.append("caseload")
+            rows = [{"student_id": f"S{i}", "wgu_id": f"w{i}"}
+                    for i in range(self.n)]
+            on_done({"ok": True, "rows": rows, "drift": [],
+                     "watch": {"bundles": ["m.js"], "flags": {}, "keys": {}}})
+        else:
+            self.steps.append(len(arg))
+            on_done({"ok": True, "students": [dict(r, momi={}) for r in arg],
+                     "statuses": {"200": len(arg)}, "keys": {"mi": ["x"]},
+                     "drift": []})
+
+
+def test_background_momi_refresh_batches_then_saves_once():
+    real = (history.persist_momi, history.momi_capture_status)
+    saved = []
+    try:
+        history.persist_momi = lambda students, **kw: (
+            saved.append(len(students)) or {"students": len(students),
+                                              "weeks_new": 0, "weeks_updated": 0,
+                                              "factor_rows": 0})
+        history.momi_capture_status = lambda **kw: {"last_captured": None}
+        a = types.SimpleNamespace()
+        for name in ("_maybe_auto_l360_momi", "_start_l360_momi_bg",
+                     "_l360_mbg_step", "_l360_mbg_got", "_l360_mbg_finish",
+                     "_l360_momi_done"):
+            setattr(a, name, getattr(App, name).__get__(a))
+        a._L360_MOMI_BATCH = App._L360_MOMI_BATCH
+        a.root, a.worker = FakeRoot(), FakeMomiWorker(45)
+        a.settings = types.SimpleNamespace(l360_auto_momi_days=7)
+        a._offline, a._is_busy, a.logs, a.watch = False, True, [], []
+        a._append_log = lambda msg, error=None, **kw: a.logs.append(msg)
+        a._l360_watch_update = lambda w, d: a.watch.append(w)
+        a._set_idle = lambda: (_ for _ in ()).throw(
+            AssertionError("background run must not touch busy state"))
+        a._maybe_auto_l360_momi()
+        a.root.pump(limit=3)
+        assert a.worker.steps == [], a.worker.steps   # waits while busy
+        a._is_busy = False
+        a.root.pump()
+        assert a.worker.steps == ["caseload", 20, 20, 5], a.worker.steps
+        assert saved == [45]                           # one save at the end
+        assert a.watch and a.watch[0]["keys"] == {"mi": ["x"]}
+        assert a._l360_mbg is None
+    finally:
+        history.persist_momi, history.momi_capture_status = real
 
 
 def main():

@@ -424,6 +424,13 @@ class BrowserWorker:
         on the worker thread."""
         self.q.put(("L360_MOMI", on_done, surface))
 
+    def submit_l360_momi_step(self, step: str, arg, on_done: Callable[[dict], None]
+                              ) -> None:
+        """One small step of the scheduled MOMI refresh (never surfaces the
+        browser): step 'caseload' (arg unused) or 'batch' (arg = caseload rows).
+        See _l360_momi_caseload / _l360_momi_fetch."""
+        self.q.put(("L360_MOMI_STEP", step, arg, on_done))
+
     def submit_l360_notes_fetch(self, targets: list,
                                 on_done: Callable[[dict], None],
                                 surface: bool = True,
@@ -1017,6 +1024,19 @@ class BrowserWorker:
                 res = self._l360_momi_capture(ctx, surface=surface)
             except Exception as e:
                 res = {"error": f"Learner360 capture crashed: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "L360_MOMI_STEP":
+            _, step, arg, on_done = cmd
+            res = {}
+            try:
+                if step == "caseload":
+                    res = self._l360_momi_caseload(ctx, surface=False, reuse=True)
+                else:
+                    res = self._l360_momi_fetch(ctx, arg, surface=False,
+                                                background=True)
+            except Exception as e:
+                res = {"error": f"Learner360 MOMI step crashed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "L360_NOTES":
@@ -2890,19 +2910,14 @@ class BrowserWorker:
                 "shape": l3.notes_shape(raws), "fetched": len(by_student),
                 "failed": sum(fails.values()), "fail_statuses": dict(fails)}
 
-    def _l360_momi_capture(self, ctx, surface: bool = True) -> dict:
-        """READ-ONLY: pull weekly MOMI history + factor breakdowns for the whole
-        Learner360 caseload. Opens (or reloads) Learner360 so the app fires fresh
-        authenticated calls, harvests its gateway auth, pages caseloads/search,
-        then GETs momentum-indicator per learner (5 concurrent, in-page). Also
-        gathers the change-watch snapshot (release fingerprint, feature flags,
-        response field sets) + contract-check drift. Persisting is the caller's
-        job. Returns {ok, students, caseload_count, momi_failed, fail_statuses,
-        watch, drift} or {error[, not_logged_in]}."""
-        import json as _json
-        from collections import Counter
+    def _l360_momi_caseload(self, ctx, surface: bool = True,
+                            reuse: bool = False) -> dict:
+        """READ-ONLY step 1 of a MOMI capture: harvest the session and page
+        caseloads/search for every learner. Returns {ok, rows, server_total,
+        pages, no_id, watch, drift} (watch = release fingerprint + flags +
+        caseload field set) or {error[, not_logged_in, drift]}."""
         from src import learner360 as l3
-        sess = self._l360_session(ctx, surface=surface)
+        sess = self._l360_session(ctx, surface=surface, reuse=reuse)
         if isinstance(sess, dict):
             return sess
         page, headers, user, snap = sess
@@ -2938,20 +2953,43 @@ class BrowserWorker:
                 break
             if pg >= total_pages:
                 break
-        rows = list(by_sid.values())
-        self.on_status(
-            f"  [l360] caseload: {len(rows)} learners (Learner360 reports "
-            f"{server_total}; {pages_read} page(s); {no_id} row(s) without a "
-            "Learner360 id) — reading MOMI…")
-        # Chunked so the log shows progress (one batch for the whole caseload ran
-        # several silent minutes) and a slow/stalled tail is visible, not a hang.
+        return {"ok": True, "rows": list(by_sid.values()),
+                "server_total": server_total, "pages": pages_read,
+                "no_id": no_id, "drift": drift,
+                "watch": {"bundles": snap.get("bundles") or [],
+                          "flags": snap.get("flags") or {}, "keys": keys}}
+
+    def _l360_momi_fetch(self, ctx, rows: list, surface: bool = True,
+                         background: bool = False) -> dict:
+        """READ-ONLY step 2: GET momentum-indicator for ``rows`` (caseload
+        rows from step 1). ``background`` = one small batch of the scheduled
+        refresh: reuse a recent session, no progress lines. A 401 (token
+        expired) refreshes the session and retries those learners. Returns
+        {ok, students, statuses, keys, drift} or {error[, not_logged_in]}."""
+        import json as _json
+        from collections import Counter
+        from src import learner360 as l3
+        sess = self._l360_session(ctx, surface=surface, reuse=background)
+        if isinstance(sess, dict):
+            return sess
+        page, headers, _user, _snap = sess
         ids = [x["wgu_id"] for x in rows]
         res, t0, chunk = {}, time.time(), 40
         for i in range(0, len(ids), chunk):
-            res.update(l3.fetch_momi_batch(page, headers, ids[i:i + chunk]))
-            self.on_status(f"  [l360] MOMI {min(i + chunk, len(ids))}/{len(ids)} "
-                           f"({time.time() - t0:.0f}s)")
-        students, statuses, checked = [], Counter(), False
+            part = ids[i:i + chunk]
+            got = l3.fetch_momi_batch(page, headers, part)
+            expired = [w for w in part if (got.get(w) or {}).get("status") == 401]
+            if expired:
+                sess = self._l360_session(ctx, surface=surface)
+                if isinstance(sess, dict):
+                    return sess
+                page, headers, _user, _snap = sess
+                got.update(l3.fetch_momi_batch(page, headers, expired))
+            res.update(got)
+            if not background:
+                self.on_status(f"  [l360] MOMI {min(i + chunk, len(ids))}/"
+                               f"{len(ids)} ({time.time() - t0:.0f}s)")
+        students, statuses, drift, keys = [], Counter(), [], {}
         for row in rows:
             rr = res.get(row["wgu_id"]) or {}
             statuses[str(rr.get("status"))] += 1
@@ -2962,26 +3000,54 @@ class BrowserWorker:
             except ValueError:
                 statuses["bad-json"] += 1
                 continue
-            if not checked:
+            if not keys:
                 drift += l3.check_contract("momentum-indicator", data)
                 keys["momentum-indicator"] = l3.observed_keys(
                     "momentum-indicator", data)
-                checked = True
             students.append(dict(row, momi=l3.parse_momi(data)))
-        failed = len(rows) - len(students)
+        sample = ""
         if rows and not students:
             sample = next((v.get("body") for v in res.values()
                            if v.get("status") != 200), "") or ""
+        return {"ok": True, "students": students, "statuses": dict(statuses),
+                "keys": keys, "drift": drift, "fail_sample": sample[:160]}
+
+    def _l360_momi_capture(self, ctx, surface: bool = True) -> dict:
+        """READ-ONLY: pull weekly MOMI history + factor breakdowns for the whole
+        Learner360 caseload in one go (the `l360momi:` keyword; the scheduled
+        refresh runs the same two steps in small batches instead). Opens (or
+        reloads) Learner360, harvests its gateway auth, pages caseloads/search,
+        then GETs momentum-indicator per learner. Also gathers the change-watch
+        snapshot (release fingerprint, feature flags, response field sets) +
+        contract-check drift. Persisting is the caller's job. Returns {ok,
+        students, caseload_count, momi_failed, fail_statuses, watch, drift} or
+        {error[, not_logged_in]}."""
+        cl = self._l360_momi_caseload(ctx, surface=surface)
+        if not cl.get("ok"):
+            return cl
+        rows = cl["rows"]
+        self.on_status(
+            f"  [l360] caseload: {len(rows)} learners (Learner360 reports "
+            f"{cl['server_total']}; {cl['pages']} page(s); {cl['no_id']} row(s) "
+            "without a Learner360 id) — reading MOMI…")
+        mf = self._l360_momi_fetch(ctx, rows, surface=surface)
+        if not mf.get("ok"):
+            return mf
+        drift = cl["drift"] + mf["drift"]
+        watch = cl["watch"]
+        watch["keys"].update(mf["keys"])
+        students, statuses = mf["students"], mf["statuses"]
+        if rows and not students:
             return {"error": "every MOMI request failed "
-                    f"({dict(statuses)}): {sample[:160]}",
+                    f"({statuses}): {mf['fail_sample']}",
                     "drift": drift + ["momentum-indicator returned "
-                                      f"{dict(statuses)} for every learner"]}
+                                      f"{statuses} for every learner"],
+                    "watch": watch}
         return {"ok": True, "students": students, "caseload_count": len(rows),
-                "momi_failed": failed,
-                "fail_statuses": {k: v for k, v in statuses.items() if k != "200"},
-                "watch": {"bundles": snap.get("bundles") or [],
-                          "flags": snap.get("flags") or {}, "keys": keys},
-                "drift": drift}
+                "momi_failed": len(rows) - len(students),
+                "fail_statuses": {k: v for k, v in statuses.items()
+                                  if k != "200"},
+                "watch": watch, "drift": drift}
 
     def _ensure_mongoose_token(self, page, timeout_ms: int = 6000) -> bool:
         """Make sure a Mongoose API Bearer token has been harvested so the API
