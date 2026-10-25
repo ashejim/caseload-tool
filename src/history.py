@@ -1062,8 +1062,10 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
     cids = contact_ids or {}
     st = Counter()
     offsets, new_months = Counter(), Counter()
+    my_names = Counter()       # 360 author of events whose SF copy is MINE
     conn = _connect(db_path)
     try:
+        sf15 = _my_sf_user_id15(conn)
         with conn:
             for sid, notes in (by_student or {}).items():
                 st["students"] += 1
@@ -1104,6 +1106,11 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                     if same:
                         claimed.add(same)
                         match[nid] = (same, "exact")
+                        if sf15 and n.get("author"):
+                            a = conn.execute("SELECT author FROM notes WHERE "
+                                             "note_id = ?", (same,)).fetchone()
+                            if a and (a["author"] or "").lstrip("/")[:15] == sf15:
+                                my_names[n["author"]] += 1
                 for kind in ("fuzzy", "type"):     # passes 2-3: nearest +/-36 h
                     for nid, n in todo:
                         if nid in match:
@@ -1146,6 +1153,13 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
             if not dry:
                 conn.execute("INSERT OR REPLACE INTO meta(key, value) "
                              "VALUES ('l360_notes_last_import', ?)", (now_iso,))
+                # Learn the instructor's Learner360 author name (for the
+                # "only my contacts" filter) from a clear majority of pairs.
+                if my_names:
+                    name, c = my_names.most_common(1)[0]
+                    if c >= 5 and c >= 0.6 * sum(my_names.values()):
+                        conn.execute("INSERT OR REPLACE INTO meta(key, value) "
+                                     "VALUES ('my_l360_author', ?)", (name,))
     finally:
         conn.close()
     out = {k: st.get(k, 0) for k in ("students", "notes", "already", "exact",
@@ -2913,8 +2927,80 @@ def _month_label(mk: str) -> str:
         return mk
 
 
+def _my_sf_user_id15(conn) -> str:
+    """The logged-in instructor's Salesforce User id (first 15 chars), from the
+    newest snapshot's LoggedInUserId; '' if unknown. SF-scraped notes record
+    their author as that id ('/005…'), not a name."""
+    for (ej,) in conn.execute("SELECT extra_json FROM snapshots ORDER BY "
+                              "collected_date DESC LIMIT 50"):
+        try:
+            v = (json.loads(ej or "{}").get("LoggedInUserId") or "").strip()
+        except Exception:
+            v = ""
+        if v:
+            return v[:15]
+    return ""
+
+
+def _learn_my_l360_name(conn) -> str:
+    """Learn the instructor's Learner360 author NAME by pairing their own SF
+    notes (author = their user id) with the same events in the last
+    Learner360 pull (l360_notes_staging, same student + same second). Needs a
+    clear majority (≥5 pairs, ≥60%) so a shared mass email can't mislabel it.
+    Cached in meta 'my_l360_author'. '' if it can't be learned yet."""
+    v = _meta_get(conn, "my_l360_author")
+    if v:
+        return v
+    sf15 = _my_sf_user_id15(conn)
+    if not sf15:
+        return ""
+    try:
+        rows = conn.execute(
+            "SELECT s.author a, COUNT(*) c FROM notes n JOIN l360_notes_staging s "
+            "ON s.student_id = n.student_id AND substr(s.created_at, 1, 19) = "
+            "substr(n.created_at, 1, 19) WHERE n.note_id NOT LIKE 'l360:%' AND "
+            "substr(ltrim(n.author, '/'), 1, 15) = ? AND COALESCE(s.author,'') "
+            "!= '' GROUP BY s.author ORDER BY c DESC", (sf15,)).fetchall()
+    except sqlite3.OperationalError:
+        return ""
+    total = sum(r["c"] for r in rows)
+    if not rows or rows[0]["c"] < 5 or rows[0]["c"] < 0.6 * total:
+        return ""
+    name = rows[0]["a"]
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
+                         "('my_l360_author', ?)", (name,))
+    except sqlite3.Error:
+        pass
+    return name
+
+
+def my_note_author_keys(*, db_path=HISTORY_DB) -> dict:
+    """{sf_id15, l360_name} identifying notes the instructor wrote — SF-scraped
+    notes carry the SF User id, Learner360-imported ones the author name."""
+    conn = _connect(db_path)
+    try:
+        return {"sf_id15": _my_sf_user_id15(conn),
+                "l360_name": _learn_my_l360_name(conn)}
+    finally:
+        conn.close()
+
+
+def _is_my_note(author: str, keys: dict) -> bool:
+    a = (author or "").strip()
+    if not a:
+        return False
+    sf15 = keys.get("sf_id15") or ""
+    if sf15 and a.lstrip("/")[:15] == sf15:
+        return True
+    name = (keys.get("l360_name") or "").strip().lower()
+    return bool(name) and a.lower() == name
+
+
 def monthly_throughput(*, db_path=HISTORY_DB, courses=None, contacts="sent",
                        date_from=None, date_to=None, include_last30=True,
+                       mine: bool = False,
                        now: Optional[datetime] = None) -> dict:
     """Caseload THROUGHPUT by month: how many DISTINCT students were assigned to
     the caseload each month (from the daily snapshots), stacked by course, with a
@@ -2940,6 +3026,12 @@ def monthly_throughput(*, db_path=HISTORY_DB, courses=None, contacts="sent",
     subset is given, contacts are filtered by the note's (best-effort)
     ``course_code`` and course-less notes are excluded; with None, every note
     counts. ``date_from``/``date_to`` bound the calendar months shown.
+
+    ``mine`` keeps only notes the instructor wrote (SF notes by their SF User
+    id; Learner360-imported notes by their learned Learner360 name — see
+    my_note_author_keys); program mentors', other instructors' and other
+    staff's notes are excluded. ``mine_keys`` in the result says which of the
+    two identities were known.
 
     ``include_last30`` appends a synthetic trailing bucket (``month='last30'``)
     for the rolling last 30 days, so recent volume shows even mid-month; it is NOT
@@ -2981,11 +3073,15 @@ def monthly_throughput(*, db_path=HISTORY_DB, courses=None, contacts="sent",
             if include_last30 and d30 <= d <= today:
                 last30_cs[cc].add(r["student_id"])
 
+        keys = ({"sf_id15": _my_sf_user_id15(conn),
+                 "l360_name": _learn_my_l360_name(conn)} if mine else {})
         for r in conn.execute(
-                "SELECT created_at, student_id, course_code, channel, direction "
-                "FROM notes"):
+                "SELECT created_at, student_id, course_code, channel, direction, "
+                "author FROM notes"):
             cc = r["course_code"] or ""
             if sel is not None and (not cc or cc not in sel):
+                continue
+            if mine and not _is_my_note(r["author"], keys):
                 continue
             is_outreach = (r["direction"] == "outbound"
                            and r["channel"] in ("text", "email", "call"))
@@ -3027,7 +3123,10 @@ def monthly_throughput(*, db_path=HISTORY_DB, courses=None, contacts="sent",
                        "by_course": by_course,
                        "total": sum(by_course.values()), "contacts": con})
     return {"months": months, "courses": present_courses,
-            "avg_load": avg, "months_count": months_count}
+            "avg_load": avg, "months_count": months_count,
+            "mine_keys": ({"sf": bool(keys.get("sf_id15")),
+                           "l360": bool(keys.get("l360_name"))}
+                          if mine else None)}
 
 
 def momentum_drift(*, db_path=HISTORY_DB, course_load="all",

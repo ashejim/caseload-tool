@@ -100,6 +100,43 @@ def test_contacts_metric_sent():
         os.unlink(p)
 
 
+def test_contacts_mine_only():
+    p = _seed(_SNAPS, [])
+    try:
+        conn = history._connect(p)
+        conn.execute("UPDATE snapshots SET extra_json = ?",
+                     ('{"LoggedInUserId": "005ME0000000001AAA"}',))
+        rows = [  # (id, created, author)
+            ("s1", "2026-06-05T10:00:00.000Z", "/005ME0000000001AAA"),  # me (SF)
+            ("s2", "2026-06-06T10:00:00.000Z", "/005PM0000000009AAA"),  # PM (SF)
+            ("l360:a", "2026-06-07T10:00:00.000Z", "Jim Ashe"),        # me (360)
+            ("l360:b", "2026-06-08T10:00:00.000Z", "Pat Mentor"),      # PM (360)
+        ]
+        for nid, ca, au in rows:
+            conn.execute("INSERT INTO notes (note_id, student_id, course_code, "
+                         "channel, direction, created_at, author) VALUES "
+                         "(?,?,?,?,?,?,?)", (nid, "s1", "C1", "email",
+                                            "outbound", ca, au))
+        # Staged Learner360 copies of MY SF notes teach the name (≥5 pairs).
+        for i in range(5):
+            ca = f"2026-05-0{i + 1}T09:00:00.000Z"
+            conn.execute("INSERT INTO notes (note_id, student_id, created_at, "
+                         "author) VALUES (?,?,?,?)",
+                         (f"old{i}", "s1", ca, "/005ME0000000001AAA"))
+            conn.execute("INSERT INTO l360_notes_staging (student_id, created_at, "
+                         "author) VALUES (?,?,?)", ("s1", ca, "Jim Ashe"))
+        conn.commit()
+        conn.close()
+        allm = _months(history.monthly_throughput(db_path=p, now=_NOW))
+        assert allm["2026-06"]["contacts"] == 4
+        d = history.monthly_throughput(db_path=p, mine=True, now=_NOW)
+        assert _months(d)["2026-06"]["contacts"] == 2, _months(d)["2026-06"]
+        assert d["mine_keys"] == {"sf": True, "l360": True}
+        assert history.my_note_author_keys(db_path=p)["l360_name"] == "Jim Ashe"
+    finally:
+        os.unlink(p)
+
+
 def test_contacts_metric_unique_and_all():
     p = _seed(_SNAPS, _NOTES)
     try:

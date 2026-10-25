@@ -78,6 +78,8 @@ class DataPanel:
         self._compl = None          # completion-by-month cache
         self._thru = None           # monthly-throughput cache
         self.contacts_metric = "sent"   # throughput contacts-line metric
+        # Throughput: count only notes I wrote (excl. PMs / other staff).
+        self.contacts_mine = True
         self.compl_by = "start"     # completion month axis
         self.compl_basis = "entry"  # Momentum reading for the predicted line
         self._ar_show_dismissed = False   # risk list: reveal dismissed rows
@@ -856,6 +858,12 @@ class DataPanel:
         cm.set(next((k for k, v in self._CONTACTS_METRICS.items()
                      if v == self.contacts_metric), "Outreach sent"))
         cm.pack(side="left")
+        mine_var = ctk.BooleanVar(value=self.contacts_mine)
+        ctk.CTkCheckBox(
+            opts, text="Only mine", variable=mine_var, width=20,
+            checkbox_width=15, checkbox_height=15, font=ctk.CTkFont(size=11),
+            command=lambda: self._set_contacts_mine(mine_var.get()),
+        ).pack(side="left", padx=(6, 0))
         ctk.CTkLabel(opts, text="Courses:").pack(side="left", padx=(10, 4))
         codes = history.course_codes()
         if self.courses is None:
@@ -870,6 +878,11 @@ class DataPanel:
                 command=lambda c=code, vv=var: self._toggle_course(c, vv),
             ).pack(side="left", padx=(0, 6))
         self._build_date_control(opts)
+
+    def _set_contacts_mine(self, on: bool) -> None:
+        self.contacts_mine = bool(on)
+        self._thru = None
+        self._render_throughput()
 
     def _set_contacts_metric(self, metric) -> None:
         self.contacts_metric = metric
@@ -900,13 +913,23 @@ class DataPanel:
                else self.courses)
         self._thru = history.monthly_throughput(
             courses=sel, contacts=self.contacts_metric,
-            date_from=df, date_to=dt_)
+            mine=self.contacts_mine, date_from=df, date_to=dt_)
         months = self._thru["months"]
         cal = [m for m in months if m["month"] != "last30"]
         avg = self._thru.get("avg_load")
         metric_lbl = {"sent": "outreach events sent",
                       "unique": "unique students contacted",
                       "all": "all logged notes"}.get(self.contacts_metric, "")
+        mk = self._thru.get("mine_keys")
+        if mk is not None:
+            metric_lbl += " that YOU wrote"
+            if not mk.get("sf"):
+                metric_lbl += (" (⚠ your Salesforce id isn't known yet — reload "
+                               "the caseload)")
+            elif not mk.get("l360"):
+                metric_lbl += (" (Learner360-imported notes not counted until "
+                               "your Learner360 name is learned — run "
+                               "l360notes:)")
         span = (f"{cal[0]['month']} – {cal[-1]['month']}" if cal
                 else "no snapshot history yet")
         avg_txt = f"{avg:.0f}" if avg is not None else "—"
