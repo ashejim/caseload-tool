@@ -223,6 +223,32 @@ def test_l360_matching_is_one_to_one():
         os.remove(path)
 
 
+def test_l360_type_pass_and_reverse_near_match():
+    path = _tmpdb()
+    try:
+        # SF has a mass email rendered differently, 9 h off → 'type' match.
+        history.persist_notes([{"type": "Mass Email", "text": "Subject line only",
+                                "date": "2026-10-01T21:00:00.000Z"}],
+                              student_id="S1", db_path=path)
+        notes = l3.parse_notes([
+            {"compositeKey": "m1", "createdDate": "2026-10-01T12:00:00Z",
+             "type": "mass_email", "text": "<p>Dear student, full body…</p>"},
+            {"compositeKey": "t1", "createdDate": "2026-10-03T15:00:00Z",
+             "type": "instant_message_text", "text": "Outgoing: new one"}])
+        r = history.persist_l360_notes({"S1": notes}, db_path=path)
+        assert (r["type"], r["new"]) == (1, 1), r
+        assert history.notes_count(db_path=path) == 2
+        # Later SF sweep scrapes t1 with a 7 h skew + different rendering →
+        # must upsert the l360 row, not add a third.
+        history.persist_notes([{"type": "Instant Message (IM) / Text",
+                                "text": "Outgoing: new one (SF export)",
+                                "date": "2026-10-03T22:00:00.000Z"}],
+                              student_id="S1", db_path=path)
+        assert history.notes_count(db_path=path) == 2
+    finally:
+        os.remove(path)
+
+
 def _tmpdb():
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)

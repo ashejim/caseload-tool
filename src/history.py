@@ -760,6 +760,7 @@ def persist_notes(notes, *, student_id: str = "", contact_id: str = "",
     try:
         now_iso = (now or datetime.now()).isoformat(timespec="seconds")
         ins = upd = skip = 0
+        l360_claimed: set = set()   # 1:1 when matching Learner360 rows
         conn = _connect(db_path)
         try:
             with conn:
@@ -794,8 +795,23 @@ def persist_notes(notes, *, student_id: str = "", contact_id: str = "",
                         same = _find_same_note(
                             conn, vals["student_id"], vals["contact_id"],
                             vals["created_at"], ntype, body)
+                        if not same and vals["student_id"]:
+                            # Learner360 copy with a skewed timestamp / other
+                            # rendering (body first, then same type +/-36 h).
+                            same, _ = _near_note(conn, vals["student_id"],
+                                                 vals["created_at"], body=body,
+                                                 exclude=l360_claimed,
+                                                 l360_rows=True)
+                            if not same:
+                                same, _ = _near_note(
+                                    conn, vals["student_id"],
+                                    vals["created_at"], ntype=ntype,
+                                    exclude=l360_claimed,
+                                    l360_rows=True)
                         if same:
                             nid, exists = same, True
+                            if same.startswith("l360:"):
+                                l360_claimed.add(same)
                     if exists:
                         # Don't blank a known student_id/contact_id if this scrape
                         # didn't carry one (COALESCE(NULLIF(...))).
@@ -974,45 +990,90 @@ def notes_freshness(*, db_path=HISTORY_DB) -> dict:
         conn.close()
 
 
+_NEAR_HOURS = 36
+
+
+def _near_note(conn, student_id: str, created_at: str, *, exclude=(),
+               body: str = "", ntype: str = "", l360_rows: bool = False,
+               hours: int = _NEAR_HOURS):
+    """Nearest stored note for this student within +/-``hours`` that matches
+    on BODY prefix (if ``body``) or else on TYPE (if ``ntype``), skipping
+    ``exclude``. ``l360_rows`` picks which side to search: Learner360-imported
+    rows (True) or SF-scraped rows (False). Returns (note_id, offset_hours) or
+    (None, None). Covers the two sources' timestamp skew (seen live: mostly
+    0 h, but a spread of +6..+17 h / -6..-7 h) and their different renderings
+    of the same mass email / text, which defeat an exact-second match."""
+    from datetime import timedelta
+    try:
+        c0 = datetime.fromisoformat((created_at or "")[:19])
+    except ValueError:
+        return None, None
+    nb = _norm_body(body) if body else ""
+    if not (nb or ntype) or not student_id:
+        return None, None
+    lo = (c0 - timedelta(hours=hours)).isoformat()
+    hi = (c0 + timedelta(hours=hours)).isoformat()
+    best, best_d = None, None
+    for r in conn.execute(
+            "SELECT note_id, created_at, type, body FROM notes WHERE "
+            "student_id = ? AND created_at BETWEEN ? AND ? AND note_id "
+            + ("LIKE" if l360_rows else "NOT LIKE") + " 'l360:%'",
+            (student_id, lo, hi)):
+        if r["note_id"] in exclude:
+            continue
+        ok = (_norm_body(r["body"]) == nb) if nb else (r["type"] == ntype)
+        if not ok:
+            continue
+        try:
+            d = (datetime.fromisoformat(r["created_at"][:19]) - c0
+                 ).total_seconds() / 3600
+        except ValueError:
+            continue
+        if best_d is None or abs(d) < abs(best_d):
+            best, best_d = r["note_id"], d
+    return best, best_d
+
+
 def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                        dry: bool = False, db_path=HISTORY_DB,
                        now: Optional[datetime] = None) -> dict:
     """Import Learner360 notes (learner360.parse_notes output) into ``notes``,
     de-duplicated against what the SF scrape already stored.
 
-    ``by_student`` = {student_id: [note, …]}. Per note, in order:
-      already  — this Learner360 note was imported before (id 'l360:<id>');
-      exact    — the SF scrape has it (same student + second + type/body);
-      fuzzy    — same student, same body prefix, within ±36 h (a timestamp
-                 skew between sources; the offsets are reported so a dry run
-                 shows whether the clocks differ systematically);
-      new      — inserted as 'l360:<id>' (channel/direction from the same
-                 classifiers as SF notes).
+    ``by_student`` = {student_id: [note, ...]}. Each learner's notes are matched
+    1:1 against that learner's SF-scraped rows in three passes (a looser pass
+    can't steal a row a stricter one needed):
+      exact    -- same second + same type or body prefix;
+      fuzzy    -- same body prefix within +/-36 h (nearest);
+      type     -- same note type within +/-36 h (nearest): the same event
+                  rendered differently by the two systems (mass emails, texts);
+    and otherwise:
+      already    -- imported before (id 'l360:<compositeKey>');
+      dup_in_360 -- Learner360 listed the same note/event twice;
+      new        -- inserted as 'l360:<id>' (channel/direction from the same
+                    classifiers as SF notes).
     Matched rows only gain a missing course code + a fresh last_seen_at; the SF
     copy's text stays. ``dry`` computes the same counts and writes NOTHING.
-    Returns {students, notes, already, exact, fuzzy, new, no_time,
-    fuzzy_offset_hours:{h: n}, new_by_month:{YYYY-MM: n}}."""
+    Returns {students, notes, already, exact, fuzzy, type, new, no_time,
+    dup_in_360, fuzzy_offset_hours:{h: n}, new_by_month:{YYYY-MM: n}}."""
     from collections import Counter
     import hashlib
     now_iso = (now or datetime.now()).isoformat(timespec="seconds")
     cids = contact_ids or {}
     st = Counter()
     offsets, new_months = Counter(), Counter()
-    # Each stored note may be claimed by ONE incoming note (1:1) — otherwise
-    # repeated texts / templated emails all collapse onto the first match.
-    claimed: set = set()
-    seen_ids: set = set()
-    seen_events: set = set()
     conn = _connect(db_path)
     try:
         with conn:
             for sid, notes in (by_student or {}).items():
                 st["students"] += 1
                 cid = cids.get(sid, "") or ""
+                todo = []                         # notes still to place
+                seen_ids, seen_events = set(), set()
                 for n in notes or []:
                     st["notes"] += 1
-                    created, body = n.get("created_at") or "", n.get("body") or ""
-                    ntype = n.get("type") or ""
+                    created = n.get("created_at") or ""
+                    body = n.get("body") or ""
                     if not created:
                         st["no_time"] += 1
                         continue
@@ -1020,15 +1081,12 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                         f"{sid}|{created}|{body[:80]}".encode("utf-8", "ignore")
                     ).hexdigest()[:16]
                     nid = "l360:" + lid
-                    ev = (sid, created[:19], _norm_body(body))
-                    if ev[2] and ev in seen_events:
-                        st["dup_in_360"] += 1       # same event, another key
-                        continue
-                    seen_events.add(ev)
-                    if nid in seen_ids:
-                        st["dup_in_360"] += 1       # same note listed twice
+                    ev = (created[:19], _norm_body(body))
+                    if nid in seen_ids or (ev[1] and ev in seen_events):
+                        st["dup_in_360"] += 1
                         continue
                     seen_ids.add(nid)
+                    seen_events.add(ev)
                     if conn.execute("SELECT 1 FROM notes WHERE note_id = ?",
                                     (nid,)).fetchone():
                         st["already"] += 1
@@ -1036,39 +1094,31 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                             conn.execute("UPDATE notes SET last_seen_at = ? "
                                          "WHERE note_id = ?", (now_iso, nid))
                         continue
-                    same = _find_same_note(conn, sid, cid, created, ntype,
-                                           body, exclude=claimed)
-                    kind = "exact" if same else ""
-                    if not same:
-                        nb = _norm_body(body)
-                        if nb:
-                            try:
-                                c0 = datetime.fromisoformat(created[:19])
-                            except ValueError:
-                                c0 = None
-                            if c0 is not None:
-                                from datetime import timedelta
-                                lo = (c0 - timedelta(hours=36)).isoformat()
-                                hi = (c0 + timedelta(hours=36)).isoformat()
-                                for r in conn.execute(
-                                        "SELECT note_id, created_at, body FROM "
-                                        "notes WHERE student_id = ? AND "
-                                        "created_at BETWEEN ? AND ? AND "
-                                        "note_id NOT LIKE 'l360:%'",
-                                        (sid, lo, hi)):
-                                    if (r["note_id"] not in claimed
-                                            and _norm_body(r["body"]) == nb):
-                                        same, kind = r["note_id"], "fuzzy"
-                                        try:
-                                            d = (datetime.fromisoformat(
-                                                r["created_at"][:19]) - c0)
-                                            offsets[round(d.total_seconds()
-                                                          / 3600)] += 1
-                                        except ValueError:
-                                            pass
-                                        break
+                    todo.append((nid, n))
+                claimed: set = set()              # 1:1 within this learner
+                match = {}                        # nid -> (row id, kind)
+                for nid, n in todo:               # pass 1: exact
+                    same = _find_same_note(conn, sid, cid, n["created_at"],
+                                           n.get("type") or "",
+                                           n.get("body") or "", exclude=claimed)
                     if same:
                         claimed.add(same)
+                        match[nid] = (same, "exact")
+                for kind in ("fuzzy", "type"):     # passes 2-3: nearest +/-36 h
+                    for nid, n in todo:
+                        if nid in match:
+                            continue
+                        same, d = _near_note(
+                            conn, sid, n["created_at"], exclude=claimed,
+                            body=(n.get("body") or "") if kind == "fuzzy" else "",
+                            ntype=(n.get("type") or "") if kind == "type" else "")
+                        if same:
+                            claimed.add(same)
+                            match[nid] = (same, kind)
+                            offsets[round(d)] += 1
+                for nid, n in todo:
+                    if nid in match:
+                        same, kind = match[nid]
                         st[kind] += 1
                         if not dry:
                             conn.execute(
@@ -1079,6 +1129,8 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                                 (n.get("course") or "", now_iso, same))
                         continue
                     st["new"] += 1
+                    created, body = n["created_at"], n.get("body") or ""
+                    ntype = n.get("type") or ""
                     new_months[created[:7]] += 1
                     if not dry:
                         conn.execute(
@@ -1097,7 +1149,8 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
     finally:
         conn.close()
     out = {k: st.get(k, 0) for k in ("students", "notes", "already", "exact",
-                                     "fuzzy", "new", "no_time", "dup_in_360")}
+                                     "fuzzy", "type", "new", "no_time",
+                                     "dup_in_360")}
     out["fuzzy_offset_hours"] = dict(sorted(offsets.items()))
     out["new_by_month"] = dict(sorted(new_months.items()))
     return out

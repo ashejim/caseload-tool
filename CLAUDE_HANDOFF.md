@@ -89,6 +89,17 @@ possibly migration copies dated by migration time. Dry runs now STAGE parsed
 notes into `history.db` table `l360_notes_staging` so the spike / leftover
 mismatches can be analyzed offline (aggregates only) without re-pulling.
 
+**Dry run #3 (2026-10-25):** weekly MOMI auto-refresh fired live on its own
+(234 learners, change-watch logged new flags) ✓. Notes: **245/267 → HTTP 401**
+(token expired mid-run; first chunk took ~4 min) → fetch now re-harvests the
+session on 401 and retries those learners (≤10 refreshes). 22 learners staged
+(9,986 notes): offline analysis showed text-prefix matching missed mass
+emails/texts rendered differently → matcher is now 3-pass per learner, 1:1:
+exact → body ±36 h → same type ±36 h (`_near_note`); SF sweep side uses the same
+near-match against `l360:` rows (also 1:1). Result on staged data: 93% of
+stored SF notes claimed; leftovers are one-sided (SF-only texts/mass emails vs
+360-only emails/calls), not double counts. September spike did not recur.
+
 **Next steps:**
 1. Run the app → type `l360notes: dry` in the caseload search box. On a fresh
    machine first run `l360momi:` (needs Learner360 ids; sign in to Learner360

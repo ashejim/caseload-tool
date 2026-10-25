@@ -11955,7 +11955,7 @@ class App:
             f"{'Learner360 notes DRY RUN' if dry else '✓ Learner360 notes'}: "
             f"{st.get('notes', 0)} notes for {st.get('students', 0)} learners — "
             f"{st.get('exact', 0)} already in SF scrape (exact), "
-            f"{st.get('fuzzy', 0)} matched loosely, "
+            f"{st.get('fuzzy', 0) + st.get('type', 0)} matched loosely, "
             f"{st.get('already', 0)} imported earlier, "
             f"{st.get('new', 0)} {'would be ' if dry else ''}new"
             f"{', ' + str(st['no_time']) + ' without a date' if st.get('no_time') else ''}"

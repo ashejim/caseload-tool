@@ -2828,9 +2828,23 @@ class BrowserWorker:
         ids = list(sid_by)
         by_student, raws, fails = {}, [], Counter()
         t0, chunk = time.time(), 40
+        refreshes = 0
         for i in range(0, len(ids), chunk):
             part = ids[i:i + chunk]
             got = l3.fetch_notes_batch(page, headers, part)
+            # The gateway token expires mid-run on a long pull (seen live:
+            # 245/267 → 401). Reload Learner360 for a fresh token and retry
+            # just the 401s (bounded, so a real sign-out can't loop).
+            expired = [w for w in part if (got.get(w) or {}).get("status") == 401]
+            if expired and refreshes < 10:
+                refreshes += 1
+                self.on_status(f"  [l360] session expired — refreshing sign-in "
+                               f"and retrying {len(expired)} learner(s)…")
+                sess = self._l360_session(ctx, surface=surface)
+                if isinstance(sess, dict):
+                    return sess
+                page, headers, _user, _snap = sess
+                got.update(l3.fetch_notes_batch(page, headers, expired))
             for w in part:
                 r = got.get(w) or {}
                 if r.get("status") != 200:
