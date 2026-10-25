@@ -2827,7 +2827,9 @@ class BrowserWorker:
         sid_by = {w: s for w, s in targets if w and s}
         ids = list(sid_by)
         by_student, raws, fails = {}, [], Counter()
-        t0, chunk = time.time(), 40
+        # Small chunks so progress shows every minute or so (notes payloads are
+        # big and the gateway is slow — 40 per chunk went silent for ~4 min).
+        t0, chunk = time.time(), 10
         refreshes = 0
         for i in range(0, len(ids), chunk):
             part = ids[i:i + chunk]
