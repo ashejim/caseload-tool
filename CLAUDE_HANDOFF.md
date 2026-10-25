@@ -100,7 +100,21 @@ near-match against `l360:` rows (also 1:1). Result on staged data: 93% of
 stored SF notes claimed; leftovers are one-sided (SF-only texts/mass emails vs
 360-only emails/calls), not double counts. September spike did not recur.
 
-**Next steps:**
+**Real import DONE 2026-10-25:** 132,730 notes / 267 learners in 3.5 min →
+119,937 new (`l360:` rows; notes table 74k → 194k), 12,306 matched to SF copies.
+Throughput **"Only mine"** (default ON; SF notes by `LoggedInUserId`, 360 notes
+by learned name, meta `my_l360_author`) — all-author counts were ~10x mine.
+**Weekly background import BUILT** (`_maybe_auto_l360_notes`, +10 min after
+startup, re-arms 6 h; batches of 10 via `_l360_bg_step` that yield while
+`_is_busy`; saves on a helper thread; stamps `l360_notes_last_import` once at
+the end via `mark_l360_notes_imported`; worker reuses the Learner360 session
+<10 min). Setting: Settings > Caseload & Data > "Learner360 notes import".
+DB connect timeout raised to 30 s. Test: tests/test_l360_notes_bg.py.
+Remaining: the weekly MOMI auto-capture still uses `_set_busy` (~5 min now
+that the server is slower) — consider batching it the same way. Then merge
+`wip/l360-notes` → main + release.
+
+**Next steps (historical):**
 1. Run the app → type `l360notes: dry` in the caseload search box. On a fresh
    machine first run `l360momi:` (needs Learner360 ids; sign in to Learner360
    in the app's browser yourself — Claude must not enter credentials).

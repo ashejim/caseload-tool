@@ -144,6 +144,9 @@ class BrowserWorker:
         # to faculty-api-gateway.wgu.edu (see _harvest_l360_auth): {headers:
         # {authorization, x-*}, user: <caller's WGU uuid>, ts}. Read-only replay.
         self._l360_auth: Optional[dict] = None
+        # Last good Learner360 session (page, headers, user, snap, at) so a
+        # background import's small batches don't reload the app each time.
+        self._l360_sess = None
         # `textapi:` capture: a persistent request/response recorder attached to
         # the Mongoose tab (captures BOTH tool-driven and MANUAL compose sends),
         # dumped to text_send_probe.txt for building an API-replay send. `sink`
@@ -423,9 +426,12 @@ class BrowserWorker:
 
     def submit_l360_notes_fetch(self, targets: list,
                                 on_done: Callable[[dict], None],
-                                surface: bool = True) -> None:
-        """READ-ONLY: pull Learner360 note histories (see _l360_notes_fetch)."""
-        self.q.put(("L360_NOTES", targets, on_done, surface))
+                                surface: bool = True,
+                                background: bool = False) -> None:
+        """READ-ONLY: pull Learner360 note histories (see _l360_notes_fetch).
+        ``background`` = one small batch of the scheduled import: no progress
+        lines, and reuse a recent Learner360 session instead of reloading."""
+        self.q.put(("L360_NOTES", targets, on_done, surface, background))
 
     def submit_export_segments(
         self, courses: list, on_done: Callable[[dict], None],
@@ -1014,10 +1020,11 @@ class BrowserWorker:
             finally:
                 on_done(res)
         elif cmd[0] == "L360_NOTES":
-            _, targets, on_done, surface = cmd
+            _, targets, on_done, surface, background = cmd
             res = {}
             try:
-                res = self._l360_notes_fetch(ctx, targets, surface=surface)
+                res = self._l360_notes_fetch(ctx, targets, surface=surface,
+                                             background=background)
             except Exception as e:
                 res = {"error": f"Learner360 notes fetch crashed: {e}"}
             finally:
@@ -2763,11 +2770,20 @@ class BrowserWorker:
                 continue
         return None
 
-    def _l360_session(self, ctx, surface: bool = True):
+    def _l360_session(self, ctx, surface: bool = True, reuse: bool = False):
         """Open (or reload) Learner360 so the app fires fresh authenticated
         calls, and harvest its gateway auth. Returns (page, headers, user, snap)
-        or an {error[, not_logged_in]} dict."""
+        or an {error[, not_logged_in]} dict. ``reuse`` returns the last
+        session if its tab is still open and it is under 10 minutes old (a 401
+        later forces a fresh one)."""
         from src import learner360 as l3
+        cached = self._l360_sess
+        if reuse and cached and time.time() - cached[4] < 600:
+            try:
+                if not cached[0].is_closed():
+                    return cached[:4]
+            except Exception:
+                pass
         page = self._learner360_page(ctx)
         self._l360_auth = None  # require a FRESH harvest from this load
         try:
@@ -2807,10 +2823,12 @@ class BrowserWorker:
         user = auth.get("user") or snap.get("wguId") or ""
         if not user:
             return {"error": "couldn't determine your Learner360 user id."}
+        self._l360_sess = (page, auth["headers"], user, snap, time.time())
         return page, auth["headers"], user, snap
 
     def _l360_notes_fetch(self, ctx, targets: list,
-                          surface: bool = True) -> dict:
+                          surface: bool = True,
+                          background: bool = False) -> dict:
         """READ-ONLY: GET each learner's full note history from Learner360.
         ``targets`` = [(wgu_id, student_id)]. Parses here (learner360.
         parse_notes) and summarizes the raw shape (notes_shape — field names
@@ -2820,7 +2838,7 @@ class BrowserWorker:
         import json as _json
         from collections import Counter
         from src import learner360 as l3
-        sess = self._l360_session(ctx, surface=surface)
+        sess = self._l360_session(ctx, surface=surface, reuse=background)
         if isinstance(sess, dict):
             return sess
         page, headers, _user, _snap = sess
@@ -2840,8 +2858,10 @@ class BrowserWorker:
             expired = [w for w in part if (got.get(w) or {}).get("status") == 401]
             if expired and refreshes < 10:
                 refreshes += 1
-                self.on_status(f"  [l360] session expired — refreshing sign-in "
-                               f"and retrying {len(expired)} learner(s)…")
+                if not background:
+                    self.on_status(f"  [l360] session expired — refreshing "
+                                   f"sign-in and retrying {len(expired)} "
+                                   "learner(s)…")
                 sess = self._l360_session(ctx, surface=surface)
                 if isinstance(sess, dict):
                     return sess
@@ -2860,8 +2880,9 @@ class BrowserWorker:
                 if len(raws) < 60:
                     raws.append(data)
                 by_student[sid_by[w]] = l3.parse_notes(data)
-            self.on_status(f"  [l360] notes {min(i + chunk, len(ids))}/"
-                           f"{len(ids)} ({time.time() - t0:.0f}s)")
+            if not background:
+                self.on_status(f"  [l360] notes {min(i + chunk, len(ids))}/"
+                               f"{len(ids)} ({time.time() - t0:.0f}s)")
         if ids and not by_student:
             return {"error": "every notes request failed "
                     f"({dict(fails)}) — Learner360 may have changed."}

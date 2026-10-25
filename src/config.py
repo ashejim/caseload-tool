@@ -399,6 +399,10 @@ class Settings:
     # weekly, so 7 is plenty. 0 = off (use the `l360momi:` keyword manually).
     # Each capture also runs the Learner360 change watch.
     l360_auto_momi_days: int = 7
+    # Learner360 notes import (full contact history → history.notes, deduped
+    # against SF-scraped notes): background, in small batches that yield to
+    # the user. Days between runs; 0 = off (use `l360notes:` manually).
+    l360_auto_notes_days: int = 7
     # Overall UI scale (CustomTkinter widget scaling); 1.0 = 100%.
     ui_scale: float = 1.0
     # Per-area text sizes (pt). 0 = use the built-in default for that area.

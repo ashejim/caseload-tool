@@ -104,7 +104,10 @@ def _connect(db_path=HISTORY_DB) -> sqlite3.Connection:
     """Open the history DB (creating/upgrading the schema as needed). Rows
     come back as ``sqlite3.Row`` so columns are addressable by name."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    # 30 s lock wait (default 5): the background Learner360 notes import
+    # writes from a helper thread, and a foreground write must wait it out
+    # rather than fail with "database is locked".
+    conn = sqlite3.connect(str(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     _init_schema(conn)
     return conn
@@ -1035,7 +1038,8 @@ def _near_note(conn, student_id: str, created_at: str, *, exclude=(),
 
 
 def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
-                       dry: bool = False, db_path=HISTORY_DB,
+                       dry: bool = False, mark_done: bool = True,
+                       db_path=HISTORY_DB,
                        now: Optional[datetime] = None) -> dict:
     """Import Learner360 notes (learner360.parse_notes output) into ``notes``,
     de-duplicated against what the SF scrape already stored.
@@ -1054,6 +1058,9 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                     classifiers as SF notes).
     Matched rows only gain a missing course code + a fresh last_seen_at; the SF
     copy's text stays. ``dry`` computes the same counts and writes NOTHING.
+    ``mark_done`` False (one batch of the background import) skips stamping
+    'l360_notes_last_import' — the run stamps it once at the end
+    (mark_l360_notes_imported), so an interrupted run is retried.
     Returns {students, notes, already, exact, fuzzy, type, new, no_time,
     dup_in_360, fuzzy_offset_hours:{h: n}, new_by_month:{YYYY-MM: n}}."""
     from collections import Counter
@@ -1151,8 +1158,10 @@ def persist_l360_notes(by_student: dict, *, contact_ids: Optional[dict] = None,
                              n.get("author") or "", n.get("subject") or "",
                              body, "", now_iso, now_iso))
             if not dry:
-                conn.execute("INSERT OR REPLACE INTO meta(key, value) "
-                             "VALUES ('l360_notes_last_import', ?)", (now_iso,))
+                if mark_done:
+                    conn.execute("INSERT OR REPLACE INTO meta(key, value) "
+                                 "VALUES ('l360_notes_last_import', ?)",
+                                 (now_iso,))
                 # Learn the instructor's Learner360 author name (for the
                 # "only my contacts" filter) from a clear majority of pairs.
                 if my_names:
@@ -1192,6 +1201,19 @@ def stage_l360_notes(by_student: dict, *, db_path=HISTORY_DB,
                 "INSERT INTO l360_notes_staging VALUES "
                 "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         return len(rows)
+    finally:
+        conn.close()
+
+
+def mark_l360_notes_imported(*, db_path=HISTORY_DB,
+                             now: Optional[datetime] = None) -> None:
+    """Stamp a completed Learner360 notes import (see persist_l360_notes)."""
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
+                         "('l360_notes_last_import', ?)", (ts,))
     finally:
         conn.close()
 

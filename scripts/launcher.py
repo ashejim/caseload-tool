@@ -8646,6 +8646,9 @@ class App:
             # Learner360 weekly MOMI history + change watch, when due. After
             # the startup caseload/EA/task scans settle; re-arms itself.
             self.root.after(180_000, self._maybe_auto_l360_momi)
+            # Learner360 notes import (weekly), in small background batches so
+            # it never holds up note filing / sends. After the MOMI check.
+            self.root.after(600_000, self._maybe_auto_l360_notes)
 
     # ----- Main (left) pane -----
 
@@ -11885,6 +11888,12 @@ class App:
             if not auto:
                 self._append_log("Browser not ready yet — wait and try again.")
             return False
+        if getattr(self, "_l360_bg", None):
+            if not auto:
+                self._append_log("Learner360 notes: the weekly import is already "
+                                 "running in the background — it'll log when "
+                                 "done.")
+            return False
         targets = history.l360_note_targets()
         if not targets:
             if not auto:
@@ -11961,6 +11970,146 @@ class App:
             f"{', ' + str(st['no_time']) + ' without a date' if st.get('no_time') else ''}"
             f"{', ' + str(st['dup_in_360']) + ' listed twice by Learner360' if st.get('dup_in_360') else ''}"
             f"{fail}." + (" Paste this log to Claude." if dry else ""))
+
+    _L360_BG_BATCH = 10        # learners per background notes batch
+
+    def _maybe_auto_l360_notes(self) -> None:
+        """Weekly background Learner360 notes import (settings.
+        l360_auto_notes_days; 0 = off). First check ~10 min after startup,
+        re-arms every 6 h. Runs as small batches (_l360_bg_step) that yield to
+        anything the user is doing, so it never blocks note filing / sends.
+        Needs Learner360 ids from a MOMI capture. Never raises."""
+        retry_ms, rearm_ms = 5 * 60_000, 6 * 3600_000
+        try:
+            if getattr(self, "_offline", False):
+                return
+            days = int(getattr(self.settings, "l360_auto_notes_days", 7) or 0)
+            if days <= 0:
+                return                       # off — and don't re-arm
+            if getattr(self, "_l360_bg", None):
+                self.root.after(rearm_ms, self._maybe_auto_l360_notes)
+                return
+            from src import learner360 as l3
+            if not l3.momi_capture_due(history.l360_notes_last_import(), days):
+                self.root.after(rearm_ms, self._maybe_auto_l360_notes)
+                return
+            targets = history.l360_note_targets()
+            if not targets or not self.worker.ready_event.is_set():
+                self.root.after(retry_ms, self._maybe_auto_l360_notes)
+                return
+            self._start_l360_notes_bg(targets)
+            self.root.after(rearm_ms, self._maybe_auto_l360_notes)
+        except Exception:
+            try:
+                self.root.after(rearm_ms, self._maybe_auto_l360_notes)
+            except Exception:
+                pass
+
+    def _start_l360_notes_bg(self, targets: list) -> None:
+        from collections import Counter
+        try:
+            from src import mongoose_contacts as _mc
+            cids = _mc.load_contact_ids()
+        except Exception:
+            cids = {}
+        self._l360_bg = {"targets": list(targets), "i": 0, "tot": Counter(),
+                         "fail": Counter(), "t0": time.time(), "cids": cids}
+        self._append_log(
+            f"Learner360 notes: weekly import starting in the background — "
+            f"{len(targets)} learners, {self._L360_BG_BATCH} at a time "
+            "(anything you do goes first).")
+        self._l360_bg_step()
+
+    def _l360_bg_step(self) -> None:
+        st = getattr(self, "_l360_bg", None)
+        if not st:
+            return
+        if st["i"] >= len(st["targets"]):
+            self._l360_bg_finish()
+            return
+        # Yield to the user: wait while a foreground task runs.
+        if (getattr(self, "_is_busy", False)
+                or not self.worker.ready_event.is_set()):
+            self.root.after(30_000, self._l360_bg_step)
+            return
+        part = st["targets"][st["i"]:st["i"] + self._L360_BG_BATCH]
+
+        def on_done(res):
+            try:
+                self.root.after(0, lambda: self._l360_bg_got(part, res))
+            except Exception:
+                pass
+
+        self.worker.submit_l360_notes_fetch(part, on_done, surface=False,
+                                            background=True)
+
+    def _l360_bg_got(self, part: list, res) -> None:
+        st = getattr(self, "_l360_bg", None)
+        if not st:
+            return
+        res = res or {}
+        if res.get("error"):
+            self._l360_bg = None
+            if res.get("not_logged_in"):
+                self._append_log("Learner360 isn't signed in, so the weekly notes "
+                                 "import paused — it'll retry later (or sign in "
+                                 "and run l360notes:).")
+            else:
+                self._append_log(f"Learner360 notes (weekly import) stopped: "
+                                 f"{res['error']}", error=True)
+            return
+        st["fail"].update(res.get("fail_statuses") or {})
+        by = res.get("by_student") or {}
+        cids = st["cids"]
+
+        def work():
+            try:
+                r = history.persist_l360_notes(by, contact_ids=cids,
+                                               mark_done=False)
+            except Exception as e:
+                r = {"error": str(e)}
+            try:
+                self.root.after(0, lambda: self._l360_bg_saved(len(part), r))
+            except Exception:
+                pass
+
+        # Save off the Tk thread so the window never freezes on a big batch.
+        threading.Thread(target=work, daemon=True,
+                         name="l360-notes-save").start()
+
+    def _l360_bg_saved(self, n: int, r: dict) -> None:
+        st = getattr(self, "_l360_bg", None)
+        if not st:
+            return
+        if (r or {}).get("error"):
+            self._l360_bg = None
+            self._append_log(f"Learner360 notes (weekly import) couldn't save: "
+                             f"{r['error']}", error=True)
+            return
+        for k in ("new", "exact", "fuzzy", "type", "already", "dup_in_360"):
+            st["tot"][k] += r.get(k, 0)
+        st["i"] += n
+        self.root.after(1500, self._l360_bg_step)
+
+    def _l360_bg_finish(self) -> None:
+        st, self._l360_bg = self._l360_bg, None
+        tot, fails = st["tot"], sum(st["fail"].values())
+        n = len(st["targets"])
+        # Stamp done only if most learners came through — else retry soon.
+        if fails <= max(3, n // 10):
+            try:
+                history.mark_l360_notes_imported()
+            except Exception:
+                pass
+        mins = (time.time() - st["t0"]) / 60
+        fail_txt = (f"; {fails} learner(s) failed {dict(st['fail'])}"
+                    + (" — will retry" if fails > max(3, n // 10) else "")
+                    if fails else "")
+        self._append_log(
+            f"✓ Learner360 notes (weekly import): {tot['new']} new note(s), "
+            f"{tot['already']} already imported, "
+            f"{tot['exact'] + tot['fuzzy'] + tot['type']} matched to Salesforce "
+            f"copies, for {n} learners in {mins:.0f} min{fail_txt}.")
 
     def _maybe_auto_l360_momi(self) -> None:
         """Background Learner360 refresh: capture weekly MOMI history (and run
@@ -19797,6 +19946,17 @@ class App:
             values=list(_L3_LABELS.keys()),
         ).pack(side="left", padx=(8, 0))
 
+        # Learner360 notes import (contact history → Throughput contacts).
+        l3n_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        l3n_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkLabel(l3n_row, text="Learner360 notes import:").pack(side="left")
+        cur_l3n = int(getattr(self.settings, "l360_auto_notes_days", 7) or 0)
+        l3n_var = ctk.StringVar(value=_L3_TO_LABEL.get(cur_l3n, "Weekly"))
+        ctk.CTkComboBox(
+            l3n_row, width=130, variable=l3n_var, state="readonly",
+            values=list(_L3_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+
         dialog = tab_general
         # Name capitalization — how student/PM names are cased in template
         # variables (papers over CSV data-entry casing errors).
@@ -20338,6 +20498,9 @@ class App:
             # Learner360 MOMI auto-refresh interval in days (0 = off).
             self.settings.l360_auto_momi_days = _L3_LABELS.get(
                 l3_var.get().strip(), 7)
+            # Learner360 notes import interval in days (0 = off).
+            self.settings.l360_auto_notes_days = _L3_LABELS.get(
+                l3n_var.get().strip(), 7)
             # Name capitalization mode (off / lower / standard).
             self.settings.name_capitalization = _NC_MODE_LABELS.get(
                 nc_var.get().strip(), "standard")
