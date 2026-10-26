@@ -339,6 +339,34 @@ class DataVault:
 ENC_SUFFIX = ".enc"
 
 
+# A plaintext "crash leftover" smaller than this fraction of its .enc is NOT
+# trusted as newer data: an empty/schema-only DB created by something opening
+# the path while the app was closed would otherwise shadow — and on exit
+# overwrite — the real encrypted history (this happened 2026-10-25).
+_LEFTOVER_MIN_FRACTION = 0.5
+# Header/MAC bytes an .enc carries beyond its plaintext (generous bound), so
+# the size comparison is meaningful for tiny files too.
+_ENC_OVERHEAD = 4096
+
+
+def _backup_enc(enc: Path, new_size: int) -> None:
+    """Before an .enc is overwritten: keep the previous one as '<enc>.prev'
+    (rotating), and if the incoming data is under half its size, ALSO keep a
+    dated '<enc>.bak-YYYYmmdd-HHMMSS' that is never rotated away. Best-effort;
+    never blocks the encrypt."""
+    try:
+        if not enc.exists():
+            return
+        import shutil
+        old_size = enc.stat().st_size
+        shutil.copy2(enc, Path(str(enc) + ".prev"))
+        if old_size and new_size < _LEFTOVER_MIN_FRACTION * old_size:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(enc, Path(f"{enc}.bak-{stamp}"))
+    except Exception:
+        pass
+
+
 def _shred(path: Path) -> None:
     """Best-effort overwrite + delete of a plaintext file. (On SSDs overwrite
     isn't a guaranteed erase, but it beats a bare unlink; the real protection
@@ -400,8 +428,17 @@ class ManagedFiles:
                     plain.exists()
                     and plain.stat().st_size > 0
                     and plain.stat().st_mtime > enc.stat().st_mtime
+                    # ...and not drastically smaller than the .enc: a fresh
+                    # schema-only file is a stray, not a crash leftover.
+                    and plain.stat().st_size
+                    >= _LEFTOVER_MIN_FRACTION
+                    * max(0, enc.stat().st_size - _ENC_OVERHEAD)
                 )
                 if not keep_leftover:
+                    if plain.exists() and plain.stat().st_size > 0:
+                        # Don't destroy it either — set it aside.
+                        stamp = time.strftime("%Y%m%d-%H%M%S")
+                        plain.replace(Path(f"{plain}.stray-{stamp}"))
                     self.vault.decrypt_file(enc, plain)
             except Exception as e:
                 errors.append(f"{plain.name}: {e}")
@@ -418,6 +455,7 @@ class ManagedFiles:
             enc = self.enc_path(plain)
             try:
                 original = plain.read_bytes()
+                _backup_enc(enc, len(original))
                 self.vault.encrypt_file(plain, enc)
                 if self.vault.decrypt_bytes_of(enc) != original:
                     errors.append(f"{plain.name}: verify mismatch — kept plaintext")
@@ -438,6 +476,7 @@ class ManagedFiles:
             enc = self.enc_path(plain)
             try:
                 original = plain.read_bytes()
+                _backup_enc(enc, len(original))
                 self.vault.encrypt_file(plain, enc)
                 if self.vault.decrypt_bytes_of(enc) != original:
                     errors.append(f"{plain.name}: verify mismatch")

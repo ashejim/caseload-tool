@@ -17,7 +17,17 @@ import types
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from src import history  # noqa: E402
+from src import history, mongoose_contacts  # noqa: E402
+from src.config import HISTORY_DB  # noqa: E402
+
+# NEVER touch the real history DB from a test. The app's at-rest encryption
+# treats a stray plaintext history.db (even an empty schema) as a crash
+# leftover and later encrypts it OVER the real data — this test once caused
+# exactly that (2026-10-25) via load_contact_ids' default db_path.
+mongoose_contacts.load_contact_ids = lambda **kw: {}
+_REAL_DB_STATE = (os.path.exists(HISTORY_DB),
+                  os.path.getmtime(HISTORY_DB) if os.path.exists(HISTORY_DB)
+                  else None)
 
 _spec = importlib.util.spec_from_file_location(
     "launcher_bg_test", os.path.join(ROOT, "scripts", "launcher.py"))
@@ -188,6 +198,9 @@ def main():
     for t in tests:
         t()
         print(f"  ok  {t.__name__}")
+    now = (os.path.exists(HISTORY_DB),
+           os.path.getmtime(HISTORY_DB) if os.path.exists(HISTORY_DB) else None)
+    assert now == _REAL_DB_STATE, "a test created/modified the REAL history.db"
     print(f"All {len(tests)} tests passed.")
 
 

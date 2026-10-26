@@ -103,6 +103,45 @@ def test_decrypt_all_ignores_zero_byte_newer_leftover():
         assert plain.read_bytes() == b"THE-REAL-HISTORY"   # restored, not empty
 
 
+def test_decrypt_all_sets_aside_small_stray_plaintext():
+    # 2026-10-25 data loss: something opened history.db while the app was
+    # closed, creating a schema-only file NEWER than a large .enc. It must not
+    # be taken as a crash leftover; decrypt the real data and keep the stray.
+    with tempfile.TemporaryDirectory() as d:
+        v = _vault(d)
+        plain = Path(d) / "history.db"
+        enc = crypto_store.ManagedFiles.enc_path(plain)
+        big = b"REAL-HISTORY" * 10000
+        plain.write_bytes(big)
+        v.encrypt_file(plain, enc)
+        _mtime(enc, 1000)
+        plain.write_bytes(b"SQLite format 3\x00" + b"\x00" * 8000)  # empty schema
+        _mtime(plain, 2000)
+        mf = crypto_store.ManagedFiles(v, [plain])
+        assert mf.decrypt_all() == []
+        assert plain.read_bytes() == big
+        strays = list(Path(d).glob("history.db.stray-*"))
+        assert len(strays) == 1 and strays[0].stat().st_size == 8016
+
+
+def test_lock_all_keeps_previous_enc_and_dated_backup_on_shrink():
+    with tempfile.TemporaryDirectory() as d:
+        v = _vault(d)
+        plain = Path(d) / "history.db"
+        enc = crypto_store.ManagedFiles.enc_path(plain)
+        plain.write_bytes(b"BIG" * 20000)
+        v.encrypt_file(plain, enc)
+        plain.write_bytes(b"tiny")               # drastically smaller
+        mf = crypto_store.ManagedFiles(v, [plain])
+        assert mf.lock_all() == []
+        prev = Path(str(enc) + ".prev")
+        assert prev.exists()
+        assert v.decrypt_bytes_of(prev) == b"BIG" * 20000
+        baks = list(Path(d).glob("history.db.enc.bak-*"))
+        assert len(baks) == 1 and v.decrypt_bytes_of(baks[0]) == b"BIG" * 20000
+        assert v.decrypt_bytes_of(enc) == b"tiny"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
