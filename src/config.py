@@ -403,6 +403,11 @@ class Settings:
     # against SF-scraped notes): background, in small batches that yield to
     # the user. Days between runs; 0 = off (use `l360notes:` manually).
     l360_auto_notes_days: int = 7
+    # Local versioned backups of history.db.enc, taken at startup before the
+    # vault is unlocked (src/local_backup.py). Blank dir = ~/Documents/
+    # CaseloadNotes Backups.
+    local_backup_enabled: bool = True
+    local_backup_dir: str = ""
     # Overall UI scale (CustomTkinter widget scaling); 1.0 = 100%.
     ui_scale: float = 1.0
     # Per-area text sizes (pt). 0 = use the built-in default for that area.

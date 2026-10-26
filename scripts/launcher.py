@@ -8649,6 +8649,8 @@ class App:
             # Learner360 notes import (weekly), in small background batches so
             # it never holds up note filing / sends. After the MOMI check.
             self.root.after(600_000, self._maybe_auto_l360_notes)
+        # Report the startup backup (taken before the log existed).
+        self.root.after(1500, self._report_startup_backup)
 
     # ----- Main (left) pane -----
 
@@ -11976,6 +11978,28 @@ class App:
             f"{', ' + str(st['no_time']) + ' without a date' if st.get('no_time') else ''}"
             f"{', ' + str(st['dup_in_360']) + ' listed twice by Learner360' if st.get('dup_in_360') else ''}"
             f"{fail}." + (" Paste this log to Claude." if dry else ""))
+
+    def _report_startup_backup(self) -> None:
+        res = getattr(self, "_startup_backup", None) or {}
+        st = res.get("status")
+        if st == "ok":
+            mb = (res.get("size") or 0) / 1e6
+            pr = res.get("pruned") or []
+            self._append_log(
+                f"✓ Local backup saved: {Path(res['path']).name} ({mb:.0f} MB) "
+                f"in {Path(res['path']).parent}"
+                + (f" — {len(pr)} older backup(s) rotated out." if pr else "."))
+        elif st == "suspicious":
+            self._append_log(
+                f"⚠ Your history database is much smaller than the last backup "
+                f"({(res.get('size') or 0) / 1e6:.0f} MB vs "
+                f"{(res.get('prior_size') or 0) / 1e6:.0f} MB) — possible data "
+                "loss. Saved it as a -SUSPICIOUS backup and kept every older "
+                f"backup. Folder: {Path(res['path']).parent} (see README.txt "
+                "there to restore).", error=True)
+        elif st == "error":
+            self._append_log(f"⚠ Local backup failed: {res.get('error')}",
+                             error=True)
 
     _L360_BG_BATCH = 10        # learners per background notes batch
 
@@ -20060,6 +20084,27 @@ class App:
             values=list(_L3_LABELS.keys()),
         ).pack(side="left", padx=(8, 0))
 
+        # Local versioned backups (src/local_backup.py) — status + open folder.
+        bk_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        bk_row.pack(fill="x", padx=32, pady=(0, 10))
+        try:
+            from src import local_backup as _lb
+            _bk_dir = Path(getattr(self.settings, "local_backup_dir", "")
+                           or _lb.default_backup_dir())
+            _bks = _lb.list_backups(_bk_dir)
+            _bk_txt = (f"Local backups: {len(_bks)} kept, newest "
+                       f"{_bks[0]['when']:%b %d %H:%M}" if _bks
+                       else "Local backups: none yet (taken at startup)")
+        except Exception:
+            _bk_dir, _bk_txt = None, "Local backups: unavailable"
+        ctk.CTkLabel(bk_row, text=_bk_txt).pack(side="left")
+        if _bk_dir is not None:
+            ctk.CTkButton(
+                bk_row, text="Open folder", width=100,
+                command=lambda d=_bk_dir: (d.mkdir(parents=True, exist_ok=True),
+                                           os.startfile(str(d))),
+            ).pack(side="left", padx=(8, 0))
+
         dialog = tab_general
         # Name capitalization — how student/PM names are cased in template
         # variables (papers over CSV data-entry casing errors).
@@ -23193,6 +23238,19 @@ class App:
         for this session. Runs at the very start of __init__, before any data
         file is read. If an already-encrypted vault can't be unlocked (user
         quits at the prompt), the app can't run on encrypted data → hard exit."""
+        # Local versioned backup FIRST — before the vault is opened or anything
+        # is decrypted/written, so it captures the last clean exit's state
+        # (src/local_backup.py). Skipped in the offline demo sandbox.
+        self._startup_backup = None
+        if (os.environ.get("CASELOAD_OFFLINE") != "1"
+                and getattr(self.settings, "local_backup_enabled", True)):
+            try:
+                from src import local_backup
+                self._startup_backup = local_backup.make_backup(
+                    Path(HISTORY_DB).parent,
+                    getattr(self.settings, "local_backup_dir", "") or None)
+            except Exception as e:
+                self._startup_backup = {"status": "error", "error": str(e)}
         try:
             vault = crypto_store.DataVault(VAULT_PATH)
             managed = crypto_store.ManagedFiles(vault, ENCRYPTED_DATA_FILES)
