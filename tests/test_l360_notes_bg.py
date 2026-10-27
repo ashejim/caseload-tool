@@ -193,6 +193,60 @@ def test_background_momi_refresh_batches_then_saves_once():
         history.persist_momi, history.momi_capture_status = real
 
 
+class FakeActivityWorker(FakeWorker):
+    def __init__(self):
+        super().__init__()
+        self.windows = []
+
+    def submit_l360_activity_fetch(self, targets, days, on_done, surface=True,
+                                   background=False):
+        assert background and not surface
+        self.batches.append(len(targets))
+        self.windows.append(days)
+        on_done({"ok": True, "failed": 0, "by_student": {
+            sid: [{"date": "2026-10-20", "category": "Coursework"}]
+            for _w, sid in targets}})
+
+
+def test_background_activity_window_batches_and_stamp():
+    from datetime import datetime, timedelta
+    real = (history.persist_l360_activity, history.mark_l360_activity_imported,
+            history.l360_activity_last_import, history.l360_note_targets)
+    calls = {"mark_done": [], "stamped": 0}
+    try:
+        history.persist_l360_activity = lambda by, **kw: (
+            calls["mark_done"].append(kw.get("mark_done"))
+            or {"events": len(by), "rows_new": len(by)})
+        history.mark_l360_activity_imported = lambda **kw: calls.__setitem__(
+            "stamped", calls["stamped"] + 1)
+        last = (datetime.now() - timedelta(days=9)).isoformat(timespec="seconds")
+        history.l360_activity_last_import = lambda **kw: last
+        history.l360_note_targets = lambda **kw: [(f"w{i}", f"S{i}")
+                                                 for i in range(43)]
+        a = types.SimpleNamespace()
+        for name in ("_maybe_auto_l360_activity", "_l360_abg_step",
+                     "_l360_abg_got", "_l360_abg_saved"):
+            setattr(a, name, getattr(App, name).__get__(a))
+        a._L360_ACT_BATCH = App._L360_ACT_BATCH
+        a.root, a.worker = FakeRoot(), FakeActivityWorker()
+        a.settings = types.SimpleNamespace(l360_auto_activity_days=7)
+        a._offline, a._is_busy, a.logs = False, True, []
+        a._append_log = lambda msg, error=None, **kw: a.logs.append(msg)
+        a._maybe_auto_l360_activity()
+        a.root.pump(limit=3)
+        assert a.worker.batches == []                  # waits while busy
+        a._is_busy = False
+        a.root.pump()
+        assert a.worker.batches == [20, 20, 3], a.worker.batches
+        assert set(a.worker.windows) == {16}           # 9 days since + 7
+        assert set(calls["mark_done"]) == {False} and calls["stamped"] == 1
+        assert a._l360_abg is None
+        assert any("43 new row(s)" in m for m in a.logs), a.logs
+    finally:
+        (history.persist_l360_activity, history.mark_l360_activity_imported,
+         history.l360_activity_last_import, history.l360_note_targets) = real
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

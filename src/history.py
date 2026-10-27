@@ -1253,7 +1253,7 @@ def l360_notes_last_import(*, db_path=HISTORY_DB) -> Optional[str]:
 
 
 def persist_l360_activity(by_student: dict, *, dry: bool = False,
-                          db_path=HISTORY_DB,
+                          mark_done: bool = True, db_path=HISTORY_DB,
                           now: Optional[datetime] = None) -> dict:
     """Upsert Learner360 academic-activity events (learner360.parse_activity
     output) into ``l360_activity``. Learner360 gives dates without a time, so
@@ -1304,7 +1304,7 @@ def persist_l360_activity(by_student: dict, *, dry: bool = False,
                             "event_at, category, type, context, course_code, "
                             "occurrences, first_seen_at, last_seen_at) VALUES "
                             "(?,?,?,?,?,?,?,?,?,?)", key + (n, ts, ts))
-            if not dry:
+            if not dry and mark_done:
                 conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
                              "('l360_activity_last_import', ?)", (ts,))
     finally:
@@ -1313,6 +1313,27 @@ def persist_l360_activity(by_student: dict, *, dry: bool = False,
                                      "rows_refreshed", "no_date")}
     out["events_by_month"] = dict(sorted(months.items()))
     return out
+
+
+def l360_activity_last_import(*, db_path=HISTORY_DB) -> Optional[str]:
+    """ISO time of the last completed Learner360 activity import, or None."""
+    conn = _connect(db_path)
+    try:
+        return _meta_get(conn, "l360_activity_last_import")
+    finally:
+        conn.close()
+
+
+def mark_l360_activity_imported(*, db_path=HISTORY_DB,
+                                now: Optional[datetime] = None) -> None:
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
+                         "('l360_activity_last_import', ?)", (ts,))
+    finally:
+        conn.close()
 
 
 def l360_note_targets(*, max_age_days: int = 30, db_path=HISTORY_DB) -> list:

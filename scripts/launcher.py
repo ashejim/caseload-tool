@@ -8658,6 +8658,8 @@ class App:
             # Learner360 notes import (weekly), in small background batches so
             # it never holds up note filing / sends. After the MOMI check.
             self.root.after(600_000, self._maybe_auto_l360_notes)
+            # Learner360 academic activity (weekly, small batches, ~1-2 min).
+            self.root.after(900_000, self._maybe_auto_l360_activity)
         # Report the startup backup (taken before the log existed).
         self.root.after(1500, self._report_startup_backup)
 
@@ -11901,6 +11903,10 @@ class App:
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
             return
+        if getattr(self, "_l360_abg", None):
+            self._append_log("Learner360 activity: the weekly import is already "
+                             "running in the background — it'll log when done.")
+            return
         targets = history.l360_note_targets()
         if not targets:
             self._append_log("Learner360 activity: no Learner360 ids yet — run "
@@ -12097,6 +12103,133 @@ class App:
         elif st == "error":
             self._append_log(f"⚠ Local backup failed: {res.get('error')}",
                              error=True)
+
+    _L360_ACT_BATCH = 20       # learners per background activity batch
+
+    def _maybe_auto_l360_activity(self) -> None:
+        """Weekly background Learner360 academic-activity import (settings.
+        l360_auto_activity_days; 0 = off), ~15 min after startup, re-arms every
+        6 h. Reads only since the last import (+7 days overlap; 365 the first
+        time) in small batches that yield to the user. Never raises."""
+        retry_ms, rearm_ms = 5 * 60_000, 6 * 3600_000
+        try:
+            if getattr(self, "_offline", False):
+                return
+            days = int(getattr(self.settings, "l360_auto_activity_days", 7) or 0)
+            if days <= 0:
+                return
+            if getattr(self, "_l360_abg", None):
+                self.root.after(rearm_ms, self._maybe_auto_l360_activity)
+                return
+            from src import learner360 as l3
+            last = history.l360_activity_last_import()
+            if not l3.momi_capture_due(last, days):
+                self.root.after(rearm_ms, self._maybe_auto_l360_activity)
+                return
+            targets = history.l360_note_targets()
+            if not targets or not self.worker.ready_event.is_set():
+                self.root.after(retry_ms, self._maybe_auto_l360_activity)
+                return
+            window = 365
+            if last:
+                try:
+                    from datetime import datetime as _dt
+                    age = (_dt.now() - _dt.fromisoformat(last[:19])).days
+                    window = max(14, min(365, age + 7))
+                except ValueError:
+                    pass
+            self._l360_abg = {"targets": list(targets), "i": 0, "window": window,
+                              "events": 0, "new": 0, "fail": 0,
+                              "t0": time.time()}
+            self._append_log(
+                f"Learner360 activity: weekly import starting in the background "
+                f"— last {window} days for {len(targets)} learners, "
+                f"{self._L360_ACT_BATCH} at a time (anything you do goes first).")
+            self._l360_abg_step()
+            self.root.after(rearm_ms, self._maybe_auto_l360_activity)
+        except Exception:
+            try:
+                self.root.after(rearm_ms, self._maybe_auto_l360_activity)
+            except Exception:
+                pass
+
+    def _l360_abg_step(self) -> None:
+        st = getattr(self, "_l360_abg", None)
+        if not st:
+            return
+        if st["i"] >= len(st["targets"]):
+            self._l360_abg = None
+            n = len(st["targets"])
+            if st["fail"] <= max(3, n // 10):
+                try:
+                    history.mark_l360_activity_imported()
+                except Exception:
+                    pass
+            mins = (time.time() - st["t0"]) / 60
+            self._append_log(
+                f"✓ Learner360 activity (weekly import): {st['events']} event(s), "
+                f"{st['new']} new row(s), for {n} learners in {mins:.0f} min"
+                + (f"; {st['fail']} learner(s) failed" if st["fail"] else "")
+                + ".")
+            return
+        if (getattr(self, "_is_busy", False)
+                or not self.worker.ready_event.is_set()):
+            self.root.after(30_000, self._l360_abg_step)
+            return
+        part = st["targets"][st["i"]:st["i"] + self._L360_ACT_BATCH]
+
+        def on_done(res):
+            try:
+                self.root.after(0, lambda: self._l360_abg_got(len(part), res))
+            except Exception:
+                pass
+
+        self.worker.submit_l360_activity_fetch(part, st["window"], on_done,
+                                               surface=False, background=True)
+
+    def _l360_abg_got(self, n: int, res) -> None:
+        st = getattr(self, "_l360_abg", None)
+        if not st:
+            return
+        res = res or {}
+        if res.get("error"):
+            self._l360_abg = None
+            if res.get("not_logged_in"):
+                self._append_log("Learner360 isn't signed in, so the weekly "
+                                 "activity import paused — it'll retry later.")
+            else:
+                self._append_log(f"Learner360 activity (weekly import) stopped: "
+                                 f"{res['error']}", error=True)
+            return
+        st["fail"] += res.get("failed") or 0
+        by = res.get("by_student") or {}
+
+        def work():
+            try:
+                r = history.persist_l360_activity(by, mark_done=False)
+            except Exception as e:
+                r = {"error": str(e)}
+            try:
+                self.root.after(0, lambda: self._l360_abg_saved(n, r))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True,
+                         name="l360-activity-save").start()
+
+    def _l360_abg_saved(self, n: int, r: dict) -> None:
+        st = getattr(self, "_l360_abg", None)
+        if not st:
+            return
+        if (r or {}).get("error"):
+            self._l360_abg = None
+            self._append_log(f"Learner360 activity (weekly import) couldn't "
+                             f"save: {r['error']}", error=True)
+            return
+        st["events"] += r.get("events", 0)
+        st["new"] += r.get("rows_new", 0)
+        st["i"] += n
+        self.root.after(1500, self._l360_abg_step)
 
     _L360_BG_BATCH = 10        # learners per background notes batch
 
@@ -20181,6 +20314,18 @@ class App:
             values=list(_L3_LABELS.keys()),
         ).pack(side="left", padx=(8, 0))
 
+        # Learner360 academic activity import (engagement events).
+        l3a_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        l3a_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkLabel(l3a_row, text="Learner360 activity import:").pack(
+            side="left")
+        cur_l3a = int(getattr(self.settings, "l360_auto_activity_days", 7) or 0)
+        l3a_var = ctk.StringVar(value=_L3_TO_LABEL.get(cur_l3a, "Weekly"))
+        ctk.CTkComboBox(
+            l3a_row, width=130, variable=l3a_var, state="readonly",
+            values=list(_L3_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+
         # Local versioned backups (src/local_backup.py) — status + open folder.
         bk_row = ctk.CTkFrame(dialog, fg_color="transparent")
         bk_row.pack(fill="x", padx=32, pady=(0, 10))
@@ -20746,6 +20891,9 @@ class App:
             # Learner360 notes import interval in days (0 = off).
             self.settings.l360_auto_notes_days = _L3_LABELS.get(
                 l3n_var.get().strip(), 7)
+            # Learner360 activity import interval in days (0 = off).
+            self.settings.l360_auto_activity_days = _L3_LABELS.get(
+                l3a_var.get().strip(), 7)
             # Name capitalization mode (off / lower / standard).
             self.settings.name_capitalization = _NC_MODE_LABELS.get(
                 nc_var.get().strip(), "standard")

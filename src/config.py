@@ -403,6 +403,9 @@ class Settings:
     # against SF-scraped notes): background, in small batches that yield to
     # the user. Days between runs; 0 = off (use `l360notes:` manually).
     l360_auto_notes_days: int = 7
+    # Learner360 academic activity (engagement events): background pull in
+    # small batches. Days between runs; 0 = off (use `l360activity:`).
+    l360_auto_activity_days: int = 7
     # Local versioned backups of history.db.enc, taken at startup before the
     # vault is unlocked (src/local_backup.py). Blank dir = ~/Documents/
     # CaseloadNotes Backups.
