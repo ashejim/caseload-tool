@@ -16,6 +16,26 @@ bundled Chromium. Distributed as an unsigned PyInstaller one-folder build.
 - Owner: Dr. Jim Ashe (mathematician; prefers standard conventions, simple
   shareable builds, workarounds over heavy fixes)
 
+## ▶ LATEST (2026-10-27) — read first
+
+- **Data loss + recovery (Oct 25–26):** a test opened the real `history.db`
+  via a default `db_path` while the app was closed; `decrypt_all` trusted the
+  stray plaintext and `lock_all` encrypted it over the real `.enc`. Restored
+  from a 10/24 laptop/OneDrive copy merged with post-wipe data (only Oct 25 AM
+  lost). Fixes: `crypto_store` stray-size guard + `.enc.prev` / dated
+  `.enc.bak-*` (b8dd478); **daily read-only local backups** to
+  `~/Documents/CaseloadNotes Backups` taken at startup before unlock
+  (`src/local_backup.py`, 48fd040). **Tests must use temp DBs and assert the
+  real DB is untouched; never touch the backup folder.**
+- **Learner360 academic activity:** `l360activity:` / `dry` → table
+  `l360_activity` (one row per distinct event-day, `occurrences` count);
+  ISO date params; ~88k events/yr for ~266 learners; weekly background pull
+  (`_maybe_auto_l360_activity`, incremental window). **Engagement columns** in
+  the viewer (`history.engagement_signals`; PA counts via learned assessment
+  codes C769=ROM3, C964=SIM3, D502=BHN1). NEXT: chase-list use of the signals,
+  December prediction check (prospective), live-verify background jobs ~Nov 1,
+  then merge `wip/l360-notes` → main + release.
+
 ## ▶ PICK UP HERE (laptop handoff, 2026-10-15)
 
 **In flight: Learner360 notes import (`l360notes:`)** — built + unit-tested,
