@@ -6349,6 +6349,15 @@ class CaseloadPanel:
         # "l360notes:" imports full note histories from Learner360 into the
         # contact-history DB, de-duplicated against SF-scraped notes (keeps
         # Throughput's contacts current). "l360notes: dry" = report only.
+        # "l360activity:" pulls Learner360 academic activity (portal / course
+        # engagement events) into history.db. "dry" = report only; a number
+        # = days back (default 365), e.g. "l360activity: dry 90".
+        if q.lower().startswith(("l360activity", "1360activity")):
+            parts = (q.split(":", 1)[1].strip().lower().split()
+                     if ":" in q else [])
+            days = next((int(x) for x in parts if x.isdigit()), 365)
+            self.app._l360_activity_import(dry="dry" in parts, days=days)
+            return "break"
         if q.lower().startswith(("l360notes", "1360notes")):
             rest = q.split(":", 1)[1].strip().lower() if ":" in q else ""
             self.app._l360_notes_import(dry="dry" in rest.split())
@@ -11877,6 +11886,93 @@ class App:
 
         self.worker.submit_l360_momi_capture(on_done, surface=not auto)
         return True
+
+    def _l360_activity_import(self, dry: bool = False, days: int = 365) -> None:
+        """`l360activity:` — READ-ONLY pull of Learner360 academic activity
+        (dated portal / course engagement events) for the Learner360 caseload
+        into history.l360_activity. ``dry`` logs the response shape (field
+        names + category/type labels only) and counts, saving nothing."""
+        if getattr(self, "_offline", False):
+            self._append_log("🔌 Demo: Learner360 isn't available offline.")
+            return
+        if getattr(self, "_is_busy", False):
+            self._append_log("Busy — wait for the current task to finish.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        targets = history.l360_note_targets()
+        if not targets:
+            self._append_log("Learner360 activity: no Learner360 ids yet — run "
+                             "l360momi: first.")
+            return
+        self._set_busy("Reading academic activity from Learner360…")
+        self._append_log(
+            f"Learner360 activity{' (DRY RUN — nothing will be saved)' if dry else ''}"
+            f": reading the last {days} days for {len(targets)} learners "
+            "(read-only)…")
+
+        def on_done(res):
+            try:
+                self.root.after(0, lambda: self._l360_activity_done(res, dry))
+            except Exception:
+                pass
+
+        self.worker.submit_l360_activity_fetch(targets, days, on_done)
+
+    def _l360_activity_done(self, res, dry: bool) -> None:
+        res = res or {}
+        if res.get("error"):
+            self._set_idle()
+            self._append_log(f"✗ Learner360 activity: {res['error']}"
+                             + (f" (date formats tried: {res.get('probe')})"
+                                if res.get("probe") else ""), error=True)
+            return
+        sh = res.get("shape") or {}
+        if dry:
+            self._append_log(f"  [l360activity] date format accepted: "
+                             f"{res.get('date_format')} (tried {res.get('probe')})")
+            self._append_log(f"  [l360activity] wrappers: {sh.get('wrappers')}")
+            self._append_log(f"  [l360activity] fields: {sh.get('keys')}")
+            self._append_log(f"  [l360activity] parser picked: {sh.get('picked')}")
+            self._append_log(f"  [l360activity] date patterns: "
+                             f"{sh.get('date_patterns')}; span seen: "
+                             f"{sh.get('span')}")
+            self._append_log(f"  [l360activity] categories: "
+                             f"{sh.get('categories')}")
+            self._append_log(f"  [l360activity] types: {sh.get('types')}")
+        by = res.get("by_student") or {}
+
+        def work():
+            try:
+                st = history.persist_l360_activity(by, dry=dry)
+            except Exception as e:
+                st = {"error": str(e)}
+            try:
+                self.root.after(0, lambda: self._l360_activity_saved(res, st, dry))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True,
+                         name="l360-activity-save").start()
+
+    def _l360_activity_saved(self, res, st, dry: bool) -> None:
+        self._set_idle()
+        if st.get("error"):
+            self._append_log(f"✗ Learner360 activity: couldn't save: "
+                             f"{st['error']}", error=True)
+            return
+        if dry:
+            self._append_log(f"  [l360activity] events by month: "
+                             f"{st.get('new_by_month')}")
+        fail = (f"; {res.get('failed')} learner(s) failed "
+                f"{res.get('fail_statuses')}" if res.get("failed") else "")
+        self._append_log(
+            f"{'Learner360 activity DRY RUN' if dry else '✓ Learner360 activity'}"
+            f": {st.get('events', 0)} event(s) for {st.get('students', 0)} "
+            f"learners — {st.get('new', 0)} {'would be ' if dry else ''}new, "
+            f"{st.get('refreshed', 0)} already stored{fail}."
+            + (" Paste this log to Claude." if dry else ""))
 
     def _l360_notes_import(self, dry: bool = False, auto: bool = False) -> bool:
         """`l360notes:` — READ-ONLY pull of each caseload learner's full note

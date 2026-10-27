@@ -14,6 +14,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from src import history, learner360 as l3  # noqa: E402
+from src.config import HISTORY_DB  # noqa: E402
+
+# Tests must never touch the real history DB (see tests_never_touch_real_db).
+_REAL_DB = (os.path.exists(HISTORY_DB),
+            os.path.getmtime(HISTORY_DB) if os.path.exists(HISTORY_DB) else None)
 
 CASELOAD = {
     "content": [
@@ -314,11 +319,52 @@ def test_old_mmddyyyy_weeks_fixed_in_place():
         os.remove(path)
 
 
+ACTIVITY = [
+    {"date": "2026-10-20T14:05:00Z", "category": "Course Material",
+     "typeDescription": "Viewed course page", "contextDescription": "Unit 3",
+     "courseCode": "C769"},
+    {"date": "10-21-2026", "category": "Assessment",
+     "typeDescription": "Started PA", "contextDescription": "", "courseCode": "C769"},
+]
+
+
+def test_activity_parse_shape_and_query():
+    from datetime import datetime as dt
+    assert l3.activity_query(dt(2026, 1, 2), dt(2026, 3, 4), "%m-%d-%Y") ==         "?startDate=01-02-2026&endDate=03-04-2026"
+    rows = l3.parse_activity({"content": ACTIVITY})
+    assert rows[0]["date"] == "2026-10-20" and rows[0]["at"].startswith("2026-10-20T14:05")
+    assert rows[1]["date"] == "2026-10-21" and rows[1]["type"] == "Started PA"
+    sh = l3.activity_shape([ACTIVITY])
+    assert sh["span"] == ("2026-10-20", "2026-10-21")
+    assert sh["categories"] == {"Course Material": 1, "Assessment": 1}
+    assert "Unit 3" not in str(sh)                     # no context values
+
+
+def test_persist_activity_idempotent_and_dry():
+    path = _tmpdb()
+    try:
+        rows = l3.parse_activity(ACTIVITY)
+        d = history.persist_l360_activity({"S1": rows}, dry=True, db_path=path)
+        assert (d["new"], d["refreshed"]) == (2, 0)
+        conn = sqlite3.connect(path)
+        assert conn.execute("SELECT COUNT(*) FROM l360_activity").fetchone()[0] == 0
+        conn.close()
+        r1 = history.persist_l360_activity({"S1": rows}, db_path=path)
+        r2 = history.persist_l360_activity({"S1": rows}, db_path=path)
+        assert (r1["new"], r2["new"], r2["refreshed"]) == (2, 0, 2), (r1, r2)
+        assert r1["new_by_month"] == {"2026-10": 2}
+    finally:
+        os.remove(path)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
         t()
         print(f"  ok  {t.__name__}")
+    now = (os.path.exists(HISTORY_DB),
+           os.path.getmtime(HISTORY_DB) if os.path.exists(HISTORY_DB) else None)
+    assert now == _REAL_DB, "a test created/modified the REAL history.db"
     print(f"All {len(tests)} tests passed.")
 
 

@@ -431,6 +431,15 @@ class BrowserWorker:
         See _l360_momi_caseload / _l360_momi_fetch."""
         self.q.put(("L360_MOMI_STEP", step, arg, on_done))
 
+    def submit_l360_activity_fetch(self, targets: list, days: int,
+                                   on_done: Callable[[dict], None],
+                                   surface: bool = True,
+                                   background: bool = False) -> None:
+        """READ-ONLY: pull Learner360 academic activity for the last ``days``
+        days (see _l360_activity_fetch)."""
+        self.q.put(("L360_ACTIVITY", targets, days, on_done, surface,
+                    background))
+
     def submit_l360_notes_fetch(self, targets: list,
                                 on_done: Callable[[dict], None],
                                 surface: bool = True,
@@ -1037,6 +1046,17 @@ class BrowserWorker:
                                                 background=True)
             except Exception as e:
                 res = {"error": f"Learner360 MOMI step crashed: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "L360_ACTIVITY":
+            _, targets, days, on_done, surface, background = cmd
+            res = {}
+            try:
+                res = self._l360_activity_fetch(ctx, targets, days,
+                                                surface=surface,
+                                                background=background)
+            except Exception as e:
+                res = {"error": f"Learner360 activity fetch crashed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "L360_NOTES":
@@ -2845,6 +2865,79 @@ class BrowserWorker:
             return {"error": "couldn't determine your Learner360 user id."}
         self._l360_sess = (page, auth["headers"], user, snap, time.time())
         return page, auth["headers"], user, snap
+
+    def _l360_activity_fetch(self, ctx, targets: list, days: int,
+                             surface: bool = True,
+                             background: bool = False) -> dict:
+        """READ-ONLY: GET each learner's academic activity for the last
+        ``days`` days. The date-parameter format is discovered on the first
+        learner (learner360.ACTIVITY_DATE_FORMATS, first 200 wins) and reused.
+        A 401 refreshes the session and retries those learners. Returns {ok,
+        by_student, shape, date_format, probe, fetched, failed, fail_statuses}
+        or {error[, not_logged_in, probe]}."""
+        import json as _json
+        from collections import Counter
+        from datetime import datetime as _dt, timedelta as _td
+        from src import learner360 as l3
+        sess = self._l360_session(ctx, surface=surface, reuse=background)
+        if isinstance(sess, dict):
+            return sess
+        page, headers, _user, _snap = sess
+        sid_by = {w: s for w, s in targets if w and s}
+        ids = list(sid_by)
+        if not ids:
+            return {"error": "no learners to read"}
+        end = _dt.now()
+        start = end - _td(days=max(1, int(days)))
+        # Discover the accepted date format on the first learner.
+        fmt, probe = None, {}
+        for f in l3.ACTIVITY_DATE_FORMATS:
+            q = l3.activity_query(start, end, f)
+            r = l3.fetch_activity_batch(page, headers, ids[:1], q).get(ids[0]) or {}
+            probe[f] = r.get("status")
+            if r.get("status") == 200:
+                fmt = f
+                break
+        if fmt is None:
+            return {"error": f"academic-activity rejected every date format "
+                    f"{probe}", "probe": probe}
+        suffix = l3.activity_query(start, end, fmt)
+        by_student, raws, fails = {}, [], Counter()
+        t0, chunk, refreshes = time.time(), 10, 0
+        for i in range(0, len(ids), chunk):
+            part = ids[i:i + chunk]
+            got = l3.fetch_activity_batch(page, headers, part, suffix)
+            expired = [w for w in part if (got.get(w) or {}).get("status") == 401]
+            if expired and refreshes < 10:
+                refreshes += 1
+                sess = self._l360_session(ctx, surface=surface)
+                if isinstance(sess, dict):
+                    return sess
+                page, headers, _user, _snap = sess
+                got.update(l3.fetch_activity_batch(page, headers, expired, suffix))
+            for w in part:
+                r = got.get(w) or {}
+                if r.get("status") != 200:
+                    fails[str(r.get("status"))] += 1
+                    continue
+                try:
+                    data = _json.loads(r.get("body") or "null")
+                except ValueError:
+                    fails["bad-json"] += 1
+                    continue
+                if len(raws) < 60:
+                    raws.append(data)
+                by_student[sid_by[w]] = l3.parse_activity(data)
+            if not background:
+                self.on_status(f"  [l360] activity {min(i + chunk, len(ids))}/"
+                               f"{len(ids)} ({time.time() - t0:.0f}s)")
+        if not by_student:
+            return {"error": "every academic-activity request failed "
+                    f"({dict(fails)})", "probe": probe}
+        return {"ok": True, "by_student": by_student,
+                "shape": l3.activity_shape(raws), "date_format": fmt,
+                "probe": probe, "fetched": len(by_student),
+                "failed": sum(fails.values()), "fail_statuses": dict(fails)}
 
     def _l360_notes_fetch(self, ctx, targets: list,
                           surface: bool = True,

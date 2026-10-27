@@ -301,6 +301,24 @@ CREATE TABLE IF NOT EXISTS l360_notes_staging (
     staged_at   TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_l360_staging ON l360_notes_staging(student_id, created_at);
+
+-- Learner360 academic activity (portal / course engagement events), one row
+-- per event; re-pulls upsert (first_seen_at kept). ``event_at`` is the full
+-- UTC timestamp when Learner360 gives one ('' = date only).
+CREATE TABLE IF NOT EXISTS l360_activity (
+    student_id    TEXT NOT NULL,
+    activity_date TEXT NOT NULL,
+    event_at      TEXT NOT NULL DEFAULT '',
+    category      TEXT NOT NULL DEFAULT '',
+    type          TEXT NOT NULL DEFAULT '',
+    context       TEXT NOT NULL DEFAULT '',
+    course_code   TEXT NOT NULL DEFAULT '',
+    first_seen_at TEXT,
+    last_seen_at  TEXT,
+    PRIMARY KEY (student_id, activity_date, event_at, category, type,
+                 context, course_code)
+);
+CREATE INDEX IF NOT EXISTS ix_l360_activity_date ON l360_activity(activity_date);
 """
 
 
@@ -1225,6 +1243,62 @@ def l360_notes_last_import(*, db_path=HISTORY_DB) -> Optional[str]:
         return _meta_get(conn, "l360_notes_last_import")
     finally:
         conn.close()
+
+
+def persist_l360_activity(by_student: dict, *, dry: bool = False,
+                          db_path=HISTORY_DB,
+                          now: Optional[datetime] = None) -> dict:
+    """Upsert Learner360 academic-activity events (learner360.parse_activity
+    output) into ``l360_activity``. Idempotent: an event already stored only
+    refreshes last_seen_at. ``dry`` counts without writing. Returns {students,
+    events, new, refreshed, no_date, new_by_month}."""
+    from collections import Counter
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    st, months = Counter(), Counter()
+    conn = _connect(db_path)
+    try:
+        with conn:
+            for sid, events in (by_student or {}).items():
+                st["students"] += 1
+                for e in events or []:
+                    st["events"] += 1
+                    day = (e.get("date") or "")[:10]
+                    if not day:
+                        st["no_date"] += 1
+                        continue
+                    key = (sid, day, e.get("at") or "", e.get("category") or "",
+                           e.get("type") or "", e.get("context") or "",
+                           e.get("course") or "")
+                    hit = conn.execute(
+                        "SELECT 1 FROM l360_activity WHERE student_id=? AND "
+                        "activity_date=? AND event_at=? AND category=? AND "
+                        "type=? AND context=? AND course_code=?", key).fetchone()
+                    if hit:
+                        st["refreshed"] += 1
+                        if not dry:
+                            conn.execute(
+                                "UPDATE l360_activity SET last_seen_at=? WHERE "
+                                "student_id=? AND activity_date=? AND event_at=? "
+                                "AND category=? AND type=? AND context=? AND "
+                                "course_code=?", (ts,) + key)
+                        continue
+                    st["new"] += 1
+                    months[day[:7]] += 1
+                    if not dry:
+                        conn.execute(
+                            "INSERT INTO l360_activity (student_id, activity_date, "
+                            "event_at, category, type, context, course_code, "
+                            "first_seen_at, last_seen_at) VALUES "
+                            "(?,?,?,?,?,?,?,?,?)", key + (ts, ts))
+            if not dry:
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
+                             "('l360_activity_last_import', ?)", (ts,))
+    finally:
+        conn.close()
+    out = {k: st.get(k, 0) for k in ("students", "events", "new", "refreshed",
+                                     "no_date")}
+    out["new_by_month"] = dict(sorted(months.items()))
+    return out
 
 
 def l360_note_targets(*, max_age_days: int = 30, db_path=HISTORY_DB) -> list:

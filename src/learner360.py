@@ -386,6 +386,120 @@ def fetch_notes_batch(page, headers: dict, wgu_ids: list,
                           max(1, int(concurrency))]) or {}
 
 
+# ---------------------------------------------------------- academic activity
+# GET /learner360/v1/academic-activity/<learner uuid>?startDate=…&endDate=…
+# → dated portal / course activity events. The accepted date format isn't
+# documented; ACTIVITY_DATE_FORMATS are tried in order on the first learner
+# and the first one the gateway accepts is used for the run.
+ACTIVITY_PATH = "/learner360/v1/academic-activity/"
+ACTIVITY_DATE_FORMATS = ("%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y")
+
+_ACT_FIELDS = {
+    "date": ("date", "activityDate", "eventDate", "createdDate", "timestamp"),
+    "category": ("category", "activityCategory"),
+    "type": ("typeDescription", "type", "activityType"),
+    "context": ("contextDescription", "context", "description"),
+    "course": ("courseCode", "course"),
+}
+
+
+def activity_query(start, end, fmt: str) -> str:
+    """'?startDate=…&endDate=…' for datetimes ``start``/``end``."""
+    return f"?startDate={start.strftime(fmt)}&endDate={end.strftime(fmt)}"
+
+
+def activity_list(resp) -> list:
+    if isinstance(resp, list):
+        return resp
+    if isinstance(resp, dict):
+        for k in ("content", "activities", "items", "data", "results"):
+            if isinstance(resp.get(k), list):
+                return resp[k]
+    return []
+
+
+def parse_activity(resp) -> list:
+    """Normalize one learner's activity → [{date (YYYY-MM-DD), at (full ISO
+    UTC or ''), category, type, context, course}]."""
+    out = []
+    for a in activity_list(resp):
+        if not isinstance(a, dict):
+            continue
+        raw = _pick(a, _ACT_FIELDS["date"])[1]
+        at = iso_utc(raw)
+        day = at[:10] if at else norm_date(str(raw or ""))[:10]
+        out.append({
+            "date": day, "at": at,
+            "category": str(_pick(a, _ACT_FIELDS["category"])[1] or ""),
+            "type": str(_pick(a, _ACT_FIELDS["type"])[1] or ""),
+            "context": str(_pick(a, _ACT_FIELDS["context"])[1] or ""),
+            "course": str(_pick(a, _ACT_FIELDS["course"])[1] or ""),
+        })
+    return out
+
+
+def activity_shape(resps: list) -> dict:
+    """FERPA-safe summary for the dry-run log: field names (+ counts), which
+    candidate each role used, masked date patterns, category / type LABELS
+    (catalogue names, not student content), and the date span seen."""
+    from collections import Counter
+    keys, picked, dates, cats, types = (Counter() for _ in range(5))
+    wrappers, days = Counter(), []
+    for resp in resps:
+        wrappers["list" if isinstance(resp, list) else
+                 ("dict:" + ",".join(sorted(resp)[:6]) if isinstance(resp, dict)
+                  else type(resp).__name__)] += 1
+        for a in activity_list(resp):
+            if not isinstance(a, dict):
+                continue
+            keys.update(a.keys())
+            for role, names in _ACT_FIELDS.items():
+                name, v = _pick(a, names)
+                if name:
+                    picked[f"{role}<-{name}"] += 1
+                    if role == "date":
+                        dates[_mask(v)] += 1
+            cats[str(_pick(a, _ACT_FIELDS["category"])[1] or "")] += 1
+            types[str(_pick(a, _ACT_FIELDS["type"])[1] or "")] += 1
+        days += [x["date"] for x in parse_activity(resp) if x["date"]]
+    return {"wrappers": dict(wrappers), "keys": dict(keys.most_common()),
+            "picked": dict(picked.most_common()),
+            "date_patterns": dict(dates.most_common(3)),
+            "categories": dict(cats.most_common(25)),
+            "types": dict(types.most_common(30)),
+            "span": (min(days), max(days)) if days else None}
+
+
+_GET_SUFFIX_BATCH_JS = """async ([base, suffix, headers, ids, conc]) => {
+  const out = {}; let i = 0;
+  const h = Object.assign(
+    {'Accept': 'application/json', 'Content-Type': 'application/json'}, headers);
+  const run = async () => {
+    while (i < ids.length) {
+      const id = ids[i++];
+      for (let a = 0; a < 4; a++) {
+        try { const r = await fetch(base + id + suffix, {headers: h});
+              out[id] = {status: r.status, body: await r.text()};
+              if (![429, 502, 503, 504].includes(r.status)) break; }
+        catch (e) { out[id] = {status: 'fetch-error', body: String(e)}; }
+        if (a < 3) await new Promise(res => setTimeout(res, [2000, 5000, 10000][a]));
+      }
+    }
+  };
+  await Promise.all(Array.from({length: conc}, run));
+  return out;
+}"""
+
+
+def fetch_activity_batch(page, headers: dict, wgu_ids: list, suffix: str,
+                         concurrency: int = 3) -> dict:
+    """GET academic-activity (with ``suffix`` query) for many learners,
+    in-page, retrying overload statuses. → {wgu_id: {status, body}}."""
+    return page.evaluate(_GET_SUFFIX_BATCH_JS,
+                         [GATEWAY + ACTIVITY_PATH, suffix, headers,
+                          list(wgu_ids), max(1, int(concurrency))]) or {}
+
+
 # ---------------------------------------------------------- change watch
 # REQUIRED fields per endpoint — what our parsers depend on. A missing one is a
 # breaking change (logged loudly; data from that endpoint can't be trusted).
