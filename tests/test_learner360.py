@@ -343,16 +343,42 @@ def test_activity_parse_shape_and_query():
 def test_persist_activity_idempotent_and_dry():
     path = _tmpdb()
     try:
-        rows = l3.parse_activity(ACTIVITY)
+        rows = l3.parse_activity(ACTIVITY + [ACTIVITY[1]])   # same-day repeat
         d = history.persist_l360_activity({"S1": rows}, dry=True, db_path=path)
-        assert (d["new"], d["refreshed"]) == (2, 0)
+        assert (d["events"], d["rows_new"], d["rows_refreshed"]) == (3, 2, 0), d
         conn = sqlite3.connect(path)
         assert conn.execute("SELECT COUNT(*) FROM l360_activity").fetchone()[0] == 0
         conn.close()
         r1 = history.persist_l360_activity({"S1": rows}, db_path=path)
         r2 = history.persist_l360_activity({"S1": rows}, db_path=path)
-        assert (r1["new"], r2["new"], r2["refreshed"]) == (2, 0, 2), (r1, r2)
-        assert r1["new_by_month"] == {"2026-10": 2}
+        assert (r1["rows_new"], r2["rows_new"], r2["rows_refreshed"]) == (2, 0, 2)
+        assert r1["events_by_month"] == {"2026-10": 3}
+        conn = sqlite3.connect(path)
+        occ = dict(conn.execute("SELECT type, occurrences FROM l360_activity"))
+        conn.close()
+        assert occ == {"Viewed course page": 1, "Started PA": 2}, occ
+    finally:
+        os.remove(path)
+
+
+def test_activity_occurrences_column_added_to_existing_table():
+    path = _tmpdb()
+    try:
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE l360_activity (student_id TEXT NOT NULL, "
+                     "activity_date TEXT NOT NULL, event_at TEXT NOT NULL "
+                     "DEFAULT '', category TEXT NOT NULL DEFAULT '', type TEXT "
+                     "NOT NULL DEFAULT '', context TEXT NOT NULL DEFAULT '', "
+                     "course_code TEXT NOT NULL DEFAULT '', first_seen_at TEXT, "
+                     "last_seen_at TEXT, PRIMARY KEY (student_id, activity_date, "
+                     "event_at, category, type, context, course_code))")
+        conn.commit(); conn.close()
+        history.persist_l360_activity({"S1": l3.parse_activity(ACTIVITY)},
+                                      db_path=path)
+        conn = sqlite3.connect(path)
+        assert conn.execute("SELECT SUM(occurrences) FROM l360_activity"
+                            ).fetchone()[0] == 2
+        conn.close()
     finally:
         os.remove(path)
 

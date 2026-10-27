@@ -313,6 +313,8 @@ CREATE TABLE IF NOT EXISTS l360_activity (
     type          TEXT NOT NULL DEFAULT '',
     context       TEXT NOT NULL DEFAULT '',
     course_code   TEXT NOT NULL DEFAULT '',
+    occurrences   INTEGER NOT NULL DEFAULT 1,   -- same event, same day (dates
+                                                -- have no time of day)
     first_seen_at TEXT,
     last_seen_at  TEXT,
     PRIMARY KEY (student_id, activity_date, event_at, category, type,
@@ -338,6 +340,11 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_DDL)  # create from scratch / fill in any gaps
     _ensure_outcome_columns(conn)    # additive columns on an existing outcomes
     _ensure_student_flag_columns(conn)  # additive columns on existing flags
+    # l360_activity.occurrences was added after the table first shipped.
+    if "occurrences" not in {r[1] for r in conn.execute(
+            "PRAGMA table_info(l360_activity)")}:
+        conn.execute("ALTER TABLE l360_activity ADD COLUMN occurrences "
+                     "INTEGER NOT NULL DEFAULT 1")
     # Learner360 MOMI weeks first stored as MM-DD-YYYY (before norm_date knew
     # that format) -> ISO YYYY-MM-DD so they sort/range-query correctly.
     # Idempotent: only rows still in the old shape match.
@@ -1249,9 +1256,12 @@ def persist_l360_activity(by_student: dict, *, dry: bool = False,
                           db_path=HISTORY_DB,
                           now: Optional[datetime] = None) -> dict:
     """Upsert Learner360 academic-activity events (learner360.parse_activity
-    output) into ``l360_activity``. Idempotent: an event already stored only
-    refreshes last_seen_at. ``dry`` counts without writing. Returns {students,
-    events, new, refreshed, no_date, new_by_month}."""
+    output) into ``l360_activity``. Learner360 gives dates without a time, so
+    identical events on the same day are stored ONCE with ``occurrences`` =
+    how many the pull returned. Re-pulls are idempotent: a stored event only
+    refreshes last_seen_at and keeps the larger count. ``dry`` counts without
+    writing. Returns {students, events, rows_new, rows_refreshed, no_date,
+    events_by_month}."""
     from collections import Counter
     ts = (now or datetime.now()).isoformat(timespec="seconds")
     st, months = Counter(), Counter()
@@ -1260,44 +1270,48 @@ def persist_l360_activity(by_student: dict, *, dry: bool = False,
         with conn:
             for sid, events in (by_student or {}).items():
                 st["students"] += 1
+                agg = Counter()
                 for e in events or []:
                     st["events"] += 1
                     day = (e.get("date") or "")[:10]
                     if not day:
                         st["no_date"] += 1
                         continue
-                    key = (sid, day, e.get("at") or "", e.get("category") or "",
-                           e.get("type") or "", e.get("context") or "",
-                           e.get("course") or "")
+                    months[day[:7]] += 1
+                    agg[(sid, day, e.get("at") or "", e.get("category") or "",
+                         e.get("type") or "", e.get("context") or "",
+                         e.get("course") or "")] += 1
+                for key, n in agg.items():
                     hit = conn.execute(
-                        "SELECT 1 FROM l360_activity WHERE student_id=? AND "
-                        "activity_date=? AND event_at=? AND category=? AND "
-                        "type=? AND context=? AND course_code=?", key).fetchone()
+                        "SELECT occurrences FROM l360_activity WHERE "
+                        "student_id=? AND activity_date=? AND event_at=? AND "
+                        "category=? AND type=? AND context=? AND course_code=?",
+                        key).fetchone()
                     if hit:
-                        st["refreshed"] += 1
+                        st["rows_refreshed"] += 1
                         if not dry:
                             conn.execute(
-                                "UPDATE l360_activity SET last_seen_at=? WHERE "
+                                "UPDATE l360_activity SET last_seen_at=?, "
+                                "occurrences=MAX(occurrences, ?) WHERE "
                                 "student_id=? AND activity_date=? AND event_at=? "
                                 "AND category=? AND type=? AND context=? AND "
-                                "course_code=?", (ts,) + key)
+                                "course_code=?", (ts, n) + key)
                         continue
-                    st["new"] += 1
-                    months[day[:7]] += 1
+                    st["rows_new"] += 1
                     if not dry:
                         conn.execute(
                             "INSERT INTO l360_activity (student_id, activity_date, "
                             "event_at, category, type, context, course_code, "
-                            "first_seen_at, last_seen_at) VALUES "
-                            "(?,?,?,?,?,?,?,?,?)", key + (ts, ts))
+                            "occurrences, first_seen_at, last_seen_at) VALUES "
+                            "(?,?,?,?,?,?,?,?,?,?)", key + (n, ts, ts))
             if not dry:
                 conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
                              "('l360_activity_last_import', ?)", (ts,))
     finally:
         conn.close()
-    out = {k: st.get(k, 0) for k in ("students", "events", "new", "refreshed",
-                                     "no_date")}
-    out["new_by_month"] = dict(sorted(months.items()))
+    out = {k: st.get(k, 0) for k in ("students", "events", "rows_new",
+                                     "rows_refreshed", "no_date")}
+    out["events_by_month"] = dict(sorted(months.items()))
     return out
 
 

@@ -11964,14 +11964,15 @@ class App:
             return
         if dry:
             self._append_log(f"  [l360activity] events by month: "
-                             f"{st.get('new_by_month')}")
+                             f"{st.get('events_by_month')}")
         fail = (f"; {res.get('failed')} learner(s) failed "
                 f"{res.get('fail_statuses')}" if res.get("failed") else "")
         self._append_log(
             f"{'Learner360 activity DRY RUN' if dry else '✓ Learner360 activity'}"
             f": {st.get('events', 0)} event(s) for {st.get('students', 0)} "
-            f"learners — {st.get('new', 0)} {'would be ' if dry else ''}new, "
-            f"{st.get('refreshed', 0)} already stored{fail}."
+            f"learners — {st.get('rows_new', 0)} {'would be ' if dry else ''}"
+            f"new, {st.get('rows_refreshed', 0)} already stored (same-day "
+            f"repeats counted, not duplicated){fail}."
             + (" Paste this log to Claude." if dry else ""))
 
     def _l360_notes_import(self, dry: bool = False, auto: bool = False) -> bool:
