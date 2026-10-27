@@ -383,6 +383,72 @@ def test_activity_occurrences_column_added_to_existing_table():
         os.remove(path)
 
 
+def _seed_engagement(path):
+    conn = history._connect(path)
+    snap = [  # (date, sid, course, task1, course start)
+        ("2026-10-26", "0001", "C1", "2026-10-05 (1)", "2026-09-01"),
+        ("2026-10-26", "0002", "C1", "2026-10-06 (1)", "2026-09-01"),
+        ("2026-10-26", "0003", "C1", "2026-10-07 (2)", "2026-09-01"),
+        ("2026-10-26", "0004", "C2", "", "2026-10-01"),
+    ]
+    for i, (d, sid, c, t1, st) in enumerate(snap):
+        conn.execute("INSERT INTO snapshots (collected_at, collected_date, "
+                     "student_id, course_code, task1, extra_json) VALUES "
+                     "(?,?,?,?,?,?)", (f"{d}T00:00:{i:02d}", d, sid, c, t1,
+                                       '{"CourseStartDate": "%s"}' % st))
+    conn.commit(); conn.close()
+    act = {}
+    for sid, d in (("0001", "2026-10-05"), ("0002", "2026-10-06"),
+                   ("0003", "2026-10-07")):
+        act[sid] = [
+            {"date": d, "category": "Assessment",
+             "type": "Dream Machine Assessment Submitted for Evaluation",
+             "context": "ABC1 Task 1: Thing submitted for evaluation"},
+            {"date": d, "category": "Assessment",       # other course's PA
+             "type": "Dream Machine Assessment Submitted for Evaluation",
+             "context": "ZZZ9 Task 2: Other submitted for evaluation"},
+        ]
+    act["0001"] += [
+        {"date": "2026-10-20", "category": "Coursework",
+         "type": "Learning Resource", "context": "x", "course": "C1"},
+        {"date": "2026-10-24", "category": "Coursework",
+         "type": "Learning Resource", "context": "y", "course": "C1"},
+        {"date": "2026-10-25", "category": "Coursework",
+         "type": "Learning Resource", "context": "z", "course": "C9"},
+        {"date": "2026-10-10", "category": "Assessment",
+         "type": "Dream Machine Assessment Returned for Revision",
+         "context": "ABC1 Task 1: Thing returned"},
+        {"date": "2026-08-01", "category": "Assessment",   # before course start
+         "type": "Dream Machine Performance Assessment Passed",
+         "context": "ABC1 Task 1: Thing passed"},
+        {"date": "2026-10-15", "category": "Contact",
+         "type": "Academic Discussion with Faculty", "context": "", "course": ""},
+    ]
+    history.persist_l360_activity(act, db_path=path)
+
+
+def test_engagement_signals_and_learned_codes():
+    from datetime import datetime as dt
+    path = _tmpdb()
+    try:
+        _seed_engagement(path)
+        today = dt(2026, 10, 27)
+        assert history.learn_course_assessment_codes(
+            db_path=path, refresh=True, today=today) == {"C1": "ABC1"}
+        sig = history.engagement_signals(db_path=path, today=today)
+        s1 = sig[("1", "C1")]
+        assert s1["days_since_course_activity"] == 3          # Oct 24, C1 only
+        assert s1["course_activity_days_14"] == 2
+        assert s1["days_since_any_activity"] == 2             # Oct 25, other course
+        assert (s1["pa_submissions"], s1["pa_returns"], s1["pa_passes"]) == (1, 1, 0)
+        assert s1["faculty_discussions_30"] == 1
+        assert sig[("2", "C1")]["days_since_course_activity"] is None
+        s4 = sig[("4", "C2")]                                 # no activity at all
+        assert s4["days_since_any_activity"] is None and s4["pa_submissions"] is None
+    finally:
+        os.remove(path)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

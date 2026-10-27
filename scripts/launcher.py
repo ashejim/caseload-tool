@@ -17216,6 +17216,13 @@ class App:
                         for k, v in history.all_student_pronouns().items()}
         except Exception:
             pron_map = {}
+        # Learner360 engagement signals (history.engagement_signals), keyed by
+        # (student id without leading zeros, course). Blank when no activity
+        # has been imported for the student.
+        try:
+            eng_map = history.engagement_signals()
+        except Exception:
+            eng_map = {}
 
         def _num(v):
             return "" if v is None else v
@@ -17262,10 +17269,28 @@ class App:
                 r["_contact_pref_source"] = ""
             # Instructor-entered pronouns (blank unless manually set).
             r["Pronouns"] = pron_map.get(sid.lstrip("0"), "")
+            # Learner360 engagement (blank if no activity data).
+            eg = eng_map.get((sid.lstrip("0"), course)) or {}
+            for col, key in self._ENGAGEMENT_COLS:
+                r[col] = _num(eg.get(key))
             # PM email captured from a prior fire/email for this student — used
             # by the panel email-click CC (real address vs the name fallback).
             pm = pm_by_sid.get(sid)
             r["_pm_email_logged"] = pm[1] if pm else ""
+
+    # Engagement columns (CSV-style key, history.engagement_signals key).
+    _ENGAGEMENT_COLS = (
+        ("DaysSinceCourseActivity", "days_since_course_activity"),
+        ("CourseActivityDays14", "course_activity_days_14"),
+        ("DaysSinceAnyActivity", "days_since_any_activity"),
+        ("PASubmissions", "pa_submissions"),
+        ("PAReturns", "pa_returns"),
+        ("PAPasses", "pa_passes"),
+        ("OAAttempts", "oa_attempts"),
+        ("PreAssessments", "preassessments"),
+        ("ApprovalRequests", "approval_requests"),
+        ("FacultyDiscussions30", "faculty_discussions_30"),
+    )
 
     # Curated value vocabulary for the task-status filter columns (the
     # aggregate "Task Status" holds combos, so deriving from data would be

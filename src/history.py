@@ -3341,6 +3341,185 @@ def student_timeline(student_id: str, *, db_path=HISTORY_DB) -> list[dict]:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Learner360 engagement signals (from l360_activity)
+# ---------------------------------------------------------------------------
+_PA_CODE_RE = re.compile(r"^([A-Z0-9]{4}) Task (\d+)\b")
+
+
+def learn_course_assessment_codes(conn=None, *, db_path=HISTORY_DB,
+                                  refresh: bool = False,
+                                  today: Optional[datetime] = None) -> dict:
+    """{course_code: assessment_code} for the caseload's courses, learned from
+    the data: a student's Task 1 ATTEMPT DATE in the caseload snapshots (task1
+    = 'YYYY-MM-DD (n)') should coincide with a Learner360 performance-
+    assessment event '<CODE> Task 1 … submitted' on the same day. The code
+    with the most same-day matches wins if it's clear (≥3 matches and ≥3x the
+    runner-up). Verified live 2026-10-27: C769→ROM3, C964→SIM3, D502→BHN1.
+    Cached in meta 'l360_pa_codes' for a day."""
+    from collections import Counter, defaultdict
+    own = conn is None
+    conn = conn or _connect(db_path)
+    try:
+        day = (today or datetime.now()).strftime("%Y-%m-%d")
+        if not refresh:
+            raw = _meta_get(conn, "l360_pa_codes")
+            if raw:
+                try:
+                    cached = json.loads(raw)
+                    if cached.get("computed") == day:
+                        return cached.get("codes") or {}
+                except ValueError:
+                    pass
+        subs = defaultdict(set)                  # (nsid, date) -> {code}
+        for r in conn.execute(
+                "SELECT student_id, activity_date, context FROM l360_activity "
+                "WHERE type LIKE 'Dream Machine Assessment%Submitted%'"):
+            m = _PA_CODE_RE.match(r["context"] or "")
+            if m and m.group(2) == "1":
+                subs[((r["student_id"] or "").lstrip("0"),
+                      r["activity_date"])].add(m.group(1))
+        hits = defaultdict(Counter)
+        for r in conn.execute("SELECT DISTINCT student_id, course_code, task1 "
+                              "FROM snapshots WHERE task1 GLOB "
+                              "'[0-9][0-9][0-9][0-9]-*'"):
+            key = ((r["student_id"] or "").lstrip("0"), (r["task1"] or "")[:10])
+            for code in subs.get(key, ()):
+                hits[r["course_code"]][code] += 1
+        codes = {}
+        for course, cnt in hits.items():
+            top = cnt.most_common(2)
+            n1 = top[0][1]
+            n2 = top[1][1] if len(top) > 1 else 0
+            if n1 >= 3 and n1 >= 3 * n2:
+                codes[course] = top[0][0]
+        try:
+            with conn:
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
+                             "('l360_pa_codes', ?)",
+                             (json.dumps({"computed": day, "codes": codes}),))
+        except sqlite3.Error:
+            pass
+        return codes
+    finally:
+        if own:
+            conn.close()
+
+
+def engagement_signals(*, db_path=HISTORY_DB,
+                       today: Optional[datetime] = None) -> dict:
+    """Per (student id without leading zeros, course) engagement signals from
+    Learner360 academic activity, for the latest caseload snapshot:
+
+      days_since_course_activity  coursework events tagged with this course
+      course_activity_days_14     distinct days with such events, last 14 days
+      days_since_any_activity     any activity, any course
+      pa_submissions / pa_returns / pa_passes
+                                  performance-assessment events for this
+                                  course's assessment code (learned — see
+                                  learn_course_assessment_codes), since the
+                                  course start date (whole window if unknown)
+      oa_attempts / preassessments / approval_requests
+                                  events tagged with this course, since start
+      faculty_discussions_30      'Academic Discussion with Faculty', 30 days
+
+    Values are None when there's no activity data for the student (so the
+    viewer shows blank, not a misleading 0). Returns {} when no activity has
+    been imported yet."""
+    from collections import defaultdict
+    from datetime import timedelta
+    now = (today or datetime.now()).date()
+    conn = _connect(db_path)
+    try:
+        if not conn.execute("SELECT 1 FROM l360_activity LIMIT 1").fetchone():
+            return {}
+        codes = learn_course_assessment_codes(conn, today=today)
+        latest = conn.execute("SELECT MAX(collected_date) FROM snapshots"
+                              ).fetchone()[0]
+        keys = {}
+        for r in conn.execute("SELECT student_id, course_code, extra_json FROM "
+                              "snapshots WHERE collected_date = ?", (latest,)):
+            try:
+                start = (json.loads(r["extra_json"] or "{}").get(
+                    "CourseStartDate") or "")
+            except ValueError:
+                start = ""
+            sd = _parse_date(start)
+            keys[((r["student_id"] or "").lstrip("0"), r["course_code"])] = (
+                sd.isoformat() if sd else "")
+        ev = defaultdict(list)
+        for r in conn.execute("SELECT student_id, activity_date, category, type, "
+                              "context, course_code, occurrences FROM "
+                              "l360_activity"):
+            ev[(r["student_id"] or "").lstrip("0")].append(r)
+    finally:
+        conn.close()
+
+    def _days(d):
+        try:
+            return (now - datetime.strptime(d, "%Y-%m-%d").date()).days
+        except (TypeError, ValueError):
+            return None
+
+    d14 = (now - timedelta(days=14)).isoformat()
+    d30 = (now - timedelta(days=30)).isoformat()
+    out = {}
+    for (sid, course), start in keys.items():
+        rows = ev.get(sid)
+        if not rows:
+            out[(sid, course)] = {k: None for k in (
+                "days_since_course_activity", "course_activity_days_14",
+                "days_since_any_activity", "pa_submissions", "pa_returns",
+                "pa_passes", "oa_attempts", "preassessments",
+                "approval_requests", "faculty_discussions_30")}
+            continue
+        code = codes.get(course)
+        last_course = last_any = ""
+        days14 = set()
+        pa_s = pa_r = pa_p = oa = pre = appr = fac = 0
+        for r in rows:
+            d, cat, typ = r["activity_date"], r["category"], r["type"]
+            n = r["occurrences"] or 1
+            last_any = max(last_any, d)
+            mine = r["course_code"] == course
+            if cat == "Coursework" and mine:
+                last_course = max(last_course, d)
+                if d >= d14:
+                    days14.add(d)
+            if typ == "Academic Discussion with Faculty" and d >= d30:
+                fac += n
+            if start and d < start:
+                continue
+            if code and typ.startswith("Dream Machine"):
+                m = _PA_CODE_RE.match(r["context"] or "")
+                if m and m.group(1) == code:
+                    if "Returned" in typ:
+                        pa_r += n
+                    elif "Passed" in typ:
+                        pa_p += n
+                    elif "Submitted" in typ:
+                        pa_s += n
+            if mine:
+                if typ == "Objective Assessment":
+                    oa += n
+                elif typ == "Objective Preassessment":
+                    pre += n
+                elif typ == "Request Assessment Approval":
+                    appr += n
+        out[(sid, course)] = {
+            "days_since_course_activity": _days(last_course) if last_course
+            else None,
+            "course_activity_days_14": len(days14),
+            "days_since_any_activity": _days(last_any) if last_any else None,
+            "pa_submissions": pa_s if code else None,
+            "pa_returns": pa_r if code else None,
+            "pa_passes": pa_p if code else None,
+            "oa_attempts": oa, "preassessments": pre,
+            "approval_requests": appr, "faculty_discussions_30": fac,
+        }
+    return out
+
+
 def task_stall_days(*, db_path=HISTORY_DB,
                     now: Optional[datetime] = None) -> dict:
     """Whole days that each student's task status has been unchanged, keyed

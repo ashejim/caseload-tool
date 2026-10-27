@@ -79,6 +79,19 @@ DISPLAY_TO_CSV: dict[str, str] = {
     "Never Attempted": "NeverAttempted",           # Yes / No
     "Contact Preference": "ContactPref",           # text / email / call
     "Pronouns": "Pronouns",                         # instructor-entered; blank default
+    # Learner360 engagement (history.engagement_signals; blank = no activity
+    # data). "Course activity" = coursework events tagged with the course;
+    # PA counts use the course's learned assessment code, since course start.
+    "Days Since Course Activity": "DaysSinceCourseActivity",
+    "Course Activity Days (14d)": "CourseActivityDays14",
+    "Days Since Any Activity": "DaysSinceAnyActivity",
+    "PA Submissions": "PASubmissions",
+    "PA Returns": "PAReturns",
+    "PA Passes": "PAPasses",
+    "OA Attempts": "OAAttempts",
+    "Pre-assessments": "PreAssessments",
+    "Approval Requests": "ApprovalRequests",
+    "Faculty Discussions (30d)": "FacultyDiscussions30",
 }
 
 
