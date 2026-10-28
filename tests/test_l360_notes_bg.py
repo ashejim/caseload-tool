@@ -247,6 +247,27 @@ def test_background_activity_window_batches_and_stamp():
          history.l360_activity_last_import, history.l360_note_targets) = real
 
 
+def test_manual_import_uses_background_batches_with_progress():
+    fd, db = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.remove(db)
+    real = (history.persist_l360_notes, history.mark_l360_notes_imported)
+    try:
+        history.persist_l360_notes = lambda by, **kw: real[0](
+            by, db_path=db, mark_done=kw.get("mark_done", True))
+        history.mark_l360_notes_imported = lambda **kw: real[1](db_path=db)
+        a = _app(db)
+        a._start_l360_notes_bg([(f"w{i}", f"S{i}") for i in range(60)],
+                               manual=True)
+        a.root.pump()
+        assert a.worker.batches == [10] * 6, a.worker.batches
+        assert any("[l360] notes 50/60" in m for m in a.logs), a.logs
+        assert any(m.startswith("✓ Learner360 notes (import)") for m in a.logs)
+    finally:
+        history.persist_l360_notes, history.mark_l360_notes_imported = real
+        os.remove(db)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

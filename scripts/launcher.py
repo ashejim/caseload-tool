@@ -12011,6 +12011,12 @@ class App:
                 self._append_log("Learner360 notes: no Learner360 ids yet — run "
                                  "l360momi: first.")
             return False
+        if not dry and not auto:
+            # A real import runs as the same small, yielding background batches
+            # as the weekly job — the gateway can be slow (an hour+ on a bad
+            # day) and a one-shot run held the browser the whole time.
+            self._start_l360_notes_bg(targets, manual=True)
+            return True
         self._set_busy("Reading notes from Learner360…")
         self._append_log(
             f"Learner360 notes{' (DRY RUN — nothing will be saved)' if dry else ''}"
@@ -12265,7 +12271,7 @@ class App:
             except Exception:
                 pass
 
-    def _start_l360_notes_bg(self, targets: list) -> None:
+    def _start_l360_notes_bg(self, targets: list, manual: bool = False) -> None:
         from collections import Counter
         try:
             from src import mongoose_contacts as _mc
@@ -12273,11 +12279,13 @@ class App:
         except Exception:
             cids = {}
         self._l360_bg = {"targets": list(targets), "i": 0, "tot": Counter(),
-                         "fail": Counter(), "t0": time.time(), "cids": cids}
+                         "fail": Counter(), "t0": time.time(), "cids": cids,
+                         "manual": manual, "last_report": 0}
         self._append_log(
-            f"Learner360 notes: weekly import starting in the background — "
-            f"{len(targets)} learners, {self._L360_BG_BATCH} at a time "
-            "(anything you do goes first).")
+            f"Learner360 notes: {'import' if manual else 'weekly import'} "
+            f"starting in the background — {len(targets)} learners, "
+            f"{self._L360_BG_BATCH} at a time (anything you do goes first"
+            + ("; progress every 50" if manual else "") + ").")
         self._l360_bg_step()
 
     def _l360_bg_step(self) -> None:
@@ -12349,6 +12357,12 @@ class App:
         for k in ("new", "exact", "fuzzy", "type", "already", "dup_in_360"):
             st["tot"][k] += r.get(k, 0)
         st["i"] += n
+        if st.get("manual") and st["i"] - st.get("last_report", 0) >= 50:
+            st["last_report"] = st["i"]
+            self._append_log(
+                f"  [l360] notes {st['i']}/{len(st['targets'])} "
+                f"({(time.time() - st['t0']) / 60:.0f} min, "
+                f"{st['tot']['new']} new so far)")
         self.root.after(1500, self._l360_bg_step)
 
     def _l360_bg_finish(self) -> None:
@@ -12366,7 +12380,8 @@ class App:
                     + (" — will retry" if fails > max(3, n // 10) else "")
                     if fails else "")
         self._append_log(
-            f"✓ Learner360 notes (weekly import): {tot['new']} new note(s), "
+            f"✓ Learner360 notes ({'import' if st.get('manual') else 'weekly import'})"
+            f": {tot['new']} new note(s), "
             f"{tot['already']} already imported, "
             f"{tot['exact'] + tot['fuzzy'] + tot['type']} matched to Salesforce "
             f"copies, for {n} learners in {mins:.0f} min{fail_txt}.")
