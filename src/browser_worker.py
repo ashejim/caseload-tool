@@ -4369,6 +4369,56 @@ class BrowserWorker:
                 except Exception:
                     pass
 
+    _OPEN_MODALS_JS = """() => {
+      const vis = el => { const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0; };
+      const out = [];
+      for (const d of document.querySelectorAll(
+          '[role="dialog"][aria-modal="true"], .slds-modal.slds-fade-in-open')) {
+        if (!vis(d)) continue;
+        let title = '';
+        const lb = d.getAttribute('aria-labelledby');
+        if (lb && document.getElementById(lb))
+          title = document.getElementById(lb).innerText || '';
+        if (!title) { const h = d.querySelector('h1, h2'); title = h ? h.innerText : ''; }
+        out.push((title || '(untitled)').trim().slice(0, 80));
+      }
+      return out;
+    }"""
+
+    def _dismiss_open_modals(self, target) -> list:
+        """Close any open Salesforce modal on the caseload page (its X /
+        Close button, else Escape) and log its title so the source can be
+        identified. Returns the titles found. Never raises."""
+        try:
+            titles = target.evaluate(self._OPEN_MODALS_JS) or []
+        except Exception:
+            return []
+        if not titles:
+            return []
+        self.on_status(f"  [caseload] closing leftover Salesforce pop-up(s): "
+                       f"{titles}")
+        for _ in range(3):
+            try:
+                closer = target.locator(
+                    '.slds-modal.slds-fade-in-open button[title="Close"], '
+                    '[role="dialog"][aria-modal="true"] button[title="Close"], '
+                    '.slds-modal.slds-fade-in-open .slds-modal__close'
+                ).filter(visible=True).first
+                if closer.count() > 0:
+                    closer.click(timeout=3000)
+                else:
+                    target.keyboard.press("Escape")
+                target.wait_for_timeout(400)
+                if not (target.evaluate(self._OPEN_MODALS_JS) or []):
+                    break
+            except Exception:
+                try:
+                    target.keyboard.press("Escape")
+                except Exception:
+                    pass
+        return titles
+
     def _open_caseload_table(self, ctx):
         """Common helper: navigate to Caseload (if not already there)
         and return a locator for the data table.
@@ -4399,6 +4449,11 @@ class BrowserWorker:
                     )
                     last_error = str(e)
                     continue
+            # A Salesforce modal left open (seen live 2026-10-27/28 after
+            # playlist / queue work) sits over the grid: it intercepts the
+            # Download click (export times out) and stops the list rendering
+            # (task scan falls back to 10 rows). Close it first.
+            self._dismiss_open_modals(target)
             try:
                 table = self._await_caseload_list(target)
                 return target, table
