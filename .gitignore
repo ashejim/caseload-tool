@@ -38,6 +38,12 @@ note_log.csv
 # data files; *.tmp is atomic-write scratch. Never commit any of these.
 vault.json
 *.enc
+# Safety copies crypto_store keeps beside each encrypted file: the previous
+# .enc on every save, dated backups when data shrinks, and set-aside stray
+# plaintext (may be UNENCRYPTED student data).
+*.enc.prev
+*.enc.bak-*
+*.stray-*
 *.tmp
 
 # Diagnostic reports from the 'griddiff:' / 'gridbuild:' keywords — hold student
