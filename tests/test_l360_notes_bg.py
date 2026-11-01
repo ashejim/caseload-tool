@@ -224,8 +224,9 @@ def test_background_activity_window_batches_and_stamp():
         history.l360_note_targets = lambda **kw: [(f"w{i}", f"S{i}")
                                                  for i in range(43)]
         a = types.SimpleNamespace()
-        for name in ("_maybe_auto_l360_activity", "_l360_abg_step",
-                     "_l360_abg_got", "_l360_abg_saved"):
+        for name in ("_maybe_auto_l360_activity", "_start_l360_activity_bg",
+                     "_l360_abg_step", "_l360_abg_got", "_l360_abg_saved",
+                     "_l360_refresh_now"):
             setattr(a, name, getattr(App, name).__get__(a))
         a._L360_ACT_BATCH = App._L360_ACT_BATCH
         a.root, a.worker = FakeRoot(), FakeActivityWorker()
@@ -242,6 +243,13 @@ def test_background_activity_window_batches_and_stamp():
         assert set(calls["mark_done"]) == {False} and calls["stamped"] == 1
         assert a._l360_abg is None
         assert any("43 new row(s)" in m for m in a.logs), a.logs
+        # "Refresh now" starts it again immediately (not due by schedule).
+        a.worker.batches.clear()
+        a._l360_refresh_now("activity")
+        a._l360_refresh_now("activity")          # second click: already running
+        a.root.pump()
+        assert a.worker.batches == [20, 20, 3], a.worker.batches
+        assert any("already running" in m for m in a.logs), a.logs
     finally:
         (history.persist_l360_activity, history.mark_l360_activity_imported,
          history.l360_activity_last_import, history.l360_note_targets) = real

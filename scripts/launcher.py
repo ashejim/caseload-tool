@@ -12132,32 +12132,75 @@ class App:
             if not l3.momi_capture_due(last, days):
                 self.root.after(rearm_ms, self._maybe_auto_l360_activity)
                 return
-            targets = history.l360_note_targets()
-            if not targets or not self.worker.ready_event.is_set():
+            if not self._start_l360_activity_bg():
                 self.root.after(retry_ms, self._maybe_auto_l360_activity)
                 return
-            window = 365
-            if last:
-                try:
-                    from datetime import datetime as _dt
-                    age = (_dt.now() - _dt.fromisoformat(last[:19])).days
-                    window = max(14, min(365, age + 7))
-                except ValueError:
-                    pass
-            self._l360_abg = {"targets": list(targets), "i": 0, "window": window,
-                              "events": 0, "new": 0, "fail": 0,
-                              "t0": time.time()}
-            self._append_log(
-                f"Learner360 activity: weekly import starting in the background "
-                f"— last {window} days for {len(targets)} learners, "
-                f"{self._L360_ACT_BATCH} at a time (anything you do goes first).")
-            self._l360_abg_step()
             self.root.after(rearm_ms, self._maybe_auto_l360_activity)
         except Exception:
             try:
                 self.root.after(rearm_ms, self._maybe_auto_l360_activity)
             except Exception:
                 pass
+
+    def _start_l360_activity_bg(self, manual: bool = False) -> bool:
+        """Start the batched activity import now. Window = days since the last
+        completed import + 7 (14..365; 365 the first time). True if started."""
+        if (getattr(self, "_offline", False) or getattr(self, "_l360_abg", None)
+                or not self.worker.ready_event.is_set()):
+            return False
+        targets = history.l360_note_targets()
+        if not targets:
+            return False
+        window, last = 365, history.l360_activity_last_import()
+        if last:
+            try:
+                from datetime import datetime as _dt
+                age = (_dt.now() - _dt.fromisoformat(last[:19])).days
+                window = max(14, min(365, age + 7))
+            except ValueError:
+                pass
+        self._l360_abg = {"targets": list(targets), "i": 0, "window": window,
+                          "events": 0, "new": 0, "fail": 0, "t0": time.time()}
+        self._append_log(
+            f"Learner360 activity: {'import' if manual else 'weekly import'} "
+            f"starting in the background — last {window} days for "
+            f"{len(targets)} learners, {self._L360_ACT_BATCH} at a time "
+            "(anything you do goes first).")
+        self._l360_abg_step()
+        return True
+
+    def _l360_refresh_now(self, which: str) -> None:
+        """Settings ▸ 'Refresh now': start a Learner360 background job
+        immediately, regardless of its schedule. ``which`` = momi | notes |
+        activity. Logs why when it can't start."""
+        names = {"momi": "MOMI history", "notes": "notes import",
+                 "activity": "activity import"}
+        running = {"momi": "_l360_mbg", "notes": "_l360_bg",
+                   "activity": "_l360_abg"}[which]
+        if getattr(self, "_offline", False):
+            self._append_log("🔌 Demo: Learner360 isn't available offline.")
+            return
+        if getattr(self, running, None):
+            self._append_log(f"Learner360 {names[which]} is already running in "
+                             "the background — it'll log when done.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — try Refresh now again "
+                             "in a moment.")
+            return
+        if which == "momi":
+            started = self._start_l360_momi_bg()
+        elif which == "notes":
+            targets = history.l360_note_targets()
+            started = bool(targets)
+            if started:
+                self._start_l360_notes_bg(targets, manual=True)
+        else:
+            started = self._start_l360_activity_bg(manual=True)
+        if not started:
+            self._append_log(f"Learner360 {names[which]} couldn't start — "
+                             "no Learner360 ids yet (run the MOMI refresh "
+                             "first).")
 
     def _l360_abg_step(self) -> None:
         st = getattr(self, "_l360_abg", None)
@@ -20342,6 +20385,10 @@ class App:
             l3_row, width=130, variable=l3_var, state="readonly",
             values=list(_L3_LABELS.keys()),
         ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            l3_row, text="Refresh now", width=100,
+            command=lambda: self._l360_refresh_now("momi"),
+        ).pack(side="left", padx=(8, 0))
 
         # Learner360 notes import (contact history → Throughput contacts).
         l3n_row = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -20352,6 +20399,10 @@ class App:
         ctk.CTkComboBox(
             l3n_row, width=130, variable=l3n_var, state="readonly",
             values=list(_L3_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            l3n_row, text="Refresh now", width=100,
+            command=lambda: self._l360_refresh_now("notes"),
         ).pack(side="left", padx=(8, 0))
 
         # Learner360 academic activity import (engagement events).
@@ -20364,6 +20415,10 @@ class App:
         ctk.CTkComboBox(
             l3a_row, width=130, variable=l3a_var, state="readonly",
             values=list(_L3_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            l3a_row, text="Refresh now", width=100,
+            command=lambda: self._l360_refresh_now("activity"),
         ).pack(side="left", padx=(8, 0))
 
         # Local versioned backups (src/local_backup.py) — status + open folder.
