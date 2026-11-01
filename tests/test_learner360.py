@@ -489,6 +489,34 @@ def test_roster_coverage_counts():
     assert c["l360_with_email"] == 2
 
 
+def test_l360_session_replaces_a_stale_token():
+    import types
+    from src.browser_worker import BrowserWorker as BW
+
+    class Page:
+        reloads = 0
+        waits = 0
+
+        def evaluate(self, js, args):
+            auth = (args[1] or {}).get("authorization")
+            return {"status": 401 if auth == "old" else 200, "body": "{}"}
+
+        def wait_for_timeout(self, ms):
+            Page.waits += 1
+            if Page.waits == 2:                     # app refreshes its token
+                fake._l360_auth = {"headers": {"authorization": "new"}}
+
+        def reload(self, **kw):
+            Page.reloads += 1
+
+    fake = types.SimpleNamespace(_l360_auth=None)
+    h = BW._l360_validated_headers(fake, Page(), {"authorization": "old"}, "u1")
+    assert h == {"authorization": "new"} and Page.reloads == 0, (h, Page.reloads)
+    fake._l360_auth = None
+    good = BW._l360_validated_headers(fake, Page(), {"authorization": "ok"}, "u1")
+    assert good == {"authorization": "ok"}
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

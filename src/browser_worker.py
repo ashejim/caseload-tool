@@ -2878,8 +2878,51 @@ class BrowserWorker:
         user = auth.get("user") or snap.get("wguId") or ""
         if not user:
             return {"error": "couldn't determine your Learner360 user id."}
-        self._l360_sess = (page, auth["headers"], user, snap, time.time())
-        return page, auth["headers"], user, snap
+        # The page's FIRST gateway calls can still carry the previous, expired
+        # token (the app refreshes it right after) — harvesting that gave HTTP
+        # 401 on the very first request (seen live 2026-11-01). Validate with a
+        # cheap call; on 401 wait for the refreshed token, then reload once.
+        headers = self._l360_validated_headers(page, auth["headers"], user)
+        if headers is None:
+            return {"error": "Learner360 sign-in was refused (HTTP 401) even "
+                    "after a reload — sign in to Learner360 in the browser "
+                    "window and try again.", "not_logged_in": True}
+        self._l360_sess = (page, headers, user, snap, time.time())
+        return page, headers, user, snap
+
+    def _l360_validated_headers(self, page, headers: dict, user: str):
+        """Return gateway headers that actually work (not 401), waiting up to
+        20 s for the app's refreshed token and then reloading once. None if
+        still refused."""
+        from src import learner360 as l3
+        probe = f"/learner360/v1/users/{user}/permissions"
+
+        def ok(h) -> bool:
+            try:
+                return l3.api(page, h, "GET", probe)["status"] != 401
+            except Exception:
+                return True          # don't block on a probe hiccup
+
+        if ok(headers):
+            return headers
+        for attempt in range(2):
+            if attempt == 1:
+                self._l360_auth = None
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30_000)
+                except Exception:
+                    pass
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                try:
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    break
+                fresh = (self._l360_auth or {}).get("headers")
+                if (fresh and fresh.get("authorization")
+                        != headers.get("authorization") and ok(fresh)):
+                    return fresh
+        return None
 
     def _l360_team_roster(self, ctx, surface: bool = True) -> dict:
         """READ-ONLY: the team's caseloads from Learner360 — teams/assigned →
