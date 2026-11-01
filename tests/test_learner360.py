@@ -517,6 +517,28 @@ def test_l360_session_replaces_a_stale_token():
     assert good == {"authorization": "ok"}
 
 
+def test_roster_replay_of_labeler_log():
+    from src import l360_roster
+    rows = [{"email": "a@wgu.edu", "courses": ["C769"], "owner": "Jim Ashe"},
+            {"email": "b@wgu.edu", "courses": ["C769"], "owner": "Lee, Tawnya"},
+            {"email": "n@wgu.edu", "courses": ["D502"], "owner": "Jeff Smith"}]
+    log = [
+        {"sender_smtp": "A@wgu.edu", "method": "email",
+         "categories": ["C769", "Jim"]},                         # same
+        {"sender_smtp": "b@wgu.edu", "method": "email",
+         "categories": ["C769", "Candice"]},                     # CI differs
+        {"sender_smtp": "gone@wgu.edu", "method": "email",
+         "categories": ["C964", "Jim"]},                         # lost
+        {"sender_smtp": "n@wgu.edu", "method": "none",
+         "categories": ["Unidentified"]},                        # newly found
+        {"sender_smtp": "me@gmail.com", "method": "none", "categories": []},
+    ]
+    r = l360_roster.replay_log(rows, log, ["C769", "C964", "D502"])
+    assert (r["senders"], r["identified_before"], r["identified_l360"]) == (5, 3, 3), r
+    assert (r["both"], r["same_categories"], r["ci_differs"]) == (2, 1, 1), r
+    assert (r["lost"], r["newly_identified"], r["course_differs"]) == (1, 1, 0), r
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

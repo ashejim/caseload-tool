@@ -11947,6 +11947,22 @@ class App:
             return
         self._append_log(f"  [l360roster] courses compared: {courses}")
         self._append_log(f"  [l360roster] coverage: {cov}")
+        # Replay the labeler's real past decisions against Learner360.
+        try:
+            import json as _json
+            logp = inbox_labeler.LOG_PATH
+            entries = []
+            if logp.exists():
+                for line in logp.read_text(encoding="utf-8").splitlines():
+                    try:
+                        entries.append(_json.loads(line))
+                    except ValueError:
+                        pass
+            rp = l360_roster.replay_log(res.get("rows") or [], entries, courses)
+            self._append_log(f"  [l360roster] replay of {len(entries)} past "
+                             f"labeler decisions: {rp}")
+        except Exception as e:
+            self._append_log(f"  [l360roster] replay failed: {e}")
         a = cov["roster_assigned"] or 1
         self._append_log(
             f"Learner360 team roster DRY RUN: {cov['l360_students']} learners "

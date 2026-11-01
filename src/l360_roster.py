@@ -12,7 +12,10 @@ This module is pure (no browser / no DB): the coverage comparison used by the
 """
 from __future__ import annotations
 
+import re
 from collections import Counter
+
+_COURSE_RE = re.compile(r"^[A-Za-z]\d{3}$")       # C769, D502 …
 
 
 def _first(name: str) -> str:
@@ -24,6 +27,59 @@ def _first(name: str) -> str:
 
 def _nsid(s) -> str:
     return str(s or "").strip().lstrip("0")
+
+
+def replay_log(l360_rows: list, log_entries: list, courses=None) -> dict:
+    """Replay the labeler's past decisions (inbox_label_log.jsonl) against the
+    Learner360 team roster: for each distinct sender, would a Learner360
+    lookup by WGU email identify them, and with the same course + CI-first-name
+    categories the course-scan roster gave? Counts only.
+
+    Returns {senders, identified_before, identified_l360, both,
+    same_categories, ci_differs, course_differs, newly_identified,
+    lost (identified before, not by Learner360)}."""
+    want = {c.strip().upper() for c in (courses or []) if c.strip()}
+    by_email = {}
+    for r in l360_rows or []:
+        em = (r.get("email") or "").strip().lower()
+        if em:
+            by_email.setdefault(em, []).append(r)
+    latest = {}
+    for e in log_entries or []:
+        s = (e.get("sender_smtp") or "").strip().lower()
+        if s:
+            latest[s] = e            # last decision per sender wins
+    st = Counter()
+    for sender, e in latest.items():
+        st["senders"] += 1
+        before = e.get("method") == "email"
+        hits = [h for h in by_email.get(sender, [])
+                if not want or {c.strip().upper() for c in h.get("courses")
+                                or []} & want]
+        st["identified_before"] += before
+        st["identified_l360"] += bool(hits)
+        if before and not hits:
+            st["lost"] += 1
+        if hits and not before:
+            st["newly_identified"] += 1
+        if before and hits:
+            st["both"] += 1
+            old = {str(c).strip() for c in (e.get("categories") or [])}
+            new_courses = {c.strip().upper() for h in hits
+                           for c in h.get("courses") or []}
+            new_cis = {_first(h.get("owner")) for h in hits} - {""}
+            old_courses = {c.upper() for c in old if _COURSE_RE.match(c)}
+            old_cis = {c.lower() for c in old if not _COURSE_RE.match(c)} - {
+                "unassigned", "unidentified"}
+            course_ok = old_courses <= new_courses if old_courses else True
+            ci_ok = (old_cis <= new_cis) if old_cis else True
+            st["course_differs"] += not course_ok
+            st["ci_differs"] += not ci_ok
+            st["same_categories"] += course_ok and ci_ok
+    keys = ("senders", "identified_before", "identified_l360", "both",
+            "same_categories", "ci_differs", "course_differs",
+            "newly_identified", "lost")
+    return {k: st.get(k, 0) for k in keys}
 
 
 def compare_coverage(l360_rows: list, roster: list, courses=None) -> dict:
