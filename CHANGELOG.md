@@ -3,6 +3,52 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.27.0 — 2026-11-01
+
+- **Learner360 data (WGU's new caseload app), read-only, alongside Salesforce.**
+  - **MOMI history:** weekly numeric momentum scores + MOMI's factor breakdown
+    for your caseload (`l360momi:`), plus a change-watch that logs when
+    Learner360 releases a new version, flips feature flags, or changes fields.
+  - **Full note history:** every learner's complete notes from Learner360
+    (`l360notes:`), de-duplicated one-to-one against notes already scraped from
+    Salesforce — fills the 60-note scrape cap and keeps contact counts current.
+  - **Academic activity:** dated portal / course activity and assessment events
+    (`l360activity:`), with same-day repeats counted rather than duplicated.
+  - **Runs on its own:** each of the three refreshes weekly in the background in
+    small batches that wait while you work, so they never block filing or
+    sending. Schedules + a **Refresh now** button for each under
+    **Settings → Caseload & Data**.
+- **Engagement columns in the caseload viewer** (filterable): days since course
+  activity, course activity days (14d), days since any activity, PA
+  submissions / returns / passes (each course's assessment code is learned
+  automatically), OA attempts, pre-assessments, approval requests, faculty
+  discussions (30d). Context only — for capstone courses they predict progress
+  weakly, so they are not used in the risk score.
+- **Throughput "Only mine".** The contacts line now counts only notes you wrote
+  (on by default). Previously it counted every author's notes — program mentors,
+  other staff, mass emails — about ten times your own outreach.
+- **Local backups of your history database.** Every day at startup — before
+  anything is unlocked or changed — the app saves a read-only, still-encrypted
+  copy to `Documents\CaseloadNotes Backups` (7 daily + 4 weekly + 6 monthly).
+  A copy much smaller than the previous one is kept as `-SUSPICIOUS` and never
+  rotates older backups out. Restore steps are in the folder's `README.txt`.
+- **Fix: a stray file could replace your encrypted history.** If a plain
+  `history.db` appeared while the app was closed, startup could treat it as a
+  crash leftover and, on exit, encrypt it over your real data (this happened
+  once, on 2026-10-25; the data was recovered). A much-smaller leftover is now
+  set aside instead of trusted, and the previous encrypted file is always kept
+  (`.enc.prev`, plus a dated copy if the data shrinks sharply).
+- **Fix: task pass/fail after a manual refresh.** When the caseload page was
+  already open, a refresh could leave the live pass/fail scan with stale data
+  and a slow fallback that read only ~10 rows. The scan now reloads the
+  caseload page once for fresh data. A leftover Salesforce pop-up over the grid
+  is also closed (and its title logged) before refreshing.
+- **Action tree** (advanced Data view) and two new sample batch actions
+  (low-momentum check-in, follow-up due) with email templates.
+- *Not yet confirmed in daily use:* the stale-data reload, and the notes /
+  activity imports running on their own weekly schedule (first due Nov 3–4;
+  the MOMI one is confirmed).
+
 ## 0.26.1 — 2026-10-01
 
 - **Fix: texts with quotes or "smart" punctuation now send.** Mongoose's SMS API
