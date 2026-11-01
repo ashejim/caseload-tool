@@ -449,6 +449,46 @@ def test_engagement_signals_and_learned_codes():
         os.remove(path)
 
 
+def test_team_query_ids_and_shape_are_values_free():
+    q = l3.team_caseload_query(2, ["u1", "u2"], "values")
+    assert q["page"] == 2 and q["filters"] == [
+        {"field": "caseloadOwner", "operator": "IN", "values": ["u1", "u2"]}]
+    u = "09eba36d-f48c-4bb5-87bd-3a62200438b5"
+    assert l3.ids_from([{"name": "Team X", "id": u}, {"id": "not-a-uuid"}]) == [u]
+    sh = l3.json_shape({"content": [{"studentId": "000123456", "name": "Pat"}],
+                        "page": {"totalElements": 3}})
+    assert "000123456" not in str(sh) and "Pat" not in str(sh)
+    assert sh["content"][0] == "list[1]" and sh["page"] == {"totalElements": "int"}
+
+
+def test_roster_coverage_counts():
+    from src import l360_roster
+    roster = [
+        {"CourseCode": "C769", "StudentID": "0001", "StudentEmail": "a@wgu.edu",
+         "CourseMentor": "Jim Ashe"},
+        {"CourseCode": "C769", "StudentID": "0002", "StudentEmail": "b@wgu.edu",
+         "CourseMentor": "Tawnya Lee"},
+        {"CourseCode": "C769", "StudentID": "0003", "StudentEmail": "c@wgu.edu",
+         "CourseMentor": ""},                                  # unassigned
+        {"CourseCode": "X999", "StudentID": "0009", "StudentEmail": "z@wgu.edu",
+         "CourseMentor": "Other Person"},                      # other course
+    ]
+    rows = [
+        {"student_id": "1", "email": "a@wgu.edu", "courses": ["C769"],
+         "owner": "Ashe, Jim"},
+        {"student_id": "", "email": "b@wgu.edu", "courses": ["C769"],
+         "owner": "Jeff Smith"},                               # CI disagrees
+        {"student_id": "7", "email": "", "courses": ["C769"], "owner": "Jim Ashe"},
+    ]
+    c = l360_roster.compare_coverage(rows, roster, ["C769"])
+    assert (c["roster_assigned"], c["roster_unassigned"]) == (2, 1)
+    assert (c["found_by_id"], c["found_by_email"]) == (1, 2)
+    assert (c["ci_compared"], c["ci_agree"]) == (2, 1)
+    assert c["unassigned_found"] == 0
+    assert c["l360_in_courses"] == 2 and c["l360_not_in_roster"] == 1  # "7"
+    assert c["l360_with_email"] == 2
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

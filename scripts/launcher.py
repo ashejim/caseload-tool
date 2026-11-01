@@ -6352,6 +6352,11 @@ class CaseloadPanel:
         # "l360activity:" pulls Learner360 academic activity (portal / course
         # engagement events) into history.db. "dry" = report only; a number
         # = days back (default 365), e.g. "l360activity: dry 90".
+        # "l360roster: dry" — read-only: pull the team's caseloads from
+        # Learner360 and compare coverage with the inbox labeler's roster.
+        if q.lower().startswith(("l360roster", "1360roster")):
+            self.app._l360_roster_probe()
+            return "break"
         if q.lower().startswith(("l360activity", "1360activity")):
             parts = (q.split(":", 1)[1].strip().lower().split()
                      if ":" in q else [])
@@ -11888,6 +11893,71 @@ class App:
 
         self.worker.submit_l360_momi_capture(on_done, surface=not auto)
         return True
+
+    def _l360_roster_probe(self) -> None:
+        """`l360roster: dry` — READ-ONLY discovery: read the team's caseloads
+        from Learner360 (Team filter) and report, as counts only, how well
+        they cover the inbox labeler's course-scan roster. Saves nothing."""
+        if getattr(self, "_offline", False):
+            self._append_log("🔌 Demo: Learner360 isn't available offline.")
+            return
+        if getattr(self, "_is_busy", False):
+            self._append_log("Busy — wait for the current task to finish.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._set_busy("Reading team caseloads from Learner360…")
+        self._append_log("Learner360 team roster (DRY RUN — nothing is saved): "
+                         "reading your team's caseloads (read-only)…")
+
+        def on_done(res):
+            try:
+                self.root.after(0, lambda: self._l360_roster_probe_done(res))
+            except Exception:
+                pass
+
+        self.worker.submit_l360_team_roster(on_done)
+
+    def _l360_roster_probe_done(self, res) -> None:
+        self._set_idle()
+        res = res or {}
+        for name, sh in (res.get("shapes") or {}).items():
+            self._append_log(f"  [l360roster] {name}: {sh}")
+        if res.get("error"):
+            self._append_log(f"✗ Learner360 team roster: {res['error']}",
+                             error=True)
+            return
+        self._append_log(
+            f"  [l360roster] teams {res.get('teams')}, members "
+            f"{res.get('members')}, filter key '{res.get('value_key')}', "
+            f"Learner360 reports {res.get('server_total')} rows")
+        try:
+            from src import inbox_labeler, inbox_triage, l360_roster
+            courses = inbox_labeler.parse_items(
+                getattr(self.settings, "inbox_labeler_courses", ""),
+                inbox_labeler.DEFAULT_COURSES)
+            roster = (inbox_triage.load_roster(inbox_labeler.ROSTER_PATH)
+                      if inbox_labeler.ROSTER_PATH.exists() else [])
+            cov = l360_roster.compare_coverage(res.get("rows") or [], roster,
+                                               courses)
+        except Exception as e:
+            self._append_log(f"✗ Learner360 team roster: comparison failed: {e}",
+                             error=True)
+            return
+        self._append_log(f"  [l360roster] courses compared: {courses}")
+        self._append_log(f"  [l360roster] coverage: {cov}")
+        a = cov["roster_assigned"] or 1
+        self._append_log(
+            f"Learner360 team roster DRY RUN: {cov['l360_students']} learners "
+            f"({cov['l360_with_email']} rows with a WGU email). Of "
+            f"{cov['roster_assigned']} assigned roster records: "
+            f"{cov['found_by_id'] * 100 // a}% found by Student ID, "
+            f"{cov['found_by_email'] * 100 // a}% by email; instructor agrees "
+            f"for {cov['ci_agree']}/{cov['ci_compared']}. Unassigned roster "
+            f"records: {cov['roster_unassigned']} ({cov['unassigned_found']} "
+            f"found). Learner360 has {cov['l360_not_in_roster']} learner(s) in "
+            "these courses the roster lacks. Paste this log to Claude.")
 
     def _l360_activity_import(self, dry: bool = False, days: int = 365) -> None:
         """`l360activity:` — READ-ONLY pull of Learner360 academic activity

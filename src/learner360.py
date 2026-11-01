@@ -46,6 +46,55 @@ def caseload_query(page: int, size: int = 100) -> dict:
             "facetFields": list(_FACETS)}
 
 
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+TEAMS_ASSIGNED = "/learner360/v1/teams/assigned"
+TEAM_MEMBERS = "/learner360/v1/teams/{team}/members"
+
+
+def team_caseload_query(page: int, owner_ids: list, value_key: str = "values",
+                        size: int = 100) -> dict:
+    """caseloads/search body filtered to several caseload owners — what the
+    UI's Team filter sends (``caseloadOwner IN [...]``). The key holding the
+    id list is probed (``values`` vs ``value``) by the dry run."""
+    q = caseload_query(page, size)
+    q["filters"] = [{"field": "caseloadOwner", "operator": "IN",
+                     value_key: list(owner_ids)}]
+    return q
+
+
+_UUID_KEYS = ("wguId", "userWguId", "memberWguId", "id", "uuid", "teamId",
+              "userId")
+
+
+def ids_from(items, prefer=_UUID_KEYS) -> list:
+    """UUID-looking ids from a list of dicts (first matching key per item)."""
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        for k in prefer:
+            v = it.get(k)
+            if isinstance(v, str) and _UUID_RE.fullmatch(v.strip()):
+                out.append(v.strip())
+                break
+    return out
+
+
+def json_shape(obj, depth: int = 2) -> object:
+    """Structure-only summary (keys / list lengths / scalar TYPES, never
+    values) for FERPA-safe discovery logs."""
+    if depth < 0:
+        return type(obj).__name__
+    if isinstance(obj, dict):
+        return {k: json_shape(v, depth - 1) for k, v in list(obj.items())[:25]}
+    if isinstance(obj, list):
+        return [f"list[{len(obj)}]"] + ([json_shape(obj[0], depth - 1)]
+                                         if obj else [])
+    return type(obj).__name__
+
+
 def looks_like_login(url: str) -> bool:
     """True while the tab is on WGU's SSO (PingFederate) rather than the app."""
     u = (url or "").lower()

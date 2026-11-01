@@ -431,6 +431,12 @@ class BrowserWorker:
         See _l360_momi_caseload / _l360_momi_fetch."""
         self.q.put(("L360_MOMI_STEP", step, arg, on_done))
 
+    def submit_l360_team_roster(self, on_done: Callable[[dict], None],
+                                surface: bool = True) -> None:
+        """READ-ONLY: the team's caseloads from Learner360 (see
+        _l360_team_roster)."""
+        self.q.put(("L360_ROSTER", on_done, surface))
+
     def submit_l360_activity_fetch(self, targets: list, days: int,
                                    on_done: Callable[[dict], None],
                                    surface: bool = True,
@@ -1046,6 +1052,15 @@ class BrowserWorker:
                                                 background=True)
             except Exception as e:
                 res = {"error": f"Learner360 MOMI step crashed: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "L360_ROSTER":
+            _, on_done, surface = cmd
+            res = {}
+            try:
+                res = self._l360_team_roster(ctx, surface=surface)
+            except Exception as e:
+                res = {"error": f"Learner360 team roster crashed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "L360_ACTIVITY":
@@ -2865,6 +2880,98 @@ class BrowserWorker:
             return {"error": "couldn't determine your Learner360 user id."}
         self._l360_sess = (page, auth["headers"], user, snap, time.time())
         return page, auth["headers"], user, snap
+
+    def _l360_team_roster(self, ctx, surface: bool = True) -> dict:
+        """READ-ONLY: the team's caseloads from Learner360 — teams/assigned →
+        team members → caseloads/search filtered ``caseloadOwner IN [members]``
+        (what the UI's Team filter sends), all pages. Returns {ok, rows,
+        shapes, value_key, teams, members, server_total} or {error, shapes}.
+        ``rows`` are compact per-learner dicts for the inbox-labeler roster;
+        ``shapes`` are structure-only (field names / types) for the log."""
+        from src import learner360 as l3
+
+        def items(resp):
+            if isinstance(resp, list):
+                return resp
+            if isinstance(resp, dict):
+                for v in resp.values():
+                    if isinstance(v, list):
+                        return v
+            return []
+
+        sess = self._l360_session(ctx, surface=surface)
+        if isinstance(sess, dict):
+            return sess
+        page, headers, user, _snap = sess
+        shapes = {}
+        r = l3.api(page, headers, "GET", l3.TEAMS_ASSIGNED)
+        shapes["teams/assigned"] = {"status": r["status"],
+                                    "shape": l3.json_shape(r["json"])}
+        team_ids = l3.ids_from(items(r["json"]), ("id", "teamId", "wguId",
+                                                  "uuid"))
+        members = []
+        for tid in team_ids[:10]:
+            m = l3.api(page, headers, "GET", l3.TEAM_MEMBERS.format(team=tid))
+            shapes.setdefault("teams/members", {"status": m["status"],
+                                                "shape": l3.json_shape(m["json"])})
+            members += l3.ids_from(items(m["json"]))
+        members = sorted(set(members))
+        if not members:
+            return {"error": "couldn't read the team's members from Learner360",
+                    "shapes": shapes}
+        value_key, first = None, None
+        for vk in ("values", "value"):
+            s = l3.api(page, headers, "POST",
+                       f"{l3.CASELOAD_SEARCH}?user={user}",
+                       l3.team_caseload_query(0, members, vk))
+            meta = l3.page_meta(s["json"]) if isinstance(s["json"], dict) else {}
+            shapes[f"search[{vk}]"] = {"status": s["status"],
+                                       "total": meta.get("total_elements")}
+            if s["status"] == 200 and meta.get("total_elements"):
+                value_key, first = vk, s["json"]
+                break
+        if not value_key:
+            return {"error": "the team caseload filter was rejected in both "
+                    "formats", "shapes": shapes}
+        content = first.get("content") or []
+        if content and isinstance(content[0], dict):
+            shapes["caseload item"] = l3.json_shape(content[0], depth=1)
+        rows, pg = [], 0
+        total_pages = (first.get("page") or {}).get("totalPages") or 1
+        data = first
+        while True:
+            for it in data.get("content") or []:
+                if not isinstance(it, dict):
+                    continue
+                au = it.get("assignedUser") or {}
+                rows.append({
+                    "student_id": str(it.get("studentId") or ""),
+                    "wgu_id": str(it.get("studentWguId") or ""),
+                    "email": str(it.get("wguEmail") or ""),
+                    "first": str(it.get("preferredName") or it.get("firstName")
+                                 or ""),
+                    "last": str(it.get("lastName") or ""),
+                    "courses": [str(c) for c in (it.get("courses") or [])],
+                    "owner": str(au.get("name") or "") if isinstance(au, dict)
+                    else "",
+                    "owner_id": str(au.get("wguId") or "") if isinstance(au, dict)
+                    else "",
+                    "mentor": str(it.get("mentorName") or ""),
+                })
+            pg += 1
+            if pg >= total_pages or pg > 200:
+                break
+            s = l3.api(page, headers, "POST",
+                       f"{l3.CASELOAD_SEARCH}?user={user}",
+                       l3.team_caseload_query(pg, members, value_key))
+            if s["status"] != 200 or not isinstance(s["json"], dict):
+                return {"error": f"team caseload page {pg} HTTP {s['status']}",
+                        "shapes": shapes}
+            data = s["json"]
+        return {"ok": True, "rows": rows, "shapes": shapes,
+                "value_key": value_key, "teams": len(team_ids),
+                "members": len(members),
+                "server_total": (first.get("page") or {}).get("totalElements")}
 
     def _l360_activity_fetch(self, ctx, targets: list, days: int,
                              surface: bool = True,
