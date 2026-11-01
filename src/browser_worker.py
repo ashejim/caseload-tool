@@ -3698,18 +3698,25 @@ class BrowserWorker:
             return hits[0][0], hits[0][1], 1
         return "", "", len(hits)
 
-    def _task_status_from_grid_api(self, want, t_start):
+    _GRID_FRESH_S = 180
+
+    def _grid_is_stale(self) -> bool:
+        """True when a grid capture exists but is older than _GRID_FRESH_S."""
+        grid = self._grid_data
+        return bool(grid) and (time.time() - grid.get("ts", 0)) >= self._GRID_FRESH_S
+
+    def _task_status_from_grid_api(self, want, t_start, wait_s: float = 6.0):
         """Phase-1 fast path: build pass/fail from the ACCUMULATED
         getCaseLoadMainGridData pages if they're fresh AND cover the expected
         task-bearers. Returns the scan-result dict (source='api'), or None to
         fall back to the scroll-scrape — so any doubt = no regression. Polls up
         to ~6s for the grid pages to finish arriving (the page fetches ~100 rows
         at a time, and the caseload nav that triggers them just happened)."""
-        deadline = time.time() + 6.0
+        deadline = time.time() + wait_s
         best_cov = -1
         while True:
             grid = self._grid_data
-            if grid and (time.time() - grid.get("ts", 0)) < 180:
+            if grid and (time.time() - grid.get("ts", 0)) < self._GRID_FRESH_S:
                 rows = list((grid.get("by_key") or {}).values())
                 try:
                     by_sid = self._grid_rows_to_task_status(rows)
@@ -5962,6 +5969,25 @@ class BrowserWorker:
         # doubt (stale / partial / parse miss) falls through to the proven
         # scrape below — never a regression.
         api = self._task_status_from_grid_api(want, t_start)
+        if api is None and self._grid_is_stale():
+            # The grid JSON only arrives on a caseload PAGE LOAD. When the tab
+            # was already sitting on the caseload page (e.g. a Learner360 job
+            # ran in its own tab meanwhile), a refresh downloads the CSV
+            # without reloading, the capture ages past 3 min, and we'd fall to
+            # the scroll-scrape (seen live: 10 of 221 rows). Reload once to get
+            # fresh grid data instead.
+            target, table = self._open_caseload_table(ctx)
+            if table is not None:
+                self.on_status("  [grid] caseload data is stale — reloading "
+                               "the caseload page for fresh task status…")
+                try:
+                    target.reload(wait_until="domcontentloaded",
+                                  timeout=30_000)
+                    self._await_caseload_list(target)
+                except Exception:
+                    pass
+                api = self._task_status_from_grid_api(want, t_start,
+                                                      wait_s=15.0)
         if api is not None:
             return api
         target, table = self._open_caseload_table(ctx)

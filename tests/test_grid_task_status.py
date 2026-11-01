@@ -57,6 +57,32 @@ def test_attempts_and_date_parsed_from_cell():
     assert task_info_from_grid("Passed", "2026-07-17")["attempts"] == 0
 
 
+def test_grid_freshness_gate():
+    # Stale grid JSON (> _GRID_FRESH_S) is refused by the fast path and
+    # flagged stale (the scan then reloads the caseload page once); fresh
+    # data is used. No browser — a stand-in `self`.
+    import time
+    import types
+    from src.browser_worker import BrowserWorker as BW
+    row = {"key": ("S1", "C1")}
+    fake = types.SimpleNamespace(
+        _GRID_FRESH_S=BW._GRID_FRESH_S, on_status=lambda m: None,
+        _grid_rows_to_task_status=lambda rows: {"S1": {1: {"state": "Passed"}}})
+    fake._grid_is_stale = BW._grid_is_stale.__get__(fake)
+    fake._grid_data = None
+    assert not fake._grid_is_stale()                 # nothing captured yet
+    fake._grid_data = {"by_key": {("S1", "C1"): row},
+                       "ts": time.time() - BW._GRID_FRESH_S - 5}
+    assert fake._grid_is_stale()
+    assert BW._task_status_from_grid_api(fake, {"S1"}, time.perf_counter(),
+                                         wait_s=0.0) is None
+    fake._grid_data["ts"] = time.time()
+    assert not fake._grid_is_stale()
+    res = BW._task_status_from_grid_api(fake, {"S1"}, time.perf_counter(),
+                                        wait_s=0.0)
+    assert res and res["source"] == "api" and "S1" in res["by_sid"]
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
