@@ -406,6 +406,10 @@ class Settings:
     # Learner360 academic activity (engagement events): background pull in
     # small batches. Days between runs; 0 = off (use `l360activity:`).
     l360_auto_activity_days: int = 7
+    # Learner360 TEAM roster (Team filter) overlaid on the inbox labeler's
+    # course-scan roster: current instructors, filled-in "Unassigned", newly
+    # assigned team students. Days between pulls; 0 = off.
+    l360_auto_roster_days: int = 1
     # Local versioned backups of history.db.enc, taken at startup before the
     # vault is unlocked (src/local_backup.py). Blank dir = ~/Documents/
     # CaseloadNotes Backups.

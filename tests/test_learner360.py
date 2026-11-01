@@ -539,6 +539,68 @@ def test_roster_replay_of_labeler_log():
     assert (r["lost"], r["newly_identified"], r["course_differs"]) == (1, 1, 0), r
 
 
+def test_roster_overlay_rules():
+    from src import l360_roster
+    assert l360_roster.display_name("Ashe, Jim") == "Jim Ashe"
+    roster = [
+        {"CourseCode": "C769", "StudentID": "0001", "StudentEmail": "a@wgu.edu",
+         "CourseMentor": "Jim Ashe"},                       # agrees
+        {"CourseCode": "C769", "StudentID": "0002", "StudentEmail": "b@wgu.edu",
+         "CourseMentor": "Candice Roe"},                    # reassigned
+        {"CourseCode": "C769", "StudentID": "0003", "StudentEmail": "c@wgu.edu",
+         "CourseMentor": ""},                               # unassigned → filled
+        {"CourseCode": "C769", "StudentID": "0004", "StudentEmail": "d@wgu.edu",
+         "CourseMentor": "Other Team"},                     # not in L360: kept
+    ]
+    team = [
+        {"student_id": "1", "course_code": "C769", "email": "a@wgu.edu",
+         "name": "A", "owner": "Ashe, Jim"},
+        {"student_id": "2", "course_code": "C769", "email": "b@wgu.edu",
+         "name": "B", "owner": "Lee, Tawnya"},
+        {"student_id": "3", "course_code": "C769", "email": "c@wgu.edu",
+         "name": "C", "owner": "Jeff Smith"},
+        {"student_id": "9", "course_code": "C769", "email": "n@wgu.edu",
+         "name": "New Student", "owner": "Jim Ashe"},       # added
+        {"student_id": "8", "course_code": "X999", "email": "x@wgu.edu",
+         "name": "X", "owner": "Jim Ashe"},                 # other course: ignored
+    ]
+    merged, st = l360_roster.overlay(roster, team, ["C769"])
+    assert st == {"agreed": 1, "corrected": 1, "filled": 1, "added": 1}, st
+    by = {r["StudentEmail"]: r for r in merged}
+    assert by["b@wgu.edu"]["CourseMentor"] == "Tawnya Lee"
+    assert by["b@wgu.edu"]["CourseMentorScan"] == "Candice Roe"
+    assert by["c@wgu.edu"]["CourseMentor"] == "Jeff Smith"
+    assert by["d@wgu.edu"]["CourseMentor"] == "Other Team"   # never removed
+    assert by["n@wgu.edu"]["Source"] == "learner360" and len(merged) == 5
+    assert all("x@wgu.edu" != r["StudentEmail"] for r in merged)
+
+
+def test_team_roster_store_load_staleness_and_readonly():
+    from datetime import datetime as dt, timedelta
+    path = _tmpdb()
+    try:
+        missing = path + ".nope"
+        assert history.load_l360_team_roster(db_path=missing) == ([], None)
+        assert not os.path.exists(missing)        # read-only: never creates
+        rows = [{"student_id": "0001", "email": "a@wgu.edu", "first": "Ann",
+                 "last": "Bee", "courses": ["C769", "D502"], "owner": "Ashe, Jim",
+                 "mentor": "Pat PM"}]
+        t0 = dt(2026, 11, 1, 9, 0)
+        assert history.replace_l360_team_roster(rows, db_path=path, now=t0) == 2
+        got, at = history.load_l360_team_roster(db_path=path, now=t0)
+        assert at.startswith("2026-11-01") and len(got) == 2
+        assert {g["course_code"] for g in got} == {"C769", "D502"}
+        assert got[0]["name"] == "Ann Bee" and got[0]["mentor_name"] == "Pat PM"
+        stale = history.load_l360_team_roster(db_path=path,
+                                              now=t0 + timedelta(days=5))
+        assert stale[0] == [] and stale[1].startswith("2026-11-01")
+        # replace is wholesale
+        history.replace_l360_team_roster(rows[:0], db_path=path, now=t0)
+        assert history.load_l360_team_roster(db_path=path, now=t0)[0] == []
+    finally:
+        os.remove(path)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

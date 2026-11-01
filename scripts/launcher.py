@@ -8665,6 +8665,8 @@ class App:
             self.root.after(600_000, self._maybe_auto_l360_notes)
             # Learner360 academic activity (weekly, small batches, ~1-2 min).
             self.root.after(900_000, self._maybe_auto_l360_activity)
+            # Learner360 team roster for the inbox labeler overlay (daily).
+            self.root.after(300_000, self._maybe_auto_l360_roster)
         # Report the startup backup (taken before the log existed).
         self.root.after(1500, self._report_startup_backup)
 
@@ -12255,14 +12257,100 @@ class App:
         self._l360_abg_step()
         return True
 
+    def _maybe_auto_l360_roster(self) -> None:
+        """Daily Learner360 team-roster pull for the inbox labeler overlay
+        (settings.l360_auto_roster_days; 0 = off): ~5 min after startup,
+        re-arms every 6 h. One short worker job (~30 quick requests). Never
+        raises."""
+        retry_ms, rearm_ms = 5 * 60_000, 6 * 3600_000
+        try:
+            if getattr(self, "_offline", False):
+                return
+            days = int(getattr(self.settings, "l360_auto_roster_days", 1) or 0)
+            if days <= 0:
+                return
+            from src import learner360 as l3
+            last = history.load_l360_team_roster(max_age_days=10_000)[1]
+            if not l3.momi_capture_due(last, days):
+                self.root.after(rearm_ms, self._maybe_auto_l360_roster)
+                return
+            if not self._start_l360_roster():
+                self.root.after(retry_ms, self._maybe_auto_l360_roster)
+                return
+            self.root.after(rearm_ms, self._maybe_auto_l360_roster)
+        except Exception:
+            try:
+                self.root.after(rearm_ms, self._maybe_auto_l360_roster)
+            except Exception:
+                pass
+
+    def _start_l360_roster(self, manual: bool = False) -> bool:
+        """Pull the team roster now (background, never surfaces the browser);
+        store it and log what the overlay changes. True if started."""
+        if (getattr(self, "_offline", False) or getattr(self, "_l360_rbg", False)
+                or getattr(self, "_is_busy", False)
+                or not self.worker.ready_event.is_set()):
+            return False
+        self._l360_rbg = True
+        if manual:
+            self._append_log("Learner360 team roster: refreshing in the "
+                             "background…")
+
+        def on_done(res):
+            def work():
+                out = {"res": res or {}}
+                try:
+                    if (res or {}).get("ok"):
+                        out["stored"] = history.replace_l360_team_roster(
+                            res.get("rows") or [])
+                        from src import inbox_labeler, inbox_triage, l360_roster
+                        courses = inbox_labeler.parse_items(
+                            getattr(self.settings, "inbox_labeler_courses", ""),
+                            inbox_labeler.DEFAULT_COURSES)
+                        rp = inbox_labeler.ROSTER_PATH
+                        base = inbox_triage.load_roster(rp) if rp.exists() else []
+                        rows, _at = history.load_l360_team_roster()
+                        out["stats"] = l360_roster.overlay(base, rows, courses)[1]
+                except Exception as e:
+                    out["error"] = str(e)
+                try:
+                    self.root.after(0, lambda: self._l360_roster_done(out))
+                except Exception:
+                    pass
+            threading.Thread(target=work, daemon=True,
+                             name="l360-roster-save").start()
+
+        self.worker.submit_l360_team_roster(on_done, surface=False)
+        return True
+
+    def _l360_roster_done(self, out: dict) -> None:
+        self._l360_rbg = False
+        res = out.get("res") or {}
+        if res.get("error") or out.get("error"):
+            msg = res.get("error") or out.get("error")
+            if res.get("not_logged_in"):
+                self._append_log("Learner360 isn't signed in, so the team-roster "
+                                 "refresh was skipped — it'll retry later.")
+            else:
+                self._append_log(f"Learner360 team roster refresh failed: {msg}",
+                                 error=True)
+            return
+        st = out.get("stats") or {}
+        self._append_log(
+            f"✓ Learner360 team roster: {out.get('stored', 0)} learner-course "
+            f"row(s). Inbox labeler overlay: {st.get('corrected', 0)} instructor "
+            f"correction(s), {st.get('filled', 0)} Unassigned filled, "
+            f"{st.get('added', 0)} team student(s) added "
+            f"({st.get('agreed', 0)} already matched).")
+
     def _l360_refresh_now(self, which: str) -> None:
         """Settings ▸ 'Refresh now': start a Learner360 background job
         immediately, regardless of its schedule. ``which`` = momi | notes |
         activity. Logs why when it can't start."""
         names = {"momi": "MOMI history", "notes": "notes import",
-                 "activity": "activity import"}
+                 "activity": "activity import", "roster": "team roster"}
         running = {"momi": "_l360_mbg", "notes": "_l360_bg",
-                   "activity": "_l360_abg"}[which]
+                   "activity": "_l360_abg", "roster": "_l360_rbg"}[which]
         if getattr(self, "_offline", False):
             self._append_log("🔌 Demo: Learner360 isn't available offline.")
             return
@@ -12273,6 +12361,11 @@ class App:
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — try Refresh now again "
                              "in a moment.")
+            return
+        if which == "roster":
+            if not self._start_l360_roster(manual=True):
+                self._append_log("Learner360 team roster couldn't start — wait "
+                                 "for the current task to finish.")
             return
         if which == "momi":
             started = self._start_l360_momi_bg()
@@ -20507,6 +20600,24 @@ class App:
             command=lambda: self._l360_refresh_now("activity"),
         ).pack(side="left", padx=(8, 0))
 
+        # Learner360 team roster → inbox labeler overlay (current instructors).
+        l3r_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        l3r_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkLabel(l3r_row, text="Learner360 team roster (inbox labeler):"
+                     ).pack(side="left")
+        _L3R_LABELS = {"Off": 0, "Daily": 1, "Every 3 days": 3, "Weekly": 7}
+        _L3R_TO_LABEL = {v: k for k, v in _L3R_LABELS.items()}
+        cur_l3r = int(getattr(self.settings, "l360_auto_roster_days", 1) or 0)
+        l3r_var = ctk.StringVar(value=_L3R_TO_LABEL.get(cur_l3r, "Daily"))
+        ctk.CTkComboBox(
+            l3r_row, width=130, variable=l3r_var, state="readonly",
+            values=list(_L3R_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            l3r_row, text="Refresh now", width=100,
+            command=lambda: self._l360_refresh_now("roster"),
+        ).pack(side="left", padx=(8, 0))
+
         # Local versioned backups (src/local_backup.py) — status + open folder.
         bk_row = ctk.CTkFrame(dialog, fg_color="transparent")
         bk_row.pack(fill="x", padx=32, pady=(0, 10))
@@ -21075,6 +21186,9 @@ class App:
             # Learner360 activity import interval in days (0 = off).
             self.settings.l360_auto_activity_days = _L3_LABELS.get(
                 l3a_var.get().strip(), 7)
+            # Learner360 team roster (inbox labeler overlay), days; 0 = off.
+            self.settings.l360_auto_roster_days = _L3R_LABELS.get(
+                l3r_var.get().strip(), 1)
             # Name capitalization mode (off / lower / standard).
             self.settings.name_capitalization = _NC_MODE_LABELS.get(
                 nc_var.get().strip(), "standard")

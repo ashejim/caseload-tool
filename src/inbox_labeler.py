@@ -124,16 +124,31 @@ def run_pass(*, folders: list, courses: list, lookback_days: float,
         raise FileNotFoundError(
             f"Inbox labeler: no roster at {rp.name} — run 'coursescan: "
             "capture' then 'coursescan: export' first.")
-    index = inbox_triage.build_index(inbox_triage.load_roster(rp), courses)
+    roster = inbox_triage.load_roster(rp)
     roster_iso = dt.datetime.fromtimestamp(
         rp.stat().st_mtime).isoformat(timespec="seconds")
+    # Learner360 team-roster overlay (current instructor assignments), read
+    # READ-ONLY from history.db and ignored if stale/missing — the course
+    # scan stays the base. A newer overlay counts as a fresher roster, so
+    # placeholder ("Unassigned") messages are re-checked against it.
+    overlay_stats = None
+    try:
+        from src import history, l360_roster
+        team_rows, team_at = history.load_l360_team_roster()
+        if team_rows:
+            roster, overlay_stats = l360_roster.overlay(roster, team_rows,
+                                                        courses)
+            roster_iso = max(roster_iso, team_at[:19])
+    except Exception:
+        overlay_stats = None
+    index = inbox_triage.build_index(roster, courses)
 
     since = dt.datetime.now() - dt.timedelta(days=lookback_days)
     now_iso = dt.datetime.now().isoformat(timespec="seconds")
     state = load_state()
     summary = {"scanned": 0, "labeled": 0, "identified": 0,
                "review": 0, "unidentified": 0, "corrected": 0,
-               "folder_errors": []}
+               "folder_errors": [], "l360_overlay": overlay_stats}
 
     with open(LOG_PATH, "a", encoding="utf-8") as log:
         for fpath in folders:

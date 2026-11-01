@@ -29,6 +29,82 @@ def _nsid(s) -> str:
     return str(s or "").strip().lstrip("0")
 
 
+def display_name(name: str) -> str:
+    """'Last, First' → 'First Last' (the roster's CourseMentor style, whose
+    first word becomes the CI category); other forms unchanged."""
+    n = (name or "").strip()
+    if "," in n:
+        last, first = n.split(",", 1)
+        return f"{first.strip()} {last.strip()}".strip()
+    return n
+
+
+def overlay(roster: list, team_rows: list, courses=None) -> tuple:
+    """Merge the Learner360 TEAM roster (history.load_l360_team_roster rows:
+    student_id, course_code, email, name, owner) over the course-scan roster.
+    Learner360 holds the CURRENT assignment, so for a matching student+course:
+      - blank CourseMentor ("Unassigned") → filled with the Learner360 owner;
+      - a different CourseMentor (by first name) → replaced (reassignment);
+    and team learners in these courses missing from the roster are ADDED.
+    Nothing is ever removed — the course scan still covers other teams'
+    students, unassigned students and departures. Original values are kept
+    as CourseMentorScan for audit. Returns (merged_roster, stats)."""
+    want = {c.strip().upper() for c in (courses or []) if c.strip()}
+    by_key = {}
+    for r in team_rows or []:
+        course = (r.get("course_code") or "").strip().upper()
+        if want and course not in want:
+            continue
+        owner = display_name(r.get("owner") or "")
+        if not owner:
+            continue
+        rec = dict(r, owner=owner, course_code=course)
+        by_key[(_nsid(r.get("student_id")), course)] = rec
+        em = (r.get("email") or "").strip().lower()
+        if em:
+            by_key[("@" + em, course)] = rec
+    st = Counter()
+    merged, seen = [], set()
+    for rec in roster or []:
+        course = (rec.get("CourseCode") or "").strip().upper()
+        sid = _nsid(rec.get("StudentID"))
+        em = (rec.get("StudentEmail") or "").strip().lower()
+        hit = by_key.get((sid, course)) or (
+            by_key.get(("@" + em, course)) if em else None)
+        if not hit:
+            merged.append(rec)
+            continue
+        seen.add((_nsid(hit.get("student_id")), course))
+        cur = (rec.get("CourseMentor") or "").strip()
+        new = dict(rec)
+        if not cur:
+            new["CourseMentor"] = hit["owner"]
+            new["CourseMentorScan"] = ""
+            st["filled"] += 1
+        elif _first(cur) != _first(hit["owner"]):
+            new["CourseMentor"] = hit["owner"]
+            new["CourseMentorScan"] = cur
+            st["corrected"] += 1
+        else:
+            st["agreed"] += 1
+        merged.append(new)
+    for (key, course), rec in by_key.items():
+        if key.startswith("@"):
+            continue
+        if (key, course) in seen:
+            continue
+        seen.add((key, course))
+        merged.append({"StudentID": rec.get("student_id") or "",
+                       "StudentEmail": rec.get("email") or "",
+                       "Name": rec.get("name") or "",
+                       "CourseCode": course,
+                       "CourseMentor": rec["owner"],
+                       "Source": "learner360"})
+        st["added"] += 1
+    return merged, {k: st.get(k, 0) for k in
+                    ("agreed", "corrected", "filled", "added")}
+
+
 def replay_log(l360_rows: list, log_entries: list, courses=None) -> dict:
     """Replay the labeler's past decisions (inbox_label_log.jsonl) against the
     Learner360 team roster: for each distinct sender, would a Learner360

@@ -321,6 +321,21 @@ CREATE TABLE IF NOT EXISTS l360_activity (
                  context, course_code)
 );
 CREATE INDEX IF NOT EXISTS ix_l360_activity_date ON l360_activity(activity_date);
+
+-- Learner360 TEAM roster (the Team filter: every caseload under the manager)
+-- — one row per learner+course, replaced wholesale on each pull. Overlaid on
+-- the course-scan roster by the inbox labeler (src/l360_roster.overlay).
+CREATE TABLE IF NOT EXISTS l360_team_roster (
+    student_id  TEXT NOT NULL,
+    course_code TEXT NOT NULL DEFAULT '',
+    email       TEXT,
+    name        TEXT,
+    owner       TEXT,            -- caseload owner = the course instructor
+    mentor_name TEXT,            -- program mentor
+    wgu_id      TEXT,
+    updated_at  TEXT,
+    PRIMARY KEY (student_id, course_code)
+);
 """
 
 
@@ -1332,6 +1347,72 @@ def mark_l360_activity_imported(*, db_path=HISTORY_DB,
         with conn:
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
                          "('l360_activity_last_import', ?)", (ts,))
+    finally:
+        conn.close()
+
+
+def replace_l360_team_roster(rows: list, *, db_path=HISTORY_DB,
+                             now: Optional[datetime] = None) -> int:
+    """Replace the stored Learner360 team roster with ``rows`` (the
+    browser_worker._l360_team_roster rows; one per learner, each with its
+    course list). Stamps meta 'l360_team_roster_at'. Returns rows stored."""
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    out = {}
+    for r in rows or []:
+        sid = str(r.get("student_id") or "").strip()
+        if not sid:
+            continue
+        name = " ".join(x for x in (r.get("first"), r.get("last")) if x)
+        for c in (r.get("courses") or [""]):
+            out[(sid, str(c or "").strip().upper())] = (
+                sid, str(c or "").strip().upper(), r.get("email") or "", name,
+                r.get("owner") or "", r.get("mentor") or "",
+                r.get("wgu_id") or "", ts)
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute("DELETE FROM l360_team_roster")
+            conn.executemany("INSERT INTO l360_team_roster VALUES "
+                             "(?,?,?,?,?,?,?,?)", list(out.values()))
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
+                         "('l360_team_roster_at', ?)", (ts,))
+        return len(out)
+    finally:
+        conn.close()
+
+
+def load_l360_team_roster(*, db_path=HISTORY_DB, max_age_days: float = 3,
+                          now: Optional[datetime] = None) -> tuple:
+    """(rows, pulled_at_iso) of the stored Learner360 team roster, or
+    ([], None) when missing / older than ``max_age_days`` / unreadable.
+
+    READ-ONLY by design (``mode=ro`` URI): the inbox labeler also runs from
+    scripts/label_inbox.py, possibly while the app is CLOSED — opening the DB
+    the normal way would create a stray plaintext history.db, the 2026-10-25
+    data-loss pattern. A read-only connect fails instead of creating."""
+    from pathlib import Path as _P
+    if not _P(db_path).exists():
+        return [], None
+    try:
+        conn = sqlite3.connect(f"file:{_P(db_path).as_posix()}?mode=ro",
+                               uri=True, timeout=10)
+    except sqlite3.Error:
+        return [], None
+    try:
+        conn.row_factory = sqlite3.Row
+        at = _meta_get(conn, "l360_team_roster_at")
+        if not at:
+            return [], None
+        age = ((now or datetime.now())
+               - datetime.fromisoformat(at[:19])).total_seconds() / 86400
+        if age > max_age_days:
+            return [], at
+        rows = [dict(r) for r in conn.execute(
+            "SELECT student_id, course_code, email, name, owner, mentor_name "
+            "FROM l360_team_roster")]
+        return rows, at
+    except (sqlite3.Error, ValueError):
+        return [], None
     finally:
         conn.close()
 
