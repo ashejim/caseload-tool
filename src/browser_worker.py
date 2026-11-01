@@ -2909,64 +2909,39 @@ class BrowserWorker:
                                     "shape": l3.json_shape(r["json"])}
         team_ids = l3.ids_from(items(r["json"]), ("id", "teamId", "wguId",
                                                   "uuid"))
-        mem_items = []
+        mem_items, team_members = [], {}
         for tid in team_ids[:10]:
-            m = l3.api(page, headers, "GET", l3.TEAM_MEMBERS.format(team=tid))
+            m = l3.api(page, headers, "GET", l3.TEAM_MEMBERS.format(team=tid)
+                       + "?page=0&size=200")
             shapes.setdefault("teams/members", {"status": m["status"],
                                                 "shape": l3.json_shape(m["json"])})
-            mem_items += [x for x in items(m["json"]) if isinstance(x, dict)]
-        if not mem_items:
+            its = [x for x in items(m["json"]) if isinstance(x, dict)]
+            mem_items += its
+            team_members[tid] = sorted({str(x["wguId"]) for x in its
+                                        if x.get("wguId")})
+        if not any(team_members.values()):
             return {"error": "couldn't read the team's members from Learner360",
                     "shapes": shapes}
-        # Baseline (no filter) = my own caseload size, and the server's own
-        # owner facet — the exact value format the UI's Team filter uses.
-        b = l3.api(page, headers, "POST", f"{l3.CASELOAD_SEARCH}?user={user}",
-                   l3.caseload_query(0, 1))
-        mine = (l3.page_meta(b["json"]) if isinstance(b["json"], dict)
-                else {}).get("total_elements") or 0
-        fo = ((b["json"] or {}).get("filterOptions") or {}) \
-            if isinstance(b["json"], dict) else {}
-        owner_opts = fo.get("owner") if isinstance(fo, dict) else None
-        shapes["filterOptions keys"] = (sorted(fo) if isinstance(fo, dict)
-                                        else type(fo).__name__)
-        shapes["filterOptions.owner"] = l3.json_shape(owner_opts)
-        facet_vals = []
-        for o in owner_opts if isinstance(owner_opts, list) else []:
-            if isinstance(o, dict):
-                v = o.get("value") or o.get("id") or o.get("key")
-                if v not in (None, ""):
-                    facet_vals.append(str(v))
-            elif isinstance(o, (str, int)):
-                facet_vals.append(str(o))
-        id_sets = {
-            "member wguId": [str(x["wguId"]) for x in mem_items if x.get("wguId")],
-            "member pidm": [str(x["pidm"]) for x in mem_items if x.get("pidm")],
-            "member email": [str(x["email"]) for x in mem_items if x.get("email")],
-        }
-        if facet_vals:
-            id_sets["owner facet values"] = facet_vals
-        # A variant only counts if it returns MORE than my own caseload (the
-        # gateway silently ignores a filter it doesn't understand).
-        members, value_key, field, first = [], None, None, None
-        for fld in ("caseloadOwner", "owner"):
-            for label, ids in id_sets.items():
-                if not ids:
-                    continue
-                q = l3.team_caseload_query(0, ids, "values")
-                q["filters"][0]["field"] = fld
-                r2 = l3.api(page, headers, "POST",
-                            f"{l3.CASELOAD_SEARCH}?user={user}", q)
-                meta = (l3.page_meta(r2["json"]) if isinstance(r2["json"], dict)
-                        else {})
-                tot = meta.get("total_elements")
-                shapes[f"search {fld} by {label}"] = {"status": r2["status"],
-                                                      "total": tot}
-                if r2["status"] == 200 and (tot or 0) > mine and first is None:
-                    members, value_key, field, first = ids, "values", fld, r2["json"]
-        shapes["my caseload (no filter)"] = mine
+        # What the UI's Team filter sends (observed 2026-11-01): the SAME
+        # search, scoped by ?team=<team id> instead of ?user=<me>, with
+        # caseloadOwner IN [member wguIds] under "values". (?user= scopes to
+        # my own caseload and the owner filter is applied within it.)
+        tid = next(t for t in team_ids if team_members.get(t))
+        members = team_members[tid]
+        field, value_key = "caseloadOwner", "values"
+        search_url = f"{l3.CASELOAD_SEARCH}?team={tid}"
+        first = None
+        r2 = l3.api(page, headers, "POST", search_url,
+                    l3.team_caseload_query(0, members, value_key))
+        meta = (l3.page_meta(r2["json"]) if isinstance(r2["json"], dict)
+                else {})
+        shapes["search ?team="] = {"status": r2["status"],
+                                   "total": meta.get("total_elements")}
+        if r2["status"] == 200 and isinstance(r2["json"], dict):
+            first = r2["json"]
         if first is None:
-            return {"error": "no team-filter format returned more than your own "
-                    "caseload — see the [l360roster] lines", "shapes": shapes}
+            return {"error": f"team caseload search HTTP {r2['status']}",
+                    "shapes": shapes}
         content = first.get("content") or []
         if content and isinstance(content[0], dict):
             shapes["caseload item"] = l3.json_shape(content[0], depth=1)
@@ -2995,10 +2970,8 @@ class BrowserWorker:
             pg += 1
             if pg >= total_pages or pg > 200:
                 break
-            qn = l3.team_caseload_query(pg, members, value_key)
-            qn["filters"][0]["field"] = field
-            s = l3.api(page, headers, "POST",
-                       f"{l3.CASELOAD_SEARCH}?user={user}", qn)
+            s = l3.api(page, headers, "POST", search_url,
+                       l3.team_caseload_query(pg, members, value_key))
             if s["status"] != 200 or not isinstance(s["json"], dict):
                 return {"error": f"team caseload page {pg} HTTP {s['status']}",
                         "shapes": shapes}
