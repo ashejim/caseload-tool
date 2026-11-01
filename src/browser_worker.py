@@ -2911,11 +2911,19 @@ class BrowserWorker:
                                                   "uuid"))
         mem_items, team_members = [], {}
         for tid in team_ids[:10]:
-            m = l3.api(page, headers, "GET", l3.TEAM_MEMBERS.format(team=tid)
-                       + "?page=0&size=200")
+            # Plain request first (works; 16 members on page 0). Page on only
+            # if the server says there's more, with ITS page size — an
+            # oversized ?size= is rejected with HTTP 400.
+            m = l3.api(page, headers, "GET", l3.TEAM_MEMBERS.format(team=tid))
             shapes.setdefault("teams/members", {"status": m["status"],
                                                 "shape": l3.json_shape(m["json"])})
             its = [x for x in items(m["json"]) if isinstance(x, dict)]
+            pinfo = m["json"] if isinstance(m["json"], dict) else {}
+            tp, sz = pinfo.get("totalPages") or 1, pinfo.get("size") or 20
+            for pn in range(1, min(int(tp), 20)):
+                mm = l3.api(page, headers, "GET", l3.TEAM_MEMBERS.format(team=tid)
+                            + f"?page={pn}&size={sz}")
+                its += [x for x in items(mm["json"]) if isinstance(x, dict)]
             mem_items += its
             team_members[tid] = sorted({str(x["wguId"]) for x in its
                                         if x.get("wguId")})
