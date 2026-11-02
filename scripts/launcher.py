@@ -3840,8 +3840,8 @@ class CaseloadPanel:
         "last_action", "followup", "tasks",
     ]
     # Pronoun selector choices (manual; no feed source). '—' = blank/unset.
-    _PRONOUN_BLANK = "—"
-    _PRONOUN_CHOICES = ["—", "he/him", "she/her", "they/them"]
+    _PRONOUN_BLANK = "pronouns?"
+    _PRONOUN_CHOICES = ["pronouns?", "he/him", "she/her", "they/them"]
 
     def _quickview_field_keys(self) -> list:
         """Configured quick-view field keys in order (Settings →
@@ -10030,10 +10030,51 @@ class App:
         except Exception:
             pass
 
+    def _on_overlay_actions(self, acts: list) -> None:
+        """Edits made in the Learner360 panel (worker thread → UI thread).
+        Only known action types for students ON the caseload are applied;
+        values are length-capped. Stored in CaseloadNotes only."""
+        def apply():
+            rows = self._caseload_rows or []
+            by_nsid = {}
+            for r in rows:
+                full = str(r.get("StudentID") or "").strip()
+                if full:
+                    by_nsid.setdefault(full.lstrip("0"), (full, r))
+            changed = False
+            for a in acts or []:
+                if not isinstance(a, dict) or a.get("type") != "pronouns":
+                    continue
+                hit = by_nsid.get(str(a.get("sid") or "").lstrip("0"))
+                if not hit:
+                    continue
+                full, row = hit
+                val = " ".join(str(a.get("value") or "").split())[:30]
+                try:
+                    history.set_student_pronouns(full, val)
+                except Exception as e:
+                    self._append_log(f"Couldn't set pronouns: {e}", error=True)
+                    continue
+                for r in rows:
+                    if str(r.get("StudentID") or "").strip() == full:
+                        r["Pronouns"] = val
+                changed = True
+                self._append_log(
+                    f"Pronouns for {row.get('Name') or full} "
+                    + (f"set to {val}" if val else "cleared")
+                    + " (from the Learner360 panel).")
+            if changed:
+                self._refresh_caseload_panel()
+        try:
+            self.root.after(0, apply)
+        except Exception:
+            pass
+
     def _apply_overlay_setting(self) -> None:
         """Push the overlay on/off setting to the worker (startup + save)."""
         try:
             on = bool(getattr(self.settings, "l360_overlay_enabled", False))
+            self.worker.on_overlay_actions = self._on_overlay_actions
             self.worker.set_overlay_enabled(on)
             if on:
                 self._push_overlay_snapshot()

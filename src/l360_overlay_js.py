@@ -15,7 +15,8 @@ OVERLAY_JS = r"""
 (() => {
   if (location.host !== 'learner360.wgu.edu' || window.__cnOverlay) return;
 
-  const S = { data: null, v: -1, on: true, queued: false, matched: 0 };
+  const S = { data: null, v: -1, on: true, queued: false, matched: 0,
+              outbox: [] };
   try { S.on = localStorage.getItem('cnOverlayOn') !== '0'; } catch (e) {}
 
   // ---- design tokens (matched to Learner360's palette) -------------------
@@ -71,6 +72,9 @@ OVERLAY_JS = r"""
   };
 
   // ---- badge rendering ---------------------------------------------------
+  const RISK_TIP = 'Estimated chance this student does not pass the course, from '
+    + 'their momentum history, calibrated on your past results. Typical is about '
+    + '8%; 20%+ stands out. A ranking aid (moderate accuracy), not a verdict.';
   const riskCls = r => r == null ? '' : (r >= 30 ? 'r-high' : r >= 15 ? 'r-mid' : 'r-low');
 
   function badgeHtml(e) {
@@ -81,7 +85,7 @@ OVERLAY_JS = r"""
       parts.push(`<span class="chip t-${esc(t.kind)}" title="${esc(tip)}">T${t.n}</span>`);
     }
     if (e.risk != null)
-      parts.push(`<span class="chip ${riskCls(e.risk)}" title="Not-pass risk (CaseloadNotes model)">${Math.round(e.risk)}%</span>`);
+      parts.push(`<span class="chip ${riskCls(e.risk)}" title="${esc(RISK_TIP)}">${Math.round(e.risk)}%</span>`);
     if (e.next_step)
       parts.push(`<span class="chip step" title="Success path: next step">${esc(e.next_step)}</span>`);
     if (e.ea)
@@ -196,6 +200,22 @@ OVERLAY_JS = r"""
     .note .meta { color: #5b6b7f; font-size: 11px; }
     .ea { color: #c2410c; font-weight: 600; }
     svg { display: block; }
+    .pron { display: flex; align-items: center; gap: 6px; margin: -4px 0 10px; }
+    .pron .unk { color: #8a97a8; font-style: italic; }
+    .icon { border: 1px solid #d5dde8; background: #fff; color: #002855;
+      border-radius: 6px; height: 22px; min-width: 22px; padding: 0 6px;
+      cursor: pointer; font: 600 11px/1 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+    .icon:hover { background: #eef2f7; }
+    .editor { display: flex; flex-wrap: wrap; gap: 4px; margin: -4px 0 10px; }
+    .editor .opt { border: 1px solid #d5dde8; background: #fff; border-radius: 11px;
+      height: 22px; padding: 0 9px; cursor: pointer; color: #1b2a3a;
+      font: 500 11.5px/1 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+    .editor .opt:hover, .editor .opt.sel { background: #002855; color: #fff;
+      border-color: #002855; }
+    .editor input { height: 22px; width: 110px; border: 1px solid #d5dde8;
+      border-radius: 6px; padding: 0 6px;
+      font: 400 11.5px/1 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+    .saved { color: #1a7f43; font-size: 11px; }
   `;
   const panelHost = document.createElement('div');
   panelHost.setAttribute('data-cn', 'panel');
@@ -227,14 +247,16 @@ OVERLAY_JS = r"""
     const e0 = entries[0];
     const courses = entries.map(e => e.course).filter(Boolean).join(' · ');
     let h = `<h2>${esc(e0.name || 'Student')}</h2>
-      <div class="sub">${esc(courses)}${e0.pronouns ? ' · ' + esc(e0.pronouns) : ''}
-      ${e0.contact_pref ? ' · prefers ' + esc(e0.contact_pref) : ''}</div>`;
+      <div class="sub">${esc(courses)}${e0.contact_pref ? ' · prefers ' + esc(e0.contact_pref) : ''}</div>
+      <div class="pron">${e0.pronouns ? `<span>${esc(e0.pronouns)}</span>`
+        : '<span class="unk">pronouns unknown</span>'}
+        <button class="icon" data-act="edit-pron" title="Set pronouns (saved in CaseloadNotes only)">✎</button></div>`;
     for (const e of entries) {
       const tasks = (e.tasks || []).map(t =>
         `<span class="chip t-${esc(t.kind)}" title="${esc(t.status || '')}">T${t.n}${t.date ? ' · ' + esc(t.date.slice(5)) : ''}${t.count ? ' (' + esc(t.count) + ')' : ''}</span>`).join('');
       h += `<div class="sec"><div class="lbl">${esc(e.course)}${e.term_end ? ' · ends ' + esc(e.term_end) : ''}</div>
         <div class="chips">${tasks}
-        ${e.risk != null ? `<span class="chip ${riskCls(e.risk)}">risk ${Math.round(e.risk)}%</span>` : ''}
+        ${e.risk != null ? `<span class="chip ${riskCls(e.risk)}" title="${esc(RISK_TIP)}">risk ${Math.round(e.risk)}%</span>` : ''}
         ${e.momentum ? `<span class="chip">${esc(e.momentum)}</span>` : ''}</div>
         ${e.ea ? `<div class="row ea"><span>Open EA</span><span>${esc(e.ea)}</span></div>` : ''}`;
       if ((e.steps || []).length) {
@@ -282,6 +304,50 @@ OVERLAY_JS = r"""
       try { localStorage.setItem('cnPanelCollapsed', panelCollapsed ? '1' : '0'); } catch (e) {}
       panelRoot.querySelector('.panel').classList.toggle('collapsed', panelCollapsed);
     });
+    const editBtn = panelRoot.querySelector('[data-act="edit-pron"]');
+    if (editBtn) editBtn.addEventListener('click', () => openPronEditor(sid, entries));
+  }
+
+  // ---- pronoun editor (saved in CaseloadNotes via the outbox) ----------
+  const PRON_CHOICES = ['he/him', 'she/her', 'they/them'];
+
+  function setPronouns(sid, entries, value) {
+    for (const e of entries) e.pronouns = value;          // optimistic
+    S.outbox.push({ type: 'pronouns', sid: sid, value: value });
+    panelKey = '';                                         // force re-render
+    renderPanel();
+    const line = panelRoot.querySelector('.pron');
+    if (line) line.insertAdjacentHTML('beforeend', '<span class="saved">saved</span>');
+  }
+
+  function openPronEditor(sid, entries) {
+    const line = panelRoot.querySelector('.pron');
+    if (!line) return;
+    const cur = entries[0].pronouns || '';
+    const opts = PRON_CHOICES.map(c =>
+      `<button class="opt${c === cur ? ' sel' : ''}" data-v="${esc(c)}">${esc(c)}</button>`).join('');
+    line.outerHTML = `<div class="editor">${opts}
+      <input maxlength="30" placeholder="other…" value="${PRON_CHOICES.includes(cur) ? '' : esc(cur)}">
+      <button class="icon" data-act="ok" title="Save">Save</button>
+      ${cur ? '<button class="icon" data-act="clear" title="Clear">Clear</button>' : ''}
+      <button class="icon" data-act="cancel" title="Cancel">✕</button></div>`;
+    const ed = panelRoot.querySelector('.editor');
+    const inp = ed.querySelector('input');
+    ed.querySelectorAll('.opt').forEach(b =>
+      b.addEventListener('click', () => setPronouns(sid, entries, b.dataset.v)));
+    ed.querySelector('[data-act="ok"]').addEventListener('click', () => {
+      const v = inp.value.trim();
+      if (v) setPronouns(sid, entries, v.slice(0, 30));
+    });
+    inp.addEventListener('keydown', ev => {
+      if (ev.key === 'Enter' && inp.value.trim()) setPronouns(sid, entries, inp.value.trim().slice(0, 30));
+      if (ev.key === 'Escape') { panelKey = ''; renderPanel(); }
+    });
+    const clr = ed.querySelector('[data-act="clear"]');
+    if (clr) clr.addEventListener('click', () => setPronouns(sid, entries, ''));
+    ed.querySelector('[data-act="cancel"]').addEventListener('click',
+      () => { panelKey = ''; renderPanel(); });
+    inp.focus();
   }
 
   // Learner360 is a single-page app: follow in-page navigation.
@@ -318,6 +384,8 @@ OVERLAY_JS = r"""
     version: () => S.v,
     setData: d => { S.data = d; S.v = (d && d.v != null) ? d.v : 0; schedule(); return S.v; },
     matched: () => S.matched,
+    // Edits made in the panel, collected by the app's worker each tick.
+    takeOutbox: () => { const o = S.outbox; S.outbox = []; return o; },
   };
 })();
 """

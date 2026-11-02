@@ -153,6 +153,7 @@ class BrowserWorker:
         self._overlay_on = False
         self._overlay_snap = None          # l360_overlay.build_snapshot dict
         self._overlay_ctx_id = None        # ctx the init script is installed in
+        self.on_overlay_actions = None     # app callback(list) for panel edits
         # `textapi:` capture: a persistent request/response recorder attached to
         # the Mongoose tab (captures BOTH tool-driven and MANUAL compose sends),
         # dumped to text_send_probe.txt for building an API-replay send. `sink`
@@ -483,6 +484,12 @@ class BrowserWorker:
                     ver = -1
                 if snap and ver != snap.get("v"):
                     pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+                # Edits made in the panel (e.g. pronouns) → the app.
+                acts = pg.evaluate(
+                    "() => window.__cnOverlay && window.__cnOverlay.takeOutbox"
+                    " ? window.__cnOverlay.takeOutbox() : []")
+                if acts and self.on_overlay_actions:
+                    self.on_overlay_actions(list(acts))
             except Exception:
                 continue
 

@@ -222,6 +222,73 @@ def test_student_panel_on_learner_page():
         b.close()
 
 
+def test_pronoun_edit_round_trip():
+    import types
+    from playwright.sync_api import sync_playwright
+    from src.browser_worker import BrowserWorker as BW
+    snap = l360_overlay.build_snapshot(ROWS, STEPS, version=4, extras=EXTRAS)
+    got = []
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context()
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html",
+                                      body="<html><body></body></html>"))
+        pg = ctx.new_page()
+        pg.goto(f"https://learner360.wgu.edu/learner/{UUID}")
+        w = types.SimpleNamespace(_overlay_on=True, _overlay_ctx_id=None,
+                                  _overlay_snap=snap,
+                                  on_overlay_actions=lambda a: got.extend(a))
+        w._overlay_pages = BW._overlay_pages.__get__(w)
+        BW._overlay_tick(w, ctx)
+        pg.wait_for_timeout(250)
+        root = "document.querySelector('[data-cn=panel]').shadowRoot"
+        assert "pronouns unknown" in pg.evaluate(f"() => {root}.innerHTML")
+        pg.evaluate(f"() => {root}.querySelector('[data-act=edit-pron]').click()")
+        pg.wait_for_timeout(100)
+        pg.evaluate(f"""() => [...{root}.querySelectorAll('.opt')]
+                       .find(b => b.dataset.v === 'she/her').click()""")
+        pg.wait_for_timeout(150)
+        html = pg.evaluate(f"() => {root}.innerHTML")
+        assert "she/her" in html and "pronouns unknown" not in html
+        BW._overlay_tick(w, ctx)                       # worker collects outbox
+        assert got == [{"type": "pronouns", "sid": "123456", "value": "she/her"}]
+        BW._overlay_tick(w, ctx)                       # outbox now empty
+        assert len(got) == 1
+        b.close()
+
+
+def test_app_applies_only_valid_pronoun_edits():
+    import importlib.util
+    import types
+    spec = importlib.util.spec_from_file_location(
+        "launcher_ov_test", os.path.join(ROOT, "scripts", "launcher.py"))
+    L = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(L)
+    saved, logs = [], []
+    real = L.history.set_student_pronouns
+    try:
+        L.history.set_student_pronouns = lambda sid, v, **kw: saved.append((sid, v))
+        rows = [{"StudentID": "000123456", "Name": "Pat Lee"}]
+        a = types.SimpleNamespace(
+            _caseload_rows=rows, _append_log=lambda m, **kw: logs.append(m),
+            _refresh_caseload_panel=lambda: logs.append("refresh"),
+            root=types.SimpleNamespace(after=lambda ms, fn: fn()))
+        L.App._on_overlay_actions(a, [
+            {"type": "pronouns", "sid": "123456", "value": "  they/them  "},
+            {"type": "pronouns", "sid": "999999", "value": "he/him"},  # not mine
+            {"type": "delete-everything", "sid": "123456"},            # unknown
+            {"type": "pronouns", "sid": "123456", "value": "x" * 99},  # capped
+        ])
+        assert saved == [("000123456", "they/them"), ("000123456", "x" * 30)]
+        assert rows[0]["Pronouns"] == "x" * 30 and "refresh" in logs
+    finally:
+        L.history.set_student_pronouns = real
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
