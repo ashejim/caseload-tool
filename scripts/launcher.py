@@ -17609,6 +17609,11 @@ class App:
                         for k, v in history.all_student_pronouns().items()}
         except Exception:
             pron_map = {}
+        # Contact preference for students the risk model doesn't score.
+        try:
+            cpref_map = history.all_contact_preferences()
+        except Exception:
+            cpref_map = {}
         # Learner360 engagement signals (history.engagement_signals), keyed by
         # (student id without leading zeros, course). Blank when no activity
         # has been imported for the student.
@@ -17658,8 +17663,11 @@ class App:
                 r["AvgMomentumRank"] = ""
                 r["MomentumTrend"] = ""
                 r["NeverAttempted"] = ""
-                r["ContactPref"] = ""
-                r["_contact_pref_source"] = ""
+                # Not scored by the risk model → still give the contact
+                # preference from note history / manual setting.
+                cp = cpref_map.get(sid.lstrip("0"))
+                r["ContactPref"] = cp[0] if cp else ""
+                r["_contact_pref_source"] = cp[1] if cp else ""
             # Instructor-entered pronouns (blank unless manually set).
             r["Pronouns"] = pron_map.get(sid.lstrip("0"), "")
             # Learner360 engagement (blank if no activity data).

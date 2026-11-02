@@ -77,6 +77,36 @@ def test_invalid_pref_rejected():
             os.unlink(db)
 
 
+
+def test_bulk_matches_per_student():
+    db = _tmp_db()
+    try:
+        history.persist_notes([   # replies by text twice, email once → text
+            _note("Instant Message (IM) / Text", "Incoming: hi", "2026-10-01T10:00:00.000Z"),
+            _note("Instant Message (IM) / Text", "Incoming: ok", "2026-10-02T10:00:00.000Z"),
+            _note("Email from Student", "q", "2026-10-03T10:00:00.000Z"),
+        ], student_id="000111", db_path=db)
+        history.persist_notes([   # only calls (both directions count) → call
+            _note("Live Call", "talked", "2026-10-04T10:00:00.000Z"),
+        ], student_id="000222", db_path=db)
+        history.persist_notes([   # tie text vs email → cheaper (text)
+            _note("Instant Message (IM) / Text", "Incoming: a", "2026-10-05T10:00:00.000Z"),
+            _note("Email from Student", "b", "2026-10-06T10:00:00.000Z"),
+        ], student_id="000333", db_path=db)
+        history.persist_notes([   # outbound only → no preference
+            _note("Email to Student", "hello", "2026-10-07T10:00:00.000Z"),
+        ], student_id="000444", db_path=db)
+        history.set_contact_preference("000555", "email", db_path=db)  # manual
+        bulk = history.all_contact_preferences(db_path=db)
+        for sid in ("000111", "000222", "000333", "000444", "000555"):
+            one = history.contact_preference(sid, db_path=db)
+            got = bulk.get(sid.lstrip("0"))
+            assert (got or ("", "none")) == (one["pref"], one["source"]), (sid, got, one)
+        assert bulk["111"] == ("text", "auto") and bulk["555"] == ("email", "manual")
+    finally:
+        os.unlink(db)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

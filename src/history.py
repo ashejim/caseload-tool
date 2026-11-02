@@ -1555,6 +1555,38 @@ _CHANNEL_COST = {"text": 1, "email": 2, "call": 3}
 _CHANNEL_ORDER = ("text", "email", "call")
 
 
+def all_contact_preferences(*, db_path=HISTORY_DB) -> dict:
+    """{student id without leading zeros: (pref, source)} for EVERY student
+    with a manual setting or note history — the bulk equivalent of
+    contact_preference() (same rules: manual wins; else the channel with the
+    most inbound events, calls counting both directions; ties → cheaper
+    channel). Two queries, so the caseload's derived columns can fill it for
+    students the momentum-risk model doesn't score."""
+    from collections import defaultdict
+    conn = _connect(db_path)
+    try:
+        scores = defaultdict(lambda: defaultdict(int))
+        for r in conn.execute(
+                "SELECT ltrim(student_id, '0') sid, channel, direction, "
+                "COUNT(*) n FROM notes WHERE channel IN ('text','email','call') "
+                "AND direction IN ('inbound','outbound') GROUP BY 1, 2, 3"):
+            if r["direction"] == "inbound" or r["channel"] == "call":
+                scores[r["sid"]][r["channel"]] += r["n"]
+        out = {}
+        for sid, sc in scores.items():
+            sc = {c: n for c, n in sc.items() if n}
+            if sc:
+                best = max(sc, key=lambda c: (sc[c], -_CHANNEL_COST.get(c, 9)))
+                out[sid] = (best, "auto")
+        for r in conn.execute("SELECT ltrim(student_id, '0') sid, contact_pref "
+                              "FROM student_flags WHERE COALESCE(contact_pref,"
+                              "'') != ''"):
+            out[r["sid"]] = (r["contact_pref"], "manual")
+        return out
+    finally:
+        conn.close()
+
+
 def engagement_ledger(student_id: str, *, db_path=HISTORY_DB,
                       now: Optional[datetime] = None) -> dict:
     """Per-student contact strategy from the note history: for each channel
