@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import _real_db_guard  # noqa: E402,F401  (opening the real history.db raises)
 from src import local_backup as lb  # noqa: E402
 from src.config import HISTORY_DB  # noqa: E402
 
@@ -22,8 +23,7 @@ def _state(p):
     return (p.exists(), p.stat().st_mtime if p.exists() else None)
 
 
-_REAL = (_state(HISTORY_DB), _state(str(HISTORY_DB) + ".enc"),
-         _state(lb.default_backup_dir()))
+_REAL = _state(lb.default_backup_dir())
 
 
 def _data(d, size=1000, enc=True):
@@ -119,9 +119,8 @@ def main():
     for t in tests:
         t()
         print(f"  ok  {t.__name__}")
-    now = (_state(HISTORY_DB), _state(str(HISTORY_DB) + ".enc"),
-           _state(lb.default_backup_dir()))
-    assert now == _REAL, "a test touched the REAL data or backup folder"
+    assert _state(lb.default_backup_dir()) == _REAL, (
+        "a test touched the REAL backup folder")
     print(f"All {len(tests)} tests passed.")
 
 

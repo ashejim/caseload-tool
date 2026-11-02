@@ -14,11 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from src import history, learner360 as l3  # noqa: E402
-from src.config import HISTORY_DB  # noqa: E402
-
-# Tests must never touch the real history DB (see tests_never_touch_real_db).
-_REAL_DB = (os.path.exists(HISTORY_DB),
-            os.path.getmtime(HISTORY_DB) if os.path.exists(HISTORY_DB) else None)
+import _real_db_guard  # noqa: E402,F401  (opening the real history.db raises)
 
 CASELOAD = {
     "content": [
@@ -632,9 +628,6 @@ def main():
     for t in tests:
         t()
         print(f"  ok  {t.__name__}")
-    now = (os.path.exists(HISTORY_DB),
-           os.path.getmtime(HISTORY_DB) if os.path.exists(HISTORY_DB) else None)
-    assert now == _REAL_DB, "a test created/modified the REAL history.db"
     print(f"All {len(tests)} tests passed.")
 
 
