@@ -6725,20 +6725,59 @@ class CaseloadPanel:
         return flagged or nonbatch
 
     def _on_fire_selected_clicked(self) -> None:
-        """Post a menu of the curated panel-action scenarios; firing one
-        runs it across the checked students as a mini-batch."""
-        if not self._checked_rows():
+        """Post a CONTEXTUAL menu for the checked students (src/
+        contextual_actions): only actions valid for every selected student's
+        course, gated by each action's conditions; the action completing the
+        students' next success-path step is suggested first. Firing runs it
+        across the checked students as a mini-batch (batch actions too — their
+        conditions pick which selected students are included)."""
+        rows = self._checked_rows()
+        if not rows:
             return
-        nonbatch = self._panel_action_scenarios()
-        if not nonbatch:
-            self.app._append_log("No non-batch actions to fire.")
+        from src import contextual_actions
+        try:
+            fits = contextual_actions.applicable_actions(
+                list(self.app.scenarios.values()), rows,
+                success_paths=getattr(self.app, "success_paths", {}) or {},
+                next_action_for=self.app._next_action_for_row)
+        except Exception as e:
+            self.app._append_log(f"Couldn't work out actions for the "
+                                 f"selection: {e}")
             return
+        if not fits:
+            self.app._append_log("No actions fit the selected students.")
+            return
+        n = len(rows)
         menu = tk.Menu(self.fire_sel_btn, tearoff=0)
-        for sc in nonbatch:
-            menu.add_command(
-                label=self.app._action_display_name(sc),
-                command=lambda s=sc: self.app._fire_on_selected(
-                    s, self._checked_rows()))
+        sugg = [a for a in fits if a["suggested"]]
+        rest = [a for a in fits if not a["suggested"]]
+
+        def label(a) -> str:
+            lab = self.app._action_display_name(a["scenario"])
+            if a["matched"] < a["total"]:
+                lab += f"   ({a['matched']} of {a['total']} meet its conditions)"
+            return lab
+
+        if sugg:
+            menu.add_command(label="Suggested next step", state="disabled")
+            for a in sugg:
+                menu.add_command(
+                    label=f"★ {label(a)}   — next step for {a['suggested']} "
+                          f"of {n}",
+                    command=lambda s=a["scenario"]: self.app._fire_on_selected(
+                        s, self._checked_rows()))
+            if rest:
+                menu.add_separator()
+        if rest:
+            courses = sorted({(r.get("CourseCode") or "").strip()
+                              for r in rows} - {""})
+            menu.add_command(label="For " + (", ".join(courses) or "these")
+                             + " students", state="disabled")
+            for a in rest:
+                menu.add_command(
+                    label=label(a),
+                    command=lambda s=a["scenario"]: self.app._fire_on_selected(
+                        s, self._checked_rows()))
         try:
             x = self.fire_sel_btn.winfo_rootx()
             y = self.fire_sel_btn.winfo_rooty() + self.fire_sel_btn.winfo_height()
@@ -17161,16 +17200,35 @@ class App:
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
             return
-        if scenario.batch is not None:
-            self._append_log(
-                f"{scenario.name!r} is a batch action; fire it from the "
-                "main window, not the panel selection."
-            )
-            return
         rows = [r for r in (rows or []) if r]
         if not rows:
             self._append_log("No students selected.")
             return
+        if scenario.batch is not None:
+            # Contextual actions: run a BATCH action on the hand-picked
+            # students. Its batch conditions decide which of them are
+            # included (exactly the batch engine's evaluation); its content
+            # then runs as a mini-batch with the usual review.
+            from dataclasses import replace as _dc_replace
+            from src import contextual_actions
+            try:
+                kept = contextual_actions.gate_rows(
+                    scenario.batch.filters or [], rows)
+            except Exception as e:
+                self._append_log(f"Couldn't check {scenario.name!r}'s "
+                                 f"conditions: {e}")
+                return
+            if not kept:
+                self._append_log(
+                    f"None of the {len(rows)} selected student(s) meet "
+                    f"{scenario.name!r}'s conditions — nothing to do.")
+                return
+            if len(kept) < len(rows):
+                self._append_log(
+                    f"{len(kept)} of {len(rows)} selected student(s) meet "
+                    f"{scenario.name!r}'s conditions; running it for them.")
+            rows = kept
+            scenario = _dc_replace(scenario, batch=None)
 
         # Off-caseload student (from the off-caseload search view): there's no
         # caseload row / CSV context and the record is already open — route
@@ -25610,6 +25668,23 @@ class App:
         if entry.submitted:
             self._log_path_step_done(
                 entry.scenario, entry.student_id, entry.course_code)
+
+    def _next_action_for_row(self, row: dict) -> str:
+        """Action bound to this caseload row's next DUE success-path step
+        ('' if none) — from the row's injected sp:<course>:<step> statuses."""
+        try:
+            course = self._norm_course_code(
+                (row.get("CourseCode") or "").strip())
+            path = (getattr(self, "success_paths", {}) or {}).get(course)
+            if not path:
+                return ""
+            nc = self._norm_course(course)   # same key the columns use
+            for st in path.steps:
+                if row.get(self._sp_col(nc, st.id)) == "due":
+                    return (st.action or "").strip()
+        except Exception:
+            pass
+        return ""
 
     def _log_path_step_done(self, scenario_name: str, student_id: str,
                             course_code: str) -> None:
