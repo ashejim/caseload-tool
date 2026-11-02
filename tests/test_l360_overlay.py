@@ -166,6 +166,62 @@ def test_overlay_handles_div_grid_markup():
         b.close()
 
 
+UUID = "09eba36d-f48c-4bb5-87bd-3a62200438b5"
+EXTRAS = {"uuid_map": {UUID: "123456"},
+          "notes": {"123456": [{"date": "2026-10-30", "type": "Email to Student",
+                                "author": "Jim Ashe", "direction": "outbound",
+                                "text": "Checking in on Task 3"}]},
+          "momi": {"123456": [["2026-09-01", 0.4], ["2026-10-01", 0.55],
+                              ["2026-10-29", 0.62]]}}
+
+
+def test_student_panel_on_learner_page():
+    from playwright.sync_api import sync_playwright
+    snap = l360_overlay.build_snapshot(ROWS, STEPS, version=3, extras=EXTRAS)
+    assert snap["uuid_map"] == {UUID: "123456"}
+    assert [s["status"] for s in snap["students"]["123456"][0]["steps"]] ==         ["done", "due"]
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context()
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html",
+                                      body="<html><body><h1>Learner</h1>"
+                                           "</body></html>"))
+        pg = ctx.new_page()
+        pg.goto(f"https://learner360.wgu.edu/learner/{UUID}")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(250)
+        html = pg.evaluate("""() => { const h = document.querySelector(
+            '[data-cn=panel]'); return h ? h.shadowRoot.innerHTML : ''; }""")
+        assert "Pat Lee" in html and "Task 3 prep" in html and "risk 35%" in html
+        assert "Checking in on Task 3" in html and "<svg" in html
+        assert "Open EA" in html and "now 62" in html
+        # SPA navigation away → panel gone; back → panel returns.
+        pg.evaluate("history.pushState({}, '', '/caseload')")
+        pg.wait_for_timeout(200)
+        assert pg.evaluate("!!document.querySelector('[data-cn=panel]')") is False
+        pg.evaluate(f"history.pushState({{}}, '', '/learner/{UUID}')")
+        pg.wait_for_timeout(200)
+        assert pg.evaluate("!!document.querySelector('[data-cn=panel]')") is True
+        # Collapse via the tab; remembered.
+        pg.evaluate("""() => document.querySelector('[data-cn=panel]').shadowRoot
+                             .querySelector('.tab').click()""")
+        pg.wait_for_timeout(250)
+        assert pg.evaluate("""() => document.querySelector('[data-cn=panel]')
+            .shadowRoot.querySelector('.panel').classList.contains('collapsed')""")
+        assert pg.evaluate("localStorage.getItem('cnPanelCollapsed')") == "1"
+        # Unknown learner → no panel.
+        pg.evaluate("history.pushState({}, '', "
+                    "'/learner/11111111-2222-3333-4444-555555555555')")
+        pg.wait_for_timeout(200)
+        assert pg.evaluate("!!document.querySelector('[data-cn=panel]')") is False
+        b.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -601,6 +601,32 @@ def test_team_roster_store_load_staleness_and_readonly():
         os.remove(path)
 
 
+def test_overlay_extras_from_temp_db():
+    path = _tmpdb()
+    try:
+        history.persist_notes([
+            {"type": "Email to Student", "text": "<p>old</p>",
+             "date": "2026-09-01T10:00:00.000Z", "author": "/005ABC"},
+            {"type": "Email from Student", "text": "newest &amp; last",
+             "date": "2026-10-30T10:00:00.000Z", "author": "Jim Ashe"},
+        ], student_id="000123", db_path=path)
+        conn = history._connect(path)
+        conn.execute("INSERT INTO l360_ids VALUES ('000123', 'AAAA-uuid', '', '')")
+        conn.executemany("INSERT INTO momi_weekly (student_id, week_date, "
+                         "momentum_score) VALUES (?,?,?)",
+                         [("000123", "2026-10-01", 0.5),
+                          ("000123", "2026-09-01", 0.4)])
+        conn.commit(); conn.close()
+        x = history.overlay_extras(["000123", "999"], db_path=path)
+        assert x["uuid_map"] == {"aaaa-uuid": "123"}
+        n = x["notes"]["123"]
+        assert [k["text"] for k in n] == ["newest & last", "old"]
+        assert n[0]["author"] == "Jim Ashe" and n[1]["author"] == ""
+        assert x["momi"]["123"] == [["2026-09-01", 0.4], ["2026-10-01", 0.5]]
+    finally:
+        os.remove(path)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

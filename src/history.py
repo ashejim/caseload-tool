@@ -1417,6 +1417,54 @@ def load_l360_team_roster(*, db_path=HISTORY_DB, max_age_days: float = 3,
         conn.close()
 
 
+def overlay_extras(student_ids, *, notes_per: int = 4, momi_weeks: int = 12,
+                   db_path=HISTORY_DB) -> dict:
+    """Per-student extras for the Learner360 overlay's student panel, in three
+    bulk queries: {"uuid_map": {learner uuid (lower): student id w/o leading
+    zeros}, "notes": {nsid: [{date, type, author, direction, text}] newest
+    first}, "momi": {nsid: [[week_date, score 0-1], …] oldest first}}.
+    Note text is tag-stripped and trimmed to 220 chars."""
+    import html as _html
+    want = {str(s or "").strip().lstrip("0") for s in student_ids or []}
+    want.discard("")
+    out = {"uuid_map": {}, "notes": {}, "momi": {}}
+    conn = _connect(db_path)
+    try:
+        for sid, wid in conn.execute(
+                "SELECT student_id, wgu_id FROM l360_ids WHERE wgu_id != '' "
+                "UNION SELECT student_id, wgu_id FROM l360_team_roster "
+                "WHERE COALESCE(wgu_id,'') != ''"):
+            n = str(sid or "").lstrip("0")
+            if n in want and wid:
+                out["uuid_map"][str(wid).lower()] = n
+        for r in conn.execute(
+                "SELECT student_id, created_at, type, author, direction, body FROM "
+                "(SELECT *, ROW_NUMBER() OVER (PARTITION BY ltrim(student_id,'0') "
+                "ORDER BY created_at DESC) rn FROM notes WHERE created_at != '') "
+                "WHERE rn <= ?", (notes_per,)):
+            n = str(r["student_id"] or "").lstrip("0")
+            if n not in want:
+                continue
+            text = _html.unescape(re.sub(r"<[^>]+>", " ", r["body"] or ""))
+            out["notes"].setdefault(n, []).append({
+                "date": (r["created_at"] or "")[:10], "type": r["type"] or "",
+                "author": r["author"] or "" if not (r["author"] or "").startswith(
+                    "/") else "", "direction": r["direction"] or "",
+                "text": " ".join(text.split())[:220]})
+        for r in conn.execute(
+                "SELECT student_id, week_date, momentum_score FROM "
+                "(SELECT *, ROW_NUMBER() OVER (PARTITION BY student_id ORDER BY "
+                "week_date DESC) rn FROM momi_weekly WHERE momentum_score IS NOT "
+                "NULL) WHERE rn <= ? ORDER BY week_date", (momi_weeks,)):
+            n = str(r["student_id"] or "").lstrip("0")
+            if n in want:
+                out["momi"].setdefault(n, []).append(
+                    [r["week_date"], round(float(r["momentum_score"]), 3)])
+        return out
+    finally:
+        conn.close()
+
+
 def l360_note_targets(*, max_age_days: int = 30, db_path=HISTORY_DB) -> list:
     """[(wgu_id, student_id)] for the Learner360 notes import: learners whose
     360 id the MOMI capture refreshed within ``max_age_days`` (≈ the current

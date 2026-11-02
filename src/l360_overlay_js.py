@@ -141,7 +141,155 @@ OVERLAY_JS = r"""
     pill.classList.toggle('off', !S.on);
     pillRoot.querySelector('.txt').textContent = !S.data ? 'CaseloadNotes · waiting for data'
       : S.on ? `CaseloadNotes · ${matched} on this page` : 'CaseloadNotes · hidden';
+    renderPanel();
   }
+
+
+  // ---- student panel (learner pages) ------------------------------------
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  const PCSS = `
+    :host { all: initial; }
+    * { box-sizing: border-box; }
+    .panel { position: fixed; top: 72px; right: 0; bottom: 16px; width: 340px;
+      z-index: 2147482999; display: flex; flex-direction: column;
+      background: #fff; border: 1px solid #d5dde8; border-right: none;
+      border-radius: 10px 0 0 10px; box-shadow: -6px 0 24px rgba(0,40,85,.12);
+      font: 400 12.5px/1.4 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      color: #1b2a3a; transform: translateX(0);
+      transition: transform .18s ease, opacity .18s ease; }
+    .panel.collapsed { transform: translateX(312px); }
+    .tab { position: absolute; left: 0; top: 0; bottom: 0; width: 28px;
+      display: flex; align-items: center; justify-content: center;
+      background: #002855; color: #fff; cursor: pointer; border: none;
+      border-radius: 10px 0 0 10px; writing-mode: vertical-rl;
+      font: 600 11px/1 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      letter-spacing: .06em; }
+    .body { margin-left: 28px; flex: 1; overflow-y: auto; padding: 14px 14px 18px;
+      scrollbar-width: thin; }
+    h2 { font-size: 15px; margin: 0 0 2px; color: #002855; }
+    .sub { color: #5b6b7f; font-size: 11.5px; margin-bottom: 10px; }
+    .sec { border-top: 1px solid #e8edf3; padding: 10px 0 6px; }
+    .sec:first-of-type { border-top: none; }
+    .lbl { font-size: 10.5px; font-weight: 700; letter-spacing: .05em;
+      text-transform: uppercase; color: #5b6b7f; margin-bottom: 6px; }
+    .row { display: flex; justify-content: space-between; gap: 8px;
+      padding: 2px 0; }
+    .row .k { color: #5b6b7f; }
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .chip { display: inline-flex; align-items: center; height: 20px;
+      padding: 0 7px; border-radius: 10px; font-size: 11px; font-weight: 600;
+      background: #eef2f7; border: 1px solid #d5dde8; white-space: nowrap; }
+    .t-pass { background:#e3f4ea; border-color:#9fd3b1; color:#135c32; }
+    .t-return { background:#fdecea; border-color:#f2b1aa; color:#8a1f14; }
+    .t-pending { background:#e8f0fb; border-color:#a9c3ea; color:#1d4f91; }
+    .t-none { background:#f4f6f9; border-color:#e1e6ee; color:#8a97a8; }
+    .r-low { background:#e3f4ea; border-color:#9fd3b1; color:#135c32; }
+    .r-mid { background:#fff4dc; border-color:#f0d08b; color:#7a5600; }
+    .r-high { background:#fdecea; border-color:#f2b1aa; color:#8a1f14; }
+    .step { display: flex; gap: 6px; align-items: baseline; padding: 2px 0; }
+    .mark { width: 14px; text-align: center; font-weight: 700; }
+    .s-done .mark { color: #1a7f43; } .s-skipped .mark { color: #8a97a8; }
+    .s-due .mark { color: #002855; } .s-blocked .mark { color: #b45309; }
+    .s-due { font-weight: 600; }
+    .note { padding: 6px 0; border-bottom: 1px dashed #e8edf3; }
+    .note:last-child { border-bottom: none; }
+    .note .meta { color: #5b6b7f; font-size: 11px; }
+    .ea { color: #c2410c; font-weight: 600; }
+    svg { display: block; }
+  `;
+  const panelHost = document.createElement('div');
+  panelHost.setAttribute('data-cn', 'panel');
+  const panelRoot = panelHost.attachShadow({ mode: 'open' });
+  let panelCollapsed = false;
+  try { panelCollapsed = localStorage.getItem('cnPanelCollapsed') === '1'; } catch (e) {}
+  let panelKey = '';
+
+  const MARK = { done: '✓', skipped: '–', due: '●', blocked: '!' };
+
+  function spark(points) {
+    if (!points || points.length < 2) return '';
+    const W = 300, H = 44, P = 4;
+    const xs = (i) => P + i * (W - 2 * P) / (points.length - 1);
+    const ys = (v) => H - P - v * (H - 2 * P);
+    const d = points.map((p, i) => (i ? 'L' : 'M') + xs(i).toFixed(1) + ' ' + ys(p[1]).toFixed(1)).join(' ');
+    const bands = [0.2, 0.5, 0.7, 0.9].map(b =>
+      `<line x1="${P}" x2="${W - P}" y1="${ys(b)}" y2="${ys(b)}" stroke="#eef2f7" stroke-width="1"/>`).join('');
+    const last = points[points.length - 1];
+    return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img"
+      aria-label="MOMI score, last ${points.length} weeks">${bands}
+      <path d="${d}" fill="none" stroke="#002855" stroke-width="2" stroke-linejoin="round"/>
+      <circle cx="${xs(points.length - 1)}" cy="${ys(last[1])}" r="3" fill="#002855"/></svg>
+      <div class="row"><span class="k">${esc(points[0][0])}</span>
+      <span>now ${Math.round(last[1] * 100)}</span></div>`;
+  }
+
+  function panelHtml(sid, entries) {
+    const e0 = entries[0];
+    const courses = entries.map(e => e.course).filter(Boolean).join(' · ');
+    let h = `<h2>${esc(e0.name || 'Student')}</h2>
+      <div class="sub">${esc(courses)}${e0.pronouns ? ' · ' + esc(e0.pronouns) : ''}
+      ${e0.contact_pref ? ' · prefers ' + esc(e0.contact_pref) : ''}</div>`;
+    for (const e of entries) {
+      const tasks = (e.tasks || []).map(t =>
+        `<span class="chip t-${esc(t.kind)}" title="${esc(t.status || '')}">T${t.n}${t.date ? ' · ' + esc(t.date.slice(5)) : ''}${t.count ? ' (' + esc(t.count) + ')' : ''}</span>`).join('');
+      h += `<div class="sec"><div class="lbl">${esc(e.course)}${e.term_end ? ' · ends ' + esc(e.term_end) : ''}</div>
+        <div class="chips">${tasks}
+        ${e.risk != null ? `<span class="chip ${riskCls(e.risk)}">risk ${Math.round(e.risk)}%</span>` : ''}
+        ${e.momentum ? `<span class="chip">${esc(e.momentum)}</span>` : ''}</div>
+        ${e.ea ? `<div class="row ea"><span>Open EA</span><span>${esc(e.ea)}</span></div>` : ''}`;
+      if ((e.steps || []).length) {
+        h += `<div style="margin-top:8px">` + e.steps.map(st =>
+          `<div class="step s-${esc(st.status)}"><span class="mark">${MARK[st.status] || '·'}</span>${esc(st.label)}</div>`).join('') + `</div>`;
+      }
+      h += `</div>`;
+    }
+    const facts = [];
+    if (e0.followup_date) facts.push(['Follow-up', e0.followup_date + (e0.followup_note ? ' — ' + e0.followup_note : '')]);
+    if (e0.last_action) facts.push(['Last action', e0.last_action + (e0.days_action != null ? ` (${Math.round(e0.days_action)}d ago)` : '')]);
+    if (e0.days_contact != null) facts.push(['Last contact', Math.round(e0.days_contact) + ' days ago']);
+    if (e0.days_course_activity != null) facts.push(['Course activity', Math.round(e0.days_course_activity) + ' days ago']);
+    if (e0.pa_returns != null) facts.push(['PA returns / passes', `${e0.pa_returns} / ${e0.pa_passes != null ? e0.pa_passes : 0}`]);
+    if (facts.length)
+      h += `<div class="sec"><div class="lbl">At a glance</div>` + facts.map(([k, v]) =>
+        `<div class="row"><span class="k">${esc(k)}</span><span>${esc(v)}</span></div>`).join('') + `</div>`;
+    const m = (S.data.momi || {})[sid];
+    if (m && m.length > 1) h += `<div class="sec"><div class="lbl">MOMI trend</div>${spark(m)}</div>`;
+    const notes = (S.data.notes || {})[sid] || [];
+    if (notes.length)
+      h += `<div class="sec"><div class="lbl">Recent notes</div>` + notes.map(n =>
+        `<div class="note"><div class="meta">${esc(n.date)} · ${esc(n.type)}${n.direction === 'inbound' ? ' · from student' : ''}${n.author ? ' · ' + esc(n.author) : ''}</div>${esc(n.text)}</div>`).join('') + `</div>`;
+    return `<style>${PCSS}</style><div class="panel${panelCollapsed ? ' collapsed' : ''}">
+      <button class="tab" title="Show/hide CaseloadNotes">CASELOADNOTES</button>
+      <div class="body">${h}</div></div>`;
+  }
+
+  function renderPanel() {
+    const m = location.pathname.match(UUID_RE) || location.href.match(UUID_RE);
+    const sid = (m && S.on && S.data) ? (S.data.uuid_map || {})[m[0].toLowerCase()] : null;
+    const entries = sid ? (S.data.students || {})[sid] : null;
+    if (!entries || !entries.length) {
+      if (panelHost.isConnected) panelHost.remove();
+      panelKey = '';
+      return;
+    }
+    if (!panelHost.isConnected && document.body) document.body.appendChild(panelHost);
+    const key = S.v + ':' + sid;
+    if (key === panelKey) return;
+    panelKey = key;
+    panelRoot.innerHTML = panelHtml(sid, entries);
+    panelRoot.querySelector('.tab').addEventListener('click', () => {
+      panelCollapsed = !panelCollapsed;
+      try { localStorage.setItem('cnPanelCollapsed', panelCollapsed ? '1' : '0'); } catch (e) {}
+      panelRoot.querySelector('.panel').classList.toggle('collapsed', panelCollapsed);
+    });
+  }
+
+  // Learner360 is a single-page app: follow in-page navigation.
+  for (const fn of ['pushState', 'replaceState']) {
+    const orig = history[fn];
+    history[fn] = function () { const r = orig.apply(this, arguments); schedule(); return r; };
+  }
+  window.addEventListener('popstate', () => schedule());
 
   function schedule() {
     if (S.queued) return;

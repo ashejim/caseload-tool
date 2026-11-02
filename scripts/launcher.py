@@ -9963,6 +9963,7 @@ class App:
             pass
 
     _overlay_version = 0
+    _overlay_extras_cache = None
 
     def _push_overlay_snapshot(self) -> None:
         """Build the Learner360-overlay snapshot from the enriched caseload
@@ -9978,11 +9979,33 @@ class App:
                 step_cols[nc] = [(self._sp_col(nc, st.id),
                                   st.description or st.id)
                                  for st in path.steps]
+            rows = [dict(r) for r in (self._caseload_rows or [])]
             App._overlay_version += 1
-            snap = l360_overlay.build_snapshot(self._caseload_rows or [],
-                                               step_cols,
-                                               version=App._overlay_version)
-            self.worker.set_overlay_snapshot(snap)
+            ver = App._overlay_version
+            # Badges right away (cheap); the student-panel extras (notes,
+            # MOMI trend, learner-id map) take ~1 s of DB work → background
+            # thread, then a second, complete snapshot.
+            self.worker.set_overlay_snapshot(
+                l360_overlay.build_snapshot(rows, step_cols, version=ver,
+                                            extras=self._overlay_extras_cache))
+
+            def work():
+                try:
+                    ex = history.overlay_extras(
+                        [r.get("StudentID") for r in rows])
+                except Exception:
+                    return
+                self._overlay_extras_cache = ex
+                if App._overlay_version != ver:
+                    return                   # a newer refresh superseded us
+                App._overlay_version += 1
+                self.worker.set_overlay_snapshot(
+                    l360_overlay.build_snapshot(rows, step_cols,
+                                                version=App._overlay_version,
+                                                extras=ex))
+
+            threading.Thread(target=work, daemon=True,
+                             name="overlay-extras").start()
         except Exception:
             pass
 

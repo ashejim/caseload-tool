@@ -39,11 +39,13 @@ def _next_step(row: dict, steps: list) -> str:
 
 
 def build_snapshot(rows: list, step_cols: Optional[dict] = None,
-                   version: int = 0) -> dict:
+                   version: int = 0, extras: Optional[dict] = None) -> dict:
     """{"v": version, "students": {student id without leading zeros:
-    [entry per course]}} from the caseload rows (after derived columns, task
-    status and EAs are applied). ``step_cols`` = {course: [(sp column,
-    step label)]} in path order."""
+    [entry per course]}, "uuid_map", "notes", "momi"} from the caseload rows
+    (after derived columns, task status and EAs are applied). ``step_cols`` =
+    {course: [(sp column, step label)]} in path order. ``extras`` =
+    history.overlay_extras(...) for the student panel (uuid → student map,
+    recent notes, MOMI trend); omitted → empty."""
     step_cols = step_cols or {}
     out: dict = {}
     for r in rows or []:
@@ -83,5 +85,15 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
             "followup_note": str(r.get("CourseFollowupNote") or "")[:200],
             "days_course_activity": _num(r.get("DaysSinceCourseActivity")),
             "pa_returns": _num(r.get("PAReturns")),
+            "pa_passes": _num(r.get("PAPasses")),
+            "steps": [{"label": lab, "status": str(r.get(col) or "")}
+                      for col, lab in step_cols.get(course, [])
+                      if str(r.get(col) or "") not in ("", "off-path")],
+            "term_end": str(r.get("EffectiveEndDate")
+                            or r.get("TermEndDate") or ""),
         })
-    return {"v": version, "students": out}
+    ex = extras or {}
+    return {"v": version, "students": out,
+            "uuid_map": dict(ex.get("uuid_map") or {}),
+            "notes": dict(ex.get("notes") or {}),
+            "momi": dict(ex.get("momi") or {})}
