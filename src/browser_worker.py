@@ -147,6 +147,12 @@ class BrowserWorker:
         # Last good Learner360 session (page, headers, user, snap, at) so a
         # background import's small batches don't reload the app each time.
         self._l360_sess = None
+        # Stage 2 overlay (src/l360_overlay*.py): CaseloadNotes badges drawn
+        # into Learner360 pages in THIS browser. Push model — the idle loop
+        # ticks ~1 s while enabled and hands pages the latest snapshot.
+        self._overlay_on = False
+        self._overlay_snap = None          # l360_overlay.build_snapshot dict
+        self._overlay_ctx_id = None        # ctx the init script is installed in
         # `textapi:` capture: a persistent request/response recorder attached to
         # the Mongoose tab (captures BOTH tool-driven and MANUAL compose sends),
         # dumped to text_send_probe.txt for building an API-replay send. `sink`
@@ -431,6 +437,68 @@ class BrowserWorker:
         See _l360_momi_caseload / _l360_momi_fetch."""
         self.q.put(("L360_MOMI_STEP", step, arg, on_done))
 
+    # ---- Stage 2 overlay (Learner360) --------------------------------------
+    def set_overlay_enabled(self, on: bool) -> None:
+        """Turn the Learner360 overlay on/off (thread-safe flag). Turning it
+        off clears badges from open Learner360 pages on the next command."""
+        self._overlay_on = bool(on)
+        if not on:
+            self.q.put(("OVERLAY_CLEAR",))
+
+    def set_overlay_snapshot(self, snap: dict) -> None:
+        """Hand the worker the latest snapshot (called from the UI thread —
+        a single attribute swap, picked up by the next tick)."""
+        self._overlay_snap = snap
+
+    def _overlay_pages(self, ctx) -> list:
+        out = []
+        for pg in list(ctx.pages):
+            try:
+                if not pg.is_closed() and "learner360.wgu.edu" in (pg.url or ""):
+                    out.append(pg)
+            except Exception:
+                continue
+        return out
+
+    def _overlay_tick(self, ctx) -> None:
+        """Install the overlay script (once per browser context) and push the
+        current snapshot into any Learner360 page whose copy is older. Cheap:
+        one small evaluate per open Learner360 page. Never raises."""
+        if not self._overlay_on:
+            return
+        from src.l360_overlay_js import OVERLAY_JS
+        try:
+            if self._overlay_ctx_id != id(ctx):
+                ctx.add_init_script(OVERLAY_JS)
+                self._overlay_ctx_id = id(ctx)
+        except Exception:
+            return
+        snap = self._overlay_snap
+        for pg in self._overlay_pages(ctx):
+            try:
+                ver = pg.evaluate(
+                    "() => window.__cnOverlay ? window.__cnOverlay.version() : -2")
+                if ver == -2:                # opened before the script existed
+                    pg.evaluate("() => {" + OVERLAY_JS + "}")
+                    ver = -1
+                if snap and ver != snap.get("v"):
+                    pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+            except Exception:
+                continue
+
+    def _overlay_clear(self, ctx) -> None:
+        for pg in self._overlay_pages(ctx):
+            try:
+                pg.evaluate("() => window.__cnOverlay && "
+                            "window.__cnOverlay.setData(null)")
+            except Exception:
+                continue
+
+    def submit_l360_open(self, on_done: Callable[[dict], None]) -> None:
+        """Open (or focus) Learner360's caseload in this browser and bring the
+        window forward — to work in Learner360 with the overlay."""
+        self.q.put(("L360_OPEN", on_done))
+
     def submit_l360_team_roster(self, on_done: Callable[[dict], None],
                                 surface: bool = True) -> None:
         """READ-ONLY: the team's caseloads from Learner360 (see
@@ -672,7 +740,11 @@ class BrowserWorker:
                         f"Command {replay[0]!r} failed after the browser "
                         f"reopened: {e}")
             while True:
-                cmd = self.q.get()
+                try:
+                    cmd = self.q.get(timeout=1.0 if self._overlay_on else None)
+                except queue.Empty:
+                    self._overlay_tick(ctx)
+                    continue
                 if cmd is self.SHUTDOWN:
                     return False
                 if isinstance(cmd, tuple) and cmd and cmd[0] == "RESTART_BROWSER":
@@ -1052,6 +1124,28 @@ class BrowserWorker:
                                                 background=True)
             except Exception as e:
                 res = {"error": f"Learner360 MOMI step crashed: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "OVERLAY_CLEAR":
+            try:
+                self._overlay_clear(ctx)
+            except Exception:
+                pass
+        elif cmd[0] == "L360_OPEN":
+            _, on_done = cmd
+            res = {}
+            try:
+                from src import learner360 as l3
+                self._overlay_tick(ctx)       # script in place before load
+                page = self._learner360_page(ctx) or ctx.new_page()
+                if "learner360.wgu.edu" not in (page.url or ""):
+                    page.goto(l3.APP_URL, wait_until="domcontentloaded",
+                              timeout=30_000)
+                self._bring_browser_forward(page)
+                self._overlay_tick(ctx)
+                res = {"ok": True}
+            except Exception as e:
+                res = {"error": f"couldn't open Learner360: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "L360_ROSTER":

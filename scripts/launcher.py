@@ -6354,6 +6354,10 @@ class CaseloadPanel:
         # = days back (default 365), e.g. "l360activity: dry 90".
         # "l360roster: dry" — read-only: pull the team's caseloads from
         # Learner360 and compare coverage with the inbox labeler's roster.
+        # "l360open:" — open Learner360 in the app's browser (overlay view).
+        if q.lower().startswith(("l360open", "1360open")):
+            self.app._l360_open()
+            return "break"
         if q.lower().startswith(("l360roster", "1360roster")):
             self.app._l360_roster_probe()
             return "break"
@@ -8595,6 +8599,7 @@ class App:
             self._enable_offline_demo()
         else:
             self.worker.start()
+            self._apply_overlay_setting()
         self._cleanup_sensitive_artifacts()   # purge old captures/probes/shots
 
         self.hotkey_listener: Optional[keyboard.Listener] = None
@@ -9952,8 +9957,69 @@ class App:
             return
         try:
             root.after(0, panel.populate)
+            # Keep the Learner360 overlay's data in step with the caseload.
+            root.after(0, self._push_overlay_snapshot)
         except Exception:
             pass
+
+    _overlay_version = 0
+
+    def _push_overlay_snapshot(self) -> None:
+        """Build the Learner360-overlay snapshot from the enriched caseload
+        rows and hand it to the worker (src/l360_overlay). No-op when the
+        overlay is off. UI thread. Never raises."""
+        try:
+            if not getattr(self.settings, "l360_overlay_enabled", False):
+                return
+            from src import l360_overlay
+            step_cols = {}
+            for course, path in (self._success_paths() or {}).items():
+                nc = self._norm_course(course)
+                step_cols[nc] = [(self._sp_col(nc, st.id),
+                                  st.description or st.id)
+                                 for st in path.steps]
+            App._overlay_version += 1
+            snap = l360_overlay.build_snapshot(self._caseload_rows or [],
+                                               step_cols,
+                                               version=App._overlay_version)
+            self.worker.set_overlay_snapshot(snap)
+        except Exception:
+            pass
+
+    def _apply_overlay_setting(self) -> None:
+        """Push the overlay on/off setting to the worker (startup + save)."""
+        try:
+            on = bool(getattr(self.settings, "l360_overlay_enabled", False))
+            self.worker.set_overlay_enabled(on)
+            if on:
+                self._push_overlay_snapshot()
+        except Exception:
+            pass
+
+    def _l360_open(self) -> None:
+        """`l360open:` — open Learner360 in the app's browser (with the
+        CaseloadNotes overlay when enabled) and bring it to the front."""
+        if getattr(self, "_offline", False):
+            self._append_log("🔌 Demo: Learner360 isn't available offline.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        if not getattr(self.settings, "l360_overlay_enabled", False):
+            self._append_log("Opening Learner360 (the CaseloadNotes overlay is "
+                             "off — turn it on in Settings → Caseload & Data).")
+        else:
+            self._push_overlay_snapshot()
+
+        def on_done(res):
+            if (res or {}).get("error"):
+                try:
+                    self.root.after(0, lambda: self._append_log(
+                        f"✗ {res['error']}", error=True))
+                except Exception:
+                    pass
+
+        self.worker.submit_l360_open(on_done)
 
     def _build_editor_pane(self) -> None:
         pane = ctk.CTkFrame(self.main_paned)
@@ -20618,6 +20684,16 @@ class App:
             command=lambda: self._l360_refresh_now("roster"),
         ).pack(side="left", padx=(8, 0))
 
+        # Stage 2 (beta): CaseloadNotes badges inside Learner360, in the app's
+        # own browser. Read-only. Open it with the l360open: keyword.
+        overlay_var = ctk.BooleanVar(
+            value=bool(getattr(self.settings, "l360_overlay_enabled", False)))
+        ctk.CTkCheckBox(
+            dialog, variable=overlay_var,
+            text="Show CaseloadNotes badges in Learner360 (beta, read-only — "
+                 "open it with l360open:)",
+        ).pack(anchor="w", padx=32, pady=(0, 10))
+
         # Local versioned backups (src/local_backup.py) — status + open folder.
         bk_row = ctk.CTkFrame(dialog, fg_color="transparent")
         bk_row.pack(fill="x", padx=32, pady=(0, 10))
@@ -21189,6 +21265,9 @@ class App:
             # Learner360 team roster (inbox labeler overlay), days; 0 = off.
             self.settings.l360_auto_roster_days = _L3R_LABELS.get(
                 l3r_var.get().strip(), 1)
+            # Learner360 overlay (Stage 2 beta).
+            self.settings.l360_overlay_enabled = bool(overlay_var.get())
+            self._apply_overlay_setting()
             # Name capitalization mode (off / lower / standard).
             self.settings.name_capitalization = _NC_MODE_LABELS.get(
                 nc_var.get().strip(), "standard")

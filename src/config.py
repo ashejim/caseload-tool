@@ -410,6 +410,9 @@ class Settings:
     # course-scan roster: current instructors, filled-in "Unassigned", newly
     # assigned team students. Days between pulls; 0 = off.
     l360_auto_roster_days: int = 1
+    # Stage 2 (beta): draw CaseloadNotes badges into Learner360 pages in the
+    # app's own browser (read-only). Off by default.
+    l360_overlay_enabled: bool = False
     # Local versioned backups of history.db.enc, taken at startup before the
     # vault is unlocked (src/local_backup.py). Blank dir = ~/Documents/
     # CaseloadNotes Backups.

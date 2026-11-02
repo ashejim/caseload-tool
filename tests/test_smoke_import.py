@@ -60,6 +60,8 @@ SRC_MODULES = [
     "src.bot_drafts_panel",
     "src.learner360",
     "src.l360_roster",
+    "src.l360_overlay",
+    "src.l360_overlay_js",
 ]
 
 
