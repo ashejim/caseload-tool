@@ -9965,6 +9965,19 @@ class App:
     _overlay_version = 0
     _overlay_extras_cache = None
 
+    def _diag_once(self, key: str, msg: str) -> None:
+        """Log ``msg`` once per session for ``key`` (no-op for empty msg)."""
+        if not msg:
+            return
+        seen = self.__dict__.setdefault("_diag_seen", set())
+        if key in seen:
+            return
+        seen.add(key)
+        try:
+            self._append_log(msg, error=msg.startswith("⚠"))
+        except Exception:
+            pass
+
     def _push_overlay_snapshot(self) -> None:
         """Build the Learner360-overlay snapshot from the enriched caseload
         rows and hand it to the worker (src/l360_overlay). No-op when the
@@ -9985,9 +9998,17 @@ class App:
             # Badges right away (cheap); the student-panel extras (notes,
             # MOMI trend, learner-id map) take ~1 s of DB work → background
             # thread, then a second, complete snapshot.
-            self.worker.set_overlay_snapshot(
-                l360_overlay.build_snapshot(rows, step_cols, version=ver,
-                                            extras=self._overlay_extras_cache))
+            first = l360_overlay.build_snapshot(
+                rows, step_cols, version=ver, extras=self._overlay_extras_cache)
+            self.worker.set_overlay_snapshot(first)
+            # One diagnostic line per session: how much the overlay gets.
+            ents = [e for v in first["students"].values() for e in v]
+            self._diag_once("overlay-snapshot", (
+                f"  [overlay] {len(first['students'])} students: "
+                f"{sum(e['risk'] is not None for e in ents)} with risk, "
+                f"{sum(bool(e['contact_pref']) for e in ents)} with contact "
+                f"preference, {sum(bool(e['next_step']) for e in ents)} with a "
+                "next step.") if ents else "")
 
             def work():
                 try:
@@ -17533,8 +17554,13 @@ class App:
         try:
             risk_map = {(_nsid(x["student_id"]), str(x["course_code"]).strip()): x
                         for x in history.momentum_risk_students()}
-        except Exception:
+        except Exception as e:
             risk_map = {}
+            # Don't fail silently: Risk %, contact preference and the overlay
+            # all depend on this.
+            self._diag_once("risk-model", f"⚠ Momentum-risk model failed while "
+                            f"loading the caseload ({type(e).__name__}: {e}) — "
+                            "Risk % and contact preference will be blank.")
         # Instructor-entered pronouns (manual only; blank for everyone else),
         # keyed by normalised student id so it fills for scored AND unscored rows.
         try:
