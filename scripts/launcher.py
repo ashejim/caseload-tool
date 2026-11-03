@@ -6724,16 +6724,16 @@ class CaseloadPanel:
                    if getattr(s, "panel_action", False)]
         return flagged or nonbatch
 
-    def _on_fire_selected_clicked(self) -> None:
-        """Post a CONTEXTUAL menu for the checked students (src/
-        contextual_actions): only actions valid for every selected student's
-        course, gated by each action's conditions; the action completing the
-        students' next success-path step is suggested first. Firing runs it
-        across the checked students as a mini-batch (batch actions too — their
-        conditions pick which selected students are included)."""
-        rows = self._checked_rows()
+    def _contextual_fire_menu(self, parent, rows_getter, near=None):
+        """A tk.Menu of the actions that fit the students ``rows_getter()``
+        returns (src/contextual_actions): sections Suggested next step /
+        <course> actions / General, each marked when not every student meets
+        its usual conditions. Shared by the selection bar's 'Fire action ▸'
+        button and the row right-click 'Fire action' / 'Fire on N selected'
+        submenus. None when nothing fits (logged)."""
+        rows = rows_getter()
         if not rows:
-            return
+            return None
         from src import contextual_actions
         try:
             fits = contextual_actions.applicable_actions(
@@ -6743,46 +6743,54 @@ class CaseloadPanel:
         except Exception as e:
             self.app._append_log(f"Couldn't work out actions for the "
                                  f"selection: {e}")
-            return
+            return None
         if not fits:
             self.app._append_log("No actions fit the selected students.")
-            return
+            return None
         n = len(rows)
-        menu = tk.Menu(self.fire_sel_btn, tearoff=0)
-        sugg = [a for a in fits if a["suggested"]]
-        course_specific = [a for a in fits if not a["suggested"] and a["courses"]]
-        general = [a for a in fits if not a["suggested"] and not a["courses"]]
+        menu = tk.Menu(parent, tearoff=0)
+        sugg = [x for x in fits if x["suggested"]]
+        course_specific = [x for x in fits if not x["suggested"] and x["courses"]]
+        general = [x for x in fits if not x["suggested"] and not x["courses"]]
 
-        def label(a) -> str:
-            lab = self.app._action_display_name(a["scenario"])
-            if a["conditions"] and a["matched"] < a["total"]:
-                lab += ("   (none meet its usual conditions)" if not a["matched"]
-                        else f"   ({a['matched']} of {a['total']} meet its "
+        def label(x) -> str:
+            lab = self.app._action_display_name(x["scenario"])
+            if x["conditions"] and x["matched"] < x["total"]:
+                lab += ("   (none meet its usual conditions)" if not x["matched"]
+                        else f"   ({x['matched']} of {x['total']} meet its "
                              "usual conditions)")
             return lab
 
-        def fire(a):
-            self.app._fire_contextual(a, self._checked_rows())
+        def fire(x):
+            self.app._fire_contextual(x, rows_getter(), near=near)
 
         sections = []
         if sugg:
             sections.append(("Suggested next step", [
-                (f"★ {label(a)}   — next step for {a['suggested']} of {n}", a)
-                for a in sugg]))
+                (f"★ {label(x)}   — next step for {x['suggested']} of {n}", x)
+                for x in sugg]))
         if course_specific:
             courses = sorted({(r.get("CourseCode") or "").strip()
                               for r in rows} - {""})
             sections.append((", ".join(courses) + " actions",
-                             [(label(a), a) for a in course_specific]))
+                             [(label(x), x) for x in course_specific]))
         if general:
             sections.append(("General actions",
-                             [(label(a), a) for a in general]))
+                             [(label(x), x) for x in general]))
         for i, (title, items) in enumerate(sections):
             if i:
                 menu.add_separator()
             menu.add_command(label=title, state="disabled")
-            for lab, a in items:
-                menu.add_command(label=lab, command=lambda a=a: fire(a))
+            for lab, x in items:
+                menu.add_command(label=lab, command=lambda x=x: fire(x))
+        return menu
+
+    def _on_fire_selected_clicked(self) -> None:
+        """The selection bar's 'Fire action ▸' — contextual menu for the
+        checked students (see _contextual_fire_menu)."""
+        menu = self._contextual_fire_menu(self.fire_sel_btn, self._checked_rows)
+        if menu is None:
+            return
         try:
             x = self.fire_sel_btn.winfo_rootx()
             y = self.fire_sel_btn.winfo_rooty() + self.fire_sel_btn.winfo_height()
@@ -8164,27 +8172,21 @@ class CaseloadPanel:
                         s, c, r))
             menu.add_cascade(label="Contact preference", menu=cp_menu)
         fire_index = None
-        nonbatch = self._panel_action_scenarios()
-        if nonbatch:
+        # Contextual: only the actions that fit THIS student (and, below, the
+        # checked selection) — see _contextual_fire_menu.
+        fire_menu = self._contextual_fire_menu(
+            menu, lambda r=row: [r], near=(x_root, y_root))
+        if fire_menu is not None:
             menu.add_separator()
-            # Fire on THIS row (single-student mini-batch → same previewer).
-            fire_menu = tk.Menu(menu, tearoff=0)
-            for sc in nonbatch:
-                fire_menu.add_command(
-                    label=self.app._action_display_name(sc),
-                    command=lambda s=sc, r=row: self.app._fire_on_selected(
-                        s, [r], near=(x_root, y_root)))
             menu.add_cascade(label="Fire action", menu=fire_menu)
             fire_index = menu.index("end")  # for keyboard pre-highlight
-            # Fire on the whole checked selection, when there is one.
-            checked = self._checked_rows()
-            if checked:
-                sel_menu = tk.Menu(menu, tearoff=0)
-                for sc in nonbatch:
-                    sel_menu.add_command(
-                        label=self.app._action_display_name(sc),
-                        command=lambda s=sc: self.app._fire_on_selected(
-                            s, self._checked_rows(), near=(x_root, y_root)))
+        checked = self._checked_rows()
+        if checked:
+            sel_menu = self._contextual_fire_menu(
+                menu, self._checked_rows, near=(x_root, y_root))
+            if sel_menu is not None:
+                if fire_menu is None:
+                    menu.add_separator()
                 menu.add_cascade(
                     label=f"Fire on {len(checked)} selected", menu=sel_menu)
         try:
@@ -25675,7 +25677,7 @@ class App:
             self._log_path_step_done(
                 entry.scenario, entry.student_id, entry.course_code)
 
-    def _fire_contextual(self, fit: dict, rows: list) -> None:
+    def _fire_contextual(self, fit: dict, rows: list, near=None) -> None:
         """Fire an action picked from the contextual menu. For a batch action
         whose usual conditions not every selected student meets, ask whether
         to include only those who meet them or all selected."""
@@ -25697,7 +25699,7 @@ class App:
                 if choice is None:
                     return
                 include_all = choice == "all"
-        self._fire_on_selected(sc, rows, include_all=include_all)
+        self._fire_on_selected(sc, rows, near=near, include_all=include_all)
 
     def _ask_who_to_include(self, name: str, meet: int, total: int,
                             conds: str):
