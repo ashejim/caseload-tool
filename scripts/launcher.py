@@ -17805,10 +17805,48 @@ class App:
             eg = eng_map.get((sid.lstrip("0"), course)) or {}
             for col, key in self._ENGAGEMENT_COLS:
                 r[col] = _num(eg.get(key))
+            self._apply_signal_columns(r, eg)
             # PM email captured from a prior fire/email for this student — used
             # by the panel email-click CC (real address vs the name fallback).
             pm = pm_by_sid.get(sid)
             r["_pm_email_logged"] = pm[1] if pm else ""
+
+    @staticmethod
+    def _apply_signal_columns(r: dict, eg: dict) -> None:
+        """Learner360 action-signal columns (history.engagement_signals
+        sig_*) + a short 'Signals' summary. Blank when there's no activity
+        data for the student."""
+        if not eg or eg.get("days_since_any_activity") is None:
+            for c in ("Signals", "SigNotOpened", "SigWorkingNoSubmit",
+                      "SigActiveElsewhere", "SigFinishedOther",
+                      "SigFinishedDays"):
+                r[c] = ""
+            return
+        # Any task already submitted/passed → they clearly opened the course.
+        has_task = any(str(r.get(f"Task{i}Status", "") or "").strip()
+                       for i in range(1, 6))
+        not_opened = bool(eg.get("sig_not_opened")) and not has_task
+        working = bool(eg.get("sig_working_no_submit"))
+        elsewhere = eg.get("sig_active_elsewhere") or ""
+        finished = eg.get("sig_finished_other") or ""
+        fdays = eg.get("sig_finished_days")
+        r["SigNotOpened"] = "Yes" if not_opened else "No"
+        r["SigWorkingNoSubmit"] = "Yes" if working else "No"
+        r["SigActiveElsewhere"] = elsewhere
+        r["SigFinishedOther"] = finished
+        r["SigFinishedDays"] = "" if fdays is None else fdays
+        parts = []
+        if finished:
+            course_, kind = (finished.split(", ")[0].split(" ", 1) + [""])[:2]
+            parts.append(f"Passed {course_} PA" if kind == "PA passed"
+                         else f"Took {course_} OA")
+        if not_opened:
+            parts.append("Never opened course")
+        if working:
+            parts.append("Working, no submission")
+        if elsewhere:
+            parts.append(f"Active elsewhere: {elsewhere}")
+        r["Signals"] = " · ".join(parts)
 
     # Engagement columns (CSV-style key, history.engagement_signals key).
     _ENGAGEMENT_COLS = (

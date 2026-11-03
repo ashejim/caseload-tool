@@ -445,6 +445,77 @@ def test_engagement_signals_and_learned_codes():
         os.remove(path)
 
 
+def test_action_signals():
+    from datetime import datetime as dt
+    path = _tmpdb()
+    try:
+        _seed_engagement(path)                   # learns C1 → ABC1
+        conn = history._connect(path)
+        for i, (sid, st) in enumerate((("0011", "2026-09-01"),
+                                       ("0012", "2026-09-01"),
+                                       ("0013", "2026-10-25"),
+                                       ("0014", "2026-09-01"))):
+            conn.execute("INSERT INTO snapshots (collected_at, collected_date, "
+                         "student_id, course_code, task1, extra_json) VALUES "
+                         "(?,?,?,?,?,?)", (f"2026-10-26T01:00:{i:02d}",
+                                           "2026-10-26", sid, "C1", "",
+                                           '{"CourseStartDate": "%s"}' % st))
+        conn.commit(); conn.close()
+        cw = lambda d, typ, ctx, c: {"date": d, "category": "Coursework",
+                                     "type": typ, "context": ctx, "course": c}
+        history.persist_l360_activity({
+            "0011": [  # never opened C1 (system events only); busy elsewhere
+                cw("2026-09-02", "Learning Resource",
+                   "Learning resource 'v4 [] X' provisioned for C1", "C1"),
+                cw("2026-09-01", "Term Enrollment", "C1 - X enrolled", "C1"),
+                cw("2026-10-20", "Course of Study Link", "Go to C9", "C9"),
+                cw("2026-10-27", "Course of Study Link", "after as_of", "C6"),
+                {"date": "2026-10-22", "category": "Assessment",
+                 "type": "Performance Assessment",
+                 "context": "Y completed for C8", "course": "C8"},
+                {"date": "2026-10-18", "category": "Assessment",
+                 "type": "Objective Assessment",
+                 "context": "Z completed for C7", "course": "C7"},
+            ],
+            "0012": [cw("2026-10-21", "Course of Study Link", "Go", "C1")],
+            "0013": [cw("2026-10-20", "Course of Study Link", "Go", "C9")],
+            "0014": [{"date": "2026-06-01", "category": "Assessment",
+                      "type": "Dream Machine Assessment Submitted for Evaluation",
+                      "context": "ABC1 Task 1: T submitted"}],
+        }, db_path=path)
+        history.mark_l360_activity_imported(db_path=path,
+                                            now=dt(2026, 10, 26, 9))
+        history.learn_course_assessment_codes(db_path=path, refresh=True,
+                                              today=dt(2026, 10, 27))
+        sig = history.engagement_signals(db_path=path, today=dt(2026, 10, 27))
+        a = sig[("11", "C1")]
+        assert a["sig_not_opened"] and not a["sig_working_no_submit"]
+        assert a["sig_active_elsewhere"] == "C8, C9, C7"   # C6 is after as_of
+        assert a["sig_finished_other"] == "C8 PA passed, C7 OA taken"
+        assert a["sig_finished_days"] == 5
+        b = sig[("12", "C1")]
+        assert b["sig_working_no_submit"] and not b["sig_not_opened"]
+        assert b["sig_active_elsewhere"] == ""          # working in C1
+        assert not sig[("13", "C1")]["sig_not_opened"]   # started < 5 days ago
+        d = sig[("14", "C1")]                            # earlier-term PA work
+        assert not d["sig_not_opened"] and not d["sig_working_no_submit"]
+        # Viewer summary column.
+        import importlib
+        launcher = importlib.import_module("scripts.launcher")
+        row = {"Task1Status": ""}
+        launcher.App._apply_signal_columns(row, a)
+        assert row["Signals"] == ("Passed C8 PA · Never opened course"
+                                  " · Active elsewhere: C8, C9, C7"), row
+        row = {"Task1Status": "Passed"}                  # has a task → opened
+        launcher.App._apply_signal_columns(row, a)
+        assert row["SigNotOpened"] == "No"
+        row = {}
+        launcher.App._apply_signal_columns(row, {})
+        assert row["Signals"] == "" and row["SigNotOpened"] == ""
+    finally:
+        os.remove(path)
+
+
 def test_team_query_ids_and_shape_are_values_free():
     q = l3.team_caseload_query(2, ["u1", "u2"], "values")
     assert q["page"] == 2 and q["filters"] == [

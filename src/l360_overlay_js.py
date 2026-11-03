@@ -270,6 +270,7 @@ OVERLAY_JS = r"""
     if (e0.last_action) facts.push(['Last action', e0.last_action + (e0.days_action != null ? ` (${Math.round(e0.days_action)}d ago)` : '')]);
     if (e0.days_contact != null) facts.push(['Last contact', Math.round(e0.days_contact) + ' days ago']);
     if (e0.days_course_activity != null) facts.push(['Course activity', Math.round(e0.days_course_activity) + ' days ago']);
+    if (e0.signals) facts.push(['Signals', e0.signals]);
     if (e0.pa_returns != null) facts.push(['PA returns / passes', `${e0.pa_returns} / ${e0.pa_passes != null ? e0.pa_passes : 0}`]);
     if (facts.length)
       h += `<div class="sec"><div class="lbl">At a glance</div>` + facts.map(([k, v]) =>

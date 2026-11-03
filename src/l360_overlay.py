@@ -84,6 +84,7 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
             "followup_date": str(r.get("CourseFollowupDate") or ""),
             "followup_note": str(r.get("CourseFollowupNote") or "")[:200],
             "days_course_activity": _num(r.get("DaysSinceCourseActivity")),
+            "signals": str(r.get("Signals", "") or ""),
             "pa_returns": _num(r.get("PAReturns")),
             "pa_passes": _num(r.get("PAPasses")),
             "steps": [{"label": lab, "status": str(r.get(col) or "")}

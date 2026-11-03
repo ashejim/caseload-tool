@@ -3584,6 +3584,23 @@ def engagement_signals(*, db_path=HISTORY_DB,
                                   events tagged with this course, since start
       faculty_discussions_30      'Academic Discussion with Faculty', 30 days
 
+    Action SIGNALS (reasons to reach out, not risk), judged as of the last
+    activity import (``as_of``) so a week-old import can't fake inactivity:
+      sig_not_opened         course started >= 5 days before as_of and the
+                             student has never opened its material / worked
+                             in it, in any term (system "provisioned" /
+                             enrollment events don't count)
+      sig_working_no_submit  opened/worked in the course in the 14 days to
+                             as_of, but no PA submission since course start
+      sig_active_elsewhere   other courses they worked in during those 14
+                             days while NOT working in this one ("D324, C777")
+      sig_finished_other     other-course assessments in those 14 days, most
+                             recent first: "D320 PA passed" (a PA "completed"
+                             event = the course's PA passed — verified against
+                             task-pass events) or "D320 OA taken" (OA
+                             "completed" includes failed attempts)
+      sig_finished_days      days since that most recent one
+
     Values are None when there's no activity data for the student (so the
     viewer shows blank, not a misleading 0). Returns {} when no activity has
     been imported yet."""
@@ -3597,6 +3614,7 @@ def engagement_signals(*, db_path=HISTORY_DB,
         codes = learn_course_assessment_codes(conn, today=today)
         latest = conn.execute("SELECT MAX(collected_date) FROM snapshots"
                               ).fetchone()[0]
+        as_of_s = (_meta_get(conn, "l360_activity_last_import") or "")[:10]
         keys = {}
         for r in conn.execute("SELECT student_id, course_code, extra_json FROM "
                               "snapshots WHERE collected_date = ?", (latest,)):
@@ -3624,6 +3642,16 @@ def engagement_signals(*, db_path=HISTORY_DB,
 
     d14 = (now - timedelta(days=14)).isoformat()
     d30 = (now - timedelta(days=30)).isoformat()
+    try:
+        as_of = datetime.strptime(as_of_s, "%Y-%m-%d").date()
+    except ValueError:
+        as_of = now
+    as_of = min(as_of, now)
+    s14 = (as_of - timedelta(days=14)).isoformat()
+    open_by = (as_of - timedelta(days=5)).isoformat()
+    sig_keys = ("sig_not_opened", "sig_working_no_submit",
+                "sig_active_elsewhere", "sig_finished_other",
+                "sig_finished_days")
     out = {}
     for (sid, course), start in keys.items():
         rows = ev.get(sid)
@@ -3632,17 +3660,40 @@ def engagement_signals(*, db_path=HISTORY_DB,
                 "days_since_course_activity", "course_activity_days_14",
                 "days_since_any_activity", "pa_submissions", "pa_returns",
                 "pa_passes", "oa_attempts", "preassessments",
-                "approval_requests", "faculty_discussions_30")}
+                "approval_requests", "faculty_discussions_30") + sig_keys}
             continue
         code = codes.get(course)
         last_course = last_any = ""
         days14 = set()
         pa_s = pa_r = pa_p = oa = pre = appr = fac = 0
+        worked_ever = worked_14 = False
+        elsewhere: dict = {}               # other course -> latest work date
+        finished: list = []                # (date, "D320 PA passed")
         for r in rows:
             d, cat, typ = r["activity_date"], r["category"], r["type"]
             n = r["occurrences"] or 1
             last_any = max(last_any, d)
             mine = r["course_code"] == course
+            other = r["course_code"] or ""
+            work = _is_student_work(r)
+            if code and not other and typ.startswith("Dream Machine"):
+                # PA events carry no course code — match by assessment code.
+                m = _PA_CODE_RE.match(r["context"] or "")
+                if m and m.group(1) == code:
+                    mine = True
+            if work and mine:
+                # Any date: a carried-over student's earlier-term work counts.
+                worked_ever = True
+                if s14 <= d <= as_of.isoformat():
+                    worked_14 = True
+            elif work and other and not mine and s14 <= d <= as_of.isoformat():
+                elsewhere[other] = max(elsewhere.get(other, ""), d)
+            if (other and not mine and s14 <= d <= as_of.isoformat()
+                    and typ in ("Performance Assessment",
+                                "Objective Assessment")):
+                finished.append((d, f"{other} PA passed"
+                                 if typ == "Performance Assessment"
+                                 else f"{other} OA taken"))
             if cat == "Coursework" and mine:
                 last_course = max(last_course, d)
                 if d >= d14:
@@ -3678,7 +3729,40 @@ def engagement_signals(*, db_path=HISTORY_DB,
             "oa_attempts": oa, "preassessments": pre,
             "approval_requests": appr, "faculty_discussions_30": fac,
         }
+        finished.sort(reverse=True)
+        seen, fin = set(), []
+        for _d, lab in finished:
+            if lab not in seen:
+                seen.add(lab)
+                fin.append(lab)
+        out[(sid, course)].update({
+            "sig_not_opened": bool(start and start <= open_by
+                                   and not worked_ever),
+            "sig_working_no_submit": bool(worked_14 and code and not pa_s
+                                          and not pa_p),
+            "sig_active_elsewhere": ", ".join(
+                sorted(elsewhere, key=lambda c: elsewhere[c], reverse=True))
+            if elsewhere and not worked_14 else "",
+            "sig_finished_other": ", ".join(fin),
+            "sig_finished_days": _days(finished[0][0]) if finished else None,
+        })
     return out
+
+
+# Activity that is the STUDENT doing something (not system bookkeeping like
+# enrollment, resource activation or "provisioned" learning resources).
+_SYSTEM_ACTIVITY_TYPES = {"Term Enrollment", "Activate Course Resources"}
+
+
+def _is_student_work(r) -> bool:
+    typ = r["type"] or ""
+    if r["category"] not in ("Coursework", "Assessment"):
+        return False
+    if typ in _SYSTEM_ACTIVITY_TYPES:
+        return False
+    if typ == "Learning Resource" and "provisioned" in (r["context"] or ""):
+        return False
+    return True
 
 
 def task_stall_days(*, db_path=HISTORY_DB,

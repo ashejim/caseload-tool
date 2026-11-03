@@ -92,6 +92,14 @@ DISPLAY_TO_CSV: dict[str, str] = {
     "Pre-assessments": "PreAssessments",
     "Approval Requests": "ApprovalRequests",
     "Faculty Discussions (30d)": "FacultyDiscussions30",
+    # Learner360 action SIGNALS (history.engagement_signals sig_*; judged as
+    # of the last activity import). Reasons to reach out, not risk.
+    "Signals": "Signals",                          # short summary of the below
+    "Signal: Not Opened": "SigNotOpened",          # Yes / No
+    "Signal: Working, No Submission": "SigWorkingNoSubmit",  # Yes / No
+    "Active Elsewhere": "SigActiveElsewhere",      # other courses, e.g. "D324"
+    "Finished Other Course": "SigFinishedOther",   # "D320 PA passed, D324 OA taken"
+    "Days Since Finished Other": "SigFinishedDays",
 }
 
 
