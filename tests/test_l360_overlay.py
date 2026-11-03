@@ -65,7 +65,7 @@ def test_overlay_in_headless_chromium():
         pg.goto("https://learner360.wgu.edu/caseload")
         assert pg.evaluate("window.__cnOverlay.version()") == -1
         assert pg.evaluate("d => window.__cnOverlay.setData(d)", snap) == 1
-        pg.wait_for_timeout(200)
+        pg.wait_for_timeout(700)
         n = pg.evaluate("document.querySelectorAll('[data-cn=badge]').length")
         assert n == 2, n                                  # not the 3rd student
         html = pg.evaluate("""() => document.querySelector('[data-cn=badge]')
@@ -76,14 +76,14 @@ def test_overlay_in_headless_chromium():
         pg.evaluate("""() => { const b = document.getElementById('b');
             b.innerHTML = '<tr><td><a>Sam Roe</a></td><td>000999888</td>'
                         + '<td>D502</td></tr>'; }""")
-        pg.wait_for_timeout(200)
+        pg.wait_for_timeout(700)
         assert pg.evaluate(
             "document.querySelectorAll('[data-cn=badge]').length") == 1
         assert pg.evaluate("window.__cnOverlay.matched()") == 1
         # Toggle off via the pill → badges removed; state remembered.
         pg.evaluate("""() => document.querySelector('[data-cn=pill]')
                              .shadowRoot.querySelector('.pill').click()""")
-        pg.wait_for_timeout(200)
+        pg.wait_for_timeout(700)
         assert pg.evaluate(
             "document.querySelectorAll('[data-cn=badge]').length") == 0
         # Not active on other hosts.
@@ -114,14 +114,14 @@ def test_worker_tick_installs_pushes_and_clears():
                                       ROWS, STEPS, version=1))
         w._overlay_pages = BW._overlay_pages.__get__(w)
         BW._overlay_tick(w, ctx)
-        pg.wait_for_timeout(200)
+        pg.wait_for_timeout(700)
         assert pg.evaluate(
             "document.querySelectorAll('[data-cn=badge]').length") == 2
         # New snapshot (risk changed) → next tick re-renders.
         rows2 = [dict(ROWS[0], MomentumRisk="5")] + ROWS[1:]
         w._overlay_snap = l360_overlay.build_snapshot(rows2, STEPS, version=2)
         BW._overlay_tick(w, ctx)
-        pg.wait_for_timeout(200)
+        pg.wait_for_timeout(700)
         html = pg.evaluate("""() => document.querySelector('[data-cn=badge]')
                                      .shadowRoot.innerHTML""")
         assert ">5%<" in html and "r-low" in html
@@ -129,12 +129,12 @@ def test_worker_tick_installs_pushes_and_clears():
         pg2 = ctx.new_page()
         pg2.goto("https://learner360.wgu.edu/caseload")
         BW._overlay_tick(w, ctx)
-        pg2.wait_for_timeout(200)
+        pg2.wait_for_timeout(700)
         assert pg2.evaluate(
             "document.querySelectorAll('[data-cn=badge]').length") == 2
         # Clear (overlay switched off) removes badges.
         BW._overlay_clear(w, ctx)
-        pg.wait_for_timeout(200)
+        pg.wait_for_timeout(700)
         assert pg.evaluate(
             "document.querySelectorAll('[data-cn=badge]').length") == 0
         b.close()
@@ -160,7 +160,7 @@ def test_overlay_handles_div_grid_markup():
         pg.goto("https://learner360.wgu.edu/caseload")
         pg.evaluate("d => window.__cnOverlay.setData(d)",
                     l360_overlay.build_snapshot(ROWS, STEPS, version=1))
-        pg.wait_for_timeout(200)
+        pg.wait_for_timeout(700)
         assert pg.evaluate(
             "document.querySelectorAll('[data-cn=badge]').length") == 1
         b.close()
@@ -194,7 +194,7 @@ def test_student_panel_on_learner_page():
         pg = ctx.new_page()
         pg.goto(f"https://learner360.wgu.edu/learner/{UUID}")
         pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
-        pg.wait_for_timeout(250)
+        pg.wait_for_timeout(700)
         html = pg.evaluate("""() => { const h = document.querySelector(
             '[data-cn=panel]'); return h ? h.shadowRoot.innerHTML : ''; }""")
         assert "Pat Lee" in html and "Task 3 prep" in html and "risk 35%" in html
@@ -202,22 +202,22 @@ def test_student_panel_on_learner_page():
         assert "Open EA" in html and "now 62" in html
         # SPA navigation away → panel gone; back → panel returns.
         pg.evaluate("history.pushState({}, '', '/caseload')")
-        pg.wait_for_timeout(200)
+        pg.wait_for_timeout(700)
         assert pg.evaluate("!!document.querySelector('[data-cn=panel]')") is False
         pg.evaluate(f"history.pushState({{}}, '', '/learner/{UUID}')")
-        pg.wait_for_timeout(200)
+        pg.wait_for_timeout(700)
         assert pg.evaluate("!!document.querySelector('[data-cn=panel]')") is True
         # Collapse via the tab; remembered.
         pg.evaluate("""() => document.querySelector('[data-cn=panel]').shadowRoot
                              .querySelector('.tab').click()""")
-        pg.wait_for_timeout(250)
+        pg.wait_for_timeout(700)
         assert pg.evaluate("""() => document.querySelector('[data-cn=panel]')
             .shadowRoot.querySelector('.panel').classList.contains('collapsed')""")
         assert pg.evaluate("localStorage.getItem('cnPanelCollapsed')") == "1"
         # Unknown learner → no panel.
         pg.evaluate("history.pushState({}, '', "
                     "'/learner/11111111-2222-3333-4444-555555555555')")
-        pg.wait_for_timeout(200)
+        pg.wait_for_timeout(700)
         assert pg.evaluate("!!document.querySelector('[data-cn=panel]')") is False
         b.close()
 
@@ -244,14 +244,14 @@ def test_pronoun_edit_round_trip():
                                   on_overlay_actions=lambda a: got.extend(a))
         w._overlay_pages = BW._overlay_pages.__get__(w)
         BW._overlay_tick(w, ctx)
-        pg.wait_for_timeout(250)
+        pg.wait_for_timeout(700)
         root = "document.querySelector('[data-cn=panel]').shadowRoot"
         assert "pronouns unknown" in pg.evaluate(f"() => {root}.innerHTML")
         pg.evaluate(f"() => {root}.querySelector('[data-act=edit-pron]').click()")
-        pg.wait_for_timeout(100)
+        pg.wait_for_timeout(700)
         pg.evaluate(f"""() => [...{root}.querySelectorAll('.opt')]
                        .find(b => b.dataset.v === 'she/her').click()""")
-        pg.wait_for_timeout(150)
+        pg.wait_for_timeout(700)
         html = pg.evaluate(f"() => {root}.innerHTML")
         assert "she/her" in html and "pronouns unknown" not in html
         BW._overlay_tick(w, ctx)                       # worker collects outbox

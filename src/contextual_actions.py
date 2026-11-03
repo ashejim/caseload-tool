@@ -9,10 +9,11 @@ rows, each action is classified by:
     course found = a GENERAL action (fits any course).
   - an action fits the selection only if it fits EVERY selected student's
     course (select C769 + C964 → only actions valid for both);
-  - its GATE — the batch filters (batch actions) or fire filters — evaluated
-    per selected student with exactly the batch engine's rules; students who
-    don't meet it are skipped at fire time, so an action whose gate nobody
-    meets is not offered;
+  - its CONDITIONS, evaluated per selected student with exactly the batch
+    engine's rules. A batch action's filters are its usual TARGETING — soft:
+    the action is still offered (with "2 of 3 meet its usual conditions") and
+    the user chooses who to include. Fire filters are a hard safety gate: an
+    action whose fire filters no selected student meets is not offered;
   - SUGGESTED when it completes a selected student's next due success-path
     step (listed first).
 
@@ -103,15 +104,30 @@ def applicable_actions(scenarios, rows: list, *, success_paths=None,
             ok = gate_rows(gate, rows) if gate else rows
         except Exception:
             ok = rows                     # unknown column etc. → don't hide it
-        if gate and not ok:
-            continue
+        is_batch = getattr(sc, "batch", None) is not None
+        if gate and not ok and not is_batch:
+            continue                      # hard fire-filter gate: nobody passes
         names = {sc.name} | set(getattr(sc, "aliases", []) or [])
         out.append({
             "scenario": sc, "name": sc.name, "courses": sorted(courses),
             "matched": len(ok), "total": len(rows),
             "suggested": sum(1 for n in nexts if n and n in names),
-            "is_batch": getattr(sc, "batch", None) is not None,
+            "is_batch": is_batch,
+            "conditions": gate,
         })
-    out.sort(key=lambda a: (-a["suggested"], a["matched"] < a["total"],
-                            not a["courses"], a["name"].lower()))
+    out.sort(key=lambda a: (-a["suggested"], not a["courses"],
+                            -(a["matched"] / max(1, a["total"])),
+                            a["name"].lower()))
     return out
+
+
+def describe_conditions(filters: list) -> str:
+    """Short human summary of an action's conditions for a prompt."""
+    parts = []
+    for f in filters or []:
+        col = str(f.get("column") or "")
+        if col.startswith("sp:"):
+            col = "success-path step " + col.split(":")[-1]
+        v = str(f.get("value") or "")
+        parts.append(f"{col} {f.get('op', '')} {v}".strip())
+    return "; ".join(parts)

@@ -6750,34 +6750,39 @@ class CaseloadPanel:
         n = len(rows)
         menu = tk.Menu(self.fire_sel_btn, tearoff=0)
         sugg = [a for a in fits if a["suggested"]]
-        rest = [a for a in fits if not a["suggested"]]
+        course_specific = [a for a in fits if not a["suggested"] and a["courses"]]
+        general = [a for a in fits if not a["suggested"] and not a["courses"]]
 
         def label(a) -> str:
             lab = self.app._action_display_name(a["scenario"])
-            if a["matched"] < a["total"]:
-                lab += f"   ({a['matched']} of {a['total']} meet its conditions)"
+            if a["conditions"] and a["matched"] < a["total"]:
+                lab += ("   (none meet its usual conditions)" if not a["matched"]
+                        else f"   ({a['matched']} of {a['total']} meet its "
+                             "usual conditions)")
             return lab
 
+        def fire(a):
+            self.app._fire_contextual(a, self._checked_rows())
+
+        sections = []
         if sugg:
-            menu.add_command(label="Suggested next step", state="disabled")
-            for a in sugg:
-                menu.add_command(
-                    label=f"★ {label(a)}   — next step for {a['suggested']} "
-                          f"of {n}",
-                    command=lambda s=a["scenario"]: self.app._fire_on_selected(
-                        s, self._checked_rows()))
-            if rest:
-                menu.add_separator()
-        if rest:
+            sections.append(("Suggested next step", [
+                (f"★ {label(a)}   — next step for {a['suggested']} of {n}", a)
+                for a in sugg]))
+        if course_specific:
             courses = sorted({(r.get("CourseCode") or "").strip()
                               for r in rows} - {""})
-            menu.add_command(label="For " + (", ".join(courses) or "these")
-                             + " students", state="disabled")
-            for a in rest:
-                menu.add_command(
-                    label=label(a),
-                    command=lambda s=a["scenario"]: self.app._fire_on_selected(
-                        s, self._checked_rows()))
+            sections.append((", ".join(courses) + " actions",
+                             [(label(a), a) for a in course_specific]))
+        if general:
+            sections.append(("General actions",
+                             [(label(a), a) for a in general]))
+        for i, (title, items) in enumerate(sections):
+            if i:
+                menu.add_separator()
+            menu.add_command(label=title, state="disabled")
+            for lab, a in items:
+                menu.add_command(label=lab, command=lambda a=a: fire(a))
         try:
             x = self.fire_sel_btn.winfo_rootx()
             y = self.fire_sel_btn.winfo_rooty() + self.fire_sel_btn.winfo_height()
@@ -17174,7 +17179,7 @@ class App:
 
     def _fire_on_selected(
         self, scenario: ScenarioConfig, rows: list[dict],
-        near: Optional[tuple] = None,
+        near: Optional[tuple] = None, include_all: bool = False,
     ) -> None:
         """Fire a (non-batch) scenario across a hand-picked set of caseload
         rows (the panel's checkbox selection) — a mini-batch. Reuses the
@@ -17212,8 +17217,9 @@ class App:
             from dataclasses import replace as _dc_replace
             from src import contextual_actions
             try:
-                kept = contextual_actions.gate_rows(
-                    scenario.batch.filters or [], rows)
+                kept = (list(rows) if include_all else
+                        contextual_actions.gate_rows(
+                            scenario.batch.filters or [], rows))
             except Exception as e:
                 self._append_log(f"Couldn't check {scenario.name!r}'s "
                                  f"conditions: {e}")
@@ -25668,6 +25674,66 @@ class App:
         if entry.submitted:
             self._log_path_step_done(
                 entry.scenario, entry.student_id, entry.course_code)
+
+    def _fire_contextual(self, fit: dict, rows: list) -> None:
+        """Fire an action picked from the contextual menu. For a batch action
+        whose usual conditions not every selected student meets, ask whether
+        to include only those who meet them or all selected."""
+        sc = fit["scenario"]
+        rows = [r for r in rows or [] if r]
+        if not rows:
+            return
+        include_all = False
+        if sc.batch is not None and fit.get("conditions"):
+            from src import contextual_actions
+            try:
+                meet = contextual_actions.gate_rows(fit["conditions"], rows)
+            except Exception:
+                meet = rows
+            if len(meet) < len(rows):
+                choice = self._ask_who_to_include(
+                    sc.name, len(meet), len(rows),
+                    contextual_actions.describe_conditions(fit["conditions"]))
+                if choice is None:
+                    return
+                include_all = choice == "all"
+        self._fire_on_selected(sc, rows, include_all=include_all)
+
+    def _ask_who_to_include(self, name: str, meet: int, total: int,
+                            conds: str):
+        """'meet' | 'all' | None (cancel) — a small topmost dialog near the
+        pointer."""
+        res = {"v": None}
+        d = ctk.CTkToplevel(self.root)
+        d.title(name)
+        d.attributes("-topmost", True)
+        d.resizable(False, False)
+        msg = (f"{meet} of {total} selected student(s) meet the usual "
+               f"conditions for “{name}”:\n{conds}" if meet else
+               f"None of the {total} selected student(s) meet the usual "
+               f"conditions for “{name}”:\n{conds}")
+        ctk.CTkLabel(d, text=msg, wraplength=420, justify="left").pack(
+            padx=16, pady=(14, 10), anchor="w")
+        bar = ctk.CTkFrame(d, fg_color="transparent")
+        bar.pack(padx=16, pady=(0, 14), anchor="e")
+
+        def done(v):
+            res["v"] = v
+            d.destroy()
+        if meet:
+            ctk.CTkButton(bar, text=f"Only the {meet}", width=110,
+                          command=lambda: done("meet")).pack(side="left", padx=4)
+        ctk.CTkButton(bar, text=f"All {total} selected", width=130,
+                      command=lambda: done("all")).pack(side="left", padx=4)
+        ctk.CTkButton(bar, text="Cancel", width=80, **SECONDARY_BTN_KWARGS,
+                      command=lambda: done(None)).pack(side="left", padx=4)
+        try:
+            _fit_dialog_to_content(d, near_mouse=True)
+        except Exception:
+            pass
+        d.grab_set()
+        d.wait_window()
+        return res["v"]
 
     def _next_action_for_row(self, row: dict) -> str:
         """Action bound to this caseload row's next DUE success-path step

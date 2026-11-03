@@ -72,10 +72,21 @@ def test_mixed_courses_only_common_actions():
     assert [a["name"] for a in res] == ["Email from ST"]
 
 
-def test_gate_nobody_meets_hides_action():
+def test_batch_conditions_are_soft_fire_filters_hard():
     rows = [{"StudentID": "9", "CourseCode": "C769", "Task1Status": ""}]
-    res = ca.applicable_actions(ACTIONS, rows, success_paths=PATHS)
-    assert "Task1 passed flup C769" not in [a["name"] for a in res]
+    res = {a["name"]: a for a in
+           ca.applicable_actions(ACTIONS, rows, success_paths=PATHS)}
+    # Batch targeting is soft: still offered, nobody meets it.
+    a = res["Task1 passed flup C769"]
+    assert (a["matched"], a["total"]) == (0, 1) and a["conditions"]
+    # A fire-filter (hard gate) action nobody passes is NOT offered.
+    gated = [sc("Hard gated C769", fire_filters=[
+        {"column": "Task 1", "op": "is", "value": "Passed"}])]
+    assert ca.applicable_actions(gated, rows, success_paths=PATHS) == []
+    assert ca.describe_conditions(a["conditions"]) == "Task 1 is Passed"
+    assert (ca.describe_conditions([{"column": "sp:C769:t2", "op": "is",
+                                     "value": "due"}])
+            == "success-path step t2 is due")
 
 
 def test_empty_selection():
