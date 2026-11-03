@@ -623,6 +623,18 @@ def test_overlay_extras_from_temp_db():
         os.remove(path)
 
 
+def test_ms_until_due_rechecks_at_due_time():
+    from datetime import datetime as _dt
+    from src import learner360 as l3
+    now = _dt(2026, 11, 3, 8, 12)
+    cap = 6 * 3600_000
+    # Due at 09:22 → re-check ~71 min later, not 6 h later.
+    assert l3.ms_until_due("2026-10-27T09:22:00", 7, cap, now=now) == (70 * 60 + 60) * 1000
+    assert l3.ms_until_due("2026-11-02T09:00:00", 7, cap, now=now) == cap   # far off
+    assert l3.ms_until_due("2026-10-01T00:00:00", 7, cap, now=now) == 60_000  # overdue
+    assert l3.ms_until_due(None, 7, cap, now=now) == cap
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

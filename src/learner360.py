@@ -200,6 +200,19 @@ def parse_momi(resp: dict) -> dict:
             "weekly": weekly, "factors": factors}
 
 
+def ms_until_due(last_captured: Optional[str], days: int, cap_ms: int,
+                 now: Optional[datetime] = None) -> int:
+    """Milliseconds until a not-yet-due background job comes due (+1 min),
+    capped at ``cap_ms`` and at least 1 min — so a scheduler re-checks right
+    when the job is due instead of up to ``cap_ms`` later."""
+    try:
+        last = datetime.fromisoformat(str(last_captured)[:19])
+    except (TypeError, ValueError):
+        return cap_ms
+    secs = days * 86400 - ((now or datetime.now()) - last).total_seconds()
+    return int(max(60_000, min(cap_ms, secs * 1000 + 60_000)))
+
+
 def momi_capture_due(last_captured: Optional[str], days: int,
                      now: Optional[datetime] = None) -> bool:
     """Should the background auto-capture run? ``last_captured`` is the ISO

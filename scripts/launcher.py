@@ -12415,7 +12415,8 @@ class App:
             from src import learner360 as l3
             last = history.l360_activity_last_import()
             if not l3.momi_capture_due(last, days):
-                self.root.after(rearm_ms, self._maybe_auto_l360_activity)
+                self.root.after(l3.ms_until_due(last, days, rearm_ms),
+                                self._maybe_auto_l360_activity)
                 return
             if not self._start_l360_activity_bg():
                 self.root.after(retry_ms, self._maybe_auto_l360_activity)
@@ -12469,7 +12470,8 @@ class App:
             from src import learner360 as l3
             last = history.load_l360_team_roster(max_age_days=10_000)[1]
             if not l3.momi_capture_due(last, days):
-                self.root.after(rearm_ms, self._maybe_auto_l360_roster)
+                self.root.after(l3.ms_until_due(last, days, rearm_ms),
+                                self._maybe_auto_l360_roster)
                 return
             if not self._start_l360_roster():
                 self.root.after(retry_ms, self._maybe_auto_l360_roster)
@@ -12675,8 +12677,10 @@ class App:
                 self.root.after(rearm_ms, self._maybe_auto_l360_notes)
                 return
             from src import learner360 as l3
-            if not l3.momi_capture_due(history.l360_notes_last_import(), days):
-                self.root.after(rearm_ms, self._maybe_auto_l360_notes)
+            last = history.l360_notes_last_import()
+            if not l3.momi_capture_due(last, days):
+                self.root.after(l3.ms_until_due(last, days, rearm_ms),
+                                self._maybe_auto_l360_notes)
                 return
             targets = history.l360_note_targets()
             if not targets or not self.worker.ready_event.is_set():
@@ -12823,7 +12827,8 @@ class App:
             from src import learner360 as l3
             last = history.momi_capture_status().get("last_captured")
             if not l3.momi_capture_due(last, days):
-                self.root.after(rearm_ms, self._maybe_auto_l360_momi)
+                self.root.after(l3.ms_until_due(last, days, rearm_ms),
+                                self._maybe_auto_l360_momi)
                 return
             started = self._start_l360_momi_bg()
             self.root.after(rearm_ms if started else retry_ms,
