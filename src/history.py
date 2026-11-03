@@ -325,6 +325,13 @@ CREATE INDEX IF NOT EXISTS ix_l360_activity_date ON l360_activity(activity_date)
 -- Learner360 TEAM roster (the Team filter: every caseload under the manager)
 -- — one row per learner+course, replaced wholesale on each pull. Overlaid on
 -- the course-scan roster by the inbox labeler (src/l360_roster.overlay).
+-- Learner360 DEGREE PLAN + community of care, one compact JSON summary per
+-- learner (learner360.parse_plan), replaced on each import.
+CREATE TABLE IF NOT EXISTS l360_degree_plan (
+    student_id  TEXT PRIMARY KEY,   -- without leading zeros
+    plan_json   TEXT NOT NULL,
+    updated_at  TEXT
+);
 CREATE TABLE IF NOT EXISTS l360_team_roster (
     student_id  TEXT NOT NULL,
     course_code TEXT NOT NULL DEFAULT '',
@@ -1347,6 +1354,74 @@ def mark_l360_activity_imported(*, db_path=HISTORY_DB,
         with conn:
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
                          "('l360_activity_last_import', ?)", (ts,))
+    finally:
+        conn.close()
+
+
+def l360_plan_targets(*, max_age_days: int = 30, db_path=HISTORY_DB) -> list:
+    """[(wgu_id, student_id, pidm)] for the degree-plan import — the current
+    caseload's learners (360 ids refreshed by the MOMI capture)."""
+    from datetime import timedelta
+    cut = (datetime.now() - timedelta(days=max_age_days)).isoformat(
+        timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        return [(r["wgu_id"], r["student_id"], str(r["pidm"] or ""))
+                for r in conn.execute(
+                    "SELECT wgu_id, student_id, pidm FROM l360_ids WHERE "
+                    "COALESCE(wgu_id,'') != '' AND updated_at >= ?", (cut,))]
+    finally:
+        conn.close()
+
+
+def persist_l360_plans(by_student: dict, *, db_path=HISTORY_DB,
+                       now: Optional[datetime] = None) -> int:
+    """Store {student_id: learner360.parse_plan(...)}; returns rows written."""
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    rows = [(str(sid).lstrip("0"), json.dumps(p, separators=(",", ":")), ts)
+            for sid, p in (by_student or {}).items() if sid and p]
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.executemany("INSERT OR REPLACE INTO l360_degree_plan "
+                             "VALUES (?,?,?)", rows)
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def l360_degree_plans(*, db_path=HISTORY_DB) -> dict:
+    """{student_id without leading zeros: plan summary dict}."""
+    conn = _connect(db_path)
+    try:
+        out = {}
+        for r in conn.execute("SELECT student_id, plan_json FROM "
+                              "l360_degree_plan"):
+            try:
+                out[r["student_id"]] = json.loads(r["plan_json"])
+            except ValueError:
+                pass
+        return out
+    finally:
+        conn.close()
+
+
+def l360_plan_last_import(*, db_path=HISTORY_DB) -> Optional[str]:
+    conn = _connect(db_path)
+    try:
+        return _meta_get(conn, "l360_plan_last_import")
+    finally:
+        conn.close()
+
+
+def mark_l360_plan_imported(*, db_path=HISTORY_DB,
+                            now: Optional[datetime] = None) -> None:
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
+                         "('l360_plan_last_import', ?)", (ts,))
     finally:
         conn.close()
 

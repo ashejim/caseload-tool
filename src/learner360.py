@@ -889,3 +889,142 @@ def discovery_diff_lines(diff: list, store: dict) -> list:
             lines.append(f"  🆕 new field(s) on {key}: "
                          f"{', '.join(new[:8])}{more}")
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Degree plan + community of care (found by `l360discover:` 2026-11-03).
+#   GET /learner360/v1/degree-plan/<id>   current term: courses (status,
+#       planned/actual dates, CUs, incomplete), weeksRemaining, planned vs
+#       completed CUs
+#   GET /learner360/v2/degree-plan/<id>   whole plan: completed/current/future
+#       terms + metadata (percentComplete, remainingCUs, ...)
+#   GET /relationships/v1/learners/<id>/community-of-care
+#       programMentor {name, mentorEmail}, instructors [{name, courseCode}]
+# Which learner id the path takes (Learner360 uuid or PIDM) is probed on the
+# first learner of a run. Only plan/progress fields are kept — no contact
+# details beyond the program mentor's (staff) name + email.
+# ---------------------------------------------------------------------------
+PLAN_V1_PATH = "/learner360/v1/degree-plan/"
+PLAN_V2_PATH = "/learner360/v2/degree-plan/"
+COC_PATH = "/relationships/v1/learners/"
+COC_SUFFIX = "/community-of-care"
+
+# Course status words that mean "done" (case-insensitive substring match).
+_DONE_WORDS = ("pass", "complete", "graded", "transfer", "waive", "earned")
+
+
+def course_done(status: str) -> bool:
+    s = str(status or "").lower()
+    if any(w in s for w in ("incomplete", "not ", "fail", "in progress")):
+        return False
+    return any(w in s for w in _DONE_WORDS)
+
+
+def fetch_get_batch(page, headers: dict, base_path: str, ids: list,
+                    suffix: str = "", concurrency: int = 3) -> dict:
+    """GET GATEWAY+base_path+<id>+suffix for many ids in-page (overload
+    retries). → {id: {status, body}}."""
+    return page.evaluate(_GET_SUFFIX_BATCH_JS,
+                         [GATEWAY + base_path, suffix, headers,
+                          [str(i) for i in ids], max(1, int(concurrency))]) or {}
+
+
+def parse_plan(v1, v2, coc) -> dict:
+    """Compact per-student plan summary from the three responses (any may be
+    None). Dates are YYYY-MM-DD; missing values are ''/None."""
+    v1 = v1 if isinstance(v1, dict) else {}
+    v2 = v2 if isinstance(v2, dict) else {}
+    coc = coc if isinstance(coc, dict) else {}
+    courses = []
+    for c in v1.get("termCourses") or []:
+        if not isinstance(c, dict):
+            continue
+        courses.append({
+            "code": str(c.get("code") or ""),
+            "name": str(c.get("name") or ""),
+            "cus": _num(c.get("cus")),
+            "status": str(c.get("status") or ""),
+            "planned_start": norm_date(c.get("plannedStartDate")),
+            "planned_end": norm_date(c.get("plannedEndDate")),
+            "start": norm_date(c.get("actualStartDate")),
+            "end": norm_date(c.get("actualEndDate")),
+            "incomplete": bool(c.get("incomplete")),
+        })
+    future = []
+    for t in v2.get("futureTerms") or []:
+        for c in (t or {}).get("courses") or []:
+            if isinstance(c, dict) and c.get("courseCode"):
+                future.append(str(c["courseCode"]))
+    md = v2.get("metadata") if isinstance(v2.get("metadata"), dict) else {}
+    pm = coc.get("programMentor") if isinstance(coc.get("programMentor"),
+                                                dict) else {}
+    return {
+        "term_code": str(v1.get("termCode") or ""),
+        "term_start": norm_date(v1.get("termStartDate")),
+        "term_end": norm_date(v1.get("termEndDate")),
+        "term_number": _num(v1.get("currentTermNumber")),
+        "total_terms": _num(v1.get("totalNumberOfTerms")),
+        "weeks_remaining": _num(v1.get("weeksRemaining")),
+        "term_planned_cus": _num(v1.get("termPlannedCus")),
+        "term_completed_cus": _num(v1.get("termCompletedCus")),
+        "courses": courses,
+        "future_courses": future,
+        "percent_complete": _num(md.get("percentComplete")),
+        "remaining_cus": _num(md.get("remainingCUs")),
+        "total_cus": _num(md.get("totalCUs")),
+        "pm_name": str(pm.get("name") or ""),
+        "pm_email": str(pm.get("mentorEmail") or ""),
+        "instructors": [
+            {"course": str(i.get("courseCode") or ""),
+             "name": str(i.get("name") or "")}
+            for i in (coc.get("instructors") or []) if isinstance(i, dict)],
+    }
+
+
+def plan_view(plan: dict, my_course: str) -> dict:
+    """What the viewer shows for one caseload row (student + MY course):
+    courses left this term (not done, incl. mine), whether mine is the last
+    one, other courses left, next planned course, CUs left, degree %."""
+    mine = str(my_course or "").strip().upper()
+    left = [c["code"] for c in plan.get("courses") or []
+            if c.get("code") and not course_done(c.get("status"))]
+    others = [c for c in left if c.upper() != mine]
+    in_term = any(c.upper() == mine for c in left)
+    # Next: a not-done term course planned to start after mine, else the
+    # first course of the next planned term.
+    mine_c = next((c for c in plan.get("courses") or []
+                   if c.get("code", "").upper() == mine), None)
+    nxt = ""
+    if mine_c:
+        after = sorted((c for c in plan.get("courses") or []
+                        if c.get("code", "").upper() != mine
+                        and not course_done(c.get("status"))
+                        and (c.get("planned_start") or "")
+                        > (mine_c.get("planned_start") or "")),
+                       key=lambda c: c.get("planned_start") or "")
+        nxt = after[0]["code"] if after else ""
+    if not nxt and plan.get("future_courses"):
+        nxt = plan["future_courses"][0]
+    pc, cc = plan.get("term_planned_cus"), plan.get("term_completed_cus")
+    return {
+        "courses_left": ", ".join(left),
+        "other_courses_left": ", ".join(others),
+        "last_course": bool(in_term and not others),
+        "next_course": nxt,
+        "term_cus_left": (pc - cc) if pc is not None and cc is not None
+        else None,
+        "weeks_left": plan.get("weeks_remaining"),
+        "degree_pct": plan.get("percent_complete"),
+        "pm_name": plan.get("pm_name") or "",
+        "pm_email": plan.get("pm_email") or "",
+    }
+
+
+def plan_vocab(plans: list) -> dict:
+    """Value LABELS seen across plans (course statuses) — for a dry run."""
+    from collections import Counter
+    st = Counter()
+    for p in plans:
+        for c in p.get("courses") or []:
+            st[c.get("status") or "(blank)"] += 1
+    return {"course_status": dict(st.most_common())}

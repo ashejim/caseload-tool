@@ -6363,6 +6363,14 @@ class CaseloadPanel:
         if q.lower().startswith(("l360discover", "1360discover")):
             self.app._l360_discover("stop" not in q.lower())
             return "break"
+        # "l360plan:" — import Learner360 degree plans + program mentors;
+        # "l360plan: dry" = read 10 learners and report labels/counts only.
+        if q.lower().startswith(("l360plan", "1360plan")):
+            if "dry" in q.lower():
+                self.app._l360_plan_dry()
+            else:
+                self.app._l360_refresh_now("plan")
+            return "break"
         if q.lower().startswith(("l360roster", "1360roster")):
             self.app._l360_roster_probe()
             return "break"
@@ -8726,6 +8734,8 @@ class App:
             # Settings: open Learner360 in a background tab / run endpoint
             # discovery from startup. After the startup caseload work.
             self.root.after(120_000, self._l360_startup_jobs)
+            # Learner360 degree plans + program mentors (weekly, batches).
+            self.root.after(1_200_000, self._maybe_auto_l360_plan)
         # Report the startup backup (taken before the log existed).
         self.root.after(1500, self._report_startup_backup)
 
@@ -12675,6 +12685,174 @@ class App:
         self._l360_abg_step()
         return True
 
+    # ----- Learner360 degree plan + community of care (weekly) -----
+
+    _L360_PLAN_BATCH = 20      # learners per background degree-plan batch
+
+    def _maybe_auto_l360_plan(self) -> None:
+        """Weekly background degree-plan import (settings.l360_auto_plan_days;
+        0 = off), ~20 min after startup; re-checks when due (max 6 h).
+        Never raises."""
+        retry_ms, rearm_ms = 5 * 60_000, 6 * 3600_000
+        try:
+            if getattr(self, "_offline", False):
+                return
+            days = int(getattr(self.settings, "l360_auto_plan_days", 7) or 0)
+            if days <= 0:
+                return
+            from src import learner360 as l3
+            last = history.l360_plan_last_import()
+            if getattr(self, "_l360_pbg", None) or not l3.momi_capture_due(
+                    last, days):
+                self.root.after(l3.ms_until_due(last, days, rearm_ms)
+                                if last else rearm_ms,
+                                self._maybe_auto_l360_plan)
+                return
+            started = self._start_l360_plan_bg()
+            self.root.after(rearm_ms if started else retry_ms,
+                            self._maybe_auto_l360_plan)
+        except Exception:
+            try:
+                self.root.after(rearm_ms, self._maybe_auto_l360_plan)
+            except Exception:
+                pass
+
+    def _start_l360_plan_bg(self, manual: bool = False) -> bool:
+        if (getattr(self, "_offline", False) or getattr(self, "_l360_pbg", None)
+                or not self.worker.ready_event.is_set()):
+            return False
+        targets = history.l360_plan_targets()
+        if not targets:
+            return False
+        self._l360_pbg = {"targets": list(targets), "i": 0, "kinds": None,
+                          "stored": 0, "fail": 0, "t0": time.time(),
+                          "manual": manual}
+        self._append_log(
+            f"Learner360 degree plans: {'import' if manual else 'weekly import'}"
+            f" starting in the background — {len(targets)} learners, "
+            f"{self._L360_PLAN_BATCH} at a time (anything you do goes first).")
+        self._l360_pbg_step()
+        return True
+
+    def _l360_pbg_step(self) -> None:
+        st = getattr(self, "_l360_pbg", None)
+        if not st:
+            return
+        if st["i"] >= len(st["targets"]):
+            self._l360_pbg = None
+            n = len(st["targets"])
+            if st["fail"] <= max(3, n // 10):
+                try:
+                    history.mark_l360_plan_imported()
+                except Exception:
+                    pass
+            mins = (time.time() - st["t0"]) / 60
+            self._append_log(
+                f"✓ Learner360 degree plans: {st['stored']} of {n} learners "
+                f"stored in {mins:.0f} min"
+                + (f"; {st['fail']} failed" if st["fail"] else "")
+                + " — the plan columns refresh on the next caseload reload.")
+            return
+        if (getattr(self, "_is_busy", False)
+                or not self.worker.ready_event.is_set()):
+            self.root.after(30_000, self._l360_pbg_step)
+            return
+        part = st["targets"][st["i"]:st["i"] + self._L360_PLAN_BATCH]
+
+        def on_done(res):
+            try:
+                self.root.after(0, lambda: self._l360_pbg_got(len(part), res))
+            except Exception:
+                pass
+
+        self.worker.submit_l360_plan_fetch(part, on_done, surface=False,
+                                           background=True, kinds=st["kinds"])
+
+    def _l360_pbg_got(self, n: int, res) -> None:
+        st = getattr(self, "_l360_pbg", None)
+        if not st:
+            return
+        res = res or {}
+        if res.get("error"):
+            self._l360_pbg = None
+            if res.get("not_logged_in"):
+                self._append_log("Learner360 isn't signed in, so the degree "
+                                 "plan import paused — it'll retry later.")
+            else:
+                self._append_log(f"Learner360 degree plans stopped: "
+                                 f"{res['error']}", error=True)
+            return
+        st["kinds"] = res.get("id_kinds") or st["kinds"]
+        st["fail"] += res.get("failed") or 0
+        by = res.get("by_student") or {}
+
+        def work():
+            try:
+                r = {"stored": history.persist_l360_plans(by)}
+            except Exception as e:
+                r = {"error": str(e)}
+            try:
+                self.root.after(0, lambda: self._l360_pbg_saved(n, r))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True,
+                         name="l360-plan-save").start()
+
+    def _l360_pbg_saved(self, n: int, r: dict) -> None:
+        st = getattr(self, "_l360_pbg", None)
+        if not st:
+            return
+        if (r or {}).get("error"):
+            self._l360_pbg = None
+            self._append_log(f"Learner360 degree plans couldn't save: "
+                             f"{r['error']}", error=True)
+            return
+        st["stored"] += r.get("stored", 0)
+        st["i"] += n
+        self.root.after(1500, self._l360_pbg_step)
+
+    def _l360_plan_dry(self) -> None:
+        """`l360plan: dry` — read 10 learners' plans; report which id kind
+        each endpoint takes, failures, and course-status LABELS (no student
+        values). Nothing is stored."""
+        if getattr(self, "_offline", False) or not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        targets = history.l360_plan_targets()[:10]
+        if not targets:
+            self._append_log("No Learner360 ids yet — run the MOMI refresh "
+                             "first.")
+            return
+        self._append_log(f"Learner360 degree plans (dry run): reading "
+                         f"{len(targets)} learners…")
+
+        def on_done(res):
+            def ui():
+                if (res or {}).get("error"):
+                    self._append_log(f"✗ {res['error']}", error=True)
+                    return
+                plans = list((res.get("by_student") or {}).values())
+                have = lambda k: sum(1 for p in plans if p.get(k))
+                self._append_log(
+                    f"  id kinds: {res.get('id_kinds')}  probe: "
+                    f"{res.get('probe')}")
+                self._append_log(
+                    f"  {res.get('fetched')} read, {res.get('failed')} failed "
+                    f"{res.get('fail_statuses') or ''}; with term courses "
+                    f"{have('courses')}, future courses {have('future_courses')}"
+                    f", degree % {sum(1 for p in plans if p.get('percent_complete') is not None)}"
+                    f", program mentor email {have('pm_email')}")
+                self._append_log(f"  course status labels: "
+                                 f"{(res.get('vocab') or {}).get('course_status')}")
+            try:
+                self.root.after(0, ui)
+            except Exception:
+                pass
+
+        self.worker.submit_l360_plan_fetch(targets, on_done, surface=False,
+                                           background=False)
+
     def _maybe_auto_l360_roster(self) -> None:
         """Daily Learner360 team-roster pull for the inbox labeler overlay
         (settings.l360_auto_roster_days; 0 = off): ~5 min after startup,
@@ -12767,9 +12945,11 @@ class App:
         immediately, regardless of its schedule. ``which`` = momi | notes |
         activity. Logs why when it can't start."""
         names = {"momi": "MOMI history", "notes": "notes import",
-                 "activity": "activity import", "roster": "team roster"}
+                 "activity": "activity import", "roster": "team roster",
+                 "plan": "degree plan import"}
         running = {"momi": "_l360_mbg", "notes": "_l360_bg",
-                   "activity": "_l360_abg", "roster": "_l360_rbg"}[which]
+                   "activity": "_l360_abg", "roster": "_l360_rbg",
+                   "plan": "_l360_pbg"}[which]
         if getattr(self, "_offline", False):
             self._append_log("🔌 Demo: Learner360 isn't available offline.")
             return
@@ -12793,6 +12973,8 @@ class App:
             started = bool(targets)
             if started:
                 self._start_l360_notes_bg(targets, manual=True)
+        elif which == "plan":
+            started = self._start_l360_plan_bg(manual=True)
         else:
             started = self._start_l360_activity_bg(manual=True)
         if not started:
@@ -17912,6 +18094,11 @@ class App:
             eng_map = history.engagement_signals()
         except Exception:
             eng_map = {}
+        # Learner360 degree plans (blank until the plan import has run).
+        try:
+            plan_map = history.l360_degree_plans()
+        except Exception:
+            plan_map = {}
 
         def _num(v):
             return "" if v is None else v
@@ -17965,11 +18152,47 @@ class App:
             eg = eng_map.get((sid.lstrip("0"), course)) or {}
             for col, key in self._ENGAGEMENT_COLS:
                 r[col] = _num(eg.get(key))
+            # Plan first: the Signals summary reads LastCourseInTerm.
+            self._apply_plan_columns(r, plan_map.get(sid.lstrip("0")), course)
             self._apply_signal_columns(r, eg)
             # PM email captured from a prior fire/email for this student — used
             # by the panel email-click CC (real address vs the name fallback).
             pm = pm_by_sid.get(sid)
             r["_pm_email_logged"] = pm[1] if pm else ""
+
+    @staticmethod
+    def _apply_plan_columns(r: dict, plan, course: str) -> None:
+        """Degree-plan columns for this row (learner360.plan_view); blank
+        when no plan has been imported for the student."""
+        cols = ("TermCoursesLeft", "OtherCoursesLeft", "LastCourseInTerm",
+                "NextPlannedCourse", "TermCUsLeft", "PlanWeeksLeft",
+                "DegreePctComplete")
+        if not plan:
+            for c in cols:
+                r[c] = ""
+            return
+        from src import learner360 as l3
+        v = l3.plan_view(plan, course)
+
+        def num(x):
+            return "" if x is None else (int(x) if float(x).is_integer() else
+                                         round(x, 1))
+        r["TermCoursesLeft"] = v["courses_left"]
+        r["OtherCoursesLeft"] = v["other_courses_left"]
+        r["LastCourseInTerm"] = "Yes" if v["last_course"] else "No"
+        r["NextPlannedCourse"] = v["next_course"]
+        r["TermCUsLeft"] = num(v["term_cus_left"])
+        r["PlanWeeksLeft"] = num(v["weeks_left"])
+        r["DegreePctComplete"] = num(v["degree_pct"])
+        # Program mentor's real email (Learner360 community of care) for the
+        # CC-the-PM paths — only when the caseload has none and Learner360's
+        # mentor is the same person as the caseload's (a PM change between
+        # imports mustn't CC the previous mentor).
+        if v["pm_email"] and not caseload_csv.first_present_value(
+                r, caseload_csv.PM_EMAIL_COLS):
+            pm = str(r.get("MentorName", "") or "")
+            if not pm or _names_loosely_match(pm, v["pm_name"]):
+                r["ProgramMentorEmail"] = v["pm_email"]
 
     @staticmethod
     def _apply_signal_columns(r: dict, eg: dict) -> None:
@@ -18004,6 +18227,8 @@ class App:
             parts.append("Never opened course")
         if working:
             parts.append("Working, no submission")
+        if r.get("LastCourseInTerm") == "Yes":
+            parts.append("Last course in term")
         if elsewhere:
             parts.append(f"Active elsewhere: {elsewhere}")
         r["Signals"] = " · ".join(parts)
@@ -21093,6 +21318,22 @@ class App:
             command=lambda: self._l360_refresh_now("activity"),
         ).pack(side="left", padx=(8, 0))
 
+        # Learner360 degree plans + program mentor (community of care).
+        l3p_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        l3p_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkLabel(l3p_row, text="Learner360 degree plans:").pack(
+            side="left")
+        cur_l3p = int(getattr(self.settings, "l360_auto_plan_days", 7) or 0)
+        l3p_var = ctk.StringVar(value=_L3_TO_LABEL.get(cur_l3p, "Weekly"))
+        ctk.CTkComboBox(
+            l3p_row, width=130, variable=l3p_var, state="readonly",
+            values=list(_L3_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            l3p_row, text="Refresh now", width=100,
+            command=lambda: self._l360_refresh_now("plan"),
+        ).pack(side="left", padx=(8, 0))
+
         # Learner360 team roster → inbox labeler overlay (current instructors).
         l3r_row = ctk.CTkFrame(dialog, fg_color="transparent")
         l3r_row.pack(fill="x", padx=32, pady=(0, 10))
@@ -21720,6 +21961,9 @@ class App:
             # Learner360 activity import interval in days (0 = off).
             self.settings.l360_auto_activity_days = _L3_LABELS.get(
                 l3a_var.get().strip(), 7)
+            # Learner360 degree plans + program mentor, days; 0 = off.
+            self.settings.l360_auto_plan_days = _L3_LABELS.get(
+                l3p_var.get().strip(), 7)
             # Learner360 team roster (inbox labeler overlay), days; 0 = off.
             self.settings.l360_auto_roster_days = _L3R_LABELS.get(
                 l3r_var.get().strip(), 1)

@@ -271,6 +271,11 @@ OVERLAY_JS = r"""
     if (e0.days_contact != null) facts.push(['Last contact', Math.round(e0.days_contact) + ' days ago']);
     if (e0.days_course_activity != null) facts.push(['Course activity', Math.round(e0.days_course_activity) + ' days ago']);
     if (e0.signals) facts.push(['Signals', e0.signals]);
+    if (e0.term_left) facts.push(['Left this term', e0.term_left
+      + (e0.term_cus_left != null ? ` (${e0.term_cus_left} CUs)` : '')]);
+    if (e0.next_course) facts.push(['Next planned', e0.next_course]);
+    if (e0.degree_pct != null) facts.push(['Degree', Math.round(e0.degree_pct) + '% complete']);
+    if (e0.pm_email) facts.push(['Program mentor', e0.pm_email]);
     if (e0.pa_returns != null) facts.push(['PA returns / passes', `${e0.pa_returns} / ${e0.pa_passes != null ? e0.pa_passes : 0}`]);
     if (facts.length)
       h += `<div class="sec"><div class="lbl">At a glance</div>` + facts.map(([k, v]) =>

@@ -445,6 +445,76 @@ def test_engagement_signals_and_learned_codes():
         os.remove(path)
 
 
+def _plan_fixture():
+    v1 = {"pidm": 1, "termCode": "202611", "termStartDate": "11-01-2026",
+          "termEndDate": "04-30-2027", "currentTermNumber": 3,
+          "totalNumberOfTerms": 4, "termPlannedCus": 12, "termCompletedCus": 4,
+          "weeksRemaining": 25, "termCourses": [
+              {"code": "D320", "name": "Cloud", "cus": 4, "status": "Passed",
+               "plannedStartDate": "11-01-2026", "actualEndDate": "11-20-2026"},
+              {"code": "C769", "name": "Capstone", "cus": 4,
+               "status": "Enrolled", "plannedStartDate": "12-01-2026"},
+              {"code": "D502", "name": "Next", "cus": 4, "status": "Planned",
+               "plannedStartDate": "01-15-2027"}]}
+    v2 = {"futureTerms": [{"courses": [{"courseCode": "D999"}]}],
+          "metadata": {"percentComplete": 87.5, "remainingCUs": 14,
+                       "totalCUs": 120}}
+    coc = {"programMentor": {"name": "Jane Smith",
+                             "mentorEmail": "jane.smith@wgu.edu"},
+           "instructors": [{"name": "Jim Ashe", "courseCode": "C769"}]}
+    return v1, v2, coc
+
+
+def test_degree_plan_parse_and_view():
+    from src import learner360 as l3
+    p = l3.parse_plan(*_plan_fixture())
+    assert p["term_end"] == "2027-04-30" and p["weeks_remaining"] == 25
+    assert [c["code"] for c in p["courses"]] == ["D320", "C769", "D502"]
+    assert p["future_courses"] == ["D999"] and p["percent_complete"] == 87.5
+    assert p["pm_email"] == "jane.smith@wgu.edu"
+    v = l3.plan_view(p, "C769")
+    assert v["courses_left"] == "C769, D502"          # D320 passed
+    assert v["other_courses_left"] == "D502" and not v["last_course"]
+    assert v["next_course"] == "D502" and v["term_cus_left"] == 8
+    # Mine is the last one left → last course, next = next term's first.
+    p["courses"][2]["status"] = "Passed"
+    v = l3.plan_view(p, "C769")
+    assert v["last_course"] and v["next_course"] == "D999"
+    assert l3.parse_plan(None, None, None)["courses"] == []
+    assert not l3.course_done("Incomplete") and l3.course_done("Completed")
+    assert not l3.course_done("Not Passed") and not l3.course_done("Failed")
+
+
+def test_degree_plan_store_and_columns():
+    import importlib
+    from src import learner360 as l3
+    path = _tmpdb()
+    try:
+        p = l3.parse_plan(*_plan_fixture())
+        assert history.persist_l360_plans({"000123": p}, db_path=path) == 1
+        got = history.l360_degree_plans(db_path=path)
+        assert got["123"]["pm_email"] == "jane.smith@wgu.edu"
+        history.mark_l360_plan_imported(db_path=path)
+        assert history.l360_plan_last_import(db_path=path)
+    finally:
+        os.remove(path)
+    launcher = importlib.import_module("scripts.launcher")
+    row = {"MentorName": "Smith, Jane"}
+    launcher.App._apply_plan_columns(row, p, "C769")
+    assert row["TermCoursesLeft"] == "C769, D502" and row["LastCourseInTerm"] == "No"
+    assert row["TermCUsLeft"] == 8 and row["DegreePctComplete"] == 87.5
+    assert row["ProgramMentorEmail"] == "jane.smith@wgu.edu"
+    row = {"MentorName": "Bob Jones"}                 # PM changed → no CC
+    launcher.App._apply_plan_columns(row, p, "C769")
+    assert "ProgramMentorEmail" not in row
+    row = {"MentorName": "Smith, Jane", "MentorEmail": "x@wgu.edu"}
+    launcher.App._apply_plan_columns(row, p, "C769")  # caseload's wins
+    assert "ProgramMentorEmail" not in row
+    row = {}
+    launcher.App._apply_plan_columns(row, None, "C769")
+    assert row["TermCoursesLeft"] == "" and row["LastCourseInTerm"] == ""
+
+
 def test_discovery_baseline_diff():
     from src import learner360 as l3
     gw = "https://faculty-api-gateway.wgu.edu/learner360/v1/"

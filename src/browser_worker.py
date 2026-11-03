@@ -545,6 +545,16 @@ class BrowserWorker:
         self.q.put(("L360_ACTIVITY", targets, days, on_done, surface,
                     background))
 
+    def submit_l360_plan_fetch(self, targets: list,
+                               on_done: Callable[[dict], None],
+                               surface: bool = True,
+                               background: bool = False,
+                               kinds: Optional[dict] = None) -> None:
+        """READ-ONLY: Learner360 degree plan + program mentor for
+        [(wgu_id, student_id, pidm)] (see _l360_plan_fetch)."""
+        self.q.put(("L360_PLAN", targets, on_done, surface, background,
+                    kinds))
+
     def submit_l360_notes_fetch(self, targets: list,
                                 on_done: Callable[[dict], None],
                                 surface: bool = True,
@@ -1209,6 +1219,16 @@ class BrowserWorker:
                 res = self._l360_team_roster(ctx, surface=surface)
             except Exception as e:
                 res = {"error": f"Learner360 team roster crashed: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "L360_PLAN":
+            _, targets, on_done, surface, background, kinds = cmd
+            res = {}
+            try:
+                res = self._l360_plan_fetch(ctx, targets, surface=surface,
+                                            background=background, kinds=kinds)
+            except Exception as e:
+                res = {"error": f"Learner360 degree plan crashed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "L360_ACTIVITY":
@@ -3278,6 +3298,98 @@ class BrowserWorker:
                 "shape": l3.activity_shape(raws), "date_format": fmt,
                 "probe": probe, "fetched": len(by_student),
                 "failed": sum(fails.values()), "fail_statuses": dict(fails)}
+
+    def _l360_plan_fetch(self, ctx, targets: list, surface: bool = True,
+                         background: bool = False,
+                         kinds: Optional[dict] = None) -> dict:
+        """READ-ONLY: each learner's degree plan (v1 current term + v2 whole
+        plan) and community of care (program mentor). ``targets`` =
+        [(wgu_id, student_id, pidm)]. Which id each path takes (360 uuid or
+        PIDM) is probed on the first learner. A 401 refreshes the session
+        once per chunk. Returns {ok, by_student, id_kinds, fetched, failed,
+        fail_statuses, vocab} or {error[, not_logged_in]}."""
+        import json as _json
+        from collections import Counter
+        from src import learner360 as l3
+        sess = self._l360_session(ctx, surface=surface, reuse=background)
+        if isinstance(sess, dict):
+            return sess
+        page, headers, _user, _snap = sess
+        tg = [(w, s_, p) for w, s_, p in targets if w and s_]
+        if not tg:
+            return {"error": "no learners to read"}
+        paths = {"v1": (l3.PLAN_V1_PATH, ""), "v2": (l3.PLAN_V2_PATH, ""),
+                 "coc": (l3.COC_PATH, l3.COC_SUFFIX)}
+        # Probe: which id each endpoint takes (first learner that answers);
+        # skipped when a previous batch of this run already found them.
+        kinds, probe = dict(kinds or {}), {}
+        for name, (base, suf) in paths.items():
+            if name in kinds:
+                continue
+            for w, _s, p in tg[:3]:
+                for kind, ident in (("uuid", w), ("pidm", p)):
+                    if not ident:
+                        continue
+                    r = l3.fetch_get_batch(page, headers, base, [ident],
+                                           suf).get(str(ident)) or {}
+                    probe[f"{name}:{kind}"] = r.get("status")
+                    if r.get("status") == 200:
+                        kinds[name] = kind
+                        break
+                if name in kinds:
+                    break
+        if "v1" not in kinds and "v2" not in kinds:
+            return {"error": f"degree-plan rejected both id kinds {probe}",
+                    "probe": probe}
+        by_student, fails = {}, Counter()
+        t0, chunk, refreshes = time.time(), 10, 0
+        for i in range(0, len(tg), chunk):
+            part = tg[i:i + chunk]
+            got = {}
+            for name, (base, suf) in paths.items():
+                if name not in kinds:
+                    continue
+                ids = [str(w if kinds[name] == "uuid" else p) for w, _s, p in part
+                       if (w if kinds[name] == "uuid" else p)]
+                res = l3.fetch_get_batch(page, headers, base, ids, suf)
+                expired = [k for k, v in res.items() if (v or {}).get("status") == 401]
+                if expired and refreshes < 10:
+                    refreshes += 1
+                    sess = self._l360_session(ctx, surface=surface)
+                    if isinstance(sess, dict):
+                        return sess
+                    page, headers, _user, _snap = sess
+                    res.update(l3.fetch_get_batch(page, headers, base, expired, suf))
+                got[name] = res
+            for w, sid, p in part:
+                bodies = {}
+                for name in paths:
+                    if name not in kinds:
+                        continue
+                    key = str(w if kinds[name] == "uuid" else p)
+                    r = (got.get(name) or {}).get(key) or {}
+                    if r.get("status") == 200:
+                        try:
+                            bodies[name] = _json.loads(r.get("body") or "null")
+                        except ValueError:
+                            fails[f"{name}:bad-json"] += 1
+                    elif r.get("status") != 204:
+                        fails[f"{name}:{r.get('status')}"] += 1
+                if bodies.get("v1") or bodies.get("v2"):
+                    by_student[sid] = l3.parse_plan(bodies.get("v1"),
+                                                    bodies.get("v2"),
+                                                    bodies.get("coc"))
+            if not background:
+                self.on_status(f"  [l360] degree plan {min(i + chunk, len(tg))}/"
+                               f"{len(tg)} ({time.time() - t0:.0f}s)")
+        if not by_student:
+            return {"error": f"every degree-plan request failed ({dict(fails)})",
+                    "probe": probe}
+        return {"ok": True, "by_student": by_student, "id_kinds": kinds,
+                "probe": probe, "fetched": len(by_student),
+                "failed": len(tg) - len(by_student),
+                "fail_statuses": dict(fails),
+                "vocab": l3.plan_vocab(list(by_student.values()))}
 
     def _l360_notes_fetch(self, ctx, targets: list,
                           surface: bool = True,

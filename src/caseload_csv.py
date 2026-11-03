@@ -100,6 +100,16 @@ DISPLAY_TO_CSV: dict[str, str] = {
     "Active Elsewhere": "SigActiveElsewhere",      # other courses, e.g. "D324"
     "Finished Other Course": "SigFinishedOther",   # "D320 PA passed, D324 OA taken"
     "Days Since Finished Other": "SigFinishedDays",
+    # Learner360 degree plan (history.l360_degree_plans → learner360.plan_view)
+    "Courses Left This Term": "TermCoursesLeft",   # incl. this course
+    "Other Courses Left": "OtherCoursesLeft",
+    "Last Course in Term": "LastCourseInTerm",     # Yes / No
+    "Next Planned Course": "NextPlannedCourse",
+    "Term CUs Left": "TermCUsLeft",
+    "Weeks Left (Plan)": "PlanWeeksLeft",
+    "Degree % Complete": "DegreePctComplete",
+    # (The program mentor's EMAIL from Learner360 fills "ProgramMentorEmail",
+    # one of PM_EMAIL_COLS, so the CC-the-PM paths pick it up.)
 }
 
 
