@@ -76,6 +76,7 @@ class BrowserWorker:
         # `l360discover:` — Learner360 gateway endpoint discovery (shapes
         # only, see learner360.discovery_add). None = off.
         self._l360_disc: Optional[dict] = None
+        self._l360_disc_lock = threading.Lock()
         # Phase-1 API fast path: the caseload page fires the Aura action
         # `getCaseLoadMainGridData` on load, whose response carries the WHOLE
         # caseload grid (per-task pass/fail + Contact ids + momentum). We
@@ -504,16 +505,30 @@ class BrowserWorker:
             except Exception:
                 continue
 
+    def l360_discovery_peek(self, reset: bool = False) -> Optional[dict]:
+        """Thread-safe copy of the running discovery store (None = off);
+        ``reset`` starts a fresh period."""
+        import copy
+        with self._l360_disc_lock:
+            if self._l360_disc is None:
+                return None
+            out = copy.deepcopy(self._l360_disc)
+            if reset:
+                self._l360_disc = {}
+            return out
+
     def submit_l360_discover(self, on: bool,
                              on_done: Callable[[dict], None]) -> None:
         """Start (on) / stop (off) Learner360 endpoint discovery. Stopping
         hands back {"store": {...}} — endpoint shapes, no values."""
         self.q.put(("L360_DISCOVER", bool(on), on_done))
 
-    def submit_l360_open(self, on_done: Callable[[dict], None]) -> None:
+    def submit_l360_open(self, on_done: Callable[[dict], None],
+                         surface: bool = True) -> None:
         """Open (or focus) Learner360's caseload in this browser and bring the
-        window forward — to work in Learner360 with the overlay."""
-        self.q.put(("L360_OPEN", on_done))
+        window forward — to work in Learner360 with the overlay. ``surface``
+        False = open it in a background tab without raising the browser."""
+        self.q.put(("L360_OPEN", on_done, surface))
 
     def submit_l360_team_roster(self, on_done: Callable[[dict], None],
                                 surface: bool = True) -> None:
@@ -1159,17 +1174,18 @@ class BrowserWorker:
                 pass
         elif cmd[0] == "L360_DISCOVER":
             _, on, on_done = cmd
-            if on:
-                if self._l360_disc is None:
-                    self._l360_disc = {}
-                res = {"ok": True}
-            else:
-                res = {"ok": True, "store": self._l360_disc or {}}
-                self._l360_disc = None
+            with self._l360_disc_lock:
+                if on:
+                    if self._l360_disc is None:
+                        self._l360_disc = {}
+                    res = {"ok": True}
+                else:
+                    res = {"ok": True, "store": self._l360_disc or {}}
+                    self._l360_disc = None
             if on_done:
                 on_done(res)
         elif cmd[0] == "L360_OPEN":
-            _, on_done = cmd
+            _, on_done, surface = cmd
             res = {}
             try:
                 from src import learner360 as l3
@@ -1178,7 +1194,8 @@ class BrowserWorker:
                 if "learner360.wgu.edu" not in (page.url or ""):
                     page.goto(l3.APP_URL, wait_until="domcontentloaded",
                               timeout=30_000)
-                self._bring_browser_forward(page)
+                if surface:
+                    self._bring_browser_forward(page)
                 self._overlay_tick(ctx)
                 res = {"ok": True}
             except Exception as e:
@@ -2824,8 +2841,10 @@ class BrowserWorker:
                     body = response.json()
             except Exception:
                 body = None
-            l3.discovery_add(self._l360_disc, method, response.url,
-                             getattr(response, "status", None), body)
+            with self._l360_disc_lock:
+                if self._l360_disc is not None:
+                    l3.discovery_add(self._l360_disc, method, response.url,
+                                     getattr(response, "status", None), body)
         except Exception:
             pass
 

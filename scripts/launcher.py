@@ -8723,6 +8723,9 @@ class App:
             self.root.after(900_000, self._maybe_auto_l360_activity)
             # Learner360 team roster for the inbox labeler overlay (daily).
             self.root.after(300_000, self._maybe_auto_l360_roster)
+            # Settings: open Learner360 in a background tab / run endpoint
+            # discovery from startup. After the startup caseload work.
+            self.root.after(120_000, self._l360_startup_jobs)
         # Report the startup backup (taken before the log existed).
         self.root.after(1500, self._report_startup_backup)
 
@@ -10168,6 +10171,10 @@ class App:
                     "not used by CaseloadNotes yet:")
                 for line in l3.discovery_summary(store):
                     self._append_log(line)
+                self._l360_seen_merge(store)
+                if getattr(self.settings, "l360_discover_on_startup", False):
+                    # The always-on watcher keeps running (fresh period).
+                    self.worker.submit_l360_discover(True, None)
                 try:
                     import json as _json
                     from datetime import datetime as _dt
@@ -10186,6 +10193,159 @@ class App:
                 pass
 
         self.worker.submit_l360_discover(on, on_done)
+
+    # ----- Learner360 startup jobs + endpoint watcher (Settings) -----
+
+    _L360_DISC_TICK_MS = 60_000
+
+    def _l360_seen_path(self):
+        from src import config as _cfg
+        return _cfg.PROJECT_ROOT / "data_analysis" / "l360_endpoints_seen.json"
+
+    def _l360_seen_load(self) -> dict:
+        """The endpoint baseline {"endpoints": {key: [field paths]},
+        "last_summary": iso, "pending": [log lines]} (structure only)."""
+        if getattr(self, "_l360_seen", None) is None:
+            import json as _json
+            try:
+                self._l360_seen = _json.loads(
+                    self._l360_seen_path().read_text(encoding="utf-8"))
+            except Exception:
+                self._l360_seen = {}
+        return self._l360_seen
+
+    def _l360_seen_save(self) -> None:
+        import json as _json
+        try:
+            p = self._l360_seen_path()
+            p.parent.mkdir(exist_ok=True)
+            p.write_text(_json.dumps(self._l360_seen_load(), indent=1),
+                         encoding="utf-8")
+        except Exception:
+            pass
+
+    def _l360_seen_merge(self, store: dict) -> None:
+        from src import learner360 as l3
+        if store:
+            l3.discovery_merge_seen(
+                self._l360_seen_load().setdefault("endpoints", {}), store)
+            self._l360_seen_save()
+
+    def _l360_startup_jobs(self) -> None:
+        """Settings ▸ Learner360 at startup: open it in a background tab
+        and/or start endpoint discovery (+ its watcher). Never raises."""
+        try:
+            if getattr(self, "_offline", False):
+                return
+            disc = bool(getattr(self.settings, "l360_discover_on_startup", False))
+            opn = bool(getattr(self.settings, "l360_open_on_startup", False))
+            if not (disc or opn):
+                return
+            if not self.worker.ready_event.is_set():
+                self.root.after(60_000, self._l360_startup_jobs)
+                return
+            if disc:
+                self._l360_start_watch(announce=True)
+            if opn:
+                if getattr(self.settings, "l360_overlay_enabled", False):
+                    self._push_overlay_snapshot()
+
+                def on_done(res):
+                    msg = ("✗ " + res["error"] if (res or {}).get("error")
+                           else "Learner360 opened in a background tab "
+                                "(Settings ▸ open at startup).")
+                    try:
+                        self.root.after(0, lambda: self._append_log(
+                            msg, error=msg.startswith("✗")))
+                    except Exception:
+                        pass
+                self.worker.submit_l360_open(on_done, surface=False)
+        except Exception:
+            pass
+
+    def _l360_start_watch(self, announce: bool = False) -> None:
+        """Start discovery (if not running) and the watcher tick (once)."""
+        mode = getattr(self.settings, "l360_discover_report", "alert")
+
+        def on_done(_res):
+            if announce:
+                try:
+                    self.root.after(0, lambda: self._append_log(
+                        "🔎 Learner360 discovery running (Settings ▸ at "
+                        f"startup; report: {self._L360_REPORT_LABEL.get(mode, mode)})"
+                        " — records field names only, never values."))
+                except Exception:
+                    pass
+        self.worker.submit_l360_discover(True, on_done)
+        if not getattr(self, "_l360_disc_ticking", False):
+            self._l360_disc_ticking = True
+            self.root.after(self._L360_DISC_TICK_MS, self._l360_disc_tick)
+
+    _L360_REPORT_LABEL = {"alert": "alert on new data",
+                          "daily": "daily summary",
+                          "weekly": "weekly summary"}
+
+    def _l360_disc_tick(self) -> None:
+        """Every minute while discovery runs: compare what Learner360 loaded
+        with the saved baseline. 'alert' logs a new data feed / new fields
+        right away; 'daily'/'weekly' collect them for a periodic summary.
+        The first run with no baseline just records it. Never raises."""
+        try:
+            from datetime import datetime as _dt, timedelta as _td
+            from src import learner360 as l3
+            store = self.worker.l360_discovery_peek()
+            mode = getattr(self.settings, "l360_discover_report", "alert")
+            if store is None:
+                return
+            seen = self._l360_seen_load()
+            eps = seen.setdefault("endpoints", {})
+            if store and not eps:
+                l3.discovery_merge_seen(eps, store)
+                self._l360_seen_save()
+                self._append_log(
+                    f"Learner360 discovery: baseline started with {len(eps)} "
+                    "data feed(s) — anything Learner360 loads that isn't in "
+                    "it will be reported.")
+            elif store:
+                diff = l3.discovery_diff(store, eps)
+                if diff:
+                    lines = l3.discovery_diff_lines(diff, store)
+                    if mode == "alert":
+                        self._append_log("Learner360 is loading data "
+                                         "CaseloadNotes hasn't seen before:")
+                        for ln in lines:
+                            self._append_log(ln)
+                    else:
+                        pend = seen.setdefault("pending", [])
+                        pend.extend(ln for ln in lines if ln not in pend)
+                    l3.discovery_merge_seen(eps, store)
+                    self._l360_seen_save()
+            if mode in ("daily", "weekly"):
+                period = _td(days=1 if mode == "daily" else 7)
+                last = seen.get("last_summary")
+                now = _dt.now()
+                if not last:
+                    seen["last_summary"] = now.isoformat(timespec="seconds")
+                    self._l360_seen_save()
+                elif now - _dt.fromisoformat(last[:19]) >= period:
+                    pend = seen.get("pending") or []
+                    self._append_log(
+                        f"Learner360 discovery ({mode} summary): {len(store)} "
+                        f"data feed(s) loaded since {last[:16].replace('T', ' ')}"
+                        + ("; new:" if pend else "; nothing new."))
+                    for ln in pend:
+                        self._append_log(ln)
+                    seen["pending"] = []
+                    seen["last_summary"] = now.isoformat(timespec="seconds")
+                    self._l360_seen_save()
+                    self.worker.l360_discovery_peek(reset=True)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.root.after(self._L360_DISC_TICK_MS, self._l360_disc_tick)
+            except Exception:
+                pass
 
     def _l360_open(self) -> None:
         """`l360open:` — open Learner360 in the app's browser (with the
@@ -20960,6 +21120,37 @@ class App:
             text="Show CaseloadNotes badges in Learner360 (beta, read-only — "
                  "open it with l360open:)",
         ).pack(anchor="w", padx=32, pady=(0, 10))
+        l3open_var = ctk.BooleanVar(
+            value=bool(getattr(self.settings, "l360_open_on_startup", False)))
+        ctk.CTkCheckBox(
+            dialog, variable=l3open_var,
+            text="Open Learner360 in a background tab at startup (l360open:)",
+        ).pack(anchor="w", padx=32, pady=(0, 6))
+        l3d_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        l3d_row.pack(fill="x", padx=32, pady=(0, 10))
+        l3disc_var = ctk.BooleanVar(
+            value=bool(getattr(self.settings, "l360_discover_on_startup", False)))
+        ctk.CTkCheckBox(
+            l3d_row, variable=l3disc_var,
+            text="Watch for new Learner360 data at startup (l360discover:)",
+        ).pack(side="left")
+        _L3D_LABELS = {"Alert on new data": "alert",
+                       "Daily summary": "daily", "Weekly summary": "weekly"}
+        _L3D_TO_LABEL = {v: k for k, v in _L3D_LABELS.items()}
+        l3d_var = ctk.StringVar(value=_L3D_TO_LABEL.get(
+            getattr(self.settings, "l360_discover_report", "alert"),
+            "Alert on new data"))
+        ctk.CTkComboBox(
+            l3d_row, width=160, variable=l3d_var, state="readonly",
+            values=list(_L3D_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+        try:
+            _attach_tooltip(l3d_row, "Records only which data feeds Learner360 loads and "
+                          "their field names — never student values. Sees "
+                          "only what's open in the app's browser, so pair it "
+                          "with 'Open Learner360 … at startup'.")
+        except Exception:
+            pass
 
         # Local versioned backups (src/local_backup.py) — status + open folder.
         bk_row = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -21535,6 +21726,20 @@ class App:
             # Learner360 overlay (Stage 2 beta).
             self.settings.l360_overlay_enabled = bool(overlay_var.get())
             self._apply_overlay_setting()
+            # Learner360 at startup: background tab / data watcher.
+            self.settings.l360_open_on_startup = bool(l3open_var.get())
+            _was_disc = bool(getattr(self.settings, "l360_discover_on_startup",
+                                     False))
+            self.settings.l360_discover_on_startup = bool(l3disc_var.get())
+            self.settings.l360_discover_report = _L3D_LABELS.get(
+                l3d_var.get().strip(), "alert")
+            if self.settings.l360_discover_on_startup and not _was_disc:
+                self._l360_start_watch(announce=True)
+            elif _was_disc and not self.settings.l360_discover_on_startup:
+                self.worker.submit_l360_discover(
+                    False, lambda r: self.root.after(
+                        0, lambda: self._l360_seen_merge(
+                            (r or {}).get("store") or {})))
             # Name capitalization mode (off / lower / standard).
             self.settings.name_capitalization = _NC_MODE_LABELS.get(
                 nc_var.get().strip(), "standard")

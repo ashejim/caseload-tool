@@ -445,6 +445,31 @@ def test_engagement_signals_and_learned_codes():
         os.remove(path)
 
 
+def test_discovery_baseline_diff():
+    from src import learner360 as l3
+    gw = "https://faculty-api-gateway.wgu.edu/learner360/v1/"
+    store = {}
+    l3.discovery_add(store, "GET", gw + "plan/abc12345678", 200,
+                     {"terms": [{"code": "x"}]})
+    seen = {}
+    assert l3.discovery_diff(store, seen) == [("GET /learner360/v1/plan/abc12345678", None)] \
+        or l3.discovery_diff(store, seen)[0][1] is None
+    l3.discovery_merge_seen(seen, store)
+    assert l3.discovery_diff(store, seen) == []           # nothing new now
+    # A new field on the known feed, and a brand-new feed.
+    l3.discovery_add(store, "GET", gw + "plan/abc12345678", 200,
+                     {"terms": [{"code": "x", "cus": 3}], "gpa": 3.1})
+    l3.discovery_add(store, "POST", gw + "summary/search", 200, {"a": 1})
+    diff = dict(l3.discovery_diff(store, seen))
+    key_plan = next(k for k in store if "/plan/" in k)
+    assert diff[key_plan] == ["gpa", "terms[].cus"]
+    assert diff["POST /learner360/v1/summary/search"] is None
+    lines = l3.discovery_diff_lines(l3.discovery_diff(store, seen), store)
+    assert any("new data feed: POST /learner360/v1/summary/search" in ln
+               for ln in lines)
+    assert any("new field(s) on" in ln and "terms[].cus" in ln for ln in lines)
+
+
 def test_action_signals():
     from datetime import datetime as dt
     path = _tmpdb()

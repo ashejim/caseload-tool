@@ -836,3 +836,53 @@ def discovery_summary(store: dict) -> list:
         lines.append(f"  [{tag}] {key}{q}  ×{e['count']} {e['statuses']}"
                      f"  → {fields}")
     return lines
+
+
+def shape_paths(shape, prefix: str = "") -> set:
+    """Dotted field paths of a disc_shape ('a.b[].c'), for new-field diffs."""
+    out = set()
+    if isinstance(shape, dict):
+        for k, v in shape.items():
+            p = f"{prefix}.{k}" if prefix else str(k)
+            out.add(p)
+            out |= shape_paths(v, p)
+    elif isinstance(shape, list) and shape:
+        out |= shape_paths(shape[0], prefix + "[]")
+    return out
+
+
+def discovery_diff(store: dict, seen: dict) -> list:
+    """What ``store`` has that the ``seen`` baseline ({key: [paths]}) lacks:
+    [(key, None)] for a new endpoint, [(key, [new field paths])] for new
+    fields on a known one."""
+    out = []
+    for key in sorted(store):
+        paths = shape_paths(store[key].get("shape"))
+        if key not in seen:
+            out.append((key, None))
+        else:
+            new = sorted(paths - set(seen[key]))
+            if new:
+                out.append((key, new))
+    return out
+
+
+def discovery_merge_seen(seen: dict, store: dict) -> None:
+    """Fold ``store``'s endpoints + field paths into the ``seen`` baseline."""
+    for key, e in store.items():
+        seen[key] = sorted(set(seen.get(key, [])) |
+                           shape_paths(e.get("shape")))
+
+
+def discovery_diff_lines(diff: list, store: dict) -> list:
+    """Human log lines for discovery_diff output."""
+    lines = []
+    for key, new in diff:
+        if new is None:
+            one = discovery_summary({key: store[key]})[0].strip()
+            lines.append(f"  🆕 new data feed: {one.replace('[NEW] ', '')}")
+        else:
+            more = f" (+{len(new) - 8} more)" if len(new) > 8 else ""
+            lines.append(f"  🆕 new field(s) on {key}: "
+                         f"{', '.join(new[:8])}{more}")
+    return lines

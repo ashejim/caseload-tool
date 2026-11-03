@@ -413,6 +413,14 @@ class Settings:
     # Stage 2 (beta): draw CaseloadNotes badges into Learner360 pages in the
     # app's own browser (read-only). Off by default.
     l360_overlay_enabled: bool = False
+    # Open Learner360 in a background tab of the app's browser at startup
+    # (overlay + discovery see it without `l360open:`).
+    l360_open_on_startup: bool = False
+    # Run endpoint discovery (`l360discover:`) from startup, reporting per
+    # l360_discover_report: "alert" = log a new data feed / new fields as
+    # soon as Learner360 loads them; "daily" / "weekly" = a summary.
+    l360_discover_on_startup: bool = False
+    l360_discover_report: str = "alert"
     # Local versioned backups of history.db.enc, taken at startup before the
     # vault is unlocked (src/local_backup.py). Blank dir = ~/Documents/
     # CaseloadNotes Backups.
