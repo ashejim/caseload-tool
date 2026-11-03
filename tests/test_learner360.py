@@ -452,8 +452,7 @@ def test_discovery_baseline_diff():
     l3.discovery_add(store, "GET", gw + "plan/abc12345678", 200,
                      {"terms": [{"code": "x"}]})
     seen = {}
-    assert l3.discovery_diff(store, seen) == [("GET /learner360/v1/plan/abc12345678", None)] \
-        or l3.discovery_diff(store, seen)[0][1] is None
+    assert [n for _k, n in l3.discovery_diff(store, seen)] == [None]
     l3.discovery_merge_seen(seen, store)
     assert l3.discovery_diff(store, seen) == []           # nothing new now
     # A new field on the known feed, and a brand-new feed.
