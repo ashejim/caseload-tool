@@ -729,3 +729,110 @@ def fetch_momi_batch(page, headers: dict, wgu_ids: list, concurrency: int = 5) -
     return page.evaluate(_MOMI_BATCH_JS,
                          [GATEWAY + MOMI_PATH, headers, list(wgu_ids),
                           max(1, int(concurrency))]) or {}
+
+
+# ---------------------------------------------------------------------------
+# Endpoint DISCOVERY (`l360discover:`): while on, the browser worker records
+# every gateway response Learner360's own pages fetch as you click around —
+# method, a path TEMPLATE (ids → {id}), query-parameter NAMES, status and the
+# JSON SHAPE (field names + types, never values). Finds data we don't collect
+# yet (degree plan, summaries, enrollments, ...) without guessing URLs. FERPA:
+# no values are kept, and id-like object keys are collapsed to {id}.
+# ---------------------------------------------------------------------------
+_ID_SEG = re.compile(
+    r"^(?:[0-9a-fA-F]{8}-[0-9a-fA-F-]{20,}|[0-9a-fA-F]{24,}|\d{3,}"
+    r"|[A-Za-z0-9]{15}|[A-Za-z0-9]{18}|\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2})$")
+_ID_KEY = re.compile(r"^(?:[0-9a-fA-F-]{16,}|\d{3,}|[A-Z]\d{3}[A-Z0-9]*|.*@.*)$")
+
+
+def path_template(url: str) -> tuple:
+    """(METHOD-less path with id-like segments → '{id}', sorted query keys)."""
+    from urllib.parse import parse_qs, urlsplit
+    sp = urlsplit(url or "")
+    segs = ["{id}" if _ID_SEG.match(s) else s for s in sp.path.split("/")]
+    return "/".join(segs), sorted(parse_qs(sp.query, keep_blank_values=True))
+
+
+def disc_shape(obj, depth: int = 0, max_depth: int = 7):
+    """Structure of a JSON value with no values: dict → {key: shape} (id-like
+    keys collapsed to '{id}'), list → [merged item shape] (+ '#n' length
+    hint), scalars → 'str' / 'num' / 'bool' / 'null'."""
+    if depth > max_depth:
+        return "…"
+    if isinstance(obj, dict):
+        out: dict = {}
+        for k, v in obj.items():
+            key = "{id}" if _ID_KEY.match(str(k)) else str(k)
+            sh = disc_shape(v, depth + 1, max_depth)
+            out[key] = _merge_shape(out[key], sh) if key in out else sh
+        return out
+    if isinstance(obj, list):
+        merged = None
+        for item in obj[:25]:
+            sh = disc_shape(item, depth + 1, max_depth)
+            merged = sh if merged is None else _merge_shape(merged, sh)
+        return [merged if merged is not None else "empty"]
+    if obj is None:
+        return "null"
+    if isinstance(obj, bool):
+        return "bool"
+    if isinstance(obj, (int, float)):
+        return "num"
+    return "str"
+
+
+def _merge_shape(a, b):
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = dict(a)
+        for k, v in b.items():
+            out[k] = _merge_shape(out[k], v) if k in out else v
+        return out
+    if isinstance(a, list) and isinstance(b, list):
+        if a == ["empty"]:
+            return b
+        if b == ["empty"]:
+            return a
+        return [_merge_shape(a[0], b[0])]
+    if a == b or b == "null":
+        return a
+    if a == "null":
+        return b
+    return f"{a}|{b}" if isinstance(a, str) and isinstance(b, str) else a
+
+
+def discovery_add(store: dict, method: str, url: str, status, body) -> None:
+    """Fold one gateway response into ``store`` {"METHOD path": entry}."""
+    path, qkeys = path_template(url)
+    key = f"{(method or 'GET').upper()} {path}"
+    e = store.setdefault(key, {"count": 0, "statuses": [], "query": [],
+                               "shape": None})
+    e["count"] += 1
+    if status not in e["statuses"]:
+        e["statuses"].append(status)
+    e["query"] = sorted(set(e["query"]) | set(qkeys))
+    if body is not None:
+        sh = disc_shape(body)
+        e["shape"] = sh if e["shape"] is None else _merge_shape(e["shape"], sh)
+
+
+def discovery_known(key: str) -> bool:
+    """Is this endpoint one CaseloadNotes already reads?"""
+    return any(p.rstrip("/") in key for p in (
+        CASELOAD_SEARCH, MOMI_PATH, TEAMS_ASSIGNED, "/learner360/v1/teams/",
+        NOTES_PATH, ACTIVITY_PATH))
+
+
+def discovery_summary(store: dict) -> list:
+    """Log lines: new endpoints first, each with its top-level fields."""
+    lines = []
+    for key in sorted(store, key=lambda k: (discovery_known(k), k)):
+        e = store[key]
+        sh = e["shape"]
+        top = sh[0] if isinstance(sh, list) and sh else sh
+        fields = (", ".join(list(top)[:14]) + (" …" if len(top) > 14 else "")
+                  if isinstance(top, dict) else str(top))
+        tag = "known" if discovery_known(key) else "NEW"
+        q = f" ?{'&'.join(e['query'])}" if e["query"] else ""
+        lines.append(f"  [{tag}] {key}{q}  ×{e['count']} {e['statuses']}"
+                     f"  → {fields}")
+    return lines

@@ -73,6 +73,9 @@ class BrowserWorker:
         # before sharing.
         self._capture_active = False
         self._capture_log: list[dict] = []
+        # `l360discover:` — Learner360 gateway endpoint discovery (shapes
+        # only, see learner360.discovery_add). None = off.
+        self._l360_disc: Optional[dict] = None
         # Phase-1 API fast path: the caseload page fires the Aura action
         # `getCaseLoadMainGridData` on load, whose response carries the WHOLE
         # caseload grid (per-task pass/fail + Contact ids + momentum). We
@@ -501,6 +504,12 @@ class BrowserWorker:
             except Exception:
                 continue
 
+    def submit_l360_discover(self, on: bool,
+                             on_done: Callable[[dict], None]) -> None:
+        """Start (on) / stop (off) Learner360 endpoint discovery. Stopping
+        hands back {"store": {...}} — endpoint shapes, no values."""
+        self.q.put(("L360_DISCOVER", bool(on), on_done))
+
     def submit_l360_open(self, on_done: Callable[[dict], None]) -> None:
         """Open (or focus) Learner360's caseload in this browser and bring the
         window forward — to work in Learner360 with the overlay."""
@@ -748,9 +757,19 @@ class BrowserWorker:
                         f"reopened: {e}")
             while True:
                 try:
-                    cmd = self.q.get(timeout=1.0 if self._overlay_on else None)
+                    cmd = self.q.get(timeout=1.0 if (
+                        self._overlay_on or self._l360_disc is not None)
+                        else None)
                 except queue.Empty:
                     self._overlay_tick(ctx)
+                    if self._l360_disc is not None and not self._overlay_on:
+                        # Sync Playwright only delivers events during a call:
+                        # a no-op evaluate lets discovery see the responses.
+                        for pg in self._overlay_pages(ctx):
+                            try:
+                                pg.evaluate("0")
+                            except Exception:
+                                pass
                     continue
                 if cmd is self.SHUTDOWN:
                     return False
@@ -1138,6 +1157,17 @@ class BrowserWorker:
                 self._overlay_clear(ctx)
             except Exception:
                 pass
+        elif cmd[0] == "L360_DISCOVER":
+            _, on, on_done = cmd
+            if on:
+                if self._l360_disc is None:
+                    self._l360_disc = {}
+                res = {"ok": True}
+            else:
+                res = {"ok": True, "store": self._l360_disc or {}}
+                self._l360_disc = None
+            if on_done:
+                on_done(res)
         elif cmd[0] == "L360_OPEN":
             _, on_done = cmd
             res = {}
@@ -2736,6 +2766,8 @@ class BrowserWorker:
         # page already fetches, so the scan can skip the scroll-scrape.
         if "getCaseLoadMainGridData" in url:
             self._capture_grid_data(response)
+        if self._l360_disc is not None and "faculty-api-gateway.wgu.edu" in url:
+            self._l360_disc_record(response)
         # While reading the EA dashboard, grab its EmployeeEvent__c JSON feed.
         if self._ea_capture_armed and "/aura" in url:
             self._capture_ea_data(response)
@@ -2772,6 +2804,28 @@ class BrowserWorker:
                 "body_len": len(body or ""),
                 "body_preview": (body or "")[:60000],
             })
+        except Exception:
+            pass
+
+    def _l360_disc_record(self, response) -> None:
+        """Fold one Learner360 gateway response into the discovery store —
+        structure only (learner360.discovery_add). Never raises."""
+        try:
+            from src import learner360 as l3
+            try:
+                method = response.request.method
+            except Exception:
+                method = "GET"
+            if method == "OPTIONS":
+                return
+            body = None
+            try:
+                if "json" in ((response.headers or {}).get("content-type", "")):
+                    body = response.json()
+            except Exception:
+                body = None
+            l3.discovery_add(self._l360_disc, method, response.url,
+                             getattr(response, "status", None), body)
         except Exception:
             pass
 

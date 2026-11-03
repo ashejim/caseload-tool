@@ -635,6 +635,40 @@ def test_ms_until_due_rechecks_at_due_time():
     assert l3.ms_until_due(None, 7, cap, now=now) == cap
 
 
+def test_discovery_keeps_structure_never_values():
+    import json as _json
+    from src import learner360 as l3
+    store = {}
+    uuid = "3f2a9c1e-1111-4222-8333-944455556666"
+    body = {"learnerId": uuid, "degreePlan": {"terms": [
+        {"termCode": "202611", "courses": [{"code": "C769", "status": "Passed",
+                                            "cus": 4, "done": True}]},
+        {"termCode": "202605", "courses": [], "note": None}]},
+        "byCourse": {"C769": {"x": 1}, "D502": {"x": 2}},
+        "email": "student@wgu.edu"}
+    l3.discovery_add(store, "GET",
+                     f"https://faculty-api-gateway.wgu.edu/learner360/v1/"
+                     f"degree-plan/{uuid}?startDate=01-01-2026&x=1", 200, body)
+    l3.discovery_add(store, "GET",
+                     "https://faculty-api-gateway.wgu.edu/learner360/v1/"
+                     "momentum-indicator/abc?y=2", 200, {"m": 1})
+    key = "GET /learner360/v1/degree-plan/{id}"
+    assert key in store, list(store)
+    e = store[key]
+    assert e["query"] == ["startDate", "x"] and e["statuses"] == [200]
+    sh = e["shape"]
+    assert sh["degreePlan"]["terms"][0]["courses"][0] == {
+        "code": "str", "status": "str", "cus": "num", "done": "bool"}
+    assert list(sh["byCourse"]) == ["{id}"]          # course-code keys collapsed
+    dumped = _json.dumps(store)
+    for value in (uuid, "202611", "C769", "Passed", "student@wgu.edu",
+                  "01-01-2026"):
+        assert value not in dumped, value
+    lines = l3.discovery_summary(store)
+    assert lines[0].startswith("  [NEW] GET /learner360/v1/degree-plan/{id}")
+    assert any("[known]" in ln for ln in lines)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

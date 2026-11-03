@@ -6358,6 +6358,11 @@ class CaseloadPanel:
         if q.lower().startswith(("l360open", "1360open")):
             self.app._l360_open()
             return "break"
+        # "l360discover:" — record which data Learner360's own pages load as
+        # you browse (field names only); "l360discover: stop" reports + saves.
+        if q.lower().startswith(("l360discover", "1360discover")):
+            self.app._l360_discover("stop" not in q.lower())
+            return "break"
         if q.lower().startswith(("l360roster", "1360roster")):
             self.app._l360_roster_probe()
             return "break"
@@ -10126,6 +10131,61 @@ class App:
                 self._push_overlay_snapshot()
         except Exception:
             pass
+
+    def _l360_discover(self, on: bool) -> None:
+        """`l360discover:` / `l360discover: stop` — Learner360 endpoint
+        discovery. While on, every gateway response Learner360's pages fetch
+        is recorded as structure only (path template, query names, field
+        names/types — no values). Stop logs NEW endpoints first and saves the
+        full shapes to data_analysis/ (git-ignored)."""
+        if getattr(self, "_offline", False):
+            self._append_log("🔌 Demo: Learner360 isn't available offline.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+
+        def on_done(res):
+            def ui():
+                if on:
+                    self._append_log(
+                        "🔎 Learner360 discovery ON — browse Learner360 in the "
+                        "app's browser: open several students and every tab / "
+                        "section (degree plan, courses, activity, summaries…). "
+                        "Then type l360discover: stop. Records field names "
+                        "only, never values.")
+                    self._l360_open()
+                    return
+                from src import learner360 as l3
+                store = (res or {}).get("store") or {}
+                if not store:
+                    self._append_log("Learner360 discovery: no gateway calls "
+                                     "recorded (was a Learner360 page open?).")
+                    return
+                new = sum(1 for k in store if not l3.discovery_known(k))
+                self._append_log(
+                    f"Learner360 discovery: {len(store)} endpoint(s), {new} "
+                    "not used by CaseloadNotes yet:")
+                for line in l3.discovery_summary(store):
+                    self._append_log(line)
+                try:
+                    import json as _json
+                    from datetime import datetime as _dt
+                    from src import config as _cfg
+                    out = _cfg.PROJECT_ROOT / "data_analysis" / (
+                        f"l360_endpoints_{_dt.now():%Y%m%d_%H%M}.json")
+                    out.parent.mkdir(exist_ok=True)
+                    out.write_text(_json.dumps(store, indent=1),
+                                   encoding="utf-8")
+                    self._append_log(f"  full field shapes saved → {out}")
+                except Exception as e:
+                    self._append_log(f"  (couldn't save the shapes: {e})")
+            try:
+                self.root.after(0, ui)
+            except Exception:
+                pass
+
+        self.worker.submit_l360_discover(on, on_done)
 
     def _l360_open(self) -> None:
         """`l360open:` — open Learner360 in the app's browser (with the
