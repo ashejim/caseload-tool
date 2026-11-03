@@ -749,7 +749,10 @@ def path_template(url: str) -> tuple:
     """(METHOD-less path with id-like segments → '{id}', sorted query keys)."""
     from urllib.parse import parse_qs, urlsplit
     sp = urlsplit(url or "")
-    segs = ["{id}" if _ID_SEG.match(s) else s for s in sp.path.split("/")]
+    # Any segment carrying a run of 5+ digits (ids, timestamps, composite
+    # note keys like "2026-10-28T12:31:18.588+0000813722205") → {id}.
+    segs = ["{id}" if (_ID_SEG.match(s) or re.search(r"\d{5}", s)) else s
+            for s in sp.path.split("/")]
     return "/".join(segs), sorted(parse_qs(sp.query, keep_blank_values=True))
 
 

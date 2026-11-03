@@ -747,6 +747,9 @@ def test_discovery_keeps_structure_never_values():
     l3.discovery_add(store, "GET",
                      "https://faculty-api-gateway.wgu.edu/learner360/v1/"
                      "momentum-indicator/abc?y=2", 200, {"m": 1})
+    assert l3.path_template("https://x/studentNotes/v1/notes/abc/note/"
+                            "2026-10-28T12:31:18.588+0000813722205")[0] ==         "/studentNotes/v1/notes/abc/note/{id}"
+    assert l3.path_template("https://x/learner360/v1/cadence/u/D502")[0] ==         "/learner360/v1/cadence/u/D502"                 # course code kept
     key = "GET /learner360/v1/degree-plan/{id}"
     assert key in store, list(store)
     e = store[key]
