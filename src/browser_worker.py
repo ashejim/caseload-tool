@@ -3078,17 +3078,22 @@ class BrowserWorker:
                 if kl.startswith("x-") and not kl.startswith(
                         ("x-dynatrace", "x-dtpc", "x-dtreferer")):
                     keep[k] = v
-            pg = None
+            pg, origin = None, ""
+            from urllib.parse import urlsplit
             try:
                 pg = request.frame.page
+                origin = urlsplit(pg.url or "").netloc
             except Exception:
-                pass
-            from urllib.parse import urlsplit
+                pass   # e.g. a service-worker request: no frame
             host = urlsplit(request.url).netloc
             if not hasattr(self, "_assess_auth"):
                 self._assess_auth = {}
-            self._assess_auth[host] = {"headers": keep, "page": pg,
-                                       "ts": time.time()}
+            prev = self._assess_auth.get(host) or {}
+            self._assess_auth[host] = {
+                "headers": keep, "ts": time.time(),
+                "page": pg or prev.get("page"),
+                "origin": origin or prev.get("origin", ""),
+            }
         except Exception:
             pass
 
@@ -3173,17 +3178,47 @@ class BrowserWorker:
             out["learners"].append(rec)
         return out
 
-    def _portal_route(self, host: str):
+    def _portal_route(self, host: str, ctx=None):
         """(page, headers) for a course-assessment gateway — the student-
-        portal page that last called it, if still open."""
+        portal page that last called it if still open, else any open page on
+        that page's origin (or a my.wgu.edu page)."""
+        from urllib.parse import urlsplit
         a = (getattr(self, "_assess_auth", {}) or {}).get(host) or {}
+        hd = a.get("headers") or {}
+        if not hd:
+            return None, None
         pg = a.get("page")
         try:
-            if pg is not None and not pg.is_closed():
-                return pg, a.get("headers") or {}
+            if pg is not None and not pg.is_closed() and \
+                    "learner360.wgu.edu" not in urlsplit(pg.url or "").netloc:
+                return pg, hd
         except Exception:
             pass
+        ctx = ctx or getattr(self, "_ctx_for_portal", None)
+        want = a.get("origin") or ""
+        for cand in (list(ctx.pages) if ctx is not None else []):
+            try:
+                if cand.is_closed():
+                    continue
+                net = urlsplit(cand.url or "").netloc
+                if (want and net == want) or net == "my.wgu.edu":
+                    a["page"] = cand
+                    return cand, hd
+            except Exception:
+                continue
         return None, None
+
+    def _open_page_hosts(self, ctx) -> list:
+        """Hosts of the open tabs (for a 'can't find the portal page' log)."""
+        from urllib.parse import urlsplit
+        out = []
+        for p in list(ctx.pages):
+            try:
+                if not p.is_closed():
+                    out.append(urlsplit(p.url or "").netloc or "(blank)")
+            except Exception:
+                continue
+        return out
 
     def _portal_get(self, host: str, url: str) -> dict:
         """GET ``url`` from the portal page (its origin passes CORS) with its
@@ -3235,11 +3270,15 @@ class BrowserWorker:
         from collections import Counter
         from src import course_assess as ca, learner360 as l3
         ai, lx = l3.ASSESS_HOSTS
-        if self._portal_route(ai)[0] is None or self._portal_route(lx)[0] is None:
-            return {"error": "open a C949 course page in the app's browser "
-                    "first (Learner360 > student > Overview > current term > "
-                    "the course link) so the import can use its sign-in.",
-                    "need_portal": True}
+        self._ctx_for_portal = ctx
+        if self._portal_route(ai, ctx)[0] is None or \
+                self._portal_route(lx, ctx)[0] is None:
+            seen = sorted((getattr(self, "_assess_auth", {}) or {}))
+            return {"error": "can't find the student-portal course page — "
+                    "open a C949 course page in the app's browser (Learner360 "
+                    "> student > Overview > current term > the course link). "
+                    f"[open tabs: {self._open_page_hosts(ctx)}; signed-in "
+                    f"gateways seen: {seen}]", "need_portal": True}
         sess = self._l360_session(ctx, surface=False, reuse=True)
         if isinstance(sess, dict):
             return sess
@@ -3268,8 +3307,9 @@ class BrowserWorker:
                 continue
             a = self._portal_get(ai, ca.assessments_url(pidm, cv))
             if a.get("status") == "no-portal-page":
-                return {"error": "the student-portal page was closed — open "
-                        "a course page again and re-run.", "need_portal": True,
+                return {"error": "lost the student-portal course page — open "
+                        "a course page again and re-run. [open tabs: "
+                        f"{self._open_page_hosts(ctx)}]", "need_portal": True,
                         "by_student": by, "counts": dict(counts)}
             if a.get("status") != 200:
                 counts[f"assessments:{a.get('status')}"] += 1
@@ -3309,9 +3349,11 @@ class BrowserWorker:
 
     def _learner360_page(self, ctx):
         """The open Learner360 tab in the launcher's context, or None."""
+        from urllib.parse import urlsplit
         for page in ctx.pages:
             try:
-                if not page.is_closed() and "learner360.wgu.edu" in (page.url or ""):
+                if not page.is_closed() and urlsplit(
+                        page.url or "").netloc == "learner360.wgu.edu":
                     return page
             except Exception:
                 continue
