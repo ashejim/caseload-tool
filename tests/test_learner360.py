@@ -822,6 +822,9 @@ def test_discovery_keeps_structure_never_values():
     assert l3.path_template("https://x/learner360/v1/cadence/u/D502")[0] ==         "/learner360/v1/cadence/u/D502"                 # course code kept
     assert l3.path_template("https://cos.wgu.edu/api/report/123456?a=1") == (
         "//cos.wgu.edu/api/report/{id}", ["a"])         # other host kept
+    assert l3.path_template("https://x/v1/mentors/hbaig5")[0] == "/v1/mentors/{id}"
+    assert l3.path_template("https://x/v1/tips/C949/student/jim.ashe")[0] ==         "/v1/tips/C949/student/{id}"                    # usernames → {id}
+    assert l3.path_template("https://x/coachingreport/v4/pidm/1")[0] ==         "/coachingreport/v4/pidm/1"                     # v4 kept
     key = "GET /learner360/v1/degree-plan/{id}"
     assert key in store, list(store)
     e = store[key]

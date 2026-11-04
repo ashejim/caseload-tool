@@ -743,6 +743,10 @@ def fetch_momi_batch(page, headers: dict, wgu_ids: list, concurrency: int = 5) -
 _ID_SEG = re.compile(
     r"^(?:[0-9a-fA-F]{8}-[0-9a-fA-F-]{20,}|[0-9a-fA-F]{24,}|\d{3,}"
     r"|[A-Za-z0-9]{15}|[A-Za-z0-9]{18}|\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2})$")
+# A path segment right after one of these is a person's id / username
+# ("students/hbaig5", "student/jim.ashe", "mentors/x") → {id}.
+_PERSON_SEG_BEFORE = {"students", "student", "mentors", "mentor", "username",
+                      "users", "user", "learners", "learner"}
 _ID_KEY = re.compile(r"^(?:[0-9a-fA-F-]{16,}|\d{3,}|[A-Z]\d{3}[A-Z0-9]*|.*@.*)$")
 
 
@@ -755,8 +759,16 @@ def path_template(url: str) -> tuple:
     host = "" if sp.netloc in ("", GATEWAY_HOST, "x") else "//" + sp.netloc
     # Any segment carrying a run of 5+ digits (ids, timestamps, composite
     # note keys like "2026-10-28T12:31:18.588+0000813722205") → {id}.
-    segs = ["{id}" if (_ID_SEG.match(s) or re.search(r"\d{5}", s)) else s
-            for s in sp.path.split("/")]
+    raw = sp.path.split("/")
+    segs = []
+    for i, seg in enumerate(raw):
+        prev = raw[i - 1].lower() if i else ""
+        idish = (_ID_SEG.match(seg) or re.search(r"\d{5}", seg)
+                 or (seg and prev in _PERSON_SEG_BEFORE
+                     and seg.lower() not in ("profile", "assigned", "search",
+                                             "notifications", "offerings",
+                                             "settings")))
+        segs.append("{id}" if idish else seg)
     return host + "/".join(segs), sorted(parse_qs(sp.query,
                                                   keep_blank_values=True))
 
