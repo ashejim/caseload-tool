@@ -3351,11 +3351,10 @@ class BrowserWorker:
                     continue
                 ids = [str(w if kinds[name] == "uuid" else p) for w, _s, p in part
                        if (w if kinds[name] == "uuid" else p)]
-                # v2 intermittently 500s under load: one at a time + a retry.
-                slow = name == "v2"
-                res = l3.fetch_get_batch(page, headers, base, ids, suf,
-                                         concurrency=1 if slow else 3,
-                                         retry_500=slow)
+                # v2 500s for most learners (not load — serial + retry didn't
+                # help, 2026-11-04), so it's best-effort: degree % / future
+                # terms only where Learner360 has them.
+                res = l3.fetch_get_batch(page, headers, base, ids, suf)
                 expired = [k for k, v in res.items() if (v or {}).get("status") == 401]
                 if expired and refreshes < 10:
                     refreshes += 1
