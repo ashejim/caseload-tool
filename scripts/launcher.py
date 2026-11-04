@@ -6363,6 +6363,16 @@ class CaseloadPanel:
         if q.lower().startswith(("l360discover", "1360discover")):
             self.app._l360_discover("stop" not in q.lower())
             return "break"
+        # "l360cohort: C949" — everyone enrolled in a course across my
+        # Learner360 teams (counts per team); "l360cohort: C949 save" stores
+        # the roster for course-focused work.
+        if q.lower().startswith(("l360cohort", "1360cohort")):
+            parts = q.split(":", 1)[1].split() if ":" in q else []
+            course = next((p.upper() for p in parts
+                           if p.lower() not in ("save", "dry")), "")
+            self.app._l360_cohort(course, save="save" in [p.lower()
+                                                          for p in parts])
+            return "break"
         # "l360plan:" — import Learner360 degree plans + program mentors;
         # "l360plan: dry" = read 10 learners and report labels/counts only.
         if q.lower().startswith(("l360plan", "1360plan")):
@@ -12811,6 +12821,54 @@ class App:
         st["stored"] += r.get("stored", 0)
         st["i"] += n
         self.root.after(1500, self._l360_pbg_step)
+
+    def _l360_cohort(self, course: str, save: bool = False) -> None:
+        """`l360cohort: C949 [save]` — learners enrolled in ``course`` across
+        all my Learner360 teams. Logs counts per team (no student values);
+        ``save`` stores the roster (history.l360_cohort)."""
+        if not course:
+            self._append_log("Usage: l360cohort: C949   (add 'save' to store "
+                             "the roster)")
+            return
+        if getattr(self, "_offline", False) or not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._append_log(f"Learner360: finding {course} students across your "
+                         "teams…")
+
+        def on_done(res):
+            def ui():
+                if (res or {}).get("error"):
+                    self._append_log(f"✗ {res['error']}", error=True)
+                    return
+                rows = res.get("rows") or []
+                for t in res.get("teams") or []:
+                    self._append_log(
+                        f"  team {t['name']}: {t['members']} member(s), "
+                        f"{t['learners']} learner(s), {t['in_course']} in "
+                        f"{course}" + (f" — {t['error']}" if t.get("error")
+                                       else ""))
+                with_pidm = sum(1 for r in rows if r.get("pidm"))
+                progs = len({r.get("program") for r in rows if r.get("program")})
+                self._append_log(f"Learner360 {course}: {len(rows)} unique "
+                                 f"student(s), {with_pidm} with a PIDM, "
+                                 f"{progs} degree program(s).")
+                if save:
+                    try:
+                        n = history.replace_l360_cohort(course, rows)
+                        self._append_log(f"  ✓ saved the {course} roster "
+                                         f"({n} students).")
+                    except Exception as e:
+                        self._append_log(f"  ✗ couldn't save: {e}", error=True)
+                else:
+                    self._append_log(f"  (dry run — type l360cohort: {course} "
+                                     "save to store it)")
+            try:
+                self.root.after(0, ui)
+            except Exception:
+                pass
+
+        self.worker.submit_l360_course_cohort(course, on_done, surface=False)
 
     def _l360_plan_dry(self) -> None:
         """`l360plan: dry` — read 10 learners' plans; report which id kind

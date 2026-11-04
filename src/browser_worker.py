@@ -545,6 +545,13 @@ class BrowserWorker:
         self.q.put(("L360_ACTIVITY", targets, days, on_done, surface,
                     background))
 
+    def submit_l360_course_cohort(self, course: str,
+                                  on_done: Callable[[dict], None],
+                                  surface: bool = True) -> None:
+        """READ-ONLY: everyone enrolled in ``course`` across my Learner360
+        teams (see _l360_course_cohort)."""
+        self.q.put(("L360_COHORT", course, on_done, surface))
+
     def submit_l360_plan_fetch(self, targets: list,
                                on_done: Callable[[dict], None],
                                surface: bool = True,
@@ -1219,6 +1226,15 @@ class BrowserWorker:
                 res = self._l360_team_roster(ctx, surface=surface)
             except Exception as e:
                 res = {"error": f"Learner360 team roster crashed: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "L360_COHORT":
+            _, course, on_done, surface = cmd
+            res = {}
+            try:
+                res = self._l360_course_cohort(ctx, course, surface=surface)
+            except Exception as e:
+                res = {"error": f"Learner360 course cohort crashed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "L360_PLAN":
@@ -3231,6 +3247,92 @@ class BrowserWorker:
                 "value_key": f"{field}/{value_key}", "teams": len(team_ids),
                 "members": len(members),
                 "server_total": (first.get("page") or {}).get("totalElements")}
+
+    def _l360_course_cohort(self, ctx, course: str,
+                            surface: bool = True) -> dict:
+        """READ-ONLY: every learner enrolled in ``course`` across ALL the
+        teams Learner360 lets me see (teams/assigned -> members -> caseloads/
+        search ?team=<id> with caseloadOwner IN members, all pages), kept
+        when their course list includes ``course``. Returns {ok, rows,
+        teams: [{name, members, learners, in_course}]} or {error}. Rows
+        carry ids + owner/team only."""
+        from src import learner360 as l3
+
+        def items(resp):
+            if isinstance(resp, list):
+                return resp
+            if isinstance(resp, dict):
+                for v in resp.values():
+                    if isinstance(v, list):
+                        return v
+            return []
+
+        want = str(course or "").strip().upper()
+        sess = self._l360_session(ctx, surface=surface)
+        if isinstance(sess, dict):
+            return sess
+        page, headers, _user, _snap = sess
+        r = l3.api(page, headers, "GET", l3.TEAMS_ASSIGNED)
+        teams = [t for t in items(r["json"]) if isinstance(t, dict)]
+        if not teams:
+            return {"error": f"no Learner360 teams (HTTP {r['status']})"}
+        rows, team_info = {}, []
+        for t in teams[:20]:
+            tid = next((str(t[k]) for k in ("id", "teamId", "uuid") if t.get(k)),
+                       "")
+            tname = str(t.get("name") or t.get("teamName") or tid)
+            if not tid:
+                continue
+            m = l3.api(page, headers, "GET", l3.TEAM_MEMBERS.format(team=tid))
+            its = [x for x in items(m["json"]) if isinstance(x, dict)]
+            pinfo = m["json"] if isinstance(m["json"], dict) else {}
+            tp, sz = pinfo.get("totalPages") or 1, pinfo.get("size") or 20
+            for pn in range(1, min(int(tp), 20)):
+                mm = l3.api(page, headers, "GET", l3.TEAM_MEMBERS.format(team=tid)
+                            + f"?page={pn}&size={sz}")
+                its += [x for x in items(mm["json"]) if isinstance(x, dict)]
+            members = sorted({str(x["wguId"]) for x in its if x.get("wguId")})
+            info = {"name": tname, "members": len(members), "learners": 0,
+                    "in_course": 0, "status": m["status"]}
+            team_info.append(info)
+            if not members:
+                continue
+            url = f"{l3.CASELOAD_SEARCH}?team={tid}"
+            pg, total_pages = 0, 1
+            while pg < total_pages and pg <= 300:
+                s_ = l3.api(page, headers, "POST", url,
+                            l3.team_caseload_query(pg, members, "values"))
+                if s_["status"] != 200 or not isinstance(s_["json"], dict):
+                    info["error"] = f"page {pg} HTTP {s_['status']}"
+                    break
+                data = s_["json"]
+                total_pages = (data.get("page") or {}).get("totalPages") or 1
+                for it in data.get("content") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    info["learners"] += 1
+                    courses = [str(c).strip().upper()
+                               for c in (it.get("courses") or [])]
+                    if want not in courses:
+                        continue
+                    info["in_course"] += 1
+                    au = it.get("assignedUser") or {}
+                    sid = str(it.get("studentId") or "")
+                    if not sid:
+                        continue
+                    rows[sid] = {
+                        "student_id": sid,
+                        "wgu_id": str(it.get("studentWguId") or ""),
+                        "pidm": str(it.get("studentPidm") or ""),
+                        "owner": str(au.get("name") or "")
+                        if isinstance(au, dict) else "",
+                        "team": tname,
+                        "term_end": l3.norm_date(it.get("termEndDate")),
+                        "momentum": str(it.get("momentum") or ""),
+                        "program": str(it.get("program") or ""),
+                    }
+                pg += 1
+        return {"ok": True, "rows": list(rows.values()), "teams": team_info}
 
     def _l360_activity_fetch(self, ctx, targets: list, days: int,
                              surface: bool = True,

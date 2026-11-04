@@ -325,6 +325,22 @@ CREATE INDEX IF NOT EXISTS ix_l360_activity_date ON l360_activity(activity_date)
 -- Learner360 TEAM roster (the Team filter: every caseload under the manager)
 -- — one row per learner+course, replaced wholesale on each pull. Overlaid on
 -- the course-scan roster by the inbox labeler (src/l360_roster.overlay).
+-- Learner360 COURSE COHORTS (e.g. C949 students across my teams) — the
+-- roster for course-focused work outside my own caseload. Replaced per
+-- course on each pull.
+CREATE TABLE IF NOT EXISTS l360_cohort (
+    course      TEXT NOT NULL,
+    student_id  TEXT NOT NULL,      -- without leading zeros
+    wgu_id      TEXT,
+    pidm        TEXT,
+    owner       TEXT,
+    team        TEXT,
+    term_end    TEXT,
+    momentum    TEXT,
+    program     TEXT,
+    updated_at  TEXT,
+    PRIMARY KEY (course, student_id)
+);
 -- Learner360 DEGREE PLAN + community of care, one compact JSON summary per
 -- learner (learner360.parse_plan), replaced on each import.
 CREATE TABLE IF NOT EXISTS l360_degree_plan (
@@ -1354,6 +1370,38 @@ def mark_l360_activity_imported(*, db_path=HISTORY_DB,
         with conn:
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
                          "('l360_activity_last_import', ?)", (ts,))
+    finally:
+        conn.close()
+
+
+def replace_l360_cohort(course: str, rows: list, *, db_path=HISTORY_DB,
+                        now: Optional[datetime] = None) -> int:
+    """Replace the stored cohort for ``course`` with ``rows``."""
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    c = str(course or "").strip().upper()
+    vals = [(c, str(r.get("student_id") or "").lstrip("0"), r.get("wgu_id") or "",
+             r.get("pidm") or "", r.get("owner") or "", r.get("team") or "",
+             r.get("term_end") or "", r.get("momentum") or "",
+             r.get("program") or "", ts)
+            for r in rows or [] if str(r.get("student_id") or "").strip()]
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute("DELETE FROM l360_cohort WHERE course = ?", (c,))
+            conn.executemany("INSERT OR REPLACE INTO l360_cohort VALUES "
+                             "(?,?,?,?,?,?,?,?,?,?)", vals)
+        return len(vals)
+    finally:
+        conn.close()
+
+
+def load_l360_cohort(course: str, *, db_path=HISTORY_DB) -> list:
+    """Stored cohort rows for ``course`` (dicts)."""
+    conn = _connect(db_path)
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM l360_cohort WHERE course = ? ORDER BY student_id",
+            (str(course or "").strip().upper(),))]
     finally:
         conn.close()
 

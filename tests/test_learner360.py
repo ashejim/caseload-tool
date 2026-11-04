@@ -515,6 +515,25 @@ def test_degree_plan_store_and_columns():
     assert row["TermCoursesLeft"] == "" and row["LastCourseInTerm"] == ""
 
 
+def test_cohort_store_replace_per_course():
+    path = _tmpdb()
+    try:
+        rows = [{"student_id": "000111", "wgu_id": "u1", "pidm": "9",
+                 "owner": "A", "team": "WST - CS Apps", "term_end": "2027-01-31",
+                 "program": "BSCS"},
+                {"student_id": "222", "wgu_id": "u2", "pidm": ""}]
+        assert history.replace_l360_cohort("c949", rows, db_path=path) == 2
+        history.replace_l360_cohort("D502", rows[:1], db_path=path)
+        got = history.load_l360_cohort("C949", db_path=path)
+        assert [r["student_id"] for r in got] == ["111", "222"]
+        assert got[0]["team"] == "WST - CS Apps" and got[0]["program"] == "BSCS"
+        history.replace_l360_cohort("C949", rows[1:], db_path=path)   # replace
+        assert len(history.load_l360_cohort("C949", db_path=path)) == 1
+        assert len(history.load_l360_cohort("D502", db_path=path)) == 1
+    finally:
+        os.remove(path)
+
+
 def test_discovery_baseline_diff():
     from src import learner360 as l3
     gw = "https://faculty-api-gateway.wgu.edu/learner360/v1/"
