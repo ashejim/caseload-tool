@@ -6403,6 +6403,18 @@ class CaseloadPanel:
         if q.lower().startswith(("l360activity", "1360activity")):
             parts = (q.split(":", 1)[1].strip().lower().split()
                      if ":" in q else [])
+            # "l360activity: C949" — the saved course cohort, 365 days.
+            course = next((p.upper() for p in parts
+                           if len(p) == 4 and p[0].isalpha() and p[1:].isdigit()),
+                          "")
+            if course:
+                if not self.app._start_l360_activity_bg(manual=True,
+                                                        cohort=course):
+                    self.app._append_log(
+                        f"Couldn't start — is another activity import running, "
+                        f"or is there no saved {course} roster (l360cohort: "
+                        f"{course} save)?")
+                return "break"
             days = next((int(x) for x in parts if x.isdigit()), 365)
             self.app._l360_activity_import(dry="dry" in parts, days=days)
             return "break"
@@ -12684,16 +12696,26 @@ class App:
             except Exception:
                 pass
 
-    def _start_l360_activity_bg(self, manual: bool = False) -> bool:
+    def _start_l360_activity_bg(self, manual: bool = False,
+                                cohort: str = "") -> bool:
         """Start the batched activity import now. Window = days since the last
-        completed import + 7 (14..365; 365 the first time). True if started."""
+        completed import + 7 (14..365; 365 the first time). ``cohort`` (a
+        course code) reads the saved course cohort instead of my caseload —
+        a full 365 days, and the weekly-import marker is left alone. True if
+        started."""
         if (getattr(self, "_offline", False) or getattr(self, "_l360_abg", None)
                 or not self.worker.ready_event.is_set()):
             return False
-        targets = history.l360_note_targets()
+        if cohort:
+            targets = [(r["wgu_id"], r["student_id"])
+                       for r in history.load_l360_cohort(cohort)
+                       if r.get("wgu_id")]
+        else:
+            targets = history.l360_note_targets()
         if not targets:
             return False
-        window, last = 365, history.l360_activity_last_import()
+        window, last = 365, (None if cohort
+                             else history.l360_activity_last_import())
         if last:
             try:
                 from datetime import datetime as _dt
@@ -12702,7 +12724,8 @@ class App:
             except ValueError:
                 pass
         self._l360_abg = {"targets": list(targets), "i": 0, "window": window,
-                          "events": 0, "new": 0, "fail": 0, "t0": time.time()}
+                          "events": 0, "new": 0, "fail": 0, "t0": time.time(),
+                          "cohort": cohort}
         self._append_log(
             f"Learner360 activity: {'import' if manual else 'weekly import'} "
             f"starting in the background — last {window} days for "
@@ -13211,7 +13234,7 @@ class App:
         if st["i"] >= len(st["targets"]):
             self._l360_abg = None
             n = len(st["targets"])
-            if st["fail"] <= max(3, n // 10):
+            if st["fail"] <= max(3, n // 10) and not st.get("cohort"):
                 try:
                     history.mark_l360_activity_imported()
                 except Exception:
