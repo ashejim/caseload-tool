@@ -102,6 +102,8 @@ def test_persist_and_load_course_assess():
                                 ).fetchone()[0] == 3
         finally:
             conn.close()
+        assert history.course_assess_recent("c949", db_path=path) == {"123", "456"}
+        assert history.course_assess_recent("D502", db_path=path) == set()
         history.mark_course_assess_imported("C949", db_path=path)
         assert history.course_assess_last_import("c949", db_path=path)
     finally:

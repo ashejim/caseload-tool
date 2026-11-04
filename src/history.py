@@ -1491,6 +1491,21 @@ def load_course_assess(course: str, *, db_path=HISTORY_DB) -> dict:
         conn.close()
 
 
+def course_assess_recent(course: str, days: float = 2, *,
+                         db_path=HISTORY_DB) -> set:
+    """Student ids whose ``course`` assessment data was stored within
+    ``days`` — so an interrupted import can resume where it stopped."""
+    from datetime import timedelta
+    cut = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT student_id FROM course_assess WHERE course = ? AND "
+            "updated_at >= ?", (str(course or "").strip().upper(), cut))}
+    finally:
+        conn.close()
+
+
 def course_assess_last_import(course: str, *, db_path=HISTORY_DB) -> Optional[str]:
     conn = _connect(db_path)
     try:

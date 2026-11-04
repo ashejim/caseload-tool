@@ -6373,10 +6373,11 @@ class CaseloadPanel:
         if q.lower().startswith(("l360assess:", "1360assess:")) or \
                 q.lower().strip() in ("l360assess", "1360assess"):
             parts = q.split(":", 1)[1].split() if ":" in q else []
-            course = next((p.upper() for p in parts if p.lower() != "dry"),
-                          "C949")
-            self.app._start_course_assess(course, dry="dry" in
-                                          [p.lower() for p in parts])
+            low = [p.lower() for p in parts]
+            course = next((p.upper() for p in parts
+                           if p.lower() not in ("dry", "all")), "C949")
+            self.app._start_course_assess(course, dry="dry" in low,
+                                          everyone="all" in low)
             return "break"
         if q.lower().startswith(("l360assessprobe", "1360assessprobe")):
             parts = q.split(":", 1)[1].split() if ":" in q else []
@@ -12863,10 +12864,12 @@ class App:
 
     _COURSE_ASSESS_BATCH = 3          # ~12 s per student; keep the worker free
 
-    def _start_course_assess(self, course: str, dry: bool = False) -> None:
+    def _start_course_assess(self, course: str, dry: bool = False,
+                             everyone: bool = False) -> None:
         """Import ``course``'s assessment data for its saved cohort, in small
         background batches that yield to the user. ``dry`` reads 10 and
-        reports counts without storing."""
+        reports counts without storing. Students stored in the last 2 days
+        are skipped (resume after an interruption) unless ``everyone``."""
         if getattr(self, "_cabg", None):
             self._append_log("A course assessment import is already running.")
             return
@@ -12880,6 +12883,20 @@ class App:
             self._append_log(f"No saved {course} roster — run l360cohort: "
                              f"{course} save first.")
             return
+        skipped = 0
+        if not dry and not everyone:
+            try:
+                done = history.course_assess_recent(course)
+            except Exception:
+                done = set()
+            before = len(tg)
+            tg = [t for t in tg if str(t[1]).lstrip("0") not in done]
+            skipped = before - len(tg)
+            if not tg:
+                self._append_log(f"{course} assessments: all {before} students "
+                                 "were imported in the last 2 days — type "
+                                 f"l360assess: {course} all to re-import.")
+                return
         if dry:
             tg = tg[:10]
         from collections import Counter
@@ -12888,7 +12905,9 @@ class App:
                       "t0": time.time()}
         self._append_log(
             f"{course} assessments: {'dry run on' if dry else 'importing'} "
-            f"{len(tg)} students in the background, "
+            f"{len(tg)} students in the background"
+            + (f" (skipping {skipped} already imported)" if skipped else "")
+            + ", "
             f"{self._COURSE_ASSESS_BATCH} at a time (anything you do goes "
             "first). Keep a course page open in the app's browser.")
         self._cabg_step()
@@ -12931,10 +12950,22 @@ class App:
             return
         res = res or {}
         if res.get("error"):
+            # Transient network/sign-in blips: retry this batch after a
+            # minute (up to 3 times in a row) before giving up.
+            st["retries"] = st.get("retries", 0) + 1
+            if st["retries"] <= 3 and not res.get("need_portal"):
+                self._append_log(f"  {st['course']} assessments: batch failed "
+                                 f"({str(res['error'])[:120]}) — retrying in "
+                                 f"1 min ({st['retries']}/3)…")
+                self.root.after(60_000, self._cabg_step)
+                return
             self._cabg = None
             self._append_log(f"{st['course']} assessments stopped after "
-                             f"{st['i']} students: {res['error']}", error=True)
+                             f"{st['i']} students: {res['error']} — type "
+                             f"l360assess: {st['course']} to resume.",
+                             error=True)
             return
+        st["retries"] = 0
         st["counts"].update(res.get("counts") or {})
         by = res.get("by_student") or {}
         if st["dry"]:
