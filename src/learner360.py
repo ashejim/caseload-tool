@@ -532,19 +532,20 @@ def activity_shape(resps: list) -> dict:
             "span": (min(days), max(days)) if days else None}
 
 
-_GET_SUFFIX_BATCH_JS = """async ([base, suffix, headers, ids, conc]) => {
+_GET_SUFFIX_BATCH_JS = """async ([base, suffix, headers, ids, conc, retry, tries]) => {
   const out = {}; let i = 0;
+  const rs = retry || [429, 502, 503, 504]; const nt = tries || 4;
   const h = Object.assign(
     {'Accept': 'application/json', 'Content-Type': 'application/json'}, headers);
   const run = async () => {
     while (i < ids.length) {
       const id = ids[i++];
-      for (let a = 0; a < 4; a++) {
+      for (let a = 0; a < nt; a++) {
         try { const r = await fetch(base + id + suffix, {headers: h});
               out[id] = {status: r.status, body: await r.text()};
-              if (![429, 502, 503, 504].includes(r.status)) break; }
+              if (!rs.includes(r.status)) break; }
         catch (e) { out[id] = {status: 'fetch-error', body: String(e)}; }
-        if (a < 3) await new Promise(res => setTimeout(res, [2000, 5000, 10000][a]));
+        if (a < nt - 1) await new Promise(res => setTimeout(res, [2000, 5000, 10000][a]));
       }
     }
   };
@@ -921,12 +922,16 @@ def course_done(status: str) -> bool:
 
 
 def fetch_get_batch(page, headers: dict, base_path: str, ids: list,
-                    suffix: str = "", concurrency: int = 3) -> dict:
+                    suffix: str = "", concurrency: int = 3,
+                    retry_500: bool = False) -> dict:
     """GET GATEWAY+base_path+<id>+suffix for many ids in-page (overload
-    retries). → {id: {status, body}}."""
+    retries). ``retry_500`` also retries a 500 once (2 s) — for an endpoint
+    that intermittently 500s. → {id: {status, body}}."""
+    extra = ([[429, 500, 502, 503, 504], 2] if retry_500 else [None, None])
     return page.evaluate(_GET_SUFFIX_BATCH_JS,
                          [GATEWAY + base_path, suffix, headers,
-                          [str(i) for i in ids], max(1, int(concurrency))]) or {}
+                          [str(i) for i in ids], max(1, int(concurrency))]
+                         + extra) or {}
 
 
 def parse_plan(v1, v2, coc) -> dict:

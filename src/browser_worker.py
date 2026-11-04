@@ -3341,7 +3341,7 @@ class BrowserWorker:
         if "v1" not in kinds and "v2" not in kinds:
             return {"error": f"degree-plan rejected both id kinds {probe}",
                     "probe": probe}
-        by_student, fails = {}, Counter()
+        by_student, fails, no_plan = {}, Counter(), 0
         t0, chunk, refreshes = time.time(), 10, 0
         for i in range(0, len(tg), chunk):
             part = tg[i:i + chunk]
@@ -3351,7 +3351,11 @@ class BrowserWorker:
                     continue
                 ids = [str(w if kinds[name] == "uuid" else p) for w, _s, p in part
                        if (w if kinds[name] == "uuid" else p)]
-                res = l3.fetch_get_batch(page, headers, base, ids, suf)
+                # v2 intermittently 500s under load: one at a time + a retry.
+                slow = name == "v2"
+                res = l3.fetch_get_batch(page, headers, base, ids, suf,
+                                         concurrency=1 if slow else 3,
+                                         retry_500=slow)
                 expired = [k for k, v in res.items() if (v or {}).get("status") == 401]
                 if expired and refreshes < 10:
                     refreshes += 1
@@ -3379,6 +3383,10 @@ class BrowserWorker:
                     by_student[sid] = l3.parse_plan(bodies.get("v1"),
                                                     bodies.get("v2"),
                                                     bodies.get("coc"))
+                elif ((got.get("v1") or {}).get(
+                        str(w if kinds.get("v1") == "uuid" else p)) or {}
+                        ).get("status") in (500, 404, 204):
+                    no_plan += 1          # Learner360 has no plan for them
             if not background:
                 self.on_status(f"  [l360] degree plan {min(i + chunk, len(tg))}/"
                                f"{len(tg)} ({time.time() - t0:.0f}s)")
@@ -3387,7 +3395,8 @@ class BrowserWorker:
                     "probe": probe}
         return {"ok": True, "by_student": by_student, "id_kinds": kinds,
                 "probe": probe, "fetched": len(by_student),
-                "failed": len(tg) - len(by_student),
+                "failed": len(tg) - len(by_student) - no_plan,
+                "no_plan": no_plan,
                 "fail_statuses": dict(fails),
                 "vocab": l3.plan_vocab(list(by_student.values()))}
 

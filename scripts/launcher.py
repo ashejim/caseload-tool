@@ -12838,7 +12838,8 @@ class App:
                     f"  id kinds: {res.get('id_kinds')}  probe: "
                     f"{res.get('probe')}")
                 self._append_log(
-                    f"  {res.get('fetched')} read, {res.get('failed')} failed "
+                    f"  {res.get('fetched')} read, {res.get('no_plan', 0)} with "
+                    f"no plan, {res.get('failed')} failed "
                     f"{res.get('fail_statuses') or ''}; with term courses "
                     f"{have('courses')}, future courses {have('future_courses')}"
                     f", degree % {sum(1 for p in plans if p.get('percent_complete') is not None)}"
