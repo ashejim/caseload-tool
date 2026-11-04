@@ -552,6 +552,11 @@ class BrowserWorker:
         teams (see _l360_course_cohort)."""
         self.q.put(("L360_COHORT", course, on_done, surface))
 
+    def submit_l360_assess_probe(self, course: str, targets: list,
+                                 on_done: Callable[[dict], None]) -> None:
+        """READ-ONLY probe of the course-assessment feeds (statuses only)."""
+        self.q.put(("L360_ASSESS_PROBE", course, targets, on_done))
+
     def submit_l360_plan_fetch(self, targets: list,
                                on_done: Callable[[dict], None],
                                surface: bool = True,
@@ -1226,6 +1231,15 @@ class BrowserWorker:
                 res = self._l360_team_roster(ctx, surface=surface)
             except Exception as e:
                 res = {"error": f"Learner360 team roster crashed: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "L360_ASSESS_PROBE":
+            _, course, targets, on_done = cmd
+            res = {}
+            try:
+                res = self._l360_assess_probe(ctx, course, targets)
+            except Exception as e:
+                res = {"error": f"assessment probe crashed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "L360_COHORT":
@@ -2782,6 +2796,12 @@ class BrowserWorker:
         # the Learner360 app's own calls — for read-only MOMI/notes replay.
         if "faculty-api-gateway.wgu.edu" in url:
             self._harvest_l360_auth(request)
+        # Course-assessment gateways (student-portal course page): keep the
+        # bearer AND the page that made the call (in-page fetches from that
+        # origin pass CORS).
+        if "ai-api-gateway.wgu.edu" in url or \
+                "learning-experience-api-gateway.wgu.edu" in url:
+            self._harvest_assess_auth(request)
         if not self._capture_active:
             return
         if method.upper() not in ("POST", "PATCH", "PUT"):
@@ -3030,6 +3050,113 @@ class BrowserWorker:
         if m:
             user = m.group(1)
         self._l360_auth = {"headers": keep, "user": user, "ts": time.time()}
+
+    def _harvest_assess_auth(self, request) -> None:
+        try:
+            hdrs = request.headers or {}
+            auth = hdrs.get("authorization", "")
+            if auth[:7].lower() != "bearer " or len(auth) < 40:
+                return
+            keep = {"authorization": auth}
+            for k, v in hdrs.items():
+                kl = k.lower()
+                if kl.startswith("x-") and not kl.startswith(
+                        ("x-dynatrace", "x-dtpc", "x-dtreferer")):
+                    keep[k] = v
+            pg = None
+            try:
+                pg = request.frame.page
+            except Exception:
+                pass
+            from urllib.parse import urlsplit
+            host = urlsplit(request.url).netloc
+            if not hasattr(self, "_assess_auth"):
+                self._assess_auth = {}
+            self._assess_auth[host] = {"headers": keep, "page": pg,
+                                       "ts": time.time()}
+        except Exception:
+            pass
+
+    def _l360_assess_probe(self, ctx, course: str, targets: list) -> dict:
+        """READ-ONLY probe for the course-assessment feeds on 1-3 learners
+        [(wgu_id, student_id, pidm)]: degree plan v1 -> courseVersionId, then
+        each feed x id kind x route (Learner360 page + its token / the
+        student-portal page + its harvested token). Returns statuses and
+        structure counts only."""
+        import json as _json
+        from urllib.parse import urlsplit
+        from src import learner360 as l3
+        sess = self._l360_session(ctx, surface=False)
+        if isinstance(sess, dict):
+            return sess
+        lpage, lheaders, _u, _s = sess
+        routes = [("l360", lpage, lheaders)]
+        for host, a in (getattr(self, "_assess_auth", {}) or {}).items():
+            pg = a.get("page")
+            try:
+                if pg is not None and not pg.is_closed():
+                    routes.append((f"portal:{host.split('.')[0]}", pg,
+                                   a["headers"]))
+            except Exception:
+                pass
+
+        def get(page, headers, url):
+            try:
+                r = page.evaluate(l3._API_JS, [url, headers, "GET", None]) or {}
+            except Exception as e:
+                return {"status": f"eval-error {type(e).__name__}"}
+            try:
+                r["json"] = _json.loads(r.get("body") or "null")
+            except ValueError:
+                r["json"] = None
+            return r
+
+        out = {"routes": [r[0] for r in routes], "learners": []}
+        for w, sid, pidm in targets[:3]:
+            rec = {"feeds": {}}
+            v1 = l3.api(lpage, lheaders, "GET", l3.PLAN_V1_PATH + w)
+            cv = l3.course_version_from_plan(v1.get("json"), course) \
+                if v1.get("status") == 200 else ""
+            rec["plan"] = v1.get("status")
+            rec["cv_found"] = bool(cv)
+            ids = {"pidm": pidm, "sid": sid, "uuid": w}
+            urls = l3.assess_urls(ids, cv)
+            parsed = {}
+            for feed in ("assessments", "engagement"):
+                for kind, url in urls[feed]:
+                    host = urlsplit(url).netloc
+                    for rname, pg, hd in routes:
+                        if rname.startswith("portal:") and \
+                                rname.split(":")[1] != host.split(".")[0]:
+                            continue
+                        r = get(pg, hd, url)
+                        rec["feeds"][f"{feed}:{kind}:{rname}"] = r.get("status")
+                        if r.get("status") == 200 and feed == "assessments" \
+                                and not parsed:
+                            parsed = l3.parse_assessments(r.get("json"))
+            rec["assessment_kinds"] = {k: {"attempts": len(v["attempts"]),
+                                           "has_code": bool(v["code"]),
+                                           "has_cut": bool(v["cut"])}
+                                       for k, v in parsed.items()}
+            pre = (parsed.get("preA") or {}).get("code") or "PVXO"
+            oa_id = (parsed.get("oa") or {}).get("id") or ""
+            more = l3.assess_urls(ids, cv, pre, oa_id)
+            for feed in ("preA", "coaching"):
+                for kind, url in more[feed]:
+                    host = urlsplit(url).netloc
+                    for rname, pg, hd in routes:
+                        if rname.startswith("portal:") and \
+                                rname.split(":")[1] != host.split(".")[0]:
+                            continue
+                        r = get(pg, hd, url)
+                        st = r.get("status")
+                        rec["feeds"][f"{feed}:{kind}:{rname}"] = st
+                        if st == 200 and feed == "preA":
+                            j = r.get("json")
+                            rec["preA_attempts"] = len(j) if isinstance(j, list) \
+                                else None
+            out["learners"].append(rec)
+        return out
 
     def _learner360_page(self, ctx):
         """The open Learner360 tab in the launcher's context, or None."""

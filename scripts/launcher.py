@@ -6366,6 +6366,12 @@ class CaseloadPanel:
         # "l360cohort: C949" — everyone enrolled in a course across my
         # Learner360 teams (counts per team); "l360cohort: C949 save" stores
         # the roster for course-focused work.
+        # "l360assessprobe: C949" — which route / id each course-assessment
+        # feed accepts, on 3 cohort students (statuses + counts only).
+        if q.lower().startswith(("l360assessprobe", "1360assessprobe")):
+            parts = q.split(":", 1)[1].split() if ":" in q else []
+            self.app._l360_assess_probe((parts[0] if parts else "C949").upper())
+            return "break"
         if q.lower().startswith(("l360cohort", "1360cohort")):
             parts = q.split(":", 1)[1].split() if ":" in q else []
             course = next((p.upper() for p in parts
@@ -12821,6 +12827,42 @@ class App:
         st["stored"] += r.get("stored", 0)
         st["i"] += n
         self.root.after(1500, self._l360_pbg_step)
+
+    def _l360_assess_probe(self, course: str) -> None:
+        rows = history.load_l360_cohort(course)
+        # Prefer students likely to HAVE attempts: momentum isn't a proxy, so
+        # just take the first few with every id.
+        tg = [(r["wgu_id"], r["student_id"], r["pidm"]) for r in rows
+              if r.get("wgu_id") and r.get("pidm")][:3]
+        if not tg:
+            self._append_log(f"No saved {course} roster — run l360cohort: "
+                             f"{course} save first.")
+            return
+        self._append_log(f"Probing {course} assessment feeds on {len(tg)} "
+                         "students (statuses only)…")
+
+        def on_done(res):
+            def ui():
+                if (res or {}).get("error"):
+                    self._append_log(f"✗ {res['error']}", error=True)
+                    return
+                self._append_log(f"  routes available: {res.get('routes')}")
+                for i, rec in enumerate(res.get("learners") or [], 1):
+                    self._append_log(
+                        f"  student {i}: plan HTTP {rec.get('plan')}, "
+                        f"course version found: {rec.get('cv_found')}, "
+                        f"assessments: {rec.get('assessment_kinds')}, "
+                        f"pre-A attempts: {rec.get('preA_attempts')}")
+                    ok = [k for k, v in rec["feeds"].items() if v == 200]
+                    bad = {k: v for k, v in rec["feeds"].items() if v != 200}
+                    self._append_log(f"    200: {ok}")
+                    self._append_log(f"    other: {bad}")
+            try:
+                self.root.after(0, ui)
+            except Exception:
+                pass
+
+        self.worker.submit_l360_assess_probe(course, tg, on_done)
 
     def _l360_cohort(self, course: str, save: bool = False) -> None:
         """`l360cohort: C949 [save]` — learners enrolled in ``course`` across

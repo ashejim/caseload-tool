@@ -1049,3 +1049,86 @@ def plan_vocab(plans: list) -> dict:
         for c in p.get("courses") or []:
             st[c.get("status") or "(blank)"] += 1
     return {"course_status": dict(st.most_common())}
+
+
+# ---------------------------------------------------------------------------
+# Course assessment feeds (C949 work; found by discovery 2026-11-04). They
+# live on OTHER WGU gateways, called by the student-portal course page.
+# ---------------------------------------------------------------------------
+AI_GW = "https://ai-api-gateway.wgu.edu"
+LX_GW = "https://learning-experience-api-gateway.wgu.edu"
+ASSESS_HOSTS = ("ai-api-gateway.wgu.edu", "learning-experience-api-gateway.wgu.edu")
+
+
+def assess_urls(ids: dict, cv: str, preA_code: str = "", oa_id: str = "") -> dict:
+    """Candidate URLs per feed for one learner. ``ids`` = {pidm, sid, uuid};
+    the probe tries each id kind. → {feed: [(id_kind, url)]}."""
+    out = {"assessments": [], "engagement": [], "preA": [], "coaching": []}
+    for kind in ("pidm", "sid", "uuid"):
+        x = ids.get(kind)
+        if not x:
+            continue
+        if cv:
+            out["assessments"].append((kind,
+                f"{AI_GW}/assessments-service/v1/students/{x}/courses/{cv}/"
+                "assessmentsWithUiState"))
+            out["engagement"].append((kind,
+                f"{LX_GW}/studentengagement/v2/status/student/{x}/course/{cv}"))
+        if preA_code:
+            out["preA"].append((kind,
+                f"{LX_GW}/pre-assessment-report/v2/students/{x}/assessments/"
+                f"{preA_code}"))
+    if ids.get("pidm") and oa_id and cv:
+        out["coaching"].append(("pidm",
+            f"{LX_GW}/coachingreport/v4/pidm/{ids['pidm']}/assessmentid/"
+            f"{oa_id}/cv/{cv}"))
+    return out
+
+
+def course_version_from_plan(v1: dict, course: str) -> str:
+    """courseVersionId of ``course`` in a degree-plan v1 response ('' if not
+    in the current term)."""
+    want = str(course or "").upper()
+    for c in (v1 or {}).get("termCourses") or []:
+        if isinstance(c, dict) and str(c.get("code") or "").upper() == want:
+            return str(c.get("courseVersionId") or "")
+    return ""
+
+
+def parse_assessments(resp) -> dict:
+    """{'oa': {...}, 'preA': {...}} from assessmentsWithUiState: code, id,
+    cut score, attempts [{n, passed, score, status, scheduled, result,
+    approval}] per assessment."""
+    out = {}
+    for a in (resp or {}).get("assessment") or [] if isinstance(resp, dict) else []:
+        if not isinstance(a, dict):
+            continue
+        kind = "preA" if a.get("isPreAssessment") else (
+            "oa" if str(a.get("assessmentType") or "").lower().startswith("obj")
+            or a.get("assessmentTypeCode") in ("OA", "O") else
+            str(a.get("assessmentType") or "other").lower())
+        hist = a.get("history") if isinstance(a.get("history"), dict) else {}
+        atts = []
+        for t in hist.get("attempts") or []:
+            if not isinstance(t, dict):
+                continue
+            atts.append({
+                "n": t.get("attemptNumber"), "passed": bool(t.get("passed")),
+                "score": str(t.get("score") or ""),
+                "status": str(t.get("status") or ""),
+                "scheduled": str(t.get("scheduleDateStr") or ""),
+                "result": str(t.get("resultDateStr") or ""),
+                "approval": str(t.get("lastApprovalStatus") or ""),
+                "pending": bool(t.get("pendingApproval")),
+            })
+        out.setdefault(kind, {
+            "code": str(a.get("assessmentCode") or ""),
+            "id": str(a.get("assessmentId") or ""),
+            "type": str(a.get("assessmentType") or ""),
+            "cut": str(a.get("cutScorePercentage") or ""),
+            "state": str(a.get("assessmentStateStr") or a.get("assessmentState")
+                         or ""),
+            "attempts_n": hist.get("numberOfAttempts"),
+            "attempts": atts,
+        })
+    return out

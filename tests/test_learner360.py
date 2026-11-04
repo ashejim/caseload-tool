@@ -515,6 +515,35 @@ def test_degree_plan_store_and_columns():
     assert row["TermCoursesLeft"] == "" and row["LastCourseInTerm"] == ""
 
 
+def test_assessment_urls_and_parse():
+    from src import learner360 as l3
+    u = l3.assess_urls({"pidm": "9", "sid": "", "uuid": "u"}, "777", "PVXO", "55")
+    assert [k for k, _ in u["assessments"]] == ["pidm", "uuid"]   # no blank sid
+    assert u["assessments"][0][1].endswith("/students/9/courses/777/"
+                                           "assessmentsWithUiState")
+    assert u["preA"][0][1].endswith("/students/9/assessments/PVXO")
+    assert u["coaching"] == [("pidm", l3.LX_GW + "/coachingreport/v4/pidm/9/"
+                                       "assessmentid/55/cv/777")]
+    assert l3.assess_urls({"pidm": "9"}, "", "", "")["assessments"] == []
+    assert l3.course_version_from_plan(
+        {"termCourses": [{"code": "C949", "courseVersionId": 777}]}, "c949") == "777"
+    resp = {"assessment": [
+        {"isPreAssessment": True, "assessmentCode": "PVXO", "assessmentId": 1,
+         "history": {"numberOfAttempts": 2, "attempts": [
+             {"attemptNumber": 1, "passed": False, "score": "55"},
+             {"attemptNumber": 2, "passed": True, "score": "80"}]}},
+        {"isPreAssessment": False, "assessmentType": "Objective",
+         "assessmentCode": "KVO1", "assessmentId": 55, "cutScorePercentage": "65",
+         "history": {"numberOfAttempts": 3, "attempts": [
+             {"attemptNumber": 3, "passed": False, "score": "60",
+              "lastApprovalStatus": "Approved"}]}}]}
+    p = l3.parse_assessments(resp)
+    assert p["preA"]["code"] == "PVXO" and len(p["preA"]["attempts"]) == 2
+    assert p["oa"]["id"] == "55" and p["oa"]["cut"] == "65"
+    assert p["oa"]["attempts"][0]["approval"] == "Approved"
+    assert l3.parse_assessments(None) == {}
+
+
 def test_cohort_store_replace_per_course():
     path = _tmpdb()
     try:
