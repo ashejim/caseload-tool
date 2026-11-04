@@ -40,13 +40,17 @@ OVERLAY_JS = r"""
     .ea   { background: #fff; border-color: #c2410c; color: #c2410c; }
     .muted { color: #5b6b7f; background: transparent; border-color: transparent;
       padding: 0 2px; }
-    .pill { position: fixed; right: 16px; bottom: 16px; z-index: 2147483000;
-      display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    .pill { position: fixed; left: 16px; bottom: 16px; z-index: 2147483000;
+      display: flex; align-items: center; gap: 6px; padding: 6px 9px;
       border-radius: 20px; background: #002855; color: #fff;
       font: 600 12px/1 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
       box-shadow: 0 4px 14px rgba(0,40,85,.28); cursor: pointer;
       user-select: none; transition: opacity .15s ease; }
     .pill.off { background: #5b6b7f; }
+    .pill .txt { max-width: 0; overflow: hidden; white-space: nowrap;
+      transition: max-width .2s ease; }
+    .pill:hover .txt, .pill.drag .txt { max-width: 320px; }
+    .pill.drag { cursor: grabbing; opacity: .85; }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #5dd39e; }
     .pill.off .dot { background: #c7d0db; }
   `;
@@ -59,10 +63,48 @@ OVERLAY_JS = r"""
   pillHost.setAttribute('data-cn', 'pill');
   const pillRoot = pillHost.attachShadow({ mode: 'open' });
   pillRoot.innerHTML = `<style>${CSS}</style>
-    <div class="pill" title="CaseloadNotes overlay — click to show/hide">
-      <span class="dot"></span><span class="txt">CaseloadNotes</span></div>`;
+    <div class="pill" title="CaseloadNotes overlay — click to show/hide, drag to move">
+      <span class="dot"></span><b>CN</b><span class="txt">CaseloadNotes</span></div>`;
   const pill = pillRoot.querySelector('.pill');
+  // Draggable (position remembered) so it never sits on the page's own
+  // buttons; a click without movement toggles the overlay.
+  const placePill = (x, y) => {
+    const w = pill.offsetWidth || 60, h = pill.offsetHeight || 28;
+    x = Math.max(4, Math.min(window.innerWidth - w - 4, x));
+    y = Math.max(4, Math.min(window.innerHeight - h - 4, y));
+    Object.assign(pill.style, {left: x + 'px', top: y + 'px', bottom: 'auto',
+                               right: 'auto'});
+  };
+  try {
+    const pos = JSON.parse(localStorage.getItem('cnPillPos') || 'null');
+    if (pos) requestAnimationFrame(() => placePill(pos.x, pos.y));
+  } catch (e) {}
+  let drag = null;
+  pill.addEventListener('pointerdown', ev => {
+    const r = pill.getBoundingClientRect();
+    drag = {dx: ev.clientX - r.left, dy: ev.clientY - r.top,
+            x0: ev.clientX, y0: ev.clientY, moved: false};
+    pill.setPointerCapture(ev.pointerId);
+  });
+  pill.addEventListener('pointermove', ev => {
+    if (!drag) return;
+    if (!drag.moved && Math.hypot(ev.clientX - drag.x0, ev.clientY - drag.y0) < 4) return;
+    drag.moved = true;
+    pill.classList.add('drag');
+    placePill(ev.clientX - drag.dx, ev.clientY - drag.dy);
+  });
+  let justDragged = false;
+  pill.addEventListener('pointerup', () => {
+    const d = drag; drag = null;
+    pill.classList.remove('drag');
+    if (d && d.moved) {
+      justDragged = true;               // swallow the click that follows
+      const r = pill.getBoundingClientRect();
+      try { localStorage.setItem('cnPillPos', JSON.stringify({x: r.left, y: r.top})); } catch (e) {}
+    }
+  });
   pill.addEventListener('click', () => {
+    if (justDragged) { justDragged = false; return; }
     S.on = !S.on;
     try { localStorage.setItem('cnOverlayOn', S.on ? '1' : '0'); } catch (e) {}
     schedule();
