@@ -6368,6 +6368,16 @@ class CaseloadPanel:
         # the roster for course-focused work.
         # "l360assessprobe: C949" — which route / id each course-assessment
         # feed accepts, on 3 cohort students (statuses + counts only).
+        # "l360assess: C949 [dry]" — import the course's assessment data for
+        # the saved cohort (background batches); dry = 10 students, counts.
+        if q.lower().startswith(("l360assess:", "1360assess:")) or \
+                q.lower().strip() in ("l360assess", "1360assess"):
+            parts = q.split(":", 1)[1].split() if ":" in q else []
+            course = next((p.upper() for p in parts if p.lower() != "dry"),
+                          "C949")
+            self.app._start_course_assess(course, dry="dry" in
+                                          [p.lower() for p in parts])
+            return "break"
         if q.lower().startswith(("l360assessprobe", "1360assessprobe")):
             parts = q.split(":", 1)[1].split() if ":" in q else []
             self.app._l360_assess_probe((parts[0] if parts else "C949").upper())
@@ -12827,6 +12837,117 @@ class App:
         st["stored"] += r.get("stored", 0)
         st["i"] += n
         self.root.after(1500, self._l360_pbg_step)
+
+    _COURSE_ASSESS_BATCH = 10
+
+    def _start_course_assess(self, course: str, dry: bool = False) -> None:
+        """Import ``course``'s assessment data for its saved cohort, in small
+        background batches that yield to the user. ``dry`` reads 10 and
+        reports counts without storing."""
+        if getattr(self, "_cabg", None):
+            self._append_log("A course assessment import is already running.")
+            return
+        if getattr(self, "_offline", False) or not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        rows = history.load_l360_cohort(course)
+        tg = [(r["wgu_id"], r["student_id"], r["pidm"]) for r in rows
+              if r.get("wgu_id") and r.get("pidm")]
+        if not tg:
+            self._append_log(f"No saved {course} roster — run l360cohort: "
+                             f"{course} save first.")
+            return
+        if dry:
+            tg = tg[:10]
+        from collections import Counter
+        self._cabg = {"course": course, "targets": tg, "i": 0, "dry": dry,
+                      "counts": Counter(), "stored": Counter(),
+                      "t0": time.time()}
+        self._append_log(
+            f"{course} assessments: {'dry run on' if dry else 'importing'} "
+            f"{len(tg)} students in the background, "
+            f"{self._COURSE_ASSESS_BATCH} at a time (anything you do goes "
+            "first). Keep a course page open in the app's browser.")
+        self._cabg_step()
+
+    def _cabg_step(self) -> None:
+        st = getattr(self, "_cabg", None)
+        if not st:
+            return
+        if st["i"] >= len(st["targets"]):
+            self._cabg = None
+            mins = (time.time() - st["t0"]) / 60
+            c = dict(st["counts"])
+            if not st["dry"]:
+                try:
+                    history.mark_course_assess_imported(st["course"])
+                except Exception:
+                    pass
+            self._append_log(
+                f"✓ {st['course']} assessments {'(dry run) ' if st['dry'] else ''}"
+                f"done in {mins:.0f} min: {c}"
+                + ("" if st["dry"] else f"; stored {dict(st['stored'])}"))
+            return
+        if (getattr(self, "_is_busy", False)
+                or not self.worker.ready_event.is_set()):
+            self.root.after(30_000, self._cabg_step)
+            return
+        part = st["targets"][st["i"]:st["i"] + self._COURSE_ASSESS_BATCH]
+
+        def on_done(res):
+            try:
+                self.root.after(0, lambda: self._cabg_got(len(part), res))
+            except Exception:
+                pass
+
+        self.worker.submit_course_assess_fetch(st["course"], part, on_done)
+
+    def _cabg_got(self, n: int, res) -> None:
+        st = getattr(self, "_cabg", None)
+        if not st:
+            return
+        res = res or {}
+        if res.get("error"):
+            self._cabg = None
+            self._append_log(f"{st['course']} assessments stopped after "
+                             f"{st['i']} students: {res['error']}", error=True)
+            return
+        st["counts"].update(res.get("counts") or {})
+        by = res.get("by_student") or {}
+        if st["dry"]:
+            st["i"] += n
+            self.root.after(500, self._cabg_step)
+            return
+
+        def work():
+            try:
+                r = history.persist_course_assess(st["course"], by)
+            except Exception as e:
+                r = {"error": str(e)}
+            try:
+                self.root.after(0, lambda: self._cabg_saved(n, r))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True,
+                         name="course-assess-save").start()
+
+    def _cabg_saved(self, n: int, r: dict) -> None:
+        st = getattr(self, "_cabg", None)
+        if not st:
+            return
+        if (r or {}).get("error"):
+            self._cabg = None
+            self._append_log(f"{st['course']} assessments couldn't save: "
+                             f"{r['error']}", error=True)
+            return
+        st["stored"].update({k: v for k, v in r.items()
+                             if isinstance(v, int)})
+        st["i"] += n
+        if st["i"] % 100 < n:
+            self._append_log(f"  {st['course']} assessments: {st['i']}/"
+                             f"{len(st['targets'])} students…")
+        self.root.after(1000, self._cabg_step)
 
     def _l360_assess_probe(self, course: str) -> None:
         rows = history.load_l360_cohort(course)

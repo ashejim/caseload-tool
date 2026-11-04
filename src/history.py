@@ -341,6 +341,47 @@ CREATE TABLE IF NOT EXISTS l360_cohort (
     updated_at  TEXT,
     PRIMARY KEY (course, student_id)
 );
+-- COURSE ASSESSMENTS (student-portal gateways; src/course_assess): one row
+-- per learner+course with the parsed feeds as JSON.
+CREATE TABLE IF NOT EXISTS course_assess (
+    course            TEXT NOT NULL,
+    student_id        TEXT NOT NULL,   -- without leading zeros
+    pidm              TEXT,
+    course_version    TEXT,
+    assessments_json  TEXT,            -- {oa: {...attempts}, preA: {...}}
+    engagement_json   TEXT,
+    coaching_json     TEXT,            -- [per OA attempt]
+    plan_history_json TEXT,            -- prior + transferred courses
+    preA_report_code  TEXT,
+    updated_at        TEXT,
+    PRIMARY KEY (course, student_id)
+);
+-- Pre-assessment items: the SAME for every student, stored once (stem,
+-- options, correct answer). Local + encrypted only — never exported.
+CREATE TABLE IF NOT EXISTS preA_item (
+    assessment_code TEXT NOT NULL,
+    item_code       TEXT NOT NULL,
+    competency      TEXT,
+    topic           TEXT,
+    item_type       TEXT,
+    text_json       TEXT,
+    first_seen_at   TEXT,
+    PRIMARY KEY (assessment_code, item_code)
+);
+-- Each student's answer to each item, per pre-assessment attempt.
+CREATE TABLE IF NOT EXISTS preA_response (
+    course          TEXT NOT NULL,
+    student_id      TEXT NOT NULL,
+    assessment_code TEXT NOT NULL,
+    attempt_n       INTEGER NOT NULL,
+    attempt_date    TEXT,
+    passed          INTEGER,
+    item_code       TEXT NOT NULL,
+    competency      TEXT,
+    correct         INTEGER,
+    answer          TEXT,
+    PRIMARY KEY (student_id, assessment_code, attempt_n, item_code)
+);
 -- Learner360 DEGREE PLAN + community of care, one compact JSON summary per
 -- learner (learner360.parse_plan), replaced on each import.
 CREATE TABLE IF NOT EXISTS l360_degree_plan (
@@ -1370,6 +1411,102 @@ def mark_l360_activity_imported(*, db_path=HISTORY_DB,
         with conn:
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
                          "('l360_activity_last_import', ?)", (ts,))
+    finally:
+        conn.close()
+
+
+def persist_course_assess(course: str, by_student: dict, *,
+                          db_path=HISTORY_DB,
+                          now: Optional[datetime] = None) -> dict:
+    """Store {student_id: {pidm, cv, assessments, engagement, coaching,
+    plan_history, preA_code, preA_attempts, preA_items}} (the worker's
+    _course_assess_fetch output). Returns counts."""
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    c = str(course or "").strip().upper()
+    dumps = lambda o: json.dumps(o, separators=(",", ":"))  # noqa: E731
+    rows, items, resps = [], {}, []
+    for sid, d in (by_student or {}).items():
+        sid = str(sid).lstrip("0")
+        if not sid or not d:
+            continue
+        rows.append((c, sid, d.get("pidm") or "", d.get("cv") or "",
+                     dumps(d.get("assessments") or {}),
+                     dumps(d.get("engagement") or {}),
+                     dumps(d.get("coaching") or []),
+                     dumps(d.get("plan_history") or {}),
+                     d.get("preA_code") or "", ts))
+        code = d.get("preA_code") or ""
+        for ic, it in (d.get("preA_items") or {}).items():
+            items[(code, ic)] = (code, ic, it.get("competency") or "",
+                                 it.get("topic") or "", it.get("type") or "",
+                                 dumps(it.get("text") or {}), ts)
+        for a in d.get("preA_attempts") or []:
+            n = a.get("n")
+            if n is None:
+                continue
+            for r in a.get("responses") or []:
+                resps.append((c, sid, code, int(n), a.get("date") or "",
+                              1 if a.get("passed") else 0, r["item"],
+                              r.get("competency") or "",
+                              1 if r.get("correct") else 0,
+                              r.get("answer") or ""))
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.executemany("INSERT OR REPLACE INTO course_assess VALUES "
+                             "(?,?,?,?,?,?,?,?,?,?)", rows)
+            # Items keep their FIRST-seen timestamp.
+            conn.executemany("INSERT OR IGNORE INTO preA_item VALUES "
+                             "(?,?,?,?,?,?,?)", list(items.values()))
+            conn.executemany("INSERT OR REPLACE INTO preA_response VALUES "
+                             "(?,?,?,?,?,?,?,?,?,?)", resps)
+        return {"students": len(rows), "items": len(items),
+                "responses": len(resps)}
+    finally:
+        conn.close()
+
+
+def load_course_assess(course: str, *, db_path=HISTORY_DB) -> dict:
+    """{student_id: {pidm, cv, assessments, engagement, coaching,
+    plan_history, preA_code, updated_at}} for ``course``."""
+    conn = _connect(db_path)
+    try:
+        out = {}
+        for r in conn.execute("SELECT * FROM course_assess WHERE course = ?",
+                              (str(course or "").strip().upper(),)):
+            d = {"pidm": r["pidm"], "cv": r["course_version"],
+                 "preA_code": r["preA_report_code"],
+                 "updated_at": r["updated_at"]}
+            for k, col in (("assessments", "assessments_json"),
+                           ("engagement", "engagement_json"),
+                           ("coaching", "coaching_json"),
+                           ("plan_history", "plan_history_json")):
+                try:
+                    d[k] = json.loads(r[col] or "null")
+                except ValueError:
+                    d[k] = None
+            out[r["student_id"]] = d
+        return out
+    finally:
+        conn.close()
+
+
+def course_assess_last_import(course: str, *, db_path=HISTORY_DB) -> Optional[str]:
+    conn = _connect(db_path)
+    try:
+        return _meta_get(conn, f"course_assess_last:{str(course).upper()}")
+    finally:
+        conn.close()
+
+
+def mark_course_assess_imported(course: str, *, db_path=HISTORY_DB,
+                                now: Optional[datetime] = None) -> None:
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                         (f"course_assess_last:{str(course).upper()}", ts))
     finally:
         conn.close()
 

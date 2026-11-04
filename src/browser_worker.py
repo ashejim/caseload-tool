@@ -552,6 +552,12 @@ class BrowserWorker:
         teams (see _l360_course_cohort)."""
         self.q.put(("L360_COHORT", course, on_done, surface))
 
+    def submit_course_assess_fetch(self, course: str, targets: list,
+                                   on_done: Callable[[dict], None]) -> None:
+        """READ-ONLY course assessment import for some learners (see
+        _course_assess_fetch)."""
+        self.q.put(("COURSE_ASSESS", course, targets, on_done))
+
     def submit_l360_assess_probe(self, course: str, targets: list,
                                  on_done: Callable[[dict], None]) -> None:
         """READ-ONLY probe of the course-assessment feeds (statuses only)."""
@@ -1231,6 +1237,15 @@ class BrowserWorker:
                 res = self._l360_team_roster(ctx, surface=surface)
             except Exception as e:
                 res = {"error": f"Learner360 team roster crashed: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "COURSE_ASSESS":
+            _, course, targets, on_done = cmd
+            res = {}
+            try:
+                res = self._course_assess_fetch(ctx, course, targets)
+            except Exception as e:
+                res = {"error": f"course assessment import crashed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "L360_ASSESS_PROBE":
@@ -3157,6 +3172,140 @@ class BrowserWorker:
                                 else None
             out["learners"].append(rec)
         return out
+
+    def _portal_route(self, host: str):
+        """(page, headers) for a course-assessment gateway — the student-
+        portal page that last called it, if still open."""
+        a = (getattr(self, "_assess_auth", {}) or {}).get(host) or {}
+        pg = a.get("page")
+        try:
+            if pg is not None and not pg.is_closed():
+                return pg, a.get("headers") or {}
+        except Exception:
+            pass
+        return None, None
+
+    def _portal_get(self, host: str, url: str) -> dict:
+        """GET ``url`` from the portal page (its origin passes CORS) with its
+        harvested bearer. A 401 reloads that page once (the portal re-signs
+        and its fresh calls re-harvest the token) and retries. → {status,
+        json}."""
+        import json as _json
+        from src import learner360 as l3
+        for attempt in range(2):
+            pg, hd = self._portal_route(host)
+            if pg is None:
+                return {"status": "no-portal-page"}
+            try:
+                r = pg.evaluate(l3._API_JS, [url, hd, "GET", None]) or {}
+            except Exception as e:
+                return {"status": f"eval-error {type(e).__name__}"}
+            if r.get("status") == 401 and attempt == 0:
+                before = ((getattr(self, "_assess_auth", {}) or {}).get(host)
+                          or {}).get("ts", 0)
+                try:
+                    pg.reload(wait_until="domcontentloaded", timeout=30_000)
+                except Exception:
+                    pass
+                deadline = time.time() + 20
+                while time.time() < deadline:
+                    a = (getattr(self, "_assess_auth", {}) or {}).get(host) or {}
+                    if a.get("ts", 0) > before:
+                        break
+                    try:
+                        pg.wait_for_timeout(500)
+                    except Exception:
+                        break
+                continue
+            try:
+                r["json"] = _json.loads(r.get("body") or "null")
+            except ValueError:
+                r["json"] = None
+            r.pop("body", None)
+            return r
+        return {"status": 401}
+
+    def _course_assess_fetch(self, ctx, course: str, targets: list,
+                             background: bool = True) -> dict:
+        """READ-ONLY: per learner [(wgu_id, student_id, pidm)] — degree plan
+        v1 (course version) + v2 (prior/transferred courses) via Learner360;
+        then via the student-portal page: assessment attempts, engagement,
+        the pre-assessment report (items + answers) and OA coaching reports.
+        Returns {ok, by_student, counts} or {error[, need_portal]}."""
+        from collections import Counter
+        from src import course_assess as ca, learner360 as l3
+        ai, lx = l3.ASSESS_HOSTS
+        if self._portal_route(ai)[0] is None or self._portal_route(lx)[0] is None:
+            return {"error": "open a C949 course page in the app's browser "
+                    "first (Learner360 > student > Overview > current term > "
+                    "the course link) so the import can use its sign-in.",
+                    "need_portal": True}
+        sess = self._l360_session(ctx, surface=False, reuse=True)
+        if isinstance(sess, dict):
+            return sess
+        lpage, lheaders, _u, _s = sess
+        extra_codes = ca.PREA_REPORT_CODES.get(str(course).upper(), [])
+        by, counts = {}, Counter()
+        for w, sid, pidm in targets:
+            rec = {"pidm": pidm}
+            v1 = l3.api(lpage, lheaders, "GET", l3.PLAN_V1_PATH + w)
+            if v1.get("status") == 401:
+                sess = self._l360_session(ctx, surface=False)
+                if isinstance(sess, dict):
+                    return sess
+                lpage, lheaders, _u, _s = sess
+                v1 = l3.api(lpage, lheaders, "GET", l3.PLAN_V1_PATH + w)
+            cv = l3.course_version_from_plan(v1.get("json"), course) \
+                if v1.get("status") == 200 else ""
+            rec["cv"] = cv
+            v2 = l3.api(lpage, lheaders, "GET", l3.PLAN_V2_PATH + w)
+            rec["plan_history"] = ca.parse_plan_history(v2.get("json")) \
+                if v2.get("status") == 200 else {}
+            counts["plan_history"] += bool(rec["plan_history"])
+            if not cv:
+                counts["no_course_version"] += 1
+                by[sid] = rec
+                continue
+            a = self._portal_get(ai, ca.assessments_url(pidm, cv))
+            if a.get("status") == "no-portal-page":
+                return {"error": "the student-portal page was closed — open "
+                        "a course page again and re-run.", "need_portal": True,
+                        "by_student": by, "counts": dict(counts)}
+            if a.get("status") != 200:
+                counts[f"assessments:{a.get('status')}"] += 1
+                by[sid] = rec
+                continue
+            parsed = l3.parse_assessments(a.get("json"))
+            rec["assessments"] = parsed
+            counts["assessments"] += 1
+            e = self._portal_get(lx, ca.engagement_url(pidm, cv))
+            if e.get("status") == 200:
+                rec["engagement"] = ca.parse_engagement(e.get("json"))
+                counts["engagement"] += 1
+            pre = parsed.get("preA") or {}
+            if pre.get("attempts"):
+                codes = [c for c in [pre.get("code")] + extra_codes if c]
+                for code in dict.fromkeys(codes):
+                    p = self._portal_get(lx, ca.preA_url(pidm, code))
+                    if p.get("status") == 200 and p.get("json"):
+                        atts, items = ca.parse_preA_report(p.get("json"))
+                        if atts:
+                            rec.update(preA_code=code, preA_attempts=atts,
+                                       preA_items=items)
+                            counts[f"preA_report:{'feed' if code == pre.get('code') else code}"] += 1
+                            break
+                else:
+                    counts["preA_report_empty"] += 1
+            oa = parsed.get("oa") or {}
+            if oa.get("attempts") and oa.get("id"):
+                c = self._portal_get(lx, ca.coaching_url(pidm, oa["id"], cv))
+                if c.get("status") == 200:
+                    rec["coaching"] = ca.parse_coaching(c.get("json"))
+                    counts["coaching"] += 1
+                else:
+                    counts[f"coaching:{c.get('status')}"] += 1
+            by[sid] = rec
+        return {"ok": True, "by_student": by, "counts": dict(counts)}
 
     def _learner360_page(self, ctx):
         """The open Learner360 tab in the launcher's context, or None."""
