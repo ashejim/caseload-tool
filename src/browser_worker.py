@@ -2803,7 +2803,7 @@ class BrowserWorker:
         # page already fetches, so the scan can skip the scroll-scrape.
         if "getCaseLoadMainGridData" in url:
             self._capture_grid_data(response)
-        if self._l360_disc is not None and "faculty-api-gateway.wgu.edu" in url:
+        if self._l360_disc is not None and ".wgu.edu/" in url:
             self._l360_disc_record(response)
         # While reading the EA dashboard, grab its EmployeeEvent__c JSON feed.
         if self._ea_capture_armed and "/aura" in url:
@@ -2856,11 +2856,17 @@ class BrowserWorker:
             if method == "OPTIONS":
                 return
             body = None
+            ctype = ""
             try:
-                if "json" in ((response.headers or {}).get("content-type", "")):
+                ctype = (response.headers or {}).get("content-type", "")
+                if "json" in ctype:
                     body = response.json()
             except Exception:
                 body = None
+            # Other WGU sites (course of study, assessment reports): data
+            # feeds only — skip pages, scripts, styles, images, fonts.
+            if "faculty-api-gateway.wgu.edu" not in response.url and "json" not in ctype:
+                return
             with self._l360_disc_lock:
                 if self._l360_disc is not None:
                     l3.discovery_add(self._l360_disc, method, response.url,
