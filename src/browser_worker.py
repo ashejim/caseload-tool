@@ -3208,6 +3208,38 @@ class BrowserWorker:
                 continue
         return None, None
 
+    def _open_portal_course_page(self, ctx, course: str, target) -> None:
+        """Open the student-portal course page for one learner in a
+        background tab (my.wgu.edu/courses/course/<course version>/for/
+        <pidm>, the page Learner360's course link opens) and wait up to 30 s
+        for its calls to the assessment gateways — so the import has a
+        signed-in portal page without the user opening one. Best-effort."""
+        from src import learner360 as l3
+        try:
+            w, _sid, pidm = target
+            sess = self._l360_session(ctx, surface=False, reuse=True)
+            if isinstance(sess, dict) or not pidm:
+                return
+            lpage, lheaders, _u, _s = sess
+            v1 = l3.api(lpage, lheaders, "GET", l3.PLAN_V1_PATH + w)
+            cv = l3.course_version_from_plan(v1.get("json"), course) \
+                if v1.get("status") == 200 else ""
+            if not cv:
+                return
+            self.on_status("  [portal] opening a course page for the "
+                           "assessment import…")
+            pg = ctx.new_page()
+            pg.goto(f"https://my.wgu.edu/courses/course/{cv}/for/{pidm}",
+                    wait_until="domcontentloaded", timeout=45_000)
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if all((getattr(self, "_assess_auth", {}) or {}).get(h)
+                       for h in l3.ASSESS_HOSTS):
+                    break
+                pg.wait_for_timeout(500)
+        except Exception:
+            pass
+
     def _open_page_hosts(self, ctx) -> list:
         """Hosts of the open tabs (for a 'can't find the portal page' log)."""
         from urllib.parse import urlsplit
@@ -3271,6 +3303,9 @@ class BrowserWorker:
         from src import course_assess as ca, learner360 as l3
         ai, lx = l3.ASSESS_HOSTS
         self._ctx_for_portal = ctx
+        if (self._portal_route(ai, ctx)[0] is None
+                or self._portal_route(lx, ctx)[0] is None) and targets:
+            self._open_portal_course_page(ctx, course, targets[0])
         if self._portal_route(ai, ctx)[0] is None or \
                 self._portal_route(lx, ctx)[0] is None:
             seen = sorted((getattr(self, "_assess_auth", {}) or {}))
