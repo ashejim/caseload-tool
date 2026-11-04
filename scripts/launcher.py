@@ -12838,7 +12838,7 @@ class App:
         st["i"] += n
         self.root.after(1500, self._l360_pbg_step)
 
-    _COURSE_ASSESS_BATCH = 10
+    _COURSE_ASSESS_BATCH = 3          # ~12 s per student; keep the worker free
 
     def _start_course_assess(self, course: str, dry: bool = False) -> None:
         """Import ``course``'s assessment data for its saved cohort, in small
