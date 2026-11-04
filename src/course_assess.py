@@ -123,7 +123,8 @@ def parse_preA_report(resp) -> tuple:
 
 
 def parse_coaching(resp) -> list:
-    """Per OA attempt: [{date, passed, rating, items, minutes,
+    """Per OA attempt: [{arp, code, location, date, passed, rating, items,
+    minutes,
     competencies: [{number, title, rating, pct, suggested: [topic titles]}],
     missed: [{item, points, seconds, type}]}]."""
     out = []
@@ -145,6 +146,11 @@ def parse_coaching(resp) -> list:
                               if isinstance(t, dict) and t.get("isSuggestedStudy")],
             })
         out.append({
+            # Per-attempt ids — may identify the OA FORM (C949 has two forms,
+            # A/B: attempt 3 repeats the first form, 4 the second).
+            "arp": str(a.get("arpId") or ""),
+            "code": str(a.get("assessmentBannerCode") or ""),
+            "location": str(a.get("locationType") or ""),
             "date": str(a.get("testDate") or ""),
             "passed": bool(a.get("isPassed")),
             "rating": str(a.get("competencyRating") or ""),
