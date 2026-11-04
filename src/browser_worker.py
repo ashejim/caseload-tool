@@ -6291,8 +6291,18 @@ class BrowserWorker:
                     _click_radio("Any Course")
                     target.wait_for_timeout(900)
                 ok, err = self._pick_course_via_popup(target, code)
+                if not ok and "intercepts pointer events" in str(err):
+                    # A leftover course-search dialog covered the input (seen
+                    # live 2026-11-04 for the 2nd course): close it, re-open
+                    # the view, and try this course once more.
+                    self._dismiss_open_modals(target)
+                    _click_radio("My Students")
+                    target.wait_for_timeout(700)
+                    _click_radio("Any Course")
+                    target.wait_for_timeout(900)
+                    ok, err = self._pick_course_via_popup(target, code)
                 if not ok:
-                    misses.append(f"{code}: {err}")
+                    misses.append(f"{code}: {str(err).splitlines()[0][:160]}")
                     continue
                 try:
                     target.wait_for_timeout(900)
