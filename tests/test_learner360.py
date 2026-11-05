@@ -544,6 +544,22 @@ def test_assessment_urls_and_parse():
     assert l3.parse_assessments(None) == {}
 
 
+def test_request_filters_keep_labels_hide_ids():
+    from src import learner360 as l3
+    got = l3.request_filters({"page": 0, "filters": [
+        {"field": "status", "operator": "IN", "values": ["ARCHIVED"]},
+        {"field": "courses", "operator": "IN", "values": ["C949"]},
+        {"field": "caseloadOwner", "operator": "IN",
+         "values": ["3f2a9c1e-1111-4222-8333-944455556666"]},
+        {"field": "email", "operator": "EQ", "value": "a@wgu.edu"},
+        {"field": "archivedDate", "operator": "GT", "value": "2026-10-06"},
+        {"field": "studentId", "operator": "EQ", "value": "000123456"}]})
+    assert got[:2] == ["status IN ['ARCHIVED']", "courses IN ['C949']"]
+    assert "<id>" in got[2] and "<id>" in got[3] and "<id>" in got[5]
+    assert "2026-10-06" in got[4] and "(other keys: page)" in got[-1]
+    assert "a@wgu.edu" not in str(got) and "000123456" not in str(got)
+
+
 def test_cohort_store_replace_per_course():
     path = _tmpdb()
     try:

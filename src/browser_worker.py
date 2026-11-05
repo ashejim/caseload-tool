@@ -2918,7 +2918,26 @@ class BrowserWorker:
             # feeds only — skip pages, scripts, styles, images, fonts.
             if "faculty-api-gateway.wgu.edu" not in response.url and "json" not in ctype:
                 return
+            # Search requests: also record HOW the page filtered (field,
+            # operator, safe label values) — e.g. the caseload archive view.
+            rf = []
+            if method == "POST" and "/search" in response.url:
+                try:
+                    import json as _json
+                    rf = l3.request_filters(_json.loads(
+                        response.request.post_data or "null"))
+                except Exception:
+                    rf = []
             with self._l360_disc_lock:
+                if self._l360_disc is not None and rf:
+                    key = (f"{method} "
+                           f"{l3.path_template(response.url)[0]}")
+                    e = self._l360_disc.setdefault(key, {
+                        "count": 0, "statuses": [], "query": [], "shape": None})
+                    seen = e.setdefault("request_filters", [])
+                    for x in rf:
+                        if x not in seen and len(seen) < 40:
+                            seen.append(x)
                 if self._l360_disc is not None:
                     l3.discovery_add(self._l360_disc, method, response.url,
                                      getattr(response, "status", None), body)

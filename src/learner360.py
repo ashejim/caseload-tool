@@ -835,6 +835,42 @@ def discovery_add(store: dict, method: str, url: str, status, body) -> None:
         e["shape"] = sh if e["shape"] is None else _merge_shape(e["shape"], sh)
 
 
+_SAFE_VALUE = re.compile(r"^[A-Za-z][A-Za-z0-9_ .-]{0,30}$")
+
+
+def request_filters(body) -> list:
+    """Structure of a search request's filters — field, operator and only
+    SAFE short label values (status words, course codes); ids, emails, dates
+    and anything with digit runs become '<id>'. → ['field OP [v1, v2]']."""
+    out = []
+    if not isinstance(body, dict):
+        return out
+
+    def safe(v):
+        v = str(v)
+        if _SAFE_VALUE.match(v) and not re.search(r"\d{5}", v) and "@" not in v:
+            return v
+        if re.match(r"^\d{4}-\d{2}-\d{2}|^\d{2}[-/]\d{2}[-/]\d{4}$", v):
+            return v[:10]                     # dates aren't personal
+        return "<id>"
+
+    for f in body.get("filters") or []:
+        if not isinstance(f, dict):
+            continue
+        vals = []
+        for k in ("values", "value"):
+            v = f.get(k)
+            if isinstance(v, list):
+                vals += [safe(x) for x in v[:6]] + (["…"] if len(v) > 6 else [])
+            elif v is not None:
+                vals.append(safe(v))
+        out.append(f"{f.get('field')} {f.get('operator')} {sorted(set(vals))}")
+    extra = sorted(k for k in body if k not in ("filters",))
+    if extra:
+        out.append(f"(other keys: {', '.join(extra)})")
+    return out
+
+
 def discovery_known(key: str) -> bool:
     """Is this endpoint one CaseloadNotes already reads?"""
     return any(p.rstrip("/") in key for p in (
@@ -855,6 +891,8 @@ def discovery_summary(store: dict) -> list:
         q = f" ?{'&'.join(e['query'])}" if e["query"] else ""
         lines.append(f"  [{tag}] {key}{q}  ×{e['count']} {e['statuses']}"
                      f"  → {fields}")
+        for rf in e.get("request_filters") or []:
+            lines.append(f"      request filter: {rf}")
     return lines
 
 
