@@ -3235,14 +3235,20 @@ class BrowserWorker:
         signed-in portal page without the user opening one. Best-effort."""
         from src import learner360 as l3
         try:
-            w, _sid, pidm = target
+            w, pidm = target[0], target[2]
+            cv_override = str(target[3]) if len(target) > 3 else ""
             sess = self._l360_session(ctx, surface=False, reuse=True)
             if isinstance(sess, dict) or not pidm:
                 return
             lpage, lheaders, _u, _s = sess
-            v1 = l3.api(lpage, lheaders, "GET", l3.PLAN_V1_PATH + w)
-            cv = l3.course_version_from_plan(v1.get("json"), course) \
-                if v1.get("status") == 200 else ""
+            if cv_override:
+                # Roster passer: course version came from the caseload roster,
+                # so open the portal page without the GUID-based plan lookup.
+                cv = cv_override
+            else:
+                v1 = l3.api(lpage, lheaders, "GET", l3.PLAN_V1_PATH + w)
+                cv = l3.course_version_from_plan(v1.get("json"), course) \
+                    if v1.get("status") == 200 else ""
             if not cv:
                 return
             self.on_status("  [portal] opening a course page for the "
@@ -3339,22 +3345,34 @@ class BrowserWorker:
         lpage, lheaders, _u, _s = sess
         extra_codes = ca.PREA_REPORT_CODES.get(str(course).upper(), [])
         by, counts = {}, Counter()
-        for w, sid, pidm in targets:
+        for t in targets:
+            w, sid, pidm = t[0], t[1], t[2]
+            cv_override = str(t[3]) if len(t) > 3 else ""
             rec = {"pidm": pidm}
-            v1 = l3.api(lpage, lheaders, "GET", l3.PLAN_V1_PATH + w)
-            if v1.get("status") == 401:
-                sess = self._l360_session(ctx, surface=False)
-                if isinstance(sess, dict):
-                    return sess
-                lpage, lheaders, _u, _s = sess
+            if not w and cv_override:
+                # Roster passer: no Learner360 GUID, but the caseload roster
+                # supplied the course version directly. Use it and skip the
+                # degree-plan calls (they key on the GUID) — we lose only
+                # prior/transferred-course history for this student, not the
+                # OA / pre-assessment / coaching data.
+                cv = cv_override
+                rec["cv"] = cv
+                rec["plan_history"] = {}
+            else:
                 v1 = l3.api(lpage, lheaders, "GET", l3.PLAN_V1_PATH + w)
-            cv = l3.course_version_from_plan(v1.get("json"), course) \
-                if v1.get("status") == 200 else ""
-            rec["cv"] = cv
-            v2 = l3.api(lpage, lheaders, "GET", l3.PLAN_V2_PATH + w)
-            rec["plan_history"] = ca.parse_plan_history(v2.get("json")) \
-                if v2.get("status") == 200 else {}
-            counts["plan_history"] += bool(rec["plan_history"])
+                if v1.get("status") == 401:
+                    sess = self._l360_session(ctx, surface=False)
+                    if isinstance(sess, dict):
+                        return sess
+                    lpage, lheaders, _u, _s = sess
+                    v1 = l3.api(lpage, lheaders, "GET", l3.PLAN_V1_PATH + w)
+                cv = l3.course_version_from_plan(v1.get("json"), course) \
+                    if v1.get("status") == 200 else ""
+                rec["cv"] = cv
+                v2 = l3.api(lpage, lheaders, "GET", l3.PLAN_V2_PATH + w)
+                rec["plan_history"] = ca.parse_plan_history(v2.get("json")) \
+                    if v2.get("status") == 200 else {}
+                counts["plan_history"] += bool(rec["plan_history"])
             if not cv:
                 counts["no_course_version"] += 1
                 by[sid] = rec
@@ -3377,8 +3395,13 @@ class BrowserWorker:
                 rec["engagement"] = ca.parse_engagement(e.get("json"))
                 counts["engagement"] += 1
             pre = parsed.get("preA") or {}
-            if pre.get("attempts"):
-                codes = [c for c in [pre.get("code")] + extra_codes if c]
+            # Fetch the pre-assessment report when the assessment feed names a
+            # pre-A code OR a known course code exists (PVXO for C949). The
+            # pre-A endpoint keys on pidm + code only (no course version), so
+            # this works for roster passers whose version-dependent OA feed
+            # came back empty.
+            codes = [c for c in [pre.get("code")] + extra_codes if c]
+            if codes:
                 for code in dict.fromkeys(codes):
                     p = self._portal_get(lx, ca.preA_url(pidm, code))
                     if p.get("status") == 200 and p.get("json"):

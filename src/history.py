@@ -1574,6 +1574,37 @@ def l360_plan_targets(*, max_age_days: int = 30, db_path=HISTORY_DB) -> list:
         conn.close()
 
 
+def load_outcome_passer_targets(course: str, *, db_path=HISTORY_DB) -> tuple:
+    """([(wgu_id, student_id, pidm)], unresolved) for students who PASSED
+    ``course`` — taken from the `outcomes` archive (WGU's 'passed in the last
+    30 days' view) and resolved to Learner360 ids via `l360_ids`. The live
+    caseload export drops passers, so this archive is the only way to reach
+    them for the assessment import. ``unresolved`` counts passers with no id
+    mapping yet (they need a MOMI/cohort pass to resolve before they can be
+    pulled). Matches ids on the student id with leading zeros stripped."""
+    crs = str(course or "").strip().upper()
+    conn = _connect(db_path)
+    try:
+        ids = {}
+        for r in conn.execute(
+                "SELECT student_id, wgu_id, pidm FROM l360_ids "
+                "WHERE COALESCE(wgu_id,'') != '' AND COALESCE(pidm,'') != ''"):
+            ids[str(r["student_id"]).lstrip("0")] = (
+                r["wgu_id"], r["student_id"], str(r["pidm"] or ""))
+        targets, unresolved = [], 0
+        for r in conn.execute(
+                "SELECT student_id FROM outcomes WHERE course_code = ? "
+                "AND LOWER(COALESCE(outcome,'')) = 'passed'", (crs,)):
+            hit = ids.get(str(r["student_id"]).lstrip("0"))
+            if hit:
+                targets.append(hit)
+            else:
+                unresolved += 1
+        return targets, unresolved
+    finally:
+        conn.close()
+
+
 def persist_l360_plans(by_student: dict, *, db_path=HISTORY_DB,
                        now: Optional[datetime] = None) -> int:
     """Store {student_id: learner360.parse_plan(...)}; returns rows written."""

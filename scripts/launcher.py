@@ -6370,14 +6370,26 @@ class CaseloadPanel:
         # feed accepts, on 3 cohort students (statuses + counts only).
         # "l360assess: C949 [dry]" — import the course's assessment data for
         # the saved cohort (background batches); dry = 10 students, counts.
+        # "l360assess: C949 passers" — import the PASSERS from the outcomes
+        # archive (resolved via l360_ids); 'archive' is an alias.
+        # "l360assess: C949 roster" — import the PASSERS captured in the
+        # Any-Course roster (coursescan_roster.json), targeted by PIDM + the
+        # roster's CourseVersion (no Learner360 GUID needed).
         if q.lower().startswith(("l360assess:", "1360assess:")) or \
                 q.lower().strip() in ("l360assess", "1360assess"):
             parts = q.split(":", 1)[1].split() if ":" in q else []
             low = [p.lower() for p in parts]
+            _kw = ("dry", "all", "passers", "archive", "roster")
             course = next((p.upper() for p in parts
-                           if p.lower() not in ("dry", "all")), "C949")
+                           if p.lower() not in _kw), "C949")
+            if "roster" in low:
+                source = "roster"
+            elif "passers" in low or "archive" in low:
+                source = "passers"
+            else:
+                source = "cohort"
             self.app._start_course_assess(course, dry="dry" in low,
-                                          everyone="all" in low)
+                                          everyone="all" in low, source=source)
             return "break"
         if q.lower().startswith(("l360assessprobe", "1360assessprobe")):
             parts = q.split(":", 1)[1].split() if ":" in q else []
@@ -6405,16 +6417,21 @@ class CaseloadPanel:
             parts = (q.split(":", 1)[1].strip().lower().split()
                      if ":" in q else [])
             # "l360activity: C949" — the saved course cohort, 365 days.
+            # "l360activity: C949 passers" — the course's passers (outcomes
+            # archive) instead of the enrolled cohort; 'archive' is an alias.
             course = next((p.upper() for p in parts
                            if len(p) == 4 and p[0].isalpha() and p[1:].isdigit()),
                           "")
             if course:
-                if not self.app._start_l360_activity_bg(manual=True,
-                                                        cohort=course):
+                passers = "passers" in parts or "archive" in parts
+                if not self.app._start_l360_activity_bg(
+                        manual=True, cohort=course, passers=passers):
                     self.app._append_log(
                         f"Couldn't start — is another activity import running, "
-                        f"or is there no saved {course} roster (l360cohort: "
-                        f"{course} save)?")
+                        + (f"or no resolvable {course} passers in the outcomes "
+                           "archive?" if passers else
+                           f"or is there no saved {course} roster (l360cohort: "
+                           f"{course} save)?"))
                 return "break"
             days = next((int(x) for x in parts if x.isdigit()), 365)
             self.app._l360_activity_import(dry="dry" in parts, days=days)
@@ -6450,7 +6467,9 @@ class CaseloadPanel:
             if parts and parts[0] == "capture":
                 secs = 60
                 if len(parts) > 1 and parts[1].isdigit():
-                    secs = max(15, min(180, int(parts[1])))
+                    # Up to 10 min: a whole-course manual scroll (e.g. C949's
+                    # ~1900 rows, ~19 pages) needs more than the old 180s cap.
+                    secs = max(15, min(600, int(parts[1])))
                 self.app._course_scan_capture(secs)
             elif parts and parts[0] == "export":
                 self.app._course_scan_export()
@@ -12698,16 +12717,20 @@ class App:
                 pass
 
     def _start_l360_activity_bg(self, manual: bool = False,
-                                cohort: str = "") -> bool:
+                                cohort: str = "", passers: bool = False) -> bool:
         """Start the batched activity import now. Window = days since the last
         completed import + 7 (14..365; 365 the first time). ``cohort`` (a
         course code) reads the saved course cohort instead of my caseload —
-        a full 365 days, and the weekly-import marker is left alone. True if
-        started."""
+        a full 365 days, and the weekly-import marker is left alone.
+        ``passers`` reads that course's passers (outcomes archive, resolved via
+        l360_ids) instead of the enrolled cohort. True if started."""
         if (getattr(self, "_offline", False) or getattr(self, "_l360_abg", None)
                 or not self.worker.ready_event.is_set()):
             return False
-        if cohort:
+        if cohort and passers:
+            tg, _unresolved = history.load_outcome_passer_targets(cohort)
+            targets = [(w, s) for (w, s, _p) in tg]
+        elif cohort:
             targets = [(r["wgu_id"], r["student_id"])
                        for r in history.load_l360_cohort(cohort)
                        if r.get("wgu_id")]
@@ -12864,25 +12887,106 @@ class App:
 
     _COURSE_ASSESS_BATCH = 3          # ~12 s per student; keep the worker free
 
+    def _roster_passer_targets(self, course: str) -> tuple:
+        """([('', student_id, pidm, course_version)], note) for PASSERS of
+        ``course`` captured in the Any-Course roster (coursescan_roster.json,
+        CourseStatus == 'Passed'). No Learner360 GUID — the import uses pidm +
+        the course version, so the plan-history step is skipped. The version
+        comes from the row's OA coaching-report URL (the REAL courseVersionId,
+        e.g. 40160025) — NOT the row's 'CourseVersion' field (a program-level
+        number like '5' that the assessment gateway doesn't accept). Deduped
+        by student id."""
+        import json as _json
+        import re as _re
+        path = USER_CONFIG_DIR / "coursescan_roster.json"
+        if not path.exists():
+            return [], ("No roster capture yet — run 'coursescan: capture' "
+                        "then 'coursescan: export' on the Any Course view.")
+        try:
+            with open(path, encoding="utf-8") as f:
+                rows = _json.load(f)
+        except Exception as e:
+            return [], f"Couldn't read the roster capture: {e}"
+        crs = str(course or "").strip().upper()
+        cv_pat = _re.compile(r"/courseVersionId/(\d+)")
+        tg, seen, no_cv = [], set(), 0
+        for r in rows:
+            if str(r.get("CourseCode") or "").strip().upper() != crs:
+                continue
+            if str(r.get("CourseStatus") or "").strip() != "Passed":
+                continue
+            sid = str(r.get("StudentID") or "").strip()
+            pidm = str(r.get("PIDM") or "").strip()
+            cv = ""
+            for k in ("LastObjectiveAssessmentDateUrl",
+                      "ObjectiveAssessmentCountUrl",
+                      "LastPreAssessmentDateUrl", "PreAssessmentCountUrl"):
+                m = cv_pat.search(str(r.get(k) or ""))
+                if m:
+                    cv = m.group(1)
+                    break
+            if not (sid and pidm):
+                continue
+            if not cv:
+                no_cv += 1
+                continue
+            if sid in seen:
+                continue
+            seen.add(sid)
+            tg.append(("", sid, pidm, cv))
+        if not tg:
+            return [], (f"No {crs} passers with a usable course version in the "
+                        "roster capture — re-scan the Any Course view for that "
+                        "course first.")
+        note = f"{crs} passers from the roster capture: {len(tg)} student(s)."
+        if no_cv:
+            note += f" ({no_cv} skipped — no assessment URL to read the version)"
+        return tg, note
+
     def _start_course_assess(self, course: str, dry: bool = False,
-                             everyone: bool = False) -> None:
-        """Import ``course``'s assessment data for its saved cohort, in small
-        background batches that yield to the user. ``dry`` reads 10 and
-        reports counts without storing. Students stored in the last 2 days
-        are skipped (resume after an interruption) unless ``everyone``."""
+                             everyone: bool = False,
+                             source: str = "cohort") -> None:
+        """Import ``course``'s assessment data in small background batches that
+        yield to the user. ``source`` 'cohort' = the saved Learner360 roster
+        (the enrolled students, all fails); 'passers' = students who PASSED,
+        from the outcomes archive resolved via l360_ids; 'roster' = PASSERS
+        from the Any-Course roster capture (coursescan_roster.json), targeted
+        by PIDM + the roster's CourseVersion. ``dry`` reads 10 and reports
+        counts without storing. Students stored in the last 2 days are skipped
+        (resume after an interruption) unless ``everyone``."""
         if getattr(self, "_cabg", None):
             self._append_log("A course assessment import is already running.")
             return
         if getattr(self, "_offline", False) or not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
             return
-        rows = history.load_l360_cohort(course)
-        tg = [(r["wgu_id"], r["student_id"], r["pidm"]) for r in rows
-              if r.get("wgu_id") and r.get("pidm")]
-        if not tg:
-            self._append_log(f"No saved {course} roster — run l360cohort: "
-                             f"{course} save first.")
-            return
+        unresolved = 0
+        if source == "roster":
+            tg, note = self._roster_passer_targets(course)
+            if not tg:
+                self._append_log(note)
+                return
+            self._append_log(note)
+        elif source == "passers":
+            tg, unresolved = history.load_outcome_passer_targets(course)
+            if not tg:
+                self._append_log(
+                    f"No resolvable {course} passers in the outcomes archive"
+                    + (f" ({unresolved} passer(s) present but missing a "
+                       "Learner360 id — run a cohort/MOMI pass to resolve them)"
+                       if unresolved else
+                       " — ingest WGU's 'passed in the last 30 days' caseload "
+                       "view first")
+                    + ".")
+                return
+        else:
+            rows = history.load_l360_cohort(course)
+            tg = [(r["wgu_id"], r["student_id"], r["pidm"]) for r in rows
+                  if r.get("wgu_id") and r.get("pidm")]
+            if not tg:
+                self._append_log(f"No saved {course} roster — run l360cohort: "
+                                 f"{course} save first.")
+                return
         skipped = 0
         if not dry and not everyone:
             try:
@@ -12904,9 +13008,13 @@ class App:
                       "counts": Counter(), "stored": Counter(),
                       "t0": time.time()}
         self._append_log(
-            f"{course} assessments: {'dry run on' if dry else 'importing'} "
+            f"{course} {'passer ' if source in ('passers', 'roster') else ''}"
+            "assessments: "
+            f"{'dry run on' if dry else 'importing'} "
             f"{len(tg)} students in the background"
             + (f" (skipping {skipped} already imported)" if skipped else "")
+            + (f"; {unresolved} passer(s) skipped — no Learner360 id yet"
+               if source == "passers" and unresolved else "")
             + ", "
             f"{self._COURSE_ASSESS_BATCH} at a time (anything you do goes "
             "first). Keep a course page open in the app's browser.")
