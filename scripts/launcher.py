@@ -12754,8 +12754,7 @@ class App:
             # Course watch: an explicit [(wgu_id, student_id)] list.
             targets = [t for t in targets if t and t[0]]
         elif cohort and passers:
-            tg, _unresolved = history.load_outcome_passer_targets(cohort)
-            targets = [(w, s) for (w, s, _p) in tg]
+            targets = self._roster_passer_activity_targets(cohort)
         elif cohort:
             targets = [(r["wgu_id"], r["student_id"])
                        for r in history.load_l360_cohort(cohort)
@@ -12804,6 +12803,8 @@ class App:
         try:
             if getattr(self, "_offline", False):
                 return
+            if not getattr(self.settings, "course_watch_enabled", False):
+                return                       # off — and don't re-arm
             courses = self._parse_courses(
                 getattr(self.settings, "course_watch_courses", ""))
             if not courses:
@@ -21922,7 +21923,10 @@ class App:
         # Course watch (daily) — catch passers before they leave the roster.
         cw_row = ctk.CTkFrame(dialog, fg_color="transparent")
         cw_row.pack(fill="x", padx=32, pady=(0, 10))
-        ctk.CTkLabel(cw_row, text="Course watch (daily):").pack(side="left")
+        cw_on_var = ctk.BooleanVar(
+            value=bool(getattr(self.settings, "course_watch_enabled", False)))
+        ctk.CTkCheckBox(cw_row, variable=cw_on_var,
+                        text="Run the course watch daily for:").pack(side="left")
         cw_var = ctk.StringVar(
             value=getattr(self.settings, "course_watch_courses", "") or "")
         cw_entry = ctk.CTkEntry(cw_row, width=200, textvariable=cw_var,
@@ -21938,8 +21942,9 @@ class App:
                             "Learner360 rosters (students who leave — e.g. "
                             "passers — are kept), then refresh students close "
                             "to finishing, new ones, and the stalest: their "
-                            "assessment attempts + 90 days of activity. Blank "
-                            "= off.")
+                            "assessment attempts + 90 days of activity. Off "
+                            "unless the box is ticked; 'coursewatch:' runs it "
+                            "once on demand.")
         except Exception:
             pass
 
@@ -22575,9 +22580,11 @@ class App:
                 l3p_var.get().strip(), 7)
             # Course watch courses (blank = off).
             _cw_new = ", ".join(self._parse_courses(cw_var.get()))
-            _cw_was = getattr(self.settings, "course_watch_courses", "") or ""
+            _cw_was_on = bool(getattr(self.settings, "course_watch_enabled",
+                                      False))
             self.settings.course_watch_courses = _cw_new
-            if _cw_new and not _cw_was:
+            self.settings.course_watch_enabled = bool(cw_on_var.get())
+            if self.settings.course_watch_enabled and _cw_new and not _cw_was_on:
                 self.root.after(5000, self._maybe_course_watch)
             # Learner360 team roster (inbox labeler overlay), days; 0 = off.
             self.settings.l360_auto_roster_days = _L3R_LABELS.get(

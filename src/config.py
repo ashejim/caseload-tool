@@ -416,7 +416,9 @@ class Settings:
     # Course watch (daily): for each listed course, re-pull its Learner360
     # cohort (keeping students who leave — passers), then refresh students
     # close to finishing + new + stalest: assessments + 90 days of activity.
-    # Comma/space separated course codes; blank = off.
+    # Comma/space separated course codes. Runs only when
+    # course_watch_enabled (off by default — it's heavy background work).
+    course_watch_enabled: bool = False
     course_watch_courses: str = ""
     # Stage 2 (beta): draw CaseloadNotes badges into Learner360 pages in the
     # app's own browser (read-only). Off by default.

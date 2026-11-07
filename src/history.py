@@ -1574,6 +1574,26 @@ def upsert_l360_cohort(course: str, rows: list, *, db_path=HISTORY_DB,
         conn.close()
 
 
+def load_known_guids(*, db_path=HISTORY_DB) -> dict:
+    """{student_id (leading zeros stripped): wgu_id} for every student whose
+    Learner360 GUID we already hold (l360_ids + l360_team_roster). These are
+    students within the caller's granted L360 scope (captured via their teams)
+    — used to pull activity for in-scope passers WITHOUT routing around L360's
+    team scoping."""
+    conn = _connect(db_path)
+    try:
+        out = {}
+        for q in ("SELECT student_id, wgu_id FROM l360_ids "
+                  "WHERE COALESCE(wgu_id,'') != ''",
+                  "SELECT student_id, wgu_id FROM l360_team_roster "
+                  "WHERE COALESCE(wgu_id,'') != ''"):
+            for r in conn.execute(q):
+                out[str(r["student_id"]).lstrip("0")] = r["wgu_id"]
+        return out
+    finally:
+        conn.close()
+
+
 def replace_l360_cohort(course: str, rows: list, *, db_path=HISTORY_DB,
                         now: Optional[datetime] = None) -> int:
     """Store a fresh pull of ``course``'s cohort (upsert — students no longer
