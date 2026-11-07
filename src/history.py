@@ -419,6 +419,11 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_DDL)  # create from scratch / fill in any gaps
     _ensure_outcome_columns(conn)    # additive columns on an existing outcomes
     _ensure_student_flag_columns(conn)  # additive columns on existing flags
+    # l360_cohort keeps departed students (course watch, 2026-11-07).
+    _cc = {r[1] for r in conn.execute("PRAGMA table_info(l360_cohort)")}
+    for _name in ("first_seen_at", "departed_at"):
+        if _name not in _cc:
+            conn.execute(f"ALTER TABLE l360_cohort ADD COLUMN {_name} TEXT")
     # l360_activity.occurrences was added after the table first shipped.
     if "occurrences" not in {r[1] for r in conn.execute(
             "PRAGMA table_info(l360_activity)")}:
@@ -1526,36 +1531,159 @@ def mark_course_assess_imported(course: str, *, db_path=HISTORY_DB,
         conn.close()
 
 
-def replace_l360_cohort(course: str, rows: list, *, db_path=HISTORY_DB,
-                        now: Optional[datetime] = None) -> int:
-    """Replace the stored cohort for ``course`` with ``rows``."""
+def upsert_l360_cohort(course: str, rows: list, *, db_path=HISTORY_DB,
+                       now: Optional[datetime] = None) -> dict:
+    """Merge a fresh pull of ``course``'s cohort: present students are
+    inserted/updated (first_seen_at kept, departed_at cleared); students no
+    longer present get departed_at = now (kept, so passers' data stays
+    attributable). → {present, arrived, departed, returned}."""
     ts = (now or datetime.now()).isoformat(timespec="seconds")
     c = str(course or "").strip().upper()
-    vals = [(c, str(r.get("student_id") or "").lstrip("0"), r.get("wgu_id") or "",
-             r.get("pidm") or "", r.get("owner") or "", r.get("team") or "",
-             r.get("term_end") or "", r.get("momentum") or "",
-             r.get("program") or "", ts)
-            for r in rows or [] if str(r.get("student_id") or "").strip()]
+    fresh = {}
+    for r in rows or []:
+        sid = str(r.get("student_id") or "").strip().lstrip("0")
+        if sid:
+            fresh[sid] = r
+    conn = _connect(db_path)
+    try:
+        old = {r["student_id"]: dict(r) for r in conn.execute(
+            "SELECT student_id, first_seen_at, departed_at FROM l360_cohort "
+            "WHERE course = ?", (c,))}
+        arrived = [s for s in fresh if s not in old]
+        returned = [s for s in fresh if s in old and old[s]["departed_at"]]
+        departed = [s for s, o in old.items()
+                    if s not in fresh and not o["departed_at"]]
+        with conn:
+            for sid, r in fresh.items():
+                first = (old.get(sid) or {}).get("first_seen_at") or ts
+                conn.execute(
+                    "INSERT OR REPLACE INTO l360_cohort (course, student_id, "
+                    "wgu_id, pidm, owner, team, term_end, momentum, program, "
+                    "updated_at, first_seen_at, departed_at) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,NULL)",
+                    (c, sid, r.get("wgu_id") or "", r.get("pidm") or "",
+                     r.get("owner") or "", r.get("team") or "",
+                     r.get("term_end") or "", r.get("momentum") or "",
+                     r.get("program") or "", ts, first))
+            conn.executemany(
+                "UPDATE l360_cohort SET departed_at = ? WHERE course = ? AND "
+                "student_id = ?", [(ts, c, s) for s in departed])
+        return {"present": len(fresh), "arrived": len(arrived),
+                "departed": len(departed), "returned": len(returned)}
+    finally:
+        conn.close()
+
+
+def replace_l360_cohort(course: str, rows: list, *, db_path=HISTORY_DB,
+                        now: Optional[datetime] = None) -> int:
+    """Store a fresh pull of ``course``'s cohort (upsert — students no longer
+    present are kept and marked departed). Returns the number present."""
+    return upsert_l360_cohort(course, rows, db_path=db_path,
+                              now=now)["present"]
+
+
+def load_l360_cohort(course: str, *, include_departed: bool = False,
+                     db_path=HISTORY_DB) -> list:
+    """Stored cohort rows for ``course`` (dicts) — current students only,
+    unless ``include_departed``."""
+    conn = _connect(db_path)
+    try:
+        q = "SELECT * FROM l360_cohort WHERE course = ?"
+        if not include_departed:
+            q += " AND departed_at IS NULL"
+        return [dict(r) for r in conn.execute(
+            q + " ORDER BY student_id", (str(course or "").strip().upper(),))]
+    finally:
+        conn.close()
+
+
+def course_watch_last(*, db_path=HISTORY_DB) -> Optional[str]:
+    conn = _connect(db_path)
+    try:
+        return _meta_get(conn, "course_watch_last")
+    finally:
+        conn.close()
+
+
+def mark_course_watch(*, db_path=HISTORY_DB,
+                      now: Optional[datetime] = None) -> None:
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
     conn = _connect(db_path)
     try:
         with conn:
-            conn.execute("DELETE FROM l360_cohort WHERE course = ?", (c,))
-            conn.executemany("INSERT OR REPLACE INTO l360_cohort VALUES "
-                             "(?,?,?,?,?,?,?,?,?,?)", vals)
-        return len(vals)
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
+                         "('course_watch_last', ?)", (ts,))
     finally:
         conn.close()
 
 
-def load_l360_cohort(course: str, *, db_path=HISTORY_DB) -> list:
-    """Stored cohort rows for ``course`` (dicts)."""
+def course_watch_targets(course: str, *, cap: int = 100,
+                         stale_days: int = 7, db_path=HISTORY_DB,
+                         today: Optional[datetime] = None) -> dict:
+    """Who the daily course watch refreshes for ``course`` — current students
+    plus those departed in the last 3 days, as [(wgu_id, student_id, pidm)]:
+      near   — likely to finish soon: an assessment attempt scheduled in the
+               last 7 days / next day with no result, a pending approval, or
+               a performance-assessment submission in the last 14 days
+               (refreshed EVERY day, uncapped)
+      new    — no assessment data stored yet
+      stale  — stored more than ``stale_days`` ago, oldest first
+    ``new`` + ``stale`` are capped at ``cap`` so a day's run stays short.
+    → {near, new, stale} lists."""
+    from datetime import timedelta
+    now = today or datetime.now()
+    d = now.date()
+    lo, hi = (d - timedelta(days=7)).isoformat(), (d + timedelta(days=1)).isoformat()
+    sub14 = (d - timedelta(days=14)).isoformat()
+    c = str(course or "").strip().upper()
+    gone_cut = (now - timedelta(days=3)).isoformat(timespec="seconds")
+    stale_cut = (now - timedelta(days=stale_days)).isoformat(timespec="seconds")
     conn = _connect(db_path)
     try:
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM l360_cohort WHERE course = ? ORDER BY student_id",
-            (str(course or "").strip().upper(),))]
+        coh = [dict(r) for r in conn.execute(
+            "SELECT student_id, wgu_id, pidm, departed_at FROM l360_cohort "
+            "WHERE course = ? AND (departed_at IS NULL OR departed_at >= ?)",
+            (c, gone_cut))]
+        stored = {r["student_id"]: (r["assessments_json"], r["updated_at"])
+                  for r in conn.execute(
+                      "SELECT student_id, assessments_json, updated_at FROM "
+                      "course_assess WHERE course = ?", (c,))}
+        submitted = {(r[0] or "").lstrip("0") for r in conn.execute(
+            "SELECT DISTINCT student_id FROM l360_activity WHERE "
+            "activity_date >= ? AND type LIKE '%Submitted for Evaluation%' "
+            "AND (course_code = ? OR course_code = '')", (sub14, c))}
     finally:
         conn.close()
+    near, new, stale = [], [], []
+    for r in coh:
+        sid, t = r["student_id"], (r["wgu_id"] or "", r["student_id"],
+                                   r["pidm"] or "")
+        if not r["pidm"]:
+            continue
+        got = stored.get(sid)
+        if not got:
+            new.append(t)
+            continue
+        try:
+            a = json.loads(got[0] or "{}") or {}
+        except ValueError:
+            a = {}
+        soon = False
+        for kind in a.values():
+            for at in (kind or {}).get("attempts") or []:
+                if at.get("result"):
+                    continue
+                sch = str(at.get("scheduled") or "")[:10]
+                if (sch and lo <= sch <= hi) or at.get("pending"):
+                    soon = True
+        if soon or sid in submitted:
+            near.append(t)
+        elif (got[1] or "") < stale_cut:
+            stale.append((got[1] or "", t))
+    stale.sort()
+    room = max(0, cap - len(new))
+    return {"near": near, "new": new[:cap],
+            "stale": [t for _, t in stale[:room]]}
 
 
 def l360_plan_targets(*, max_age_days: int = 30, db_path=HISTORY_DB) -> list:

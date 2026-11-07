@@ -110,6 +110,52 @@ def test_persist_and_load_course_assess():
         os.remove(path)
 
 
+def test_cohort_upsert_keeps_departed_and_watch_targets():
+    import json as _json
+    from datetime import datetime as dt
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        row = lambda sid: {"student_id": sid, "wgu_id": "u" + sid, "pidm": "p" + sid}
+        r = history.upsert_l360_cohort("C949", [row("1"), row("2"), row("3")],
+                                       db_path=path, now=dt(2026, 11, 1))
+        assert r == {"present": 3, "arrived": 3, "departed": 0, "returned": 0}
+        r = history.upsert_l360_cohort("C949", [row("1"), row("2"), row("4")],
+                                       db_path=path, now=dt(2026, 11, 6))
+        assert (r["arrived"], r["departed"]) == (1, 1)          # 4 in, 3 out
+        cur = {x["student_id"] for x in history.load_l360_cohort("C949", db_path=path)}
+        allr = {x["student_id"]: x for x in history.load_l360_cohort(
+            "C949", include_departed=True, db_path=path)}
+        assert cur == {"1", "2", "4"} and allr["3"]["departed_at"].startswith("2026-11-06")
+        assert allr["1"]["first_seen_at"].startswith("2026-11-01")
+        r = history.upsert_l360_cohort("C949", [row("1"), row("2"), row("3"), row("4")],
+                                       db_path=path, now=dt(2026, 11, 7))
+        assert r["returned"] == 1 and not history.load_l360_cohort(
+            "C949", include_departed=True, db_path=path)[2]["departed_at"]
+        # Watch targets: 1 has an OA scheduled yesterday (near), 2 stored
+        # long ago (stale), 3 fresh (skip), 4 never stored (new).
+        oa_soon = {"oa": {"attempts": [{"n": 1, "scheduled": "2026-11-06",
+                                        "result": ""}]}}
+        history.persist_course_assess("C949", {
+            "1": {"pidm": "p1", "assessments": oa_soon},
+            "2": {"pidm": "p2", "assessments": {}}}, db_path=path,
+            now=dt(2026, 10, 1))
+        history.persist_course_assess("C949", {"3": {"pidm": "p3"}},
+                                      db_path=path, now=dt(2026, 11, 7))
+        t = history.course_watch_targets("C949", db_path=path,
+                                         today=dt(2026, 11, 7, 9))
+        assert [x[1] for x in t["near"]] == ["1"]
+        assert [x[1] for x in t["new"]] == ["4"]
+        assert [x[1] for x in t["stale"]] == ["2"]
+        t = history.course_watch_targets("C949", cap=1, db_path=path,
+                                         today=dt(2026, 11, 7, 9))
+        assert t["stale"] == [] and len(t["new"]) == 1          # cap shared
+        history.mark_course_watch(db_path=path)
+        assert history.course_watch_last(db_path=path)
+    finally:
+        os.remove(path)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

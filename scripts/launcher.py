@@ -6363,6 +6363,13 @@ class CaseloadPanel:
         if q.lower().startswith(("l360discover", "1360discover")):
             self.app._l360_discover("stop" not in q.lower())
             return "break"
+        # "coursewatch:" — run the daily course watch now (Settings list);
+        # "coursewatch: C949 C769" — just those courses, once.
+        if q.lower().startswith(("coursewatch", "course watch")):
+            rest = q.split(":", 1)[1] if ":" in q else ""
+            self.app._start_course_watch(self.app._parse_courses(rest) or None,
+                                         manual=True)
+            return "break"
         # "l360cohort: C949" — everyone enrolled in a course across my
         # Learner360 teams (counts per team); "l360cohort: C949 save" stores
         # the roster for course-focused work.
@@ -8469,6 +8476,18 @@ def _vault_setup_prompt() -> Optional[str]:
 # Main app
 # ============================================================
 
+def _run_on_finish(root, st) -> None:
+    """Run a finished background job's ``on_finish`` (course-watch chaining)
+    on the Tk loop. Never raises."""
+    fn = st.get("on_finish") if isinstance(st, dict) else None
+    if fn:
+        st["on_finish"] = None
+        try:
+            root.after(0, fn)
+        except Exception:
+            pass
+
+
 class App:
     def __init__(self) -> None:
         ctk.set_appearance_mode("System")
@@ -8794,6 +8813,8 @@ class App:
             self.root.after(120_000, self._l360_startup_jobs)
             # Learner360 degree plans + program mentors (weekly, batches).
             self.root.after(1_200_000, self._maybe_auto_l360_plan)
+            # Course watch (daily) — after the other startup Learner360 jobs.
+            self.root.after(1_500_000, self._maybe_course_watch)
         # Report the startup backup (taken before the log existed).
         self.root.after(1500, self._report_startup_backup)
 
@@ -12717,7 +12738,9 @@ class App:
                 pass
 
     def _start_l360_activity_bg(self, manual: bool = False,
-                                cohort: str = "", passers: bool = False) -> bool:
+                                cohort: str = "", passers: bool = False,
+                                targets=None, window_days: int = 0,
+                                on_finish=None, label: str = "") -> bool:
         """Start the batched activity import now. Window = days since the last
         completed import + 7 (14..365; 365 the first time). ``cohort`` (a
         course code) reads the saved course cohort instead of my caseload —
@@ -12727,7 +12750,10 @@ class App:
         if (getattr(self, "_offline", False) or getattr(self, "_l360_abg", None)
                 or not self.worker.ready_event.is_set()):
             return False
-        if cohort and passers:
+        if targets is not None:
+            # Course watch: an explicit [(wgu_id, student_id)] list.
+            targets = [t for t in targets if t and t[0]]
+        elif cohort and passers:
             tg, _unresolved = history.load_outcome_passer_targets(cohort)
             targets = [(w, s) for (w, s, _p) in tg]
         elif cohort:
@@ -12738,8 +12764,10 @@ class App:
             targets = history.l360_note_targets()
         if not targets:
             return False
-        window, last = 365, (None if cohort
+        window, last = 365, (None if (cohort or window_days)
                              else history.l360_activity_last_import())
+        if window_days:
+            window = int(window_days)
         if last:
             try:
                 from datetime import datetime as _dt
@@ -12749,14 +12777,174 @@ class App:
                 pass
         self._l360_abg = {"targets": list(targets), "i": 0, "window": window,
                           "events": 0, "new": 0, "fail": 0, "t0": time.time(),
-                          "cohort": cohort}
+                          "cohort": cohort or label, "on_finish": on_finish}
         self._append_log(
-            f"Learner360 activity: {'import' if manual else 'weekly import'} "
+            f"Learner360 activity{' (' + label + ')' if label else ''}: "
+            f"{'import' if manual else 'weekly import'} "
             f"starting in the background — last {window} days for "
             f"{len(targets)} learners, {self._L360_ACT_BATCH} at a time "
             "(anything you do goes first).")
         self._l360_abg_step()
         return True
+
+    # ----- Course watch (daily): catch passers before they leave -----
+
+    _COURSE_WATCH_CAP = 100       # new + stale students refreshed per course/day
+
+    @staticmethod
+    def _parse_courses(text) -> list:
+        import re as _re
+        return [c.upper() for c in _re.findall(r"\b[A-Za-z]{1,2}\d{3}\b",
+                                                str(text or ""))]
+
+    def _maybe_course_watch(self) -> None:
+        """Daily course watch (settings.course_watch_courses; blank = off):
+        due once a day, re-checks when due (max 6 h). Never raises."""
+        rearm = 6 * 3600_000
+        try:
+            if getattr(self, "_offline", False):
+                return
+            courses = self._parse_courses(
+                getattr(self.settings, "course_watch_courses", ""))
+            if not courses:
+                return
+            from src import learner360 as l3
+            last = history.course_watch_last()
+            if not l3.momi_capture_due(last, 1):
+                self.root.after(l3.ms_until_due(last, 1, rearm),
+                                self._maybe_course_watch)
+                return
+            if not self._start_course_watch(courses):
+                self.root.after(10 * 60_000, self._maybe_course_watch)
+                return
+            self.root.after(rearm, self._maybe_course_watch)
+        except Exception:
+            try:
+                self.root.after(rearm, self._maybe_course_watch)
+            except Exception:
+                pass
+
+    def _start_course_watch(self, courses=None, manual: bool = False) -> bool:
+        """For each course: re-pull its Learner360 cohort (keeping departed
+        students), then refresh near-finish + new + stalest students —
+        assessments, then 90 days of activity. One course at a time, each step
+        a background job that yields to the user. True if started."""
+        if getattr(self, "_cw", None):
+            if manual:
+                self._append_log("The course watch is already running.")
+            return False
+        if getattr(self, "_offline", False) or not self.worker.ready_event.is_set():
+            if manual:
+                self._append_log("Browser not ready yet — wait and try again.")
+            return False
+        courses = courses or self._parse_courses(
+            getattr(self.settings, "course_watch_courses", ""))
+        if not courses:
+            if manual:
+                self._append_log("No courses to watch — add them in Settings ▸ "
+                                 "Caseload & Data ▸ Course watch, or type "
+                                 "coursewatch: C949 C769.")
+            return False
+        self._cw = {"courses": courses, "i": 0, "t0": time.time(),
+                    "summary": [], "manual": manual}
+        self._append_log(f"Course watch: {', '.join(courses)} — roster, then "
+                         "students close to finishing / new / stalest, in the "
+                         "background (anything you do goes first).")
+        self._cw_next()
+        return True
+
+    def _cw_next(self) -> None:
+        st = getattr(self, "_cw", None)
+        if not st:
+            return
+        if st["i"] >= len(st["courses"]):
+            self._cw = None
+            try:
+                history.mark_course_watch()
+            except Exception:
+                pass
+            mins = (time.time() - st["t0"]) / 60
+            self._append_log(f"✓ Course watch done in {mins:.0f} min — "
+                             + "; ".join(st["summary"]))
+            return
+        course = st["courses"][st["i"]]
+
+        def on_done(res):
+            try:
+                self.root.after(0, lambda: self._cw_roster(course, res))
+            except Exception:
+                pass
+
+        self.worker.submit_l360_course_cohort(course, on_done, surface=False)
+
+    def _cw_advance(self) -> None:
+        st = getattr(self, "_cw", None)
+        if st:
+            st["i"] += 1
+            self.root.after(1000, self._cw_next)
+
+    def _cw_roster(self, course: str, res, tries: int = 0) -> None:
+        st = getattr(self, "_cw", None)
+        if not st:
+            return
+        res = res or {}
+        if res.get("error"):
+            self._append_log(f"  Course watch {course}: roster failed — "
+                             f"{res['error']}", error=True)
+            st["summary"].append(f"{course}: roster failed")
+            self._cw_advance()
+            return
+        if tries == 0:
+            try:
+                r = history.upsert_l360_cohort(course, res.get("rows") or [])
+                t = history.course_watch_targets(course,
+                                                 cap=self._COURSE_WATCH_CAP)
+            except Exception as e:
+                self._append_log(f"  Course watch {course}: {e}", error=True)
+                self._cw_advance()
+                return
+            seen, tg = set(), []
+            for x in t["near"] + t["new"] + t["stale"]:
+                if x[1] not in seen:
+                    seen.add(x[1])
+                    tg.append(x)
+            st["tg"] = tg
+            st["summary"].append(
+                f"{course}: {r['present']} enrolled (+{r['arrived']} new, "
+                f"{r['departed']} left), refreshed {len(tg)}")
+            self._append_log(
+                f"  Course watch {course}: {r['present']} enrolled, "
+                f"{r['arrived']} new, {r['departed']} left since last pull; "
+                f"refreshing {len(t['near'])} close to finishing, "
+                f"{len(t['new'])} new, {len(t['stale'])} stalest.")
+        tg = st.get("tg") or []
+        if not tg:
+            self._cw_advance()
+            return
+        if not self._start_course_assess(
+                course, targets=tg,
+                on_finish=lambda: self._cw_activity(course, tg)):
+            if tries < 15:          # another import running — wait for it
+                self.root.after(120_000,
+                                lambda: self._cw_roster(course, res, tries + 1))
+            else:
+                self._cw_activity(course, tg)
+
+    def _cw_activity(self, course: str, tg, tries: int = 0) -> None:
+        if not getattr(self, "_cw", None):
+            return
+        act = [(w, s) for (w, s, *_r) in tg if w]
+        if not act:
+            self._cw_advance()
+            return
+        if not self._start_l360_activity_bg(
+                manual=True, targets=act, window_days=90,
+                on_finish=self._cw_advance, label=f"course watch {course}"):
+            if tries < 15:
+                self.root.after(120_000,
+                                lambda: self._cw_activity(course, tg, tries + 1))
+            else:
+                self._cw_advance()
 
     # ----- Learner360 degree plan + community of care (weekly) -----
 
@@ -12945,7 +13133,8 @@ class App:
 
     def _start_course_assess(self, course: str, dry: bool = False,
                              everyone: bool = False,
-                             source: str = "cohort") -> None:
+                             source: str = "cohort", targets=None,
+                             on_finish=None) -> bool:
         """Import ``course``'s assessment data in small background batches that
         yield to the user. ``source`` 'cohort' = the saved Learner360 roster
         (the enrolled students, all fails); 'passers' = students who PASSED,
@@ -12956,12 +13145,17 @@ class App:
         (resume after an interruption) unless ``everyone``."""
         if getattr(self, "_cabg", None):
             self._append_log("A course assessment import is already running.")
-            return
+            return False
         if getattr(self, "_offline", False) or not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
-            return
+            return False
         unresolved = 0
-        if source == "roster":
+        if targets is not None:
+            # Course watch: an explicit list, refreshed even if recent.
+            tg, everyone = list(targets), True
+            if not tg:
+                return False
+        elif source == "roster":
             tg, note = self._roster_passer_targets(course)
             if not tg:
                 self._append_log(note)
@@ -13006,7 +13200,7 @@ class App:
         from collections import Counter
         self._cabg = {"course": course, "targets": tg, "i": 0, "dry": dry,
                       "counts": Counter(), "stored": Counter(),
-                      "t0": time.time()}
+                      "t0": time.time(), "on_finish": on_finish}
         self._append_log(
             f"{course} {'passer ' if source in ('passers', 'roster') else ''}"
             "assessments: "
@@ -13019,6 +13213,7 @@ class App:
             f"{self._COURSE_ASSESS_BATCH} at a time (anything you do goes "
             "first). Keep a course page open in the app's browser.")
         self._cabg_step()
+        return True
 
     def _cabg_step(self) -> None:
         st = getattr(self, "_cabg", None)
@@ -13026,6 +13221,7 @@ class App:
             return
         if st["i"] >= len(st["targets"]):
             self._cabg = None
+            _run_on_finish(self.root, st)
             mins = (time.time() - st["t0"]) / 60
             c = dict(st["counts"])
             if not st["dry"]:
@@ -13068,6 +13264,7 @@ class App:
                 self.root.after(60_000, self._cabg_step)
                 return
             self._cabg = None
+            _run_on_finish(self.root, st)
             self._append_log(f"{st['course']} assessments stopped after "
                              f"{st['i']} students: {res['error']} — type "
                              f"l360assess: {st['course']} to resume.",
@@ -13100,6 +13297,7 @@ class App:
             return
         if (r or {}).get("error"):
             self._cabg = None
+            _run_on_finish(self.root, st)
             self._append_log(f"{st['course']} assessments couldn't save: "
                              f"{r['error']}", error=True)
             return
@@ -13372,6 +13570,7 @@ class App:
             return
         if st["i"] >= len(st["targets"]):
             self._l360_abg = None
+            _run_on_finish(self.root, st)
             n = len(st["targets"])
             if st["fail"] <= max(3, n // 10) and not st.get("cohort"):
                 try:
@@ -13407,6 +13606,7 @@ class App:
         res = res or {}
         if res.get("error"):
             self._l360_abg = None
+            _run_on_finish(self.root, st)
             if res.get("not_logged_in"):
                 self._append_log("Learner360 isn't signed in, so the weekly "
                                  "activity import paused — it'll retry later.")
@@ -13436,6 +13636,7 @@ class App:
             return
         if (r or {}).get("error"):
             self._l360_abg = None
+            _run_on_finish(self.root, st)
             self._append_log(f"Learner360 activity (weekly import) couldn't "
                              f"save: {r['error']}", error=True)
             return
@@ -21718,6 +21919,30 @@ class App:
             command=lambda: self._l360_refresh_now("plan"),
         ).pack(side="left", padx=(8, 0))
 
+        # Course watch (daily) — catch passers before they leave the roster.
+        cw_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        cw_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkLabel(cw_row, text="Course watch (daily):").pack(side="left")
+        cw_var = ctk.StringVar(
+            value=getattr(self.settings, "course_watch_courses", "") or "")
+        cw_entry = ctk.CTkEntry(cw_row, width=200, textvariable=cw_var,
+                                placeholder_text="e.g. C949, C769, C964")
+        cw_entry.pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            cw_row, text="Run now", width=100,
+            command=lambda: self._start_course_watch(
+                self._parse_courses(cw_var.get()) or None, manual=True),
+        ).pack(side="left", padx=(8, 0))
+        try:
+            _attach_tooltip(cw_entry, "Each day: re-pull these courses' "
+                            "Learner360 rosters (students who leave — e.g. "
+                            "passers — are kept), then refresh students close "
+                            "to finishing, new ones, and the stalest: their "
+                            "assessment attempts + 90 days of activity. Blank "
+                            "= off.")
+        except Exception:
+            pass
+
         # Learner360 team roster → inbox labeler overlay (current instructors).
         l3r_row = ctk.CTkFrame(dialog, fg_color="transparent")
         l3r_row.pack(fill="x", padx=32, pady=(0, 10))
@@ -22348,6 +22573,12 @@ class App:
             # Learner360 degree plans + program mentor, days; 0 = off.
             self.settings.l360_auto_plan_days = _L3_LABELS.get(
                 l3p_var.get().strip(), 7)
+            # Course watch courses (blank = off).
+            _cw_new = ", ".join(self._parse_courses(cw_var.get()))
+            _cw_was = getattr(self.settings, "course_watch_courses", "") or ""
+            self.settings.course_watch_courses = _cw_new
+            if _cw_new and not _cw_was:
+                self.root.after(5000, self._maybe_course_watch)
             # Learner360 team roster (inbox labeler overlay), days; 0 = off.
             self.settings.l360_auto_roster_days = _L3R_LABELS.get(
                 l3r_var.get().strip(), 1)

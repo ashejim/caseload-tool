@@ -413,6 +413,11 @@ class Settings:
     # Learner360 degree plan + community of care (program mentor): background
     # pull in small batches. Days between runs; 0 = off (use `l360plan:`).
     l360_auto_plan_days: int = 7
+    # Course watch (daily): for each listed course, re-pull its Learner360
+    # cohort (keeping students who leave — passers), then refresh students
+    # close to finishing + new + stalest: assessments + 90 days of activity.
+    # Comma/space separated course codes; blank = off.
+    course_watch_courses: str = ""
     # Stage 2 (beta): draw CaseloadNotes badges into Learner360 pages in the
     # app's own browser (read-only). Off by default.
     l360_overlay_enabled: bool = False
