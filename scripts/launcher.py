@@ -10563,8 +10563,10 @@ class App:
             # Badges right away (cheap); the student-panel extras (notes,
             # MOMI trend, learner-id map) take ~1 s of DB work → background
             # thread, then a second, complete snapshot.
+            fields = self._panel_fields()
             first = l360_overlay.build_snapshot(
-                rows, step_cols, version=ver, extras=self._overlay_extras_cache)
+                rows, step_cols, version=ver, extras=self._overlay_extras_cache,
+                fields=fields)
             self.worker.set_overlay_snapshot(first)
             # One diagnostic line per session: how much the overlay gets.
             ents = [e for v in first["students"].values() for e in v]
@@ -10588,6 +10590,16 @@ class App:
                     ax = assess_summary.load([r.get("StudentID") for r in rows])
                     ex["uuid_map"].update(ax["uuid_map"])
                     ex["assess"], ex["cohort"] = ax["assess"], ax["cohort"]
+                    # Caseload-browser fields for the panel's ⚙ Fields picker
+                    # (stays app-side; only chosen values go to the page).
+                    import json as _json
+                    from src.config import USER_CONFIG_DIR as _ucd
+                    _rp = _ucd / "coursescan_roster.json"
+                    if _rp.exists():
+                        ids = {str(r.get("StudentID") or "").lstrip("0")
+                               for r in rows} | set(ax["cohort"])
+                        ex["roster"] = l360_overlay.roster_fields(
+                            _json.loads(_rp.read_text(encoding="utf-8")), ids)
                 except Exception as e:
                     self._diag_once("overlay-assess", f"  [overlay] assessment "
                                     f"summaries unavailable: {e}")
@@ -10598,7 +10610,7 @@ class App:
                 self.worker.set_overlay_snapshot(
                     l360_overlay.build_snapshot(rows, step_cols,
                                                 version=App._overlay_version,
-                                                extras=ex))
+                                                extras=ex, fields=fields))
 
             threading.Thread(target=work, daemon=True,
                              name="overlay-extras").start()
@@ -10618,6 +10630,9 @@ class App:
                     by_nsid.setdefault(full.lstrip("0"), (full, r))
             changed = False
             for a in acts or []:
+                if isinstance(a, dict) and a.get("type") == "panel_fields":
+                    self._set_panel_fields(a.get("keys"))
+                    continue
                 if isinstance(a, dict) and a.get("type") == "refresh_assess":
                     self._refresh_one_assess(str(a.get("sid") or ""),
                                              str(a.get("course") or ""))
@@ -10684,6 +10699,29 @@ class App:
                 except Exception:
                     pass
         self.worker.submit_open_url(url, on_done)
+
+    def _panel_fields(self) -> list:
+        """Caseload column keys chosen for the Learner360 panel."""
+        import json as _json
+        try:
+            v = _json.loads(getattr(self.settings, "l360_panel_fields", "") or "[]")
+            return [str(k) for k in v if isinstance(k, str)][:40]
+        except ValueError:
+            return []
+
+    def _set_panel_fields(self, keys) -> None:
+        """⚙ Fields in the Learner360 panel: keep only real caseload columns
+        (max 40), save, and re-push the panel data."""
+        import json as _json
+        from src import l360_overlay
+        rows = self._caseload_rows or []
+        valid = {k for k, _d in l360_overlay.field_catalog(
+            rows, getattr(self, "_overlay_extras_cache", None) or {})}
+        keys = [k for k in (keys or []) if isinstance(k, str) and k in valid][:40]
+        self.settings.l360_panel_fields = _json.dumps(keys)
+        save_settings(self.settings)
+        self._append_log(f"Learner360 panel: showing {len(keys)} extra field(s).")
+        self._push_overlay_snapshot()
 
     def _refresh_one_assess(self, sid: str, course: str) -> None:
         """↻ in the Learner360 panel: re-import one student's assessments for

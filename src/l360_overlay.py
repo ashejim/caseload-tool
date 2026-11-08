@@ -10,6 +10,7 @@ Pure: no browser, no DB. Read-only by design (P0 shows data; changes nothing).
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 # Task status labels as the caseload rows carry them (TASK_STATE_LABELS).
@@ -38,8 +39,72 @@ def _next_step(row: dict, steps: list) -> str:
     return ""
 
 
+# Caseload-browser (Any-Course scan) fields offered to the panel as "CB:<f>"
+# — link / tooltip / styling / bookkeeping fields are skipped.
+_CB_SKIP = re.compile(r"(Url|hoverText|cssStyle|Yesterday)$|^(uniqueKey|"
+                      r"LoggedInUser|CaseloadTotalRows|contactterm|"
+                      r"StudentAcademicCourseId|contactID|PIDM|MentorId|"
+                      r"CourseMentorID|CourseMentorUserID|Birthday)$")
+
+
+def _human(name: str) -> str:
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(name))
+    return re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s).strip()
+
+
+def roster_fields(roster_rows, student_ids=None) -> dict:
+    """{nsid: {course: {field: value}}} from the caseload-browser scan rows,
+    for ``student_ids`` (all when None), useful fields only."""
+    want = ({_nsid(s) for s in student_ids} - {""}) if student_ids is not None \
+        else None
+    out: dict = {}
+    for r in roster_rows or []:
+        sid = _nsid(r.get("StudentID"))
+        course = str(r.get("CourseCode") or "").strip().upper()
+        if not sid or not course or (want is not None and sid not in want):
+            continue
+        out.setdefault(sid, {})[course] = {
+            k: v for k, v in r.items()
+            if k and not _CB_SKIP.search(k) and str(v or "").strip()}
+    return out
+
+
+def _disp(key: str) -> str:
+    from src import caseload_csv
+    if str(key).startswith("CB:"):
+        return "CB · " + _human(key[3:])
+    return caseload_csv.display_for_column(key)
+
+
+def field_catalog(rows: list, extras: Optional[dict] = None) -> list:
+    """[[key, display name]] the panel's ⚙ Fields picker offers: every
+    caseload column (internal, per-task facet and success-path helpers
+    excluded) + every caseload-browser field seen ("CB:<field>"), sorted by
+    display name."""
+    from src import caseload_filter
+    keys = []
+    if rows:
+        keys = [k for k in rows[0].keys()
+                if k and not str(k).startswith("_") and not str(k).startswith("sp:")
+                and not caseload_filter.is_task_facet_col(k)]
+    cb = set()
+    for per in ((extras or {}).get("roster") or {}).values():
+        for flds in per.values():
+            cb.update(flds)
+    keys += ["CB:" + f for f in sorted(cb)]
+    return sorted(([k, _disp(k)] for k in keys), key=lambda kd: kd[1].lower())
+
+
+def _field_value(key: str, row: Optional[dict], roster: dict, sid: str,
+                 course: str) -> str:
+    if str(key).startswith("CB:"):
+        return str(((roster.get(sid) or {}).get(course) or {}).get(key[3:]) or "").strip()
+    return str((row or {}).get(key) or "").strip()
+
+
 def build_snapshot(rows: list, step_cols: Optional[dict] = None,
-                   version: int = 0, extras: Optional[dict] = None) -> dict:
+                   version: int = 0, extras: Optional[dict] = None,
+                   fields: Optional[list] = None) -> dict:
     """{"v": version, "students": {student id without leading zeros:
     [entry per course]}, "uuid_map", "notes", "momi"} from the caseload rows
     (after derived columns, task status and EAs are applied). ``step_cols`` =
@@ -47,6 +112,7 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
     history.overlay_extras(...) for the student panel (uuid → student map,
     recent notes, MOMI trend); omitted → empty."""
     step_cols = step_cols or {}
+    roster = (extras or {}).get("roster") or {}
     out: dict = {}
     for r in rows or []:
         sid = _nsid(r.get("StudentID") or r.get("Student ID"))
@@ -68,7 +134,10 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
                           "date": date,
                           "count": str(r.get(f"Task{n}Count") or "")})
         risk = _num(r.get("MomentumRisk"))
+        chosen = [[_disp(k), v] for k in fields or []
+                  if (v := _field_value(k, r, roster, sid, course))]
         out.setdefault(sid, []).append({
+            "fields": chosen,
             "course": course,
             "name": str(r.get("Name") or ""),
             "tasks": tasks,
@@ -116,12 +185,17 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
             e = {"course": c["course"], "name": "", "tasks": [], "risk": None,
                  "momentum": c.get("momentum") or "", "next_step": "",
                  "steps": [], "term_end": c.get("term_end") or "",
-                 "cohort": c}
+                 "cohort": c,
+                 "fields": [[_disp(k), v] for k in fields or []
+                            if (v := _field_value(k, None, roster, sid,
+                                                  c["course"]))]}
             a = (assess.get(sid) or {}).get(c["course"])
             if a:
                 e["assess"] = a
             out.setdefault(sid, []).append(e)
     return {"v": version, "students": out,
+            "field_catalog": field_catalog(rows, extras),
+            "panel_fields": list(fields or []),
             "uuid_map": dict(ex.get("uuid_map") or {}),
             "notes": dict(ex.get("notes") or {}),
             "momi": dict(ex.get("momi") or {})}

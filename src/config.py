@@ -421,6 +421,9 @@ class Settings:
     course_watch_enabled: bool = False
     # Courses last chosen in the viewer's "👥 Course cohort" view.
     cohort_view_courses: str = ""
+    # Extra caseload columns shown in the Learner360 student panel (JSON list
+    # of column keys), chosen with the panel's ⚙ Fields picker.
+    l360_panel_fields: str = ""
     course_watch_courses: str = ""
     # Stage 2 (beta): draw CaseloadNotes badges into Learner360 pages in the
     # app's own browser (read-only). Off by default.

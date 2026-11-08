@@ -351,6 +351,59 @@ def test_pa_only_course_box_shows_tasks_not_oa():
         b.close()
 
 
+def test_panel_fields_catalog_values_and_picker():
+    from playwright.sync_api import sync_playwright
+    roster = l360_overlay.roster_fields([
+        {"StudentID": "000123456", "CourseCode": "C769", "TermSAP": "Yes",
+         "AcademicStanding": "Good Standing", "NameUrl": "https://x",
+         "Task1hoverText": "tip"},
+        {"StudentID": "000555555", "CourseCode": "C949", "TotalCompletedCU": "88"}])
+    assert set(roster["123456"]["C769"]) == {"StudentID", "CourseCode", "TermSAP",
+                                             "AcademicStanding"}   # links/tips skipped
+    extras = {"uuid_map": {UUID: "123456", U2: "555555"}, "roster": roster,
+              "cohort": {"555555": [{"course": "C949", "owner": "X", "team": "T"}]}}
+    snap = l360_overlay.build_snapshot(
+        ROWS, STEPS, version=5, extras=extras,
+        fields=["DaysSinceCourseActivity", "CB:TermSAP", "CB:TotalCompletedCU"])
+    cat = dict(snap["field_catalog"])
+    assert cat["CB:TermSAP"] == "CB · Term SAP" and "CB:NameUrl" not in cat
+    assert "DaysSinceCourseActivity" in cat
+    e = snap["students"]["123456"][0]
+    assert e["fields"] == [[cat["DaysSinceCourseActivity"], "12"],
+                           ["CB · Term SAP", "Yes"]]
+    assert snap["students"]["555555"][0]["fields"] == [["CB · Total Completed CU", "88"]]
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context()
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html",
+                                      body="<html><body>x</body></html>"))
+        pg = ctx.new_page()
+        pg.goto(f"https://learner360.wgu.edu/learner/{UUID}")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(700)
+        root = "document.querySelector('[data-cn=panel]').shadowRoot"
+        html = pg.evaluate(f"() => {root}.innerHTML")
+        assert "CB · Term SAP" in html and "⚙ Fields (3)" in html
+        pg.evaluate(f"() => {root}.querySelector('[data-act=pick-fields]').click()")
+        pg.wait_for_timeout(200)
+        pg.evaluate(f"""() => {{ const s = {root}.querySelector('.fsearch');
+            s.value = 'standing'; s.dispatchEvent(new Event('input')); }}""")
+        opts = pg.evaluate(f"() => [...{root}.querySelectorAll('.fopt')].map(l => l.textContent.trim())")
+        assert opts == ["CB · Academic Standing"], opts
+        pg.evaluate(f"() => {root}.querySelector('.fopt input').click()")
+        pg.evaluate(f"() => {root}.querySelector('[data-f=save]').click()")
+        out = pg.evaluate("window.__cnOverlay.takeOutbox()")
+        assert out == [{"type": "panel_fields", "keys": [   # picker (A-Z) order
+            "CB:AcademicStanding", "CB:TermSAP", "CB:TotalCompletedCU",
+            "DaysSinceCourseActivity"]}], out
+        b.close()
+
+
 def test_pronoun_edit_round_trip():
     import types
     from playwright.sync_api import sync_playwright

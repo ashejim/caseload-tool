@@ -225,6 +225,14 @@ OVERLAY_JS = r"""
     .sec { border-top: 1px solid #e8edf3; padding: 10px 0 6px; }
     .asm { margin-top: 8px; padding-top: 6px; border-top: 1px dashed #e8edf3; }
     .tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 6px; }
+    .flds { margin-top: 6px; }
+    .fbtn { margin-left: 6px; padding: 3px 6px; }
+    .fsearch { width: 100%; box-sizing: border-box; margin: 4px 0 6px;
+      padding: 5px 7px; border: 1px solid #c9d4e2; border-radius: 6px;
+      font: 12px -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+    .flist { max-height: 46vh; overflow: auto; border: 1px solid #e8edf3;
+      border-radius: 6px; padding: 4px 6px; }
+    .fopt { display: block; font-size: 12px; padding: 2px 0; cursor: pointer; }
     .tb { font: 600 11px/1 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
       padding: 4px 7px; border-radius: 12px; border: 1px solid #c9d4e2;
       background: #fff; color: #3d4b5c; cursor: pointer; }
@@ -446,6 +454,40 @@ OVERLAY_JS = r"""
     return h + `</div>`;
   }
 
+  // ---- ⚙ Fields picker: which caseload columns the panel shows ---------
+  function openFieldPicker() {
+    const cat = S.data.field_catalog || [];
+    const chosen = new Set(S.data.panel_fields || []);
+    const body = panelRoot.querySelector('.body');
+    if (!body || !cat.length) return;
+    const list = q => cat.filter(([k, d]) => !q || d.toLowerCase().includes(q))
+      .map(([k, d]) => `<label class="fopt"><input type="checkbox" value="${esc(k)}"${chosen.has(k) ? ' checked' : ''}> ${esc(d)}</label>`).join('');
+    body.innerHTML = `<div class="sec"><div class="lbl">Fields to show (${cat.length} available)</div>
+      <input class="fsearch" placeholder="Search fields…">
+      <div class="flist">${list('')}</div>
+      <div class="links"><button class="lnk" data-f="save">Save</button><button class="lnk" data-f="cancel">Cancel</button><button class="lnk" data-f="none">Clear all</button></div></div>`;
+    const flist = body.querySelector('.flist');
+    const keep = () => flist.querySelectorAll('input').forEach(i =>
+      i.checked ? chosen.add(i.value) : chosen.delete(i.value));
+    body.querySelector('.fsearch').addEventListener('input', ev => {
+      keep();
+      flist.innerHTML = list(ev.target.value.trim().toLowerCase());
+    });
+    body.querySelector('[data-f="save"]').addEventListener('click', () => {
+      keep();
+      const keys = cat.map(([k]) => k).filter(k => chosen.has(k));  // catalog order
+      S.outbox.push({ type: 'panel_fields', keys: keys });
+      S.data.panel_fields = keys;
+      panelKey = '';
+      renderPanel();
+    });
+    body.querySelector('[data-f="cancel"]').addEventListener('click', () => { panelKey = ''; renderPanel(); });
+    body.querySelector('[data-f="none"]').addEventListener('click', () => {
+      chosen.clear();
+      flist.querySelectorAll('input').forEach(i => { i.checked = false; });
+    });
+  }
+
   function panelHtml(sid, entries) {
     const e0 = entries[0];
     const courses = entries.map(e => e.course).filter(Boolean).join(' · ');
@@ -453,7 +495,8 @@ OVERLAY_JS = r"""
       <div class="sub">${esc(courses)}${e0.contact_pref ? ' · prefers ' + esc(e0.contact_pref) : ''}</div>
       <div class="pron">${e0.pronouns ? `<span>${esc(e0.pronouns)}</span>`
         : '<span class="unk">pronouns unknown</span>'}
-        <button class="icon" data-act="edit-pron" title="Set pronouns (saved in CaseloadNotes only)">✎</button></div>`;
+        <button class="icon" data-act="edit-pron" title="Set pronouns (saved in CaseloadNotes only)">✎</button>
+        <button class="lnk fbtn" data-act="pick-fields" title="Choose extra caseload columns to show here">⚙ Fields${(S.data.panel_fields || []).length ? ' (' + S.data.panel_fields.length + ')' : ''}</button></div>`;
     for (const e of entries) {
       const box = assessBox(e, sid);
       const tasks = box ? '' : taskChips(e);   // tasks live in the box when shown
@@ -462,6 +505,9 @@ OVERLAY_JS = r"""
         ${e.risk != null ? `<span class="chip ${riskCls(e.risk)}" title="${esc(RISK_TIP)}">risk ${Math.round(e.risk)}%</span>` : ''}
         ${e.momentum ? `<span class="chip">${esc(e.momentum)}</span>` : ''}</div>
         ${e.ea ? `<div class="row ea"><span>Open EA</span><span>${esc(e.ea)}</span></div>` : ''}`;
+      if ((e.fields || []).length)
+        h += `<div class="flds">` + e.fields.map(([k, v]) =>
+          `<div class="row"><span class="k">${esc(k)}</span><span>${esc(v)}</span></div>`).join('') + `</div>`;
       if (e.cohort)
         h += `<div class="sub">${esc(e.cohort.team || 'team')} student · CI ${esc(e.cohort.owner || '—')}${e.cohort.program ? ' · ' + esc(e.cohort.program) : ''}${e.cohort.departed ? ' · left the roster ' + esc(e.cohort.departed) : ''}</div>`;
       h += box;
@@ -516,6 +562,8 @@ OVERLAY_JS = r"""
       try { localStorage.setItem('cnPanelCollapsed', panelCollapsed ? '1' : '0'); } catch (e) {}
       panelRoot.querySelector('.panel').classList.toggle('collapsed', panelCollapsed);
     });
+    const fb = panelRoot.querySelector('[data-act="pick-fields"]');
+    if (fb) fb.addEventListener('click', () => openFieldPicker());
     panelRoot.querySelectorAll('.tb[data-tab]').forEach(b =>
       b.addEventListener('click', () => {
         tabSel[b.dataset.key] = b.dataset.tab;
