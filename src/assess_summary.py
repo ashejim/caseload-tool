@@ -185,7 +185,7 @@ def summarize(course: str, ca: Optional[dict], pre_rows: list,
 
 
 def load(student_ids=None, *, roster_path: Optional[Path] = None,
-         cohort_days: int = 30, db_path=None) -> dict:
+         cohort_days: int = 30, db_path=None, only=None) -> dict:
     """Everything the panel/student view needs, in one pass:
     {"assess": {nsid: {course: summary}}, "cohort": {nsid: [{course, owner,
     team, program, momentum, term_end, departed}]}, "uuid_map": {uuid: nsid}}
@@ -203,6 +203,8 @@ def load(student_ids=None, *, roster_path: Optional[Path] = None,
     except (OSError, ValueError):
         rows = []
     want = set(raw["ids"])
+    if only is not None:      # just these students (the in-app student view)
+        want = {_nsid(s) for s in only} - {""}
     ri = roster_index([r for r in rows if _nsid(r.get("StudentID")) in want])
     base = coaching_base(rows)
     assess = {}

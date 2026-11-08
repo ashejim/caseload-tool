@@ -4801,6 +4801,7 @@ class CaseloadPanel:
         # Editable follow-up date (writes back to Salesforce) — full width.
         self._qv_grid = full
         rF = self._qv_followup_editor(rF, row)
+        rF = self._qv_assessments(rF, self._cell(row, "StudentID"))
         self._qv_grid = self.qv_body
         # Notes-column header: last action + latest course note pinned atop
         # the notes (the at-a-glance context, kept on screen above them).
@@ -7457,6 +7458,9 @@ class CaseloadPanel:
                 if c and c in supported and c not in shown_courses:
                     shown_courses.add(c)
                     r = self._qv_offcaseload_task_badges(r, c, oc_sid, name)
+        if oc_sid:
+            self._qv_grid = self.qv_body
+            r = self._qv_assessments(r, oc_sid)
         r = line(r, "Program", profile.get("program", "")
                  or profile.get("degree_program", ""))
         r = line(r, "Term #", profile.get("term_number", ""))
@@ -7472,6 +7476,98 @@ class CaseloadPanel:
             self._ensure_detail_height()
         except Exception:
             pass
+
+    def _qv_assessments(self, r: int, sid: str) -> int:
+        """OA / pre-assessment block (src/assess_summary): per course with
+        data — OA attempts with scores vs the cut, next attempt, attempt-4
+        hint, pre-A sittings, latest coaching, and buttons to open the course
+        page / coaching / pre-A report in the app's browser + ↻ refresh.
+        Renders nothing when there's no assessment data. Returns next row."""
+        if not str(sid or "").strip():
+            return r
+        try:
+            from src import assess_summary
+            data = assess_summary.load([sid], only=[sid])
+            per = (data.get("assess") or {}).get(str(sid).strip().lstrip("0")) or {}
+        except Exception:
+            return r
+        g = self._qv_grid
+        for course, a in sorted(per.items()):
+            oa, pre = a.get("oa") or {}, a.get("pre") or {}
+            box = ctk.CTkFrame(g, corner_radius=6,
+                               fg_color=("#f3f6fa", "#1f2630"))
+            box.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(6, 2))
+            box.grid_columnconfigure(0, weight=1)
+            r += 1
+            k = 0
+
+            def add(text, bold=False, color=None):
+                nonlocal k
+                kw = {"text_color": color} if color else {}
+                ctk.CTkLabel(box, text=text, anchor="w", justify="left",
+                             wraplength=520,
+                             font=ctk.CTkFont(size=12 if not bold else 11,
+                                              weight="bold" if bold else "normal"),
+                             **kw).grid(row=k, column=0, sticky="w",
+                                        padx=8, pady=(4 if k == 0 else 0, 1))
+                k += 1
+            add(f"Assessments · {course}"
+                + (f" · {a.get('oa_code')}" if a.get("oa_code") else "")
+                + (f" · cut {a['cut']}" if a.get("cut") else ""), bold=True,
+                color=("gray35", "gray70"))
+            sits = " · ".join(
+                f"#{t.get('n')} {t.get('score') if t.get('score') is not None else '—'}"
+                f"{' ✓' if t.get('passed') else ''}"
+                for t in oa.get("sittings") or [])
+            add("OA: " + ("passed" if oa.get("passed") else
+                          f"{oa.get('used', 0)} of {oa.get('max', 4)} used")
+                + (f"   ({sits})" if sits else ""))
+            nx = oa.get("next") or {}
+            if nx.get("scheduled") or nx.get("approval"):
+                add("Next: " + " · ".join(x for x in (
+                    f"scheduled {nx['scheduled']}" if nx.get("scheduled") else "",
+                    nx.get("approval") or "") if x))
+            if a.get("prep"):
+                p = a["prep"]
+                add("Next is attempt 4 — it repeats attempt 2's form. "
+                    + (f"Not competent then: {', '.join(p.get('not_competent') or [])}. "
+                       if p.get("not_competent") else "")
+                    + (f"Attempt-2 study topics: {'; '.join(p.get('suggested') or [])}"
+                       if p.get("suggested") else ""),
+                    color=("#8a4b00", "#f0b45c"))
+            if pre.get("sittings"):
+                pct = lambda x: "—" if x is None else f"{x}%"  # noqa: E731
+                add(f"Pre-A: {pre['sittings']} sitting(s) · first "
+                    f"{pct(pre.get('first_pct'))} · last {pct(pre.get('last_pct'))}"
+                    + (f" ({pre['last_date']})" if pre.get("last_date") else "")
+                    + (f" · {pre['since_last_oa']} since last OA"
+                       if pre.get("since_last_oa") else "")
+                    + "   (not a readiness signal)")
+            c = a.get("coaching")
+            if c:
+                add("Coaching" + (f" ({c['date']})" if c.get("date") else "") + ": "
+                    + " · ".join(f"{x.get('title') or x.get('num')}: {x.get('rating')}"
+                                 for x in c.get("ratings") or []))
+                if c.get("suggested"):
+                    add("Suggested: " + "; ".join(c["suggested"]))
+            bar = ctk.CTkFrame(box, fg_color="transparent")
+            bar.grid(row=k, column=0, sticky="w", padx=6, pady=(2, 6))
+            links = a.get("links") or {}
+            for i, (key, label) in enumerate((("cos", "Course page"),
+                                              ("coaching", "Coaching report"),
+                                              ("preA", "Pre-A report"))):
+                if links.get(key):
+                    ctk.CTkButton(
+                        bar, text=label, height=24, width=10,
+                        **SECONDARY_BTN_KWARGS,
+                        command=lambda u=links[key]: self.app._open_wgu_url(u),
+                    ).grid(row=0, column=i, padx=2)
+            ctk.CTkButton(
+                bar, text="↻", height=24, width=28, **SECONDARY_BTN_KWARGS,
+                command=lambda c_=course: self.app._refresh_one_assess(
+                    str(sid), c_),
+            ).grid(row=0, column=4, padx=2)
+        return r
 
     def _oc_aci_block(self, r: int, active: list, enriched: bool = True) -> int:
         """Render the active ACI (assigned course instructor) as a highlighted
@@ -10226,6 +10322,22 @@ class App:
             self.root.after(0, apply)
         except Exception:
             pass
+
+    def _open_wgu_url(self, url: str) -> None:
+        """Open a WGU page (course page / coaching / pre-A report) in the
+        app's signed-in browser."""
+        if getattr(self, "_offline", False) or not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+
+        def on_done(res):
+            if (res or {}).get("error"):
+                try:
+                    self.root.after(0, lambda: self._append_log(
+                        f"✗ {res['error']}", error=True))
+                except Exception:
+                    pass
+        self.worker.submit_open_url(url, on_done)
 
     def _refresh_one_assess(self, sid: str, course: str) -> None:
         """↻ in the Learner360 panel: re-import one student's assessments for

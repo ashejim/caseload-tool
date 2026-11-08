@@ -115,6 +115,13 @@ def test_load_from_temp_db_and_roster():
         s = out["assess"]["555555"]["C949"]
         assert s["oa"]["used"] == 3                     # roster count wins
         assert s["pre"]["first_pct"] == 50 and s["pre"]["rows"][0]["date"] == "2026-07-20"
+        # Just one student (the in-app student view).
+        one = asum.load(["555555"], only=["0555555"], roster_path=rpath,
+                        db_path=path)
+        assert set(one["assess"]) == {"555555"}
+        none = asum.load(["000123"], only=["000123"], roster_path=rpath,
+                         db_path=path)
+        assert none["assess"] == {}
     finally:
         os.remove(path)
         os.remove(rpath)

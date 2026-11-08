@@ -523,6 +523,15 @@ class BrowserWorker:
         hands back {"store": {...}} — endpoint shapes, no values."""
         self.q.put(("L360_DISCOVER", bool(on), on_done))
 
+    _OPEN_URL_HOSTS = ("my.wgu.edu", "learner360.wgu.edu")
+
+    def submit_open_url(self, url: str,
+                        on_done: Optional[Callable[[dict], None]] = None) -> None:
+        """Open a WGU page (student course page, coaching / pre-assessment
+        report, Learner360) in a new tab of this signed-in browser and bring
+        it forward. Other hosts are refused."""
+        self.q.put(("OPEN_URL", url, on_done))
+
     def submit_l360_open(self, on_done: Callable[[dict], None],
                          surface: bool = True) -> None:
         """Open (or focus) Learner360's caseload in this browser and bring the
@@ -1212,6 +1221,23 @@ class BrowserWorker:
                     self._l360_disc = None
             if on_done:
                 on_done(res)
+        elif cmd[0] == "OPEN_URL":
+            _, url, on_done = cmd
+            res = {}
+            try:
+                from urllib.parse import urlsplit
+                sp = urlsplit(str(url or ""))
+                if sp.scheme != "https" or sp.netloc not in self._OPEN_URL_HOSTS:
+                    raise ValueError(f"not a WGU page: {sp.netloc or url!r}")
+                page = ctx.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                self._bring_browser_forward(page)
+                res = {"ok": True}
+            except Exception as e:
+                res = {"error": f"couldn't open the page: {e}"}
+            finally:
+                if on_done:
+                    on_done(res)
         elif cmd[0] == "L360_OPEN":
             _, on_done, surface = cmd
             res = {}
