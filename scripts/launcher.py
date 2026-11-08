@@ -4769,6 +4769,7 @@ class CaseloadPanel:
         # Contact-column fields (the rest go to the general/left column); wide
         # or long fields span the full width below both columns.
         contact_keys = {"email", "timezone"}
+        show_tasks = False
         for key in self._quickview_field_keys():
             ent = catalog.get(key)
             if not ent:
@@ -4780,9 +4781,9 @@ class CaseloadPanel:
                 continue
             label, csv_key, kind = ent
             if kind == "tasks":
-                self._qv_grid = full
-                self._qv_task_badges(rF, row)
-                rF += 1
+                # Tasks (PAs) live in the Assessments box (below).
+                show_tasks = True
+                continue
             elif kind == "longtext":
                 self._qv_grid = full
                 rF = self._qv_field(rF, row, label, csv_key, kind)
@@ -4801,7 +4802,8 @@ class CaseloadPanel:
         # Editable follow-up date (writes back to Salesforce) — full width.
         self._qv_grid = full
         rF = self._qv_followup_editor(rF, row)
-        rF = self._qv_assessments(rF, self._cell(row, "StudentID"))
+        rF = self._qv_assessments(rF, self._cell(row, "StudentID"), row=row,
+                                  show_tasks=show_tasks)
         self._qv_grid = self.qv_body
         # Notes-column header: last action + latest course note pinned atop
         # the notes (the at-a-glance context, kept on screen above them).
@@ -6364,6 +6366,13 @@ class CaseloadPanel:
         if q.lower().startswith(("l360discover", "1360discover")):
             self.app._l360_discover("stop" not in q.lower())
             return "break"
+        # "oasample: [C949]" — open up to 3 students with 3+ OA attempts on
+        # their Learner360 pages (to check the Assessments panel). No ids are
+        # logged.
+        if q.lower().startswith("oasample"):
+            rest = q.split(":", 1)[1] if ":" in q else ""
+            self.app._oa_sample((self.app._parse_courses(rest) or ["C949"])[0])
+            return "break"
         # "coursewatch:" — run the daily course watch now (Settings list);
         # "coursewatch: C949 C769" — just those courses, once.
         if q.lower().startswith(("coursewatch", "course watch")):
@@ -7460,7 +7469,9 @@ class CaseloadPanel:
                     r = self._qv_offcaseload_task_badges(r, c, oc_sid, name)
         if oc_sid:
             self._qv_grid = self.qv_body
-            r = self._qv_assessments(r, oc_sid)
+            r = self._qv_assessments(
+                r, oc_sid, courses=[str(a.get("course", "") or "").strip().upper()
+                                    for a in active])
         r = line(r, "Program", profile.get("program", "")
                  or profile.get("degree_program", ""))
         r = line(r, "Term #", profile.get("term_number", ""))
@@ -7477,97 +7488,224 @@ class CaseloadPanel:
         except Exception:
             pass
 
-    def _qv_assessments(self, r: int, sid: str) -> int:
-        """OA / pre-assessment block (src/assess_summary): per course with
-        data — OA attempts with scores vs the cut, next attempt, attempt-4
-        hint, pre-A sittings, latest coaching, and buttons to open the course
-        page / coaching / pre-A report in the app's browser + ↻ refresh.
-        Renders nothing when there's no assessment data. Returns next row."""
-        if not str(sid or "").strip():
+    _GRID_BG = {"ok": ("#e3f4ea", "#1e3a2a"), "mid": ("#fff4e5", "#3d3020"),
+                "bad": ("#fde8e8", "#3d2020"), "": "transparent"}
+
+    def _qv_assessments(self, r: int, sid: str, row: dict = None,
+                        show_tasks: bool = False, courses=None) -> int:
+        """The Assessments box (src/assess_summary) — one course at a time:
+        your own student → their caseload course (tasks inside the box);
+        an off-caseload student → a course picker over ``courses`` + any
+        course with assessment data. Tabs: Summary (tasks / OA status /
+        attempt-4 hint / pre-A + the competency × attempt grid), Tasks,
+        Pre-A, OA 1..n. Only what applies to the course is shown. Buttons
+        open the course page / reports in the app's browser; ↻ re-imports.
+        Returns the next grid row."""
+        sid = str(sid or "").strip()
+        if not sid:
             return r
         try:
             from src import assess_summary
             data = assess_summary.load([sid], only=[sid])
-            per = (data.get("assess") or {}).get(str(sid).strip().lstrip("0")) or {}
+            per = (data.get("assess") or {}).get(sid.lstrip("0")) or {}
         except Exception:
+            per, assess_summary = {}, None
+        if assess_summary is None:
+            return r
+        own_course = (self._cell(row, "CourseCode").strip().upper()
+                      if row else "")
+        if own_course:
+            options = [own_course]
+        else:
+            options = sorted({c for c in (courses or []) if c} | set(per))
+        if not options or (own_course and not show_tasks
+                           and not per.get(own_course)):
             return r
         g = self._qv_grid
-        for course, a in sorted(per.items()):
-            oa, pre = a.get("oa") or {}, a.get("pre") or {}
-            box = ctk.CTkFrame(g, corner_radius=6,
-                               fg_color=("#f3f6fa", "#1f2630"))
-            box.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(6, 2))
-            box.grid_columnconfigure(0, weight=1)
-            r += 1
-            k = 0
+        holder = ctk.CTkFrame(g, corner_radius=6, fg_color=("#f3f6fa", "#1f2630"))
+        holder.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(6, 2))
+        holder.grid_columnconfigure(0, weight=1)
+        sel_course = getattr(self, "_qv_assess_course", {}).get(sid)
+        if sel_course not in options:
+            # Default: a course with OA/pre-A data, else the first.
+            sel_course = next((c for c in options if (per.get(c) or {}).get(
+                "attempts") or ((per.get(c) or {}).get("pre") or {}).get(
+                    "sittings")), options[0])
 
-            def add(text, bold=False, color=None):
-                nonlocal k
-                kw = {"text_color": color} if color else {}
-                ctk.CTkLabel(box, text=text, anchor="w", justify="left",
-                             wraplength=520,
-                             font=ctk.CTkFont(size=12 if not bold else 11,
-                                              weight="bold" if bold else "normal"),
-                             **kw).grid(row=k, column=0, sticky="w",
-                                        padx=8, pady=(4 if k == 0 else 0, 1))
+        def render(course):
+            self._qv_assess_course = getattr(self, "_qv_assess_course", {})
+            self._qv_assess_course[sid] = course
+            for w in holder.winfo_children():
+                w.destroy()
+            k = 0
+            if len(options) > 1:
+                pick = ctk.CTkSegmentedButton(
+                    holder, values=options, command=render, height=24)
+                pick.set(course)
+                pick.grid(row=k, column=0, sticky="w", padx=8, pady=(6, 2))
                 k += 1
-            add(f"Assessments · {course}"
-                + (f" · {a.get('oa_code')}" if a.get("oa_code") else "")
-                + (f" · cut {a['cut']}" if a.get("cut") else ""), bold=True,
-                color=("gray35", "gray70"))
-            sits = " · ".join(
-                f"#{t.get('n')} {t.get('score') if t.get('score') is not None else '—'}"
-                f"{' ✓' if t.get('passed') else ''}"
-                for t in oa.get("sittings") or [])
-            add("OA: " + ("passed" if oa.get("passed") else
-                          f"{oa.get('used', 0)} of {oa.get('max', 4)} used")
-                + (f"   ({sits})" if sits else ""))
-            nx = oa.get("next") or {}
-            if nx.get("scheduled") or nx.get("approval"):
-                add("Next: " + " · ".join(x for x in (
-                    f"scheduled {nx['scheduled']}" if nx.get("scheduled") else "",
-                    nx.get("approval") or "") if x))
-            if a.get("prep"):
-                p = a["prep"]
-                add("Next is attempt 4 — it repeats attempt 2's form. "
-                    + (f"Not competent then: {', '.join(p.get('not_competent') or [])}. "
-                       if p.get("not_competent") else "")
-                    + (f"Attempt-2 study topics: {'; '.join(p.get('suggested') or [])}"
-                       if p.get("suggested") else ""),
-                    color=("#8a4b00", "#f0b45c"))
-            if pre.get("sittings"):
-                pct = lambda x: "—" if x is None else f"{x}%"  # noqa: E731
-                add(f"Pre-A: {pre['sittings']} sitting(s) · first "
-                    f"{pct(pre.get('first_pct'))} · last {pct(pre.get('last_pct'))}"
-                    + (f" ({pre['last_date']})" if pre.get("last_date") else "")
-                    + (f" · {pre['since_last_oa']} since last OA"
-                       if pre.get("since_last_oa") else "")
-                    + "   (not a readiness signal)")
-            c = a.get("coaching")
-            if c:
-                add("Coaching" + (f" ({c['date']})" if c.get("date") else "") + ": "
-                    + " · ".join(f"{x.get('title') or x.get('num')}: {x.get('rating')}"
-                                 for x in c.get("ratings") or []))
-                if c.get("suggested"):
-                    add("Suggested: " + "; ".join(c["suggested"]))
-            bar = ctk.CTkFrame(box, fg_color="transparent")
+            a = per.get(course)
+            has_tasks = bool(show_tasks and own_course == course)
+            f = assess_summary.box_flags(a, has_tasks)
+            head = f"Assessments · {course}"
+            if a and f["oa"] and a.get("oa_code"):
+                head += f" · {a['oa_code']}"
+            if a and f["oa"] and a.get("cut"):
+                head += f" · cut {a['cut']}"
+            ctk.CTkLabel(holder, text=head, anchor="w",
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=("gray35", "gray70")).grid(
+                row=k, column=0, sticky="w", padx=8, pady=(4, 0))
+            k += 1
+            if not (f["pa"] or f["oa"] or f["pre"] or (a or {}).get("links")):
+                ctk.CTkLabel(holder, text="No assessment data for this course "
+                             "yet.", anchor="w").grid(row=k, column=0,
+                                                      sticky="w", padx=8,
+                                                      pady=(0, 6))
+                return
+            tabs = ["Summary"]
+            if f["pa"]:
+                tabs.append("Tasks")
+            if f["pre"]:
+                tabs.append("Pre-A")
+            if f["oa"]:
+                tabs += [f"OA {t.get('n')}" for t in (a or {}).get("attempts") or []]
+            body = ctk.CTkFrame(holder, fg_color="transparent")
+
+            def show(tab):
+                for w in body.winfo_children():
+                    w.destroy()
+                self._qv_assess_body(body, tab, a or {}, f, row, course)
+            if len(tabs) > 1:
+                seg = ctk.CTkSegmentedButton(holder, values=tabs, command=show,
+                                             height=24)
+                seg.set("Summary")
+                seg.grid(row=k, column=0, sticky="w", padx=8, pady=(2, 2))
+                k += 1
+            body.grid(row=k, column=0, sticky="ew", padx=8)
+            body.grid_columnconfigure(0, weight=1)
+            k += 1
+            show("Summary")
+            bar = ctk.CTkFrame(holder, fg_color="transparent")
             bar.grid(row=k, column=0, sticky="w", padx=6, pady=(2, 6))
-            links = a.get("links") or {}
-            for i, (key, label) in enumerate((("cos", "Course page"),
-                                              ("coaching", "Coaching report"),
-                                              ("preA", "Pre-A report"))):
-                if links.get(key):
+            links = (a or {}).get("links") or {}
+            col = 0
+            for key, label, ok in (("cos", "Course page", True),
+                                   ("coaching", "Coaching report", f["oa"]),
+                                   ("preA", "Pre-A report", f["pre"])):
+                if ok and links.get(key):
                     ctk.CTkButton(
                         bar, text=label, height=24, width=10,
                         **SECONDARY_BTN_KWARGS,
                         command=lambda u=links[key]: self.app._open_wgu_url(u),
-                    ).grid(row=0, column=i, padx=2)
-            ctk.CTkButton(
-                bar, text="↻", height=24, width=28, **SECONDARY_BTN_KWARGS,
-                command=lambda c_=course: self.app._refresh_one_assess(
-                    str(sid), c_),
-            ).grid(row=0, column=4, padx=2)
-        return r
+                    ).grid(row=0, column=col, padx=2)
+                    col += 1
+            if a:
+                ctk.CTkButton(
+                    bar, text="↻", height=24, width=28, **SECONDARY_BTN_KWARGS,
+                    command=lambda c_=course: self.app._refresh_one_assess(sid, c_),
+                ).grid(row=0, column=col, padx=2)
+
+        render(sel_course)
+        return r + 1
+
+    def _qv_assess_body(self, body, tab: str, a: dict, f: dict, row, course):
+        """One tab of the Assessments box (see _qv_assessments)."""
+        from src import assess_summary
+        k = 0
+
+        def add(text, color=None, wrap=520):
+            nonlocal k
+            kw = {"text_color": color} if color else {}
+            ctk.CTkLabel(body, text=text, anchor="w", justify="left",
+                         wraplength=wrap, font=ctk.CTkFont(size=12), **kw).grid(
+                row=k, column=0, sticky="w", pady=1)
+            k += 1
+        oa, pre = a.get("oa") or {}, a.get("pre") or {}
+        pct = lambda x: "—" if x is None else f"{x}%"  # noqa: E731
+        if tab in ("Summary", "Tasks") and f["pa"] and row is not None:
+            saved = self._qv_grid
+            self._qv_grid = body
+            try:
+                self._qv_task_badges(k, row)
+            finally:
+                self._qv_grid = saved
+            k += 1
+            if tab == "Tasks":
+                return
+        if tab == "Summary":
+            if f["oa"]:
+                add("OA: " + ("passed" if oa.get("passed") else
+                              f"{oa.get('used', 0)} of {oa.get('max', 4)} used"))
+                nx = oa.get("next") or {}
+                if nx.get("scheduled") or nx.get("approval"):
+                    add("Next: " + " · ".join(x for x in (
+                        f"scheduled {nx['scheduled']}" if nx.get("scheduled") else "",
+                        nx.get("approval") or "") if x))
+                if a.get("prep"):
+                    p = a["prep"]
+                    add("Next is attempt 4 — it repeats attempt 2's form. "
+                        + (f"Not competent then: {', '.join(p.get('not_competent') or [])}. "
+                           if p.get("not_competent") else "")
+                        + (f"Attempt-2 study topics: {'; '.join(p.get('suggested') or [])}"
+                           if p.get("suggested") else ""),
+                        color=("#8a4b00", "#f0b45c"))
+            if f["pre"]:
+                add(f"Pre-A: {pre.get('sittings')} sitting(s) · first "
+                    f"{pct(pre.get('first_pct'))} · last {pct(pre.get('last_pct'))}"
+                    + (f" · {pre['since_last_oa']} since last OA"
+                       if pre.get("since_last_oa") else "")
+                    + "   (not a readiness signal)")
+            if f["oa"] or f["pre"]:
+                gr = assess_summary.grid(a)
+                if gr["cols"]:
+                    tbl = ctk.CTkFrame(body, fg_color="transparent")
+                    tbl.grid(row=k, column=0, sticky="w", pady=(4, 2))
+                    k += 1
+                    for ci, lab in enumerate([""] + gr["cols"]):
+                        ctk.CTkLabel(tbl, text=lab, font=ctk.CTkFont(
+                            size=11, weight="bold"), text_color=("gray40", "gray65")
+                        ).grid(row=0, column=ci, padx=2, sticky="w" if ci == 0 else "")
+                    for ri, (lab, cells) in enumerate(gr["rows"], start=1):
+                        ctk.CTkLabel(tbl, text=lab[:26], anchor="w",
+                                     font=ctk.CTkFont(size=11)).grid(
+                            row=ri, column=0, padx=(0, 6), sticky="w")
+                        for ci, (txt, lvl) in enumerate(cells, start=1):
+                            ctk.CTkLabel(tbl, text=txt, width=46, corner_radius=4,
+                                         fg_color=self._GRID_BG.get(lvl, self._GRID_BG[""]),
+                                         font=ctk.CTkFont(size=11)).grid(
+                                row=ri, column=ci, padx=1, pady=1)
+            return
+        if tab == "Pre-A":
+            nums = sorted({n for p in pre.get("rows") or [] for n in (p.get("comps") or {})})
+            titles = a.get("titles") or {}
+            for p in pre.get("rows") or []:
+                comps = " · ".join(f"{(titles.get(n) or n).split(' ')[0]} "
+                                   f"{pct((p.get('comps') or {}).get(n))}" for n in nums)
+                add(f"#{p.get('n')}  {p.get('date') or ''}  total {pct(p.get('pct'))}"
+                    + (" ✓" if p.get("passed") else "") + (f"   ({comps})" if comps else ""))
+            add("Pre-A scores don't predict OA results (C949 analysis) — "
+                "students can retake it and learn the items.",
+                color=("gray45", "gray60"))
+            return
+        if tab.startswith("OA "):
+            n = tab.split(" ", 1)[1]
+            t = next((x for x in a.get("attempts") or [] if str(x.get("n")) == n), None)
+            if not t:
+                return
+            add(f"OA {n}: {t.get('date') or ''} · score "
+                f"{t.get('score') if t.get('score') is not None else '—'}"
+                + (f" (cut {a['cut']})" if a.get("cut") else "")
+                + (" ✓ passed" if t.get("passed") else "")
+                + (f" · {round(t['minutes'])} min" if t.get("minutes") is not None else ""))
+            for x in t.get("comps") or []:
+                add(f"  {x.get('title') or x.get('num')}: {x.get('rating')}"
+                    + (f" · {x['pct']}%" if x.get("pct") is not None else ""))
+            if not t.get("comps"):
+                add("No coaching report stored for this attempt.",
+                    color=("gray45", "gray60"))
+            if t.get("topics"):
+                add("Suggested study: " + "; ".join(t["topics"]))
 
     def _oc_aci_block(self, r: int, active: list, enriched: bool = True) -> int:
         """Render the active ACI (assigned course instructor) as a highlighted
@@ -10322,6 +10460,26 @@ class App:
             self.root.after(0, apply)
         except Exception:
             pass
+
+    def _oa_sample(self, course: str) -> None:
+        """Open up to 3 ``course`` students with 3+ OA attempts on their
+        Learner360 pages in the app's browser. Deliberately logs NO ids (the
+        log gets pasted around)."""
+        try:
+            uuids = history.oa_sample_uuids(course)
+        except Exception as e:
+            self._append_log(f"oasample: {e}", error=True)
+            return
+        if not uuids:
+            self._append_log(f"No {course} students with 3+ OA attempts and a "
+                             "coaching report yet — run l360assess: "
+                             f"{course} first.")
+            return
+        for u in uuids:
+            self._open_wgu_url(f"https://learner360.wgu.edu/learner/{u}")
+        self._append_log(f"Opened {len(uuids)} {course} student(s) with 3+ OA "
+                         "attempts in the app's browser — the CaseloadNotes "
+                         "panel is on the right (CN dot bottom-left toggles it).")
 
     def _open_wgu_url(self, url: str) -> None:
         """Open a WGU page (course page / coaching / pre-A report) in the

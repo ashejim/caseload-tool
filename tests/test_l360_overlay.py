@@ -235,8 +235,23 @@ ASSESS = {"course": "C949", "cut": 74, "oa_code": "VXO1",
           "prep": {"attempt": 2, "suggested": ["Hash tables"],
                    "not_competent": ["Explains Algorithms"]},
           "engagement": {},
+          "titles": {"4048.4.4": "Explains Algorithms"},
+          "types": {"oa": True, "pa": False},
+          "attempts": [
+              {"n": 1, "date": "2026-08-01", "score": 61, "passed": False,
+               "comps": [{"num": "4048.4.4", "title": "Explains Algorithms",
+                          "rating": "Approaching", "pct": 55}], "topics": ["Heaps"]},
+              {"n": 2, "date": "2026-09-01", "score": 66, "passed": False,
+               "comps": [{"num": "4048.4.4", "title": "Explains Algorithms",
+                          "rating": "Approaching", "pct": 60}],
+               "topics": ["Hash tables"], "minutes": 50},
+              {"n": 3, "date": "2026-10-01", "score": 70, "passed": False}],
           "links": {"cos": "https://my.wgu.edu/courses/course/1/for/2",
                     "coaching": "https://my.wgu.edu/coaching-report/x"}}
+ASSESS["pre"]["rows"] = [{"n": 1, "date": "2026-07-20", "pct": 58, "passed": False,
+                          "comps": {"4048.4.4": 50}},
+                         {"n": 2, "date": "2026-10-20", "pct": 80, "passed": True,
+                          "comps": {"4048.4.4": 82}}]
 U2 = "11111111-2222-4333-8444-555555555555"
 
 
@@ -282,6 +297,57 @@ def test_cohort_student_panel_with_assessments():
                           .querySelector('[data-act=refresh-assess]').click()""")
         out = pg.evaluate("window.__cnOverlay.takeOutbox()")
         assert out == [{"type": "refresh_assess", "sid": "555555", "course": "C949"}]
+        # Summary grid: per-competency % across Pre-A first/last + OA 1-3.
+        assert "<table class=\"grid\"" in panel and "Pre 1" in panel and "OA 3" in panel
+        assert ">55%<" in panel and ">82%<" in panel
+        # Tabs: OA 2 detail, then Pre-A sittings.
+        def tab(label):
+            pg.evaluate("""l => [...document.querySelector('[data-cn=panel]').shadowRoot
+                .querySelectorAll('.tb')].find(b => b.textContent === l).click()""", label)
+            pg.wait_for_timeout(300)
+            return pg.evaluate("""() => document.querySelector('[data-cn=panel]')
+                                     .shadowRoot.innerHTML""")
+        t2 = tab("OA 2")
+        assert "score 66" in t2 and "Hash tables" in t2 and "50 min" in t2
+        tp = tab("Pre-A")
+        assert "2026-07-20" in tp and "58%" in tp
+        assert "Tasks" not in tp                         # OA course: no PA tab
+        b.close()
+
+
+def test_pa_only_course_box_shows_tasks_not_oa():
+    """A PA course (types pa only): tasks move into the Assessments box and
+    no OA / pre-A lines appear."""
+    extras = {"uuid_map": {UUID: "123456"},
+              "assess": {"123456": {"C769": {
+                  "course": "C769", "cut": None, "oa_code": "",
+                  "oa": {"used": 0, "max": 4, "passed": False, "sittings": [],
+                         "next": None},
+                  "pre": {"sittings": 0, "rows": []}, "coaching": None,
+                  "prep": None, "attempts": [], "titles": {},
+                  "types": {"oa": False, "pa": True}, "engagement": {},
+                  "links": {"cos": "https://my.wgu.edu/courses/course/9/for/8"}}}}}
+    snap = l360_overlay.build_snapshot(ROWS, STEPS, version=4, extras=extras)
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context()
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html",
+                                      body="<html><body>x</body></html>"))
+        pg = ctx.new_page()
+        pg.goto(f"https://learner360.wgu.edu/learner/{UUID}")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(700)
+        html = pg.evaluate("""() => document.querySelector('[data-cn=panel]')
+                                 .shadowRoot.innerHTML""")
+        box = html[html.index('class="asm"'):]
+        assert "Tasks" in box and "T1" in box and "Course page" in box
+        assert ">OA<" not in box and "Pre-A" not in box and "of 4 used" not in box
         b.close()
 
 

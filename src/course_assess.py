@@ -140,7 +140,12 @@ def parse_coaching(resp) -> list:
                 "number": str(c.get("competencyNumber") or ""),
                 "title": str(c.get("competencyTitle") or ""),
                 "rating": str(c.get("competencyRating") or ""),
+                # assessmentPercentage = the competency's WEIGHT on the
+                # exam; percentWidth = the report's per-competency bar
+                # (believed to be the student's % — verify against WGU's
+                # coaching report page).
                 "pct": _n(c.get("assessmentPercentage")),
+                "width": _n(c.get("percentWidth")),
                 "suggested": [str(t.get("topicTitle") or "")
                               for t in c.get("topics") or []
                               if isinstance(t, dict) and t.get("isSuggestedStudy")],

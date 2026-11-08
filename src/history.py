@@ -1978,9 +1978,52 @@ def assess_raw(student_ids=None, *, cohort_days: int = 30,
                 d = ""
             pre.setdefault((n, r["course"]), []).append({
                 "n": r["attempt_n"], "date": d,
-                "pct": round(100 * (r["p"] or 0)), "passed": bool(r["ok"])})
+                "pct": round(100 * (r["p"] or 0)), "passed": bool(r["ok"]),
+                "comps": {}})
+        # Per-competency % for each sitting (items carry their competency).
+        idx = {(k, p["n"]): p for k, lst in pre.items() for p in lst}
+        for r in conn.execute(
+                "SELECT course, student_id, attempt_n, competency, AVG(correct) p "
+                "FROM preA_response GROUP BY course, student_id, attempt_n, "
+                "competency"):
+            n = str(r["student_id"] or "").lstrip("0")
+            hit = idx.get(((n, r["course"]), r["attempt_n"]))
+            if hit is not None and r["competency"]:
+                hit["comps"][r["competency"]] = round(100 * (r["p"] or 0))
         return {"ids": ids, "cohort": cohort, "uuid_map": uuid_map,
                 "ca": ca, "pre": pre}
+    finally:
+        conn.close()
+
+
+def oa_sample_uuids(course: str, min_fails: int = 3, limit: int = 3, *,
+                    db_path=HISTORY_DB) -> list:
+    """Learner360 uuids of up to ``limit`` CURRENT ``course`` cohort students
+    with >= ``min_fails`` failed OA sittings and a coaching report — for
+    checking the Assessments panel. Most attempts first."""
+    c = str(course or "").strip().upper()
+    conn = _connect(db_path)
+    try:
+        uuid = {r["student_id"]: r["wgu_id"] for r in conn.execute(
+            "SELECT student_id, wgu_id FROM l360_cohort WHERE course = ? AND "
+            "departed_at IS NULL AND COALESCE(wgu_id,'') != ''", (c,))}
+        found = []
+        for r in conn.execute("SELECT student_id, assessments_json, "
+                              "coaching_json FROM course_assess WHERE course = ?",
+                              (c,)):
+            if r["student_id"] not in uuid:
+                continue
+            try:
+                a = json.loads(r["assessments_json"] or "{}") or {}
+                co = json.loads(r["coaching_json"] or "[]") or []
+            except ValueError:
+                continue
+            fails = sum(1 for t in (a.get("oa") or {}).get("attempts") or []
+                        if t.get("status") == "Not Passed")
+            if fails >= min_fails and co:
+                found.append((fails, uuid[r["student_id"]]))
+        found.sort(reverse=True)
+        return [u for _f, u in found[:limit]]
     finally:
         conn.close()
 

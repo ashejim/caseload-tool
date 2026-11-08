@@ -127,6 +127,27 @@ def test_load_from_temp_db_and_roster():
         os.remove(rpath)
 
 
+def test_box_flags_and_grid():
+    oa_sum = {"types": {"oa": True, "pa": False}, "oa": {"used": 2},
+              "pre": {"sittings": 1, "rows": [
+                  {"n": 1, "pct": 60, "comps": {"4048.4.4": 50}}]},
+              "cut": 74, "titles": {"4048.4.4": "Explains Algorithms"},
+              "attempts": [{"n": 1, "score": 66, "comps": [
+                  {"num": "4048.4.4", "rating": "Approaching", "pct": None}]},
+                           {"n": 2, "score": 76, "passed": True, "comps": [
+                  {"num": "4048.4.4", "rating": "Competent", "pct": 80}]}]}
+    assert asum.box_flags(oa_sum, has_tasks=False) == {"pa": False, "oa": True, "pre": True}
+    pa_sum = {"types": {"oa": False, "pa": True}, "oa": {"used": 0}, "pre": {}}
+    assert asum.box_flags(pa_sum, has_tasks=True) == {"pa": True, "oa": False, "pre": False}
+    assert asum.box_flags(None, has_tasks=True)["pa"] is True     # unknown → data
+    g = asum.grid(oa_sum)
+    assert g["cols"] == ["Pre 1", "OA 1", "OA 2"]
+    assert g["rows"][0] == ("Score", [("60%", "bad"), ("66", "mid"), ("76 ✓", "ok")])
+    assert g["rows"][1] == ("Explains Algorithms",
+                            [("50%", "bad"), ("Appro", "mid"), ("80%", "ok")])
+    assert asum.grid({}) == {"cols": [], "rows": []}
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -35,6 +35,7 @@ COACHING = {"assessments": [
      "numberOfItems": 60, "totalTimeInMinutes": 95,
      "competencies": [{"competencyNumber": "1.1", "competencyTitle": "Sorting",
                        "competencyRating": "Low", "assessmentPercentage": 40,
+                       "percentWidth": 62,
                        "topics": [{"topicTitle": "Heaps", "isSuggestedStudy": True},
                                   {"topicTitle": "Lists",
                                    "isSuggestedStudy": False}]}],
@@ -59,7 +60,7 @@ def test_parse_preA_report_items_and_answers():
 def test_parse_coaching_and_engagement_and_history():
     c = ca.parse_coaching(COACHING)
     assert c[0]["arp"] == "A77" and c[0]["code"] == "KVO1"
-    assert c[0]["minutes"] == 95 and c[0]["competencies"][0]["suggested"] == ["Heaps"]
+    assert c[0]["minutes"] == 95 and c[0]["competencies"][0]["width"] == 62 and c[0]["competencies"][0]["suggested"] == ["Heaps"]
     assert c[0]["missed"][0] == {"item": "Z9", "points": 1, "seconds": 12,
                                  "type": "MC"}
     e = ca.parse_engagement({"engagedViews": 14, "previewViews": 2,

@@ -224,6 +224,22 @@ OVERLAY_JS = r"""
     .sub { color: #5b6b7f; font-size: 11.5px; margin-bottom: 10px; }
     .sec { border-top: 1px solid #e8edf3; padding: 10px 0 6px; }
     .asm { margin-top: 8px; padding-top: 6px; border-top: 1px dashed #e8edf3; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 6px; }
+    .tb { font: 600 11px/1 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      padding: 4px 7px; border-radius: 12px; border: 1px solid #c9d4e2;
+      background: #fff; color: #3d4b5c; cursor: pointer; }
+    .tb.on { background: #002855; border-color: #002855; color: #fff; }
+    .grid { border-collapse: collapse; width: 100%; margin: 6px 0 2px;
+      font-size: 11px; }
+    .grid th { font-weight: 700; color: #5b6b7f; padding: 2px 3px;
+      text-align: center; white-space: nowrap; }
+    .grid td { border: 1px solid #e8edf3; padding: 3px; text-align: center; }
+    .grid td.rl { text-align: left; color: #3d4b5c; max-width: 110px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .g-ok { background: #e3f4ea; color: #145c32; }
+    .g-mid { background: #fff4e5; color: #8a4b00; }
+    .g-bad { background: #fde8e8; color: #9b1c1c; }
+    .hint { font-size: 10.5px; color: #7a8796; margin: 2px 0 4px; }
     .warn { margin: 6px 0; padding: 6px 8px; border-radius: 6px;
       background: #fff4e5; color: #8a4b00; font-size: 12px; line-height: 1.35; }
     .topics { font-size: 12px; color: #3d4b5c; margin: 4px 0; line-height: 1.35; }
@@ -302,45 +318,132 @@ OVERLAY_JS = r"""
       <span>now ${Math.round(last[1] * 100)}</span></div>`;
   }
 
-  // ---- OA / pre-assessment section (src/assess_summary) ---------------
+  // ---- Assessments box (src/assess_summary): PA tasks, OA, pre-A -------
   const PRE_TIP = 'Pre-assessment scores did not predict OA scores in the C949 '
     + 'analysis (students can retake it and learn the items) — not a readiness signal.';
-  function assessHtml(a, course) {
-    const oa = a.oa || {}, pre = a.pre || {};
-    let h = `<div class="asm"><div class="lbl">Assessments${a.oa_code ? ' · ' + esc(a.oa_code) : ''}${a.cut ? ' · cut ' + esc(a.cut) : ''}</div>`;
-    const sits = (oa.sittings || []).map(t => {
-      const cls = t.passed ? 't-pass' : 't-return';
-      return `<span class="chip ${cls}" title="${esc(t.date)}">#${esc(t.n)}${t.score != null ? ' · ' + esc(t.score) : ''}${t.passed ? ' ✓' : ''}</span>`;
-    }).join('');
-    h += `<div class="row"><span class="k">OA</span><span>${oa.passed ? 'passed' : esc(oa.used || 0) + ' of ' + esc(oa.max || 4) + ' used'}</span></div>`;
-    if (sits) h += `<div class="chips">${sits}</div>`;
-    if (oa.next && (oa.next.scheduled || oa.next.approval))
-      h += `<div class="row"><span class="k">Next</span><span>${oa.next.scheduled ? 'scheduled ' + esc(oa.next.scheduled) : ''}${oa.next.scheduled && oa.next.approval ? ' · ' : ''}${esc(oa.next.approval || '')}</span></div>`;
-    if (a.prep) {
-      h += `<div class="warn">Next is attempt 4 — it repeats the form from attempt 2. `
-        + (a.prep.not_competent && a.prep.not_competent.length ? `Not competent then: ${esc(a.prep.not_competent.join(', '))}. ` : '')
-        + (a.prep.suggested && a.prep.suggested.length ? `Attempt-2 study topics: ${esc(a.prep.suggested.join('; '))}` : '') + `</div>`;
+  const tabSel = {};                       // "sid|course" -> selected tab
+  const rateCls = r => r === 'Competent' || r === 'Exemplary' ? 'g-ok'
+    : (r === 'Unsatisfactory' ? 'g-bad' : (r ? 'g-mid' : ''));
+  const pctCls = (p, cut) => p == null ? '' : (p >= (cut || 74) ? 'g-ok' : (p >= (cut || 74) - 10 ? 'g-mid' : 'g-bad'));
+  const pctTxt = p => p == null ? '' : p + '%';
+
+  function boxFlags(e) {
+    const a = e.assess || {}, ty = a.types || {}, oa = a.oa || {};
+    const tasks = (e.tasks || []).length > 0;
+    return {
+      pa: tasks && ty.pa !== false,
+      oa: ty.oa === true || (ty.oa == null && !!(oa.used || (a.links || {}).coaching)),
+      pre: ty.oa !== false && !!((a.pre || {}).sittings),
+    };
+  }
+
+  function taskChips(e) {
+    return (e.tasks || []).map(t =>
+      `<span class="chip t-${esc(t.kind)}" title="${esc(t.status || '')}">T${t.n}${t.date ? ' · ' + esc(t.date.slice(5)) : ''}${t.count ? ' (' + esc(t.count) + ')' : ''}</span>`).join('');
+  }
+
+  // Competency × attempt grid: Pre-A first/last + every OA attempt.
+  function gridHtml(a) {
+    const cols = [], pre = (a.pre && a.pre.rows) || [], cut = a.cut;
+    const preWith = pre.filter(p => p.pct != null);
+    if (preWith.length) cols.push({ lab: 'Pre ' + preWith[0].n, kind: 'pre', d: preWith[0] });
+    if (preWith.length > 1) cols.push({ lab: 'Pre ' + preWith[preWith.length - 1].n, kind: 'pre', d: preWith[preWith.length - 1] });
+    for (const t of a.attempts || []) cols.push({ lab: 'OA ' + t.n, kind: 'oa', d: t });
+    if (!cols.length) return '';
+    const nums = Object.keys(a.titles || {});
+    for (const c of cols) for (const k of Object.keys((c.d.comps && !Array.isArray(c.d.comps)) ? c.d.comps : {}))
+      if (!nums.includes(k)) nums.push(k);
+    nums.sort();
+    let h = `<table class="grid"><tr><th></th>${cols.map(c => `<th>${esc(c.lab)}</th>`).join('')}</tr>`;
+    h += `<tr><td class="rl">Score</td>` + cols.map(c => {
+      const v = c.kind === 'pre' ? c.d.pct : c.d.score;
+      const cls = c.kind === 'oa' && c.d.passed ? 'g-ok' : pctCls(v, cut);
+      return `<td class="${cls}" title="${esc(c.d.date || '')}">${v == null ? '—' : esc(v) + (c.kind === 'pre' ? '%' : '')}${c.kind === 'oa' && c.d.passed ? ' ✓' : ''}</td>`;
+    }).join('') + `</tr>`;
+    for (const n of nums) {
+      const title = (a.titles || {})[n] || n;
+      h += `<tr><td class="rl" title="${esc(n)}">${esc(title)}</td>` + cols.map(c => {
+        if (c.kind === 'pre') {
+          const p = (c.d.comps || {})[n];
+          return `<td class="${pctCls(p, cut)}">${pctTxt(p) || '—'}</td>`;
+        }
+        const x = (c.d.comps || []).find(z => z.num === n);
+        if (!x) return `<td>—</td>`;
+        return `<td class="${rateCls(x.rating)}" title="${esc(x.rating)}">${x.pct != null ? x.pct + '%' : esc((x.rating || '').slice(0, 5))}</td>`;
+      }).join('') + `</tr>`;
     }
-    if (pre.sittings) {
-      const pct = x => x == null ? '—' : x + '%';
-      h += `<div class="row" title="${esc(PRE_TIP)}"><span class="k">Pre-A</span><span>${esc(pre.sittings)} sitting${pre.sittings === 1 ? '' : 's'} · first ${pct(pre.first_pct)} · last ${pct(pre.last_pct)}${pre.last_date ? ' (' + esc(pre.last_date) + ')' : ''}${pre.since_last_oa ? ' · ' + esc(pre.since_last_oa) + ' since last OA' : ''} ⓘ</span></div>`;
+    return h + `</table><div class="hint">Cells: pre-A % correct per competency; OA = coaching rating${a.attempts && a.attempts.some(t => (t.comps || []).some(z => z.pct != null)) ? ' and %' : ''}. Green = competent / ≥ cut.</div>`;
+  }
+
+  function oaTab(a, t) {
+    let h = `<div class="row"><span class="k">OA ${esc(t.n)}</span><span>${esc(t.date || '')} · score ${t.score != null ? esc(t.score) : '—'}${a.cut ? ' (cut ' + esc(a.cut) + ')' : ''}${t.passed ? ' ✓ passed' : ''}${t.minutes != null ? ' · ' + esc(Math.round(t.minutes)) + ' min' : ''}</span></div>`;
+    if ((t.comps || []).length)
+      h += `<div class="chips">` + t.comps.map(x =>
+        `<span class="chip ${rateCls(x.rating)}" title="${esc(x.num)}">${esc(x.title || x.num)}: ${esc(x.rating)}${x.pct != null ? ' · ' + x.pct + '%' : ''}</span>`).join('') + `</div>`;
+    else h += `<div class="hint">No coaching report stored for this attempt.</div>`;
+    if ((t.topics || []).length) h += `<div class="topics">Suggested study: ${esc(t.topics.join('; '))}</div>`;
+    return h;
+  }
+
+  function preTab(a) {
+    const pre = a.pre || {}, rows = pre.rows || [];
+    let h = `<div class="row" title="${esc(PRE_TIP)}"><span class="k">Pre-A</span><span>${esc(pre.sittings || 0)} sitting(s)${pre.since_last_oa ? ' · ' + esc(pre.since_last_oa) + ' since last OA' : ''} ⓘ</span></div>`;
+    const nums = Object.keys(a.titles || {});
+    for (const p of rows) for (const k of Object.keys(p.comps || {})) if (!nums.includes(k)) nums.push(k);
+    nums.sort();
+    if (rows.length) {
+      h += `<table class="grid"><tr><th>#</th><th>Date</th><th>Total</th>${nums.map(n => `<th title="${esc(n)}">${esc(((a.titles || {})[n] || n).split(' ')[0])}</th>`).join('')}</tr>`
+        + rows.map(p => `<tr><td>${esc(p.n)}</td><td>${esc(p.date || '')}</td><td class="${pctCls(p.pct, a.cut)}">${pctTxt(p.pct) || (p.passed ? 'passed' : '—')}</td>`
+          + nums.map(n => { const v = (p.comps || {})[n]; return `<td class="${pctCls(v, a.cut)}">${pctTxt(v) || '—'}</td>`; }).join('') + `</tr>`).join('')
+        + `</table>`;
     }
-    const c = a.coaching;
-    if (c) {
-      const rk = r => r === 'Competent' || r === 'Exemplary' ? 't-pass' : (r === 'Unsatisfactory' ? 'risk-hi' : 't-return');
-      h += `<div class="row"><span class="k">Coaching</span><span>${esc(c.date || '')}${c.minutes != null ? ' · ' + esc(Math.round(c.minutes)) + ' min' : ''}</span></div>`
-        + `<div class="chips">` + (c.ratings || []).map(r =>
-          `<span class="chip ${rk(r.rating)}" title="${esc(r.num + ' ' + r.title)}">${esc(r.title || r.num)}: ${esc(r.rating)}</span>`).join('') + `</div>`;
-      if ((c.suggested || []).length)
-        h += `<div class="topics">Suggested: ${esc(c.suggested.join('; '))}</div>`;
+    return h;
+  }
+
+  function assessBox(e, sid) {
+    const a = e.assess || {}, f = boxFlags(e), course = e.course;
+    if (!f.pa && !f.oa && !f.pre && !((a.links || {}).cos)) return '';
+    const oa = a.oa || {}, key = sid + '|' + course;
+    const tabs = [['sum', 'Summary']];
+    if (f.pa) tabs.push(['pa', 'Tasks']);
+    if (f.pre) tabs.push(['pre', 'Pre-A']);
+    if (f.oa) for (const t of a.attempts || []) tabs.push(['oa' + t.n, 'OA ' + t.n]);
+    const sel = tabs.some(t => t[0] === tabSel[key]) ? tabSel[key] : 'sum';
+    let h = `<div class="asm"><div class="lbl">Assessments${a.oa_code && f.oa ? ' · ' + esc(a.oa_code) : ''}${a.cut && f.oa ? ' · cut ' + esc(a.cut) : ''}</div>`;
+    if (tabs.length > 1)
+      h += `<div class="tabs">` + tabs.map(([k, lab]) =>
+        `<button class="tb${k === sel ? ' on' : ''}" data-tab="${esc(k)}" data-key="${esc(key)}">${esc(lab)}</button>`).join('') + `</div>`;
+    if (sel === 'sum') {
+      if (f.pa) h += `<div class="row"><span class="k">Tasks</span><span></span></div><div class="chips">${taskChips(e)}</div>`;
+      if (f.oa) {
+        h += `<div class="row"><span class="k">OA</span><span>${oa.passed ? 'passed' : esc(oa.used || 0) + ' of ' + esc(oa.max || 4) + ' used'}</span></div>`;
+        if (oa.next && (oa.next.scheduled || oa.next.approval))
+          h += `<div class="row"><span class="k">Next</span><span>${oa.next.scheduled ? 'scheduled ' + esc(oa.next.scheduled) : ''}${oa.next.scheduled && oa.next.approval ? ' · ' : ''}${esc(oa.next.approval || '')}</span></div>`;
+        if (a.prep)
+          h += `<div class="warn">Next is attempt 4 — it repeats the form from attempt 2. `
+            + (a.prep.not_competent && a.prep.not_competent.length ? `Not competent then: ${esc(a.prep.not_competent.join(', '))}. ` : '')
+            + (a.prep.suggested && a.prep.suggested.length ? `Attempt-2 study topics: ${esc(a.prep.suggested.join('; '))}` : '') + `</div>`;
+      }
+      if (f.pre) {
+        const pre = a.pre || {};
+        h += `<div class="row" title="${esc(PRE_TIP)}"><span class="k">Pre-A</span><span>${esc(pre.sittings)} sitting(s) · first ${pctTxt(pre.first_pct) || '—'} · last ${pctTxt(pre.last_pct) || '—'}${pre.since_last_oa ? ' · ' + esc(pre.since_last_oa) + ' since last OA' : ''} ⓘ</span></div>`;
+      }
+      if (f.oa || f.pre) h += gridHtml(a);
+    } else if (sel === 'pa') {
+      h += `<div class="chips">${taskChips(e)}</div>`;
+    } else if (sel === 'pre') {
+      h += preTab(a);
+    } else {
+      const t = (a.attempts || []).find(x => 'oa' + x.n === sel);
+      if (t) h += oaTab(a, t);
     }
     const L = a.links || {}, btns = [];
     if (L.cos) btns.push(`<a class="lnk" href="${esc(L.cos)}" target="_blank" rel="noopener">Course page</a>`);
-    if (L.coaching) btns.push(`<a class="lnk" href="${esc(L.coaching)}" target="_blank" rel="noopener">Coaching report</a>`);
-    if (L.preA) btns.push(`<a class="lnk" href="${esc(L.preA)}" target="_blank" rel="noopener">Pre-A report</a>`);
-    btns.push(`<button class="lnk" data-act="refresh-assess" data-course="${esc(course)}" title="Re-import this student's ${esc(course)} attempts, scores and coaching">↻ refresh</button>`);
-    h += `<div class="links">${btns.join('')}</div></div>`;
-    return h;
+    if (f.oa && L.coaching) btns.push(`<a class="lnk" href="${esc(L.coaching)}" target="_blank" rel="noopener">Coaching report</a>`);
+    if (f.pre && L.preA) btns.push(`<a class="lnk" href="${esc(L.preA)}" target="_blank" rel="noopener">Pre-A report</a>`);
+    if (e.assess) btns.push(`<button class="lnk" data-act="refresh-assess" data-course="${esc(course)}" title="Re-import this student's ${esc(course)} attempts, scores and coaching">↻ refresh</button>`);
+    if (btns.length) h += `<div class="links">${btns.join('')}</div>`;
+    return h + `</div>`;
   }
 
   function panelHtml(sid, entries) {
@@ -352,8 +455,8 @@ OVERLAY_JS = r"""
         : '<span class="unk">pronouns unknown</span>'}
         <button class="icon" data-act="edit-pron" title="Set pronouns (saved in CaseloadNotes only)">✎</button></div>`;
     for (const e of entries) {
-      const tasks = (e.tasks || []).map(t =>
-        `<span class="chip t-${esc(t.kind)}" title="${esc(t.status || '')}">T${t.n}${t.date ? ' · ' + esc(t.date.slice(5)) : ''}${t.count ? ' (' + esc(t.count) + ')' : ''}</span>`).join('');
+      const box = assessBox(e, sid);
+      const tasks = box ? '' : taskChips(e);   // tasks live in the box when shown
       h += `<div class="sec"><div class="lbl">${esc(e.course)}${e.term_end ? ' · ends ' + esc(e.term_end) : ''}</div>
         <div class="chips">${tasks}
         ${e.risk != null ? `<span class="chip ${riskCls(e.risk)}" title="${esc(RISK_TIP)}">risk ${Math.round(e.risk)}%</span>` : ''}
@@ -361,7 +464,7 @@ OVERLAY_JS = r"""
         ${e.ea ? `<div class="row ea"><span>Open EA</span><span>${esc(e.ea)}</span></div>` : ''}`;
       if (e.cohort)
         h += `<div class="sub">${esc(e.cohort.team || 'team')} student · CI ${esc(e.cohort.owner || '—')}${e.cohort.program ? ' · ' + esc(e.cohort.program) : ''}${e.cohort.departed ? ' · left the roster ' + esc(e.cohort.departed) : ''}</div>`;
-      if (e.assess) h += assessHtml(e.assess, e.course);
+      h += box;
       if ((e.steps || []).length) {
         h += `<div style="margin-top:8px">` + e.steps.map(st =>
           `<div class="step s-${esc(st.status)}"><span class="mark">${MARK[st.status] || '·'}</span>${esc(st.label)}</div>`).join('') + `</div>`;
@@ -413,6 +516,12 @@ OVERLAY_JS = r"""
       try { localStorage.setItem('cnPanelCollapsed', panelCollapsed ? '1' : '0'); } catch (e) {}
       panelRoot.querySelector('.panel').classList.toggle('collapsed', panelCollapsed);
     });
+    panelRoot.querySelectorAll('.tb[data-tab]').forEach(b =>
+      b.addEventListener('click', () => {
+        tabSel[b.dataset.key] = b.dataset.tab;
+        panelKey = '';
+        renderPanel();
+      }));
     panelRoot.querySelectorAll('[data-act="refresh-assess"]').forEach(b =>
       b.addEventListener('click', () => {
         S.outbox.push({ type: 'refresh_assess', sid: sid, course: b.dataset.course });
