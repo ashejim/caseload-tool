@@ -6424,8 +6424,8 @@ class CaseloadPanel:
             parts = (q.split(":", 1)[1].strip().lower().split()
                      if ":" in q else [])
             # "l360activity: C949" — the saved course cohort, 365 days.
-            # "l360activity: C949 passers" — the course's passers (outcomes
-            # archive) instead of the enrolled cohort; 'archive' is an alias.
+            # "l360activity: C949 passers" — roster PASSERS whose L360 GUID we
+            # already hold (in-scope passer slice); 'archive' is an alias.
             course = next((p.upper() for p in parts
                            if len(p) == 4 and p[0].isalpha() and p[1:].isdigit()),
                           "")
@@ -6434,9 +6434,9 @@ class CaseloadPanel:
                 if not self.app._start_l360_activity_bg(
                         manual=True, cohort=course, passers=passers):
                     self.app._append_log(
-                        f"Couldn't start — is another activity import running, "
-                        + (f"or no resolvable {course} passers in the outcomes "
-                           "archive?" if passers else
+                        "Couldn't start — is another activity import running, "
+                        + (f"or no in-scope {course} passers with a known GUID "
+                           "yet (none to pull)?" if passers else
                            f"or is there no saved {course} roster (l360cohort: "
                            f"{course} save)?"))
                 return "break"
@@ -13075,6 +13075,37 @@ class App:
         self.root.after(1500, self._l360_pbg_step)
 
     _COURSE_ASSESS_BATCH = 3          # ~12 s per student; keep the worker free
+
+    def _roster_passer_activity_targets(self, course: str) -> list:
+        """[(wgu_id, student_id)] for roster PASSERS of ``course`` whose L360
+        GUID we already hold (within granted L360 scope). Used to pull their
+        academic-activity — the in-scope passer slice for the LR-prep peek.
+        Does NOT route around L360 team scoping: only students whose GUID was
+        already captured via the caller's own teams are included."""
+        import json as _json
+        path = USER_CONFIG_DIR / "coursescan_roster.json"
+        if not path.exists():
+            return []
+        try:
+            with open(path, encoding="utf-8") as f:
+                rows = _json.load(f)
+        except Exception:
+            return []
+        guids = history.load_known_guids()
+        crs = str(course or "").strip().upper()
+        out, seen = [], set()
+        for r in rows:
+            if str(r.get("CourseCode") or "").strip().upper() != crs:
+                continue
+            if str(r.get("CourseStatus") or "").strip() != "Passed":
+                continue
+            sid = str(r.get("StudentID") or "").strip()
+            k = sid.lstrip("0")
+            w = guids.get(k)
+            if w and k not in seen:
+                seen.add(k)
+                out.append((w, sid))
+        return out
 
     def _roster_passer_targets(self, course: str) -> tuple:
         """([('', student_id, pidm, course_version)], note) for PASSERS of
