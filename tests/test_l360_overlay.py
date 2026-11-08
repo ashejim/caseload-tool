@@ -222,6 +222,69 @@ def test_student_panel_on_learner_page():
         b.close()
 
 
+ASSESS = {"course": "C949", "cut": 74, "oa_code": "VXO1",
+          "oa": {"used": 3, "max": 4, "passed": False, "next": None,
+                 "sittings": [{"n": 1, "date": "2026-08-01", "score": 61, "passed": False},
+                              {"n": 2, "date": "2026-09-01", "score": 66, "passed": False},
+                              {"n": 3, "date": "2026-10-01", "score": 70, "passed": False}]},
+          "pre": {"sittings": 2, "rows": [], "first_pct": 58, "last_pct": 80,
+                  "last_date": "2026-10-20", "since_last_oa": 1, "code": "PVXO"},
+          "coaching": {"date": "2026-10-01", "minutes": 55, "suggested": ["Heaps"],
+                       "ratings": [{"num": "4048.4.4", "title": "Explains Algorithms",
+                                    "rating": "Approaching"}]},
+          "prep": {"attempt": 2, "suggested": ["Hash tables"],
+                   "not_competent": ["Explains Algorithms"]},
+          "engagement": {},
+          "links": {"cos": "https://my.wgu.edu/courses/course/1/for/2",
+                    "coaching": "https://my.wgu.edu/coaching-report/x"}}
+U2 = "11111111-2222-4333-8444-555555555555"
+
+
+def test_cohort_student_panel_with_assessments():
+    """A C949 team student (not on my caseload) gets a panel on their
+    Learner360 page with the Assessments section, links, the attempt-4 hint
+    and a working ↻ refresh; their list row gets an OA badge."""
+    from playwright.sync_api import sync_playwright
+    extras = {"uuid_map": {U2: "555555"}, "assess": {"555555": {"C949": ASSESS}},
+              "cohort": {"555555": [{"course": "C949", "owner": "A CI",
+                                     "team": "WST- CS Apps", "program": "BSCS",
+                                     "momentum": "Low", "term_end": "2027-01-31",
+                                     "departed": ""}]}}
+    snap = l360_overlay.build_snapshot(ROWS, STEPS, version=3, extras=extras)
+    e = snap["students"]["555555"][0]
+    assert e["course"] == "C949" and e["assess"]["oa"]["used"] == 3
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context()
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html",
+                                      body=PAGE))
+        pg = ctx.new_page()
+        pg.goto("https://learner360.wgu.edu/caseload")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(700)
+        badges = pg.evaluate("""() => [...document.querySelectorAll('[data-cn=badge]')]
+                                  .map(h => h.shadowRoot.innerHTML).join('|')""")
+        assert "OA 3/4 · 70" in badges, badges            # the 3rd (team) row
+        pg.evaluate(f"() => history.pushState(null, '', '/learner/{U2}')")
+        pg.wait_for_timeout(700)
+        panel = pg.evaluate("""() => { const h = document.querySelector('[data-cn=panel]');
+                                     return h ? h.shadowRoot.innerHTML : ''; }""")
+        assert "Assessments" in panel and "cut 74" in panel and "3 of 4 used" in panel
+        assert "attempt 4" in panel and "Hash tables" in panel
+        assert "WST- CS Apps student" in panel and "first 58%" in panel
+        assert "Course page" in panel and "Coaching report" in panel
+        pg.evaluate("""() => document.querySelector('[data-cn=panel]').shadowRoot
+                          .querySelector('[data-act=refresh-assess]').click()""")
+        out = pg.evaluate("window.__cnOverlay.takeOutbox()")
+        assert out == [{"type": "refresh_assess", "sid": "555555", "course": "C949"}]
+        b.close()
+
+
 def test_pronoun_edit_round_trip():
     import types
     from playwright.sync_api import sync_playwright

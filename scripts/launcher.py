@@ -10159,6 +10159,16 @@ class App:
                         [r.get("StudentID") for r in rows])
                 except Exception:
                     return
+                try:
+                    # OA / pre-assessment summaries + course-cohort students
+                    # (their Learner360 pages get a panel too).
+                    from src import assess_summary
+                    ax = assess_summary.load([r.get("StudentID") for r in rows])
+                    ex["uuid_map"].update(ax["uuid_map"])
+                    ex["assess"], ex["cohort"] = ax["assess"], ax["cohort"]
+                except Exception as e:
+                    self._diag_once("overlay-assess", f"  [overlay] assessment "
+                                    f"summaries unavailable: {e}")
                 self._overlay_extras_cache = ex
                 if App._overlay_version != ver:
                     return                   # a newer refresh superseded us
@@ -10186,6 +10196,10 @@ class App:
                     by_nsid.setdefault(full.lstrip("0"), (full, r))
             changed = False
             for a in acts or []:
+                if isinstance(a, dict) and a.get("type") == "refresh_assess":
+                    self._refresh_one_assess(str(a.get("sid") or ""),
+                                             str(a.get("course") or ""))
+                    continue
                 if not isinstance(a, dict) or a.get("type") != "pronouns":
                     continue
                 hit = by_nsid.get(str(a.get("sid") or "").lstrip("0"))
@@ -10212,6 +10226,39 @@ class App:
             self.root.after(0, apply)
         except Exception:
             pass
+
+    def _refresh_one_assess(self, sid: str, course: str) -> None:
+        """↻ in the Learner360 panel: re-import one student's assessments for
+        ``course`` (attempts, scores, coaching, pre-A), then refresh the
+        panel. Read-only. Students we hold ids for only."""
+        import re as _re
+        course = course.strip().upper()
+        if not _re.fullmatch(r"[A-Z]{1,2}\d{3}", course):
+            return
+        n = sid.strip().lstrip("0")
+        t = None
+        try:
+            for r in history.load_l360_cohort(course, include_departed=True):
+                if str(r["student_id"]).lstrip("0") == n and r.get("pidm"):
+                    t = (r.get("wgu_id") or "", r["student_id"], r["pidm"])
+                    break
+            if t is None:
+                for w, s, p in history.l360_plan_targets(max_age_days=3650):
+                    if str(s).lstrip("0") == n and p:
+                        t = (w, s, p)
+                        break
+        except Exception:
+            t = None
+        if t is None:
+            self._append_log(f"Can't refresh {course} assessments for that "
+                             "student — no ids stored for them yet.")
+            return
+        self._append_log(f"Refreshing {course} assessments for one student "
+                         "(from the Learner360 panel)…")
+        if not self._start_course_assess(course, targets=[t],
+                                         on_finish=self._push_overlay_snapshot):
+            self._append_log("  …another assessment import is running — try "
+                             "again when it finishes.")
 
     def _apply_overlay_setting(self) -> None:
         """Push the overlay on/off setting to the worker (startup + save)."""

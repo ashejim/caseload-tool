@@ -1919,6 +1919,72 @@ def overlay_extras(student_ids, *, notes_per: int = 4, momi_weeks: int = 12,
         conn.close()
 
 
+def assess_raw(student_ids=None, *, cohort_days: int = 30,
+               db_path=HISTORY_DB) -> dict:
+    """Raw inputs for src/assess_summary.load, in a few bulk queries:
+    {"ids": set of nsids (``student_ids`` + cohort students current or
+    departed within ``cohort_days``), "cohort": {nsid: [{course, owner, team,
+    program, momentum, term_end, departed}]}, "uuid_map": {learner uuid
+    (lower): nsid} for cohort students, "ca": {(nsid, course): course_assess
+    record}, "pre": {(nsid, course): [{n, date, pct, passed}]}}."""
+    from datetime import timedelta
+    want = {str(s or "").strip().lstrip("0") for s in student_ids or []}
+    want.discard("")
+    cut = (datetime.now() - timedelta(days=cohort_days)).isoformat(
+        timespec="seconds")
+    cohort, uuid_map = {}, {}
+    conn = _connect(db_path)
+    try:
+        for r in conn.execute(
+                "SELECT * FROM l360_cohort WHERE departed_at IS NULL OR "
+                "departed_at >= ?", (cut,)):
+            n = str(r["student_id"] or "").lstrip("0")
+            if not n:
+                continue
+            cohort.setdefault(n, []).append({
+                "course": r["course"], "owner": r["owner"] or "",
+                "team": r["team"] or "", "program": r["program"] or "",
+                "momentum": r["momentum"] or "", "term_end": r["term_end"] or "",
+                "departed": (r["departed_at"] or "")[:10]})
+            if r["wgu_id"]:
+                uuid_map[str(r["wgu_id"]).lower()] = n
+        ids = want | set(cohort)
+        ca = {}
+        for r in conn.execute("SELECT * FROM course_assess"):
+            n = str(r["student_id"] or "").lstrip("0")
+            if n not in ids:
+                continue
+            d = {"pidm": r["pidm"], "cv": r["course_version"],
+                 "preA_code": r["preA_report_code"]}
+            for k, col in (("assessments", "assessments_json"),
+                           ("engagement", "engagement_json"),
+                           ("coaching", "coaching_json")):
+                try:
+                    d[k] = json.loads(r[col] or "null")
+                except ValueError:
+                    d[k] = None
+            ca[(n, r["course"])] = d
+        pre = {}
+        for r in conn.execute(
+                "SELECT course, student_id, attempt_n, MAX(attempt_date) d, "
+                "AVG(correct) p, MAX(passed) ok FROM preA_response "
+                "GROUP BY course, student_id, attempt_n"):
+            n = str(r["student_id"] or "").lstrip("0")
+            if n not in ids:
+                continue
+            try:
+                d = datetime.strptime(str(r["d"])[:10], "%m/%d/%Y").date().isoformat()
+            except ValueError:
+                d = ""
+            pre.setdefault((n, r["course"]), []).append({
+                "n": r["attempt_n"], "date": d,
+                "pct": round(100 * (r["p"] or 0)), "passed": bool(r["ok"])})
+        return {"ids": ids, "cohort": cohort, "uuid_map": uuid_map,
+                "ca": ca, "pre": pre}
+    finally:
+        conn.close()
+
+
 def l360_note_targets(*, max_age_days: int = 30, db_path=HISTORY_DB) -> list:
     """[(wgu_id, student_id)] for the Learner360 notes import: learners whose
     360 id the MOMI capture refreshed within ``max_age_days`` (≈ the current

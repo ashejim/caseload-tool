@@ -128,6 +128,14 @@ OVERLAY_JS = r"""
     }
     if (e.risk != null)
       parts.push(`<span class="chip ${riskCls(e.risk)}" title="${esc(RISK_TIP)}">${Math.round(e.risk)}%</span>`);
+    const oa = e.assess && e.assess.oa;
+    if (oa && (oa.used || oa.passed)) {
+      const last = (oa.sittings || []).slice(-1)[0];
+      const tip = (oa.sittings || []).map(t => `#${t.n} ${t.date}${t.score != null ? ' · ' + t.score : ''}${t.passed ? ' ✓' : ''}`).join('\n')
+        + (e.assess.cut ? `\ncut ${e.assess.cut}` : '');
+      const cls = oa.passed ? 't-pass' : (oa.used >= 3 ? 'risk-hi' : 't-return');
+      parts.push(`<span class="chip ${cls}" title="${esc(tip)}">OA ${oa.passed ? '✓' : oa.used + '/' + oa.max}${last && last.score != null ? ' · ' + last.score : ''}</span>`);
+    }
     if (e.next_step)
       parts.push(`<span class="chip step" title="Success path: next step">${esc(e.next_step)}</span>`);
     if (e.ea)
@@ -215,6 +223,15 @@ OVERLAY_JS = r"""
     h2 { font-size: 15px; margin: 0 0 2px; color: #002855; }
     .sub { color: #5b6b7f; font-size: 11.5px; margin-bottom: 10px; }
     .sec { border-top: 1px solid #e8edf3; padding: 10px 0 6px; }
+    .asm { margin-top: 8px; padding-top: 6px; border-top: 1px dashed #e8edf3; }
+    .warn { margin: 6px 0; padding: 6px 8px; border-radius: 6px;
+      background: #fff4e5; color: #8a4b00; font-size: 12px; line-height: 1.35; }
+    .topics { font-size: 12px; color: #3d4b5c; margin: 4px 0; line-height: 1.35; }
+    .links { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .lnk { font: 600 11.5px/1 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      padding: 5px 8px; border-radius: 6px; border: 1px solid #c9d4e2;
+      background: #fff; color: #002855; text-decoration: none; cursor: pointer; }
+    .lnk:hover { background: #eef3f9; }
     .sec:first-of-type { border-top: none; }
     .lbl { font-size: 10.5px; font-weight: 700; letter-spacing: .05em;
       text-transform: uppercase; color: #5b6b7f; margin-bottom: 6px; }
@@ -285,6 +302,47 @@ OVERLAY_JS = r"""
       <span>now ${Math.round(last[1] * 100)}</span></div>`;
   }
 
+  // ---- OA / pre-assessment section (src/assess_summary) ---------------
+  const PRE_TIP = 'Pre-assessment scores did not predict OA scores in the C949 '
+    + 'analysis (students can retake it and learn the items) — not a readiness signal.';
+  function assessHtml(a, course) {
+    const oa = a.oa || {}, pre = a.pre || {};
+    let h = `<div class="asm"><div class="lbl">Assessments${a.oa_code ? ' · ' + esc(a.oa_code) : ''}${a.cut ? ' · cut ' + esc(a.cut) : ''}</div>`;
+    const sits = (oa.sittings || []).map(t => {
+      const cls = t.passed ? 't-pass' : 't-return';
+      return `<span class="chip ${cls}" title="${esc(t.date)}">#${esc(t.n)}${t.score != null ? ' · ' + esc(t.score) : ''}${t.passed ? ' ✓' : ''}</span>`;
+    }).join('');
+    h += `<div class="row"><span class="k">OA</span><span>${oa.passed ? 'passed' : esc(oa.used || 0) + ' of ' + esc(oa.max || 4) + ' used'}</span></div>`;
+    if (sits) h += `<div class="chips">${sits}</div>`;
+    if (oa.next && (oa.next.scheduled || oa.next.approval))
+      h += `<div class="row"><span class="k">Next</span><span>${oa.next.scheduled ? 'scheduled ' + esc(oa.next.scheduled) : ''}${oa.next.scheduled && oa.next.approval ? ' · ' : ''}${esc(oa.next.approval || '')}</span></div>`;
+    if (a.prep) {
+      h += `<div class="warn">Next is attempt 4 — it repeats the form from attempt 2. `
+        + (a.prep.not_competent && a.prep.not_competent.length ? `Not competent then: ${esc(a.prep.not_competent.join(', '))}. ` : '')
+        + (a.prep.suggested && a.prep.suggested.length ? `Attempt-2 study topics: ${esc(a.prep.suggested.join('; '))}` : '') + `</div>`;
+    }
+    if (pre.sittings) {
+      const pct = x => x == null ? '—' : x + '%';
+      h += `<div class="row" title="${esc(PRE_TIP)}"><span class="k">Pre-A</span><span>${esc(pre.sittings)} sitting${pre.sittings === 1 ? '' : 's'} · first ${pct(pre.first_pct)} · last ${pct(pre.last_pct)}${pre.last_date ? ' (' + esc(pre.last_date) + ')' : ''}${pre.since_last_oa ? ' · ' + esc(pre.since_last_oa) + ' since last OA' : ''} ⓘ</span></div>`;
+    }
+    const c = a.coaching;
+    if (c) {
+      const rk = r => r === 'Competent' || r === 'Exemplary' ? 't-pass' : (r === 'Unsatisfactory' ? 'risk-hi' : 't-return');
+      h += `<div class="row"><span class="k">Coaching</span><span>${esc(c.date || '')}${c.minutes != null ? ' · ' + esc(Math.round(c.minutes)) + ' min' : ''}</span></div>`
+        + `<div class="chips">` + (c.ratings || []).map(r =>
+          `<span class="chip ${rk(r.rating)}" title="${esc(r.num + ' ' + r.title)}">${esc(r.title || r.num)}: ${esc(r.rating)}</span>`).join('') + `</div>`;
+      if ((c.suggested || []).length)
+        h += `<div class="topics">Suggested: ${esc(c.suggested.join('; '))}</div>`;
+    }
+    const L = a.links || {}, btns = [];
+    if (L.cos) btns.push(`<a class="lnk" href="${esc(L.cos)}" target="_blank" rel="noopener">Course page</a>`);
+    if (L.coaching) btns.push(`<a class="lnk" href="${esc(L.coaching)}" target="_blank" rel="noopener">Coaching report</a>`);
+    if (L.preA) btns.push(`<a class="lnk" href="${esc(L.preA)}" target="_blank" rel="noopener">Pre-A report</a>`);
+    btns.push(`<button class="lnk" data-act="refresh-assess" data-course="${esc(course)}" title="Re-import this student's ${esc(course)} attempts, scores and coaching">↻ refresh</button>`);
+    h += `<div class="links">${btns.join('')}</div></div>`;
+    return h;
+  }
+
   function panelHtml(sid, entries) {
     const e0 = entries[0];
     const courses = entries.map(e => e.course).filter(Boolean).join(' · ');
@@ -301,6 +359,9 @@ OVERLAY_JS = r"""
         ${e.risk != null ? `<span class="chip ${riskCls(e.risk)}" title="${esc(RISK_TIP)}">risk ${Math.round(e.risk)}%</span>` : ''}
         ${e.momentum ? `<span class="chip">${esc(e.momentum)}</span>` : ''}</div>
         ${e.ea ? `<div class="row ea"><span>Open EA</span><span>${esc(e.ea)}</span></div>` : ''}`;
+      if (e.cohort)
+        h += `<div class="sub">${esc(e.cohort.team || 'team')} student · CI ${esc(e.cohort.owner || '—')}${e.cohort.program ? ' · ' + esc(e.cohort.program) : ''}${e.cohort.departed ? ' · left the roster ' + esc(e.cohort.departed) : ''}</div>`;
+      if (e.assess) h += assessHtml(e.assess, e.course);
       if ((e.steps || []).length) {
         h += `<div style="margin-top:8px">` + e.steps.map(st =>
           `<div class="step s-${esc(st.status)}"><span class="mark">${MARK[st.status] || '·'}</span>${esc(st.label)}</div>`).join('') + `</div>`;
@@ -352,6 +413,12 @@ OVERLAY_JS = r"""
       try { localStorage.setItem('cnPanelCollapsed', panelCollapsed ? '1' : '0'); } catch (e) {}
       panelRoot.querySelector('.panel').classList.toggle('collapsed', panelCollapsed);
     });
+    panelRoot.querySelectorAll('[data-act="refresh-assess"]').forEach(b =>
+      b.addEventListener('click', () => {
+        S.outbox.push({ type: 'refresh_assess', sid: sid, course: b.dataset.course });
+        b.textContent = 'refreshing…';
+        b.disabled = true;
+      }));
     const editBtn = panelRoot.querySelector('[data-act="edit-pron"]');
     if (editBtn) editBtn.addEventListener('click', () => openPronEditor(sid, entries));
   }

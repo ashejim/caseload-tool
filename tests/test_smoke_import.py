@@ -64,6 +64,7 @@ SRC_MODULES = [
     "src.l360_overlay_js",
     "src.contextual_actions",
     "src.course_assess",
+    "src.assess_summary",
 ]
 
 

@@ -99,6 +99,28 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
                             or r.get("TermEndDate") or ""),
         })
     ex = extras or {}
+    # OA / pre-assessment summaries (src/assess_summary) on caseload entries,
+    # and entries for COURSE-COHORT students (e.g. C949 on my team, not my
+    # caseload) so their Learner360 page gets a panel too.
+    assess = ex.get("assess") or {}
+    for sid, ents in out.items():
+        for e in ents:
+            a = (assess.get(sid) or {}).get(e["course"])
+            if a:
+                e["assess"] = a
+    for sid, cl in (ex.get("cohort") or {}).items():
+        have = {e["course"] for e in out.get(sid, [])}
+        for c in cl:
+            if c["course"] in have:
+                continue
+            e = {"course": c["course"], "name": "", "tasks": [], "risk": None,
+                 "momentum": c.get("momentum") or "", "next_step": "",
+                 "steps": [], "term_end": c.get("term_end") or "",
+                 "cohort": c}
+            a = (assess.get(sid) or {}).get(c["course"])
+            if a:
+                e["assess"] = a
+            out.setdefault(sid, []).append(e)
     return {"v": version, "students": out,
             "uuid_map": dict(ex.get("uuid_map") or {}),
             "notes": dict(ex.get("notes") or {}),
