@@ -4700,6 +4700,9 @@ class CaseloadPanel:
         # is consistent: show the full profile from the session cache if we
         # scraped it earlier, else the minimal view + the ‘Get info’ button.
         # This is what makes moving away and back NOT need a re-scrape.
+        if row and row.get("_cohort"):
+            self._show_cohort_quick_view(row)
+            return
         if row and row.get("_offcaseload"):
             cid = str(row.get("Contact id") or "").strip()
             nm = str(row.get("Name") or "").strip()
@@ -6822,6 +6825,12 @@ class CaseloadPanel:
         rows = rows_getter()
         if not rows:
             return None
+        if any(r.get("_cohort") for r in rows):
+            self.app._append_log(
+                "The course-cohort view is read-only — these are mostly other "
+                "CIs' students. Open a student (double-click) to act on them "
+                "individually.")
+            return None
         from src import contextual_actions
         try:
             fits = contextual_actions.applicable_actions(
@@ -7008,6 +7017,7 @@ class CaseloadPanel:
     _VIEW_ARCHIVED = "🗄 Archived (past students)"
     _VIEW_OFFCASELOAD = "🔎 Off-caseload (not yours)"
     _VIEW_LIVE = "◀ Live caseload"
+    _VIEW_COHORT = "👥 Course cohort…"
 
     def _load_views(self) -> list:
         import json
@@ -7082,14 +7092,17 @@ class CaseloadPanel:
         names = [v["name"] for v in views]
         archived = getattr(self, "_archived_mode", False)
         offcl = getattr(self, "_offcaseload_mode", False)
+        cohort = getattr(self, "_cohort_mode", False)
         values = []
-        if archived or offcl:
+        if archived or offcl or cohort:
             values.append(self._VIEW_LIVE)          # way back to the live caseload
-        values += names + [self._VIEW_ARCHIVED, self._VIEW_SAVE]
+        values += names + [self._VIEW_COHORT, self._VIEW_ARCHIVED, self._VIEW_SAVE]
         if names:
             values.append(self._VIEW_MANAGE)
         self.view_menu.configure(values=values)
-        if offcl:
+        if cohort:
+            self.view_menu.set("👥 " + ", ".join(self._cohort_courses or []))
+        elif offcl:
             self.view_menu.set(self._VIEW_OFFCASELOAD)
         elif archived:
             self.view_menu.set(self._VIEW_ARCHIVED)
@@ -7104,8 +7117,16 @@ class CaseloadPanel:
             self._exit_archived_mode(repopulate=repopulate)
         elif getattr(self, "_offcaseload_mode", False):
             self._exit_offcaseload_mode(repopulate=repopulate)
+        elif getattr(self, "_cohort_mode", False):
+            self._exit_cohort_mode(repopulate=repopulate)
 
     def _on_view_select(self, choice: str) -> None:
+        if choice == self._VIEW_COHORT:
+            self._refresh_view_menu()          # keep the label until chosen
+            self._cohort_dialog()
+            return
+        if choice.startswith("👥 ") and getattr(self, "_cohort_mode", False):
+            return                              # re-picked the current label
         if choice == self._VIEW_ARCHIVED:
             self._exit_special_modes(repopulate=False)
             self._enter_archived_mode()
@@ -7205,6 +7226,160 @@ class CaseloadPanel:
                 text_color=getattr(self, "_caseload_label_fg",
                                    ("gray10", "gray90")))
             self.search_entry.configure(placeholder_text="Search caseload…")
+        except Exception:
+            pass
+
+    # ---- Course-cohort mode (my team's students in chosen courses) -------
+    def _cohort_dialog(self) -> None:
+        """Pick courses → show every student my team has in them."""
+        from src import cohort_view
+        try:
+            avail = cohort_view.available_courses()
+        except Exception as e:
+            self.app._append_log(f"Couldn't list courses: {e}", error=True)
+            return
+        if not avail:
+            self.app._append_log(
+                "No course rosters yet — pull one with l360cohort: C949 save "
+                "(or turn on the course watch).")
+            return
+        prev = set(self.app._parse_courses(
+            getattr(self.app.settings, "cohort_view_courses", "")))
+        d = ctk.CTkToplevel(self.frame)
+        d.title("Course cohort")
+        d.attributes("-topmost", True)
+        d.resizable(False, False)
+        ctk.CTkLabel(d, text="Show my team's students in:", anchor="w",
+                     font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=14, pady=(12, 4))
+        vars_ = {}
+        for i, (c, n) in enumerate(sorted(avail.items()), start=1):
+            label = (f"{c}  —  {n['team']} on my team" if n["team"] else
+                     f"{c}  —  course scan only ({n['scan']} rows, all CIs)")
+            v = ctk.BooleanVar(value=c in prev)
+            vars_[c] = v
+            ctk.CTkCheckBox(d, text=label, variable=v).grid(
+                row=i, column=0, sticky="w", padx=18, pady=2)
+        bar = ctk.CTkFrame(d, fg_color="transparent")
+        bar.grid(row=len(avail) + 1, column=0, sticky="e", padx=14, pady=12)
+
+        def show():
+            chosen = [c for c, v in vars_.items() if v.get()]
+            d.destroy()
+            if chosen:
+                self.app.settings.cohort_view_courses = ", ".join(chosen)
+                save_settings(self.app.settings)
+                self._enter_cohort_mode(chosen)
+        ctk.CTkButton(bar, text="Show", width=90, command=show).pack(
+            side="left", padx=4)
+        ctk.CTkButton(bar, text="Cancel", width=80, **SECONDARY_BTN_KWARGS,
+                      command=d.destroy).pack(side="left", padx=4)
+        try:
+            _fit_dialog_to_content(d, near_mouse=True)
+        except Exception:
+            pass
+
+    def _enter_cohort_mode(self, courses: list) -> None:
+        """Switch the grid to the course cohort (built in the background —
+        assessment summaries for a few hundred students take a moment)."""
+        from src import cohort_view
+        self.app._append_log(f"👥 Loading the {', '.join(courses)} cohort…")
+
+        def work():
+            try:
+                rows, err = cohort_view.load(courses), None
+            except Exception as e:
+                rows, err = [], e
+
+            def done():
+                if err is not None:
+                    self.app._append_log(f"Couldn't load the cohort: {err}",
+                                         error=True)
+                    return
+                self._exit_special_modes(repopulate=False)
+                self._cohort_rows = rows
+                self._cohort_courses = list(courses)
+                self._cohort_mode = True
+                self._show_cohort_banner()
+                self.populate()
+                self._refresh_view_menu()
+                by = {}
+                for r in rows:
+                    by[r["_course"]] = by.get(r["_course"], 0) + 1
+                scan = sorted({r["_course"] for r in rows
+                               if str(r.get("Source", "")).startswith("Course scan")})
+                self.app._append_log(
+                    "👥 Cohort: " + ", ".join(f"{c} {n}" for c, n in by.items())
+                    + " student(s). Read-only for actions; double-click opens a "
+                    "student." + (f" ({', '.join(scan)}: from the course scan, "
+                                  "all CIs — pull the team roster with "
+                                  "l360cohort: <course> save for team-only.)"
+                                  if scan else ""))
+            try:
+                self.frame.after(0, done)
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True, name="cohort-view").start()
+
+    def _exit_cohort_mode(self, repopulate: bool = True) -> None:
+        self._cohort_mode = False
+        self._cohort_rows = None
+        self._hide_archived_banner()
+        if repopulate:
+            self.populate()
+            self._refresh_view_menu()
+
+    def _show_cohort_banner(self) -> None:
+        try:
+            if not hasattr(self, "_caseload_label_fg"):
+                self._caseload_label_fg = self.caseload_label.cget("text_color")
+            self.caseload_label.configure(
+                text="👥 Cohort", text_color=("#1f6feb", "#58a6ff"))
+            self.search_entry.configure(placeholder_text="Search cohort…")
+        except Exception:
+            pass
+
+    def _show_cohort_quick_view(self, row: dict) -> None:
+        """Student info for a course-cohort row: who/where + their
+        Assessments box for that course. Read-only."""
+        self._qv_row = row
+        for w in self.qv_body.winfo_children():
+            w.destroy()
+        for w in self.qv_notehead.winfo_children():
+            w.destroy()
+        self.qv_name.configure(text=f"👥 {row.get('Name') or '(name not loaded)'}")
+        self._qv_grid = self.qv_body
+        r = 0
+        for label, key in (("Student ID", "StudentID"), ("Course", "CourseCode"),
+                           ("Assigned CI", "Assigned CI"), ("Team", "Team"),
+                           ("Program", "Program"), ("Momentum", "Momentum"),
+                           ("Term end", "TermEndDate"),
+                           ("Course status", "Course Status"),
+                           ("Last activity", "Last Activity"),
+                           ("Email", "StudentEmail"), ("Mobile", "MobilePhone"),
+                           ("Source", "Source")):
+            v = str(row.get(key) or "").strip()
+            if not v:
+                continue
+            ctk.CTkLabel(self.qv_body, text=f"{label}:", anchor="nw",
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=("gray35", "gray70"), width=90).grid(
+                row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ctk.CTkLabel(self.qv_body, text=v, anchor="w", justify="left",
+                         font=ctk.CTkFont(size=12)).grid(
+                row=r, column=1, sticky="w", pady=1)
+            r += 1
+        tasks = [f"T{n}: {row[f'PA Task {n}']}" for n in range(1, 6)
+                 if str(row.get(f"PA Task {n}") or "").strip()]
+        if tasks:
+            ctk.CTkLabel(self.qv_body, text="Tasks:  " + "   ".join(tasks),
+                         anchor="w", font=ctk.CTkFont(size=12)).grid(
+                row=r, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            r += 1
+        self._qv_assessments(r, str(row.get("StudentID") or ""),
+                             fixed_course=str(row.get("_course") or ""))
+        try:
+            self._ensure_detail_height()
         except Exception:
             pass
 
@@ -7492,7 +7667,8 @@ class CaseloadPanel:
                 "bad": ("#fde8e8", "#3d2020"), "": "transparent"}
 
     def _qv_assessments(self, r: int, sid: str, row: dict = None,
-                        show_tasks: bool = False, courses=None) -> int:
+                        show_tasks: bool = False, courses=None,
+                        fixed_course: str = "") -> int:
         """The Assessments box (src/assess_summary) — one course at a time:
         your own student → their caseload course (tasks inside the box);
         an off-caseload student → a course picker over ``courses`` + any
@@ -7514,8 +7690,8 @@ class CaseloadPanel:
             return r
         own_course = (self._cell(row, "CourseCode").strip().upper()
                       if row else "")
-        if own_course:
-            options = [own_course]
+        if own_course or fixed_course:
+            options = [own_course or fixed_course.strip().upper()]
         else:
             options = sorted({c for c in (courses or []) if c} | set(per))
         if not options or (own_course and not show_tasks
@@ -8205,6 +8381,8 @@ class CaseloadPanel:
             return self._archived_rows or []
         if getattr(self, "_offcaseload_mode", False):
             return self._offcaseload_rows or []
+        if getattr(self, "_cohort_mode", False):
+            return self._cohort_rows or []
         if getattr(self, "_search_archived", False):
             return (self.app._caseload_rows or []) + (self._archived_rows or [])
         return self.app._caseload_rows or []
@@ -8336,6 +8514,16 @@ class CaseloadPanel:
     def _open_row(self, event, new_tab: bool) -> None:
         query, _label = self._row_query_label(event)
         row = self._row_by_iid.get(self.tree.focus())
+        if row and row.get("_cohort"):
+            # Course-cohort student: their Salesforce record (Contact id from
+            # the course scan), else their Learner360 page.
+            cid = str(row.get("Contact id") or "").strip()
+            if cid:
+                self.app._open_contact_id(cid, str(row.get("Name") or ""))
+            elif row.get("_uuid"):
+                self.app._open_wgu_url(
+                    f"https://learner360.wgu.edu/learner/{row['_uuid']}")
+            return
         if row and row.get("_offcaseload"):
             # Off-caseload search match — open directly by its Contact id.
             cid = str(row.get("Contact id") or "").strip()
@@ -18551,6 +18739,11 @@ class App:
         rows = [r for r in (rows or []) if r]
         if not rows:
             self._append_log("No students selected.")
+            return
+        if any(r.get("_cohort") for r in rows):
+            self._append_log("The course-cohort view is read-only — open a "
+                             "student (double-click) to act on them "
+                             "individually.")
             return
         if scenario.batch is not None:
             # Contextual actions: run a BATCH action on the hand-picked

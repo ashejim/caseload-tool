@@ -421,7 +421,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     _ensure_student_flag_columns(conn)  # additive columns on existing flags
     # l360_cohort keeps departed students (course watch, 2026-11-07).
     _cc = {r[1] for r in conn.execute("PRAGMA table_info(l360_cohort)")}
-    for _name in ("first_seen_at", "departed_at"):
+    for _name in ("first_seen_at", "departed_at", "name", "email"):
         if _name not in _cc:
             conn.execute(f"ALTER TABLE l360_cohort ADD COLUMN {_name} TEXT")
     # l360_activity.occurrences was added after the table first shipped.
@@ -1559,12 +1559,13 @@ def upsert_l360_cohort(course: str, rows: list, *, db_path=HISTORY_DB,
                 conn.execute(
                     "INSERT OR REPLACE INTO l360_cohort (course, student_id, "
                     "wgu_id, pidm, owner, team, term_end, momentum, program, "
-                    "updated_at, first_seen_at, departed_at) VALUES "
-                    "(?,?,?,?,?,?,?,?,?,?,?,NULL)",
+                    "updated_at, first_seen_at, departed_at, name, email) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)",
                     (c, sid, r.get("wgu_id") or "", r.get("pidm") or "",
                      r.get("owner") or "", r.get("team") or "",
                      r.get("term_end") or "", r.get("momentum") or "",
-                     r.get("program") or "", ts, first))
+                     r.get("program") or "", ts, first,
+                     r.get("name") or "", r.get("email") or ""))
             conn.executemany(
                 "UPDATE l360_cohort SET departed_at = ? WHERE course = ? AND "
                 "student_id = ?", [(ts, c, s) for s in departed])
@@ -1613,6 +1614,17 @@ def load_l360_cohort(course: str, *, include_departed: bool = False,
             q += " AND departed_at IS NULL"
         return [dict(r) for r in conn.execute(
             q + " ORDER BY student_id", (str(course or "").strip().upper(),))]
+    finally:
+        conn.close()
+
+
+def cohort_course_counts(*, db_path=HISTORY_DB) -> dict:
+    """{course: current team students} from l360_cohort."""
+    conn = _connect(db_path)
+    try:
+        return {r[0]: r[1] for r in conn.execute(
+            "SELECT course, COUNT(*) FROM l360_cohort WHERE departed_at IS NULL "
+            "GROUP BY course")}
     finally:
         conn.close()
 

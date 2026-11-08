@@ -65,6 +65,7 @@ SRC_MODULES = [
     "src.contextual_actions",
     "src.course_assess",
     "src.assess_summary",
+    "src.cohort_view",
 ]
 
 

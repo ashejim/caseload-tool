@@ -3751,6 +3751,10 @@ class BrowserWorker:
                         "term_end": l3.norm_date(it.get("termEndDate")),
                         "momentum": str(it.get("momentum") or ""),
                         "program": str(it.get("program") or ""),
+                        "name": " ".join(x for x in (
+                            str(it.get("preferredName") or it.get("firstName")
+                                or ""), str(it.get("lastName") or "")) if x),
+                        "email": str(it.get("wguEmail") or ""),
                     }
                 pg += 1
         return {"ok": True, "rows": list(rows.values()), "teams": team_info}
