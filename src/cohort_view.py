@@ -72,7 +72,9 @@ def build_rows(courses, cohort: dict, roster_rows: list,
                 "Name": ro.get("Name") or m.get("name") or "",
                 "StudentID": ro.get("StudentID") or m.get("student_id") or sid,
                 "CourseCode": course,
-                "Assigned CI": m.get("owner") or ro.get("CourseMentor") or "",
+                # Same key as the caseload's CI column, so 'Course
+                # Instructor' filters / saved views work in both.
+                "CourseMentor": m.get("owner") or ro.get("CourseMentor") or "",
                 "Team": m.get("team") or "",
                 "Program": m.get("program") or ro.get("ProgramName") or "",
                 "Momentum": m.get("momentum") or ro.get("Momentum") or "",

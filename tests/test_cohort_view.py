@@ -49,7 +49,7 @@ def test_build_rows_team_fallback_and_competency_columns():
     by = {(r["StudentID"].lstrip("0"), r["CourseCode"]): r for r in rows}
     assert set(by) == {("555", "C949"), ("777", "C949"), ("888", "C769")}  # passer excluded
     a = by[("555", "C949")]
-    assert a["Name"] == "Ann A" and a["Assigned CI"] == "CI One"
+    assert a["Name"] == "Ann A" and a["CourseMentor"] == "CI One"
     assert a["Source"] == "Team (Learner360)" and a["Contact id"] == "003X"
     assert a["OA Used"] == 3 and a["OA Scores"] == "65 / 70 / 66"
     assert (a["OA 1"], a["OA 2"], a["OA 3"], a["OA 4"]) == (65, 70, 66, "")
@@ -62,9 +62,24 @@ def test_build_rows_team_fallback_and_competency_columns():
     assert a["Pre-A First %"] == 58 and a["_uuid"] == "u-555"
     assert by[("777", "C949")]["Source"].endswith("· left")
     b = by[("888", "C769")]
-    assert b["Source"].startswith("Course scan") and b["Assigned CI"] == "Me"
+    assert b["Source"].startswith("Course scan") and b["CourseMentor"] == "Me"
     assert b["PA Task 1"] == "2026-10-01✓ (1)" and b["OA Used"] == ""
     assert set(rows[0]) == set(rows[-1])                     # uniform columns
+
+
+def test_course_instructor_filter_works_on_cohort_rows():
+    """The viewer's 'Course Instructor' filter (the caseload's CI column)
+    must match the cohort's CI column — it returned 0 rows live."""
+    from src import caseload_csv, contextual_actions
+    rows = cohort_view.build_rows(["C949", "C769"], COHORT, ROSTER, SUMM)
+    headers = list(rows[0].keys())
+    assert caseload_csv.resolve_column("Course Instructor", headers) == "CourseMentor"
+    got = contextual_actions.gate_rows(
+        [{"column": "Course Instructor", "op": "is not empty", "value": ""}], rows)
+    assert len(got) == 3
+    got = contextual_actions.gate_rows(
+        [{"column": "Course Instructor", "op": "is any of", "value": "CI One, Me"}], rows)
+    assert sorted(r["CourseMentor"] for r in got) == ["CI One", "Me"]
 
 
 def test_cohort_quick_view_renders():

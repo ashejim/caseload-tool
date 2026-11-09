@@ -6898,13 +6898,26 @@ class CaseloadPanel:
     # ----- column filters (collapsible; reuses the batch FilterRow) -----
 
     def _panel_columns(self) -> list[str]:
-        """Display-name columns for the filter dropdowns, from the loaded
-        caseload (CSV header → display name, same as the batch editor)."""
-        rows = self.app._caseload_rows or []
+        """Display-name columns for the filter dropdowns, from the rows the
+        viewer is showing (the caseload, or the cohort / archived /
+        off-caseload list) — CSV header → display name, same as the batch
+        editor."""
+        rows = self._source_rows() or []
         if not rows:
             return []
         return [caseload_csv.display_for_column(h) for h in rows[0].keys()
-                if not caseload_filter.is_task_facet_col(h)]
+                if not caseload_filter.is_task_facet_col(h)
+                and not str(h).startswith("_")]
+
+    def _refresh_filter_columns(self) -> None:
+        """After switching what the viewer shows, give existing filter rows
+        the new column list."""
+        cols = self._panel_columns()
+        for r in list(getattr(self, "filter_rows", []) or []):
+            try:
+                r.set_columns(cols)
+            except Exception:
+                pass
 
     def _toggle_filters(self) -> None:
         if self._filters_open:
@@ -6957,7 +6970,8 @@ class CaseloadPanel:
         row = FilterRow(
             self.filters_container, self._panel_columns(),
             on_delete=self._delete_filter_row,
-            value_provider=self.app._filter_value_suggestions,
+            value_provider=lambda col, op="": self.app._filter_value_suggestions(
+                col, op, rows=self._source_rows()),
             open_picker=self._open_column_picker,
             label_for_key=self._sp_label_for_key,
             curated_provider=self._curated_columns,
@@ -7303,6 +7317,7 @@ class CaseloadPanel:
                 self._show_cohort_banner()
                 self.populate()
                 self._refresh_view_menu()
+                self._refresh_filter_columns()
                 by = {}
                 for r in rows:
                     by[r["_course"]] = by.get(r["_course"], 0) + 1
@@ -7325,6 +7340,7 @@ class CaseloadPanel:
         self._cohort_mode = False
         self._cohort_rows = None
         self._hide_archived_banner()
+        self._refresh_filter_columns()
         if repopulate:
             self.populate()
             self._refresh_view_menu()
@@ -7351,7 +7367,7 @@ class CaseloadPanel:
         self._qv_grid = self.qv_body
         r = 0
         for label, key in (("Student ID", "StudentID"), ("Course", "CourseCode"),
-                           ("Assigned CI", "Assigned CI"), ("Team", "Team"),
+                           ("Assigned CI", "CourseMentor"), ("Team", "Team"),
                            ("Program", "Program"), ("Momentum", "Momentum"),
                            ("Term end", "TermEndDate"),
                            ("Course status", "Course Status"),
@@ -19417,7 +19433,8 @@ class App:
     # messy — offer the atomic states instead).
     _TASK_STATUS_VALUES = ["Passed", "Returned", "In Process", "Submitted"]
 
-    def _filter_value_suggestions(self, display_col: str, op: str = "") -> list:
+    def _filter_value_suggestions(self, display_col: str, op: str = "",
+                                  rows=None) -> list:
         """Suggested values for a filter row's value field, given the chosen
         column + operator.
         - Date/number ops → `{Other Column}` comparison refs of the matching
@@ -19426,7 +19443,8 @@ class App:
         - Text ops → a small fixed vocabulary: task-status columns get the
           curated states; any other column with few distinct values
           (timezone, Essential Action, momentum…) gets those. [] otherwise."""
-        rows = getattr(self, "_caseload_rows", None) or []
+        rows = rows if rows is not None else (
+            getattr(self, "_caseload_rows", None) or [])
         if not rows or not display_col:
             return []
         headers = list(rows[0].keys())
