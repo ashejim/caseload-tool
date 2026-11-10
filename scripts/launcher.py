@@ -6372,6 +6372,11 @@ class CaseloadPanel:
         if q.lower().startswith(("l360discover", "1360discover")):
             self.app._l360_discover("stop" not in q.lower())
             return "break"
+        # "l360probe:" — log how the open Learner360 page is BUILT (tags /
+        # roles / classes / layout + column header labels; no student data).
+        if q.lower().startswith(("l360probe", "1360probe")):
+            self.app._l360_probe()
+            return "break"
         # "oasample: [C949]" — open up to 3 students with 3+ OA attempts on
         # their Learner360 pages (to check the Assessments panel). No ids are
         # logged.
@@ -10910,6 +10915,51 @@ class App:
                 pass
 
         self.worker.submit_l360_discover(on, on_done)
+
+    def _l360_probe(self) -> None:
+        """`l360probe:` — log the DOM structure of the open Learner360 tab
+        (src/l360_probe: tags, roles, classes, layout, column header labels;
+        never cell values) and save the full result to data_analysis/."""
+        if getattr(self, "_offline", False):
+            self._append_log("🔌 Demo: Learner360 isn't available offline.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+
+        def on_done(res):
+            def ui():
+                if (res or {}).get("error"):
+                    self._append_log(f"⚠ {res['error']}")
+                    return
+                from src import l360_probe
+                frames = (res or {}).get("frames") or []
+                self._append_log(f"🔬 Learner360 page structure ({len(frames)} "
+                                 "frame(s); no student data):")
+                for k, fr in enumerate(frames):
+                    if k and not fr.get("lists"):
+                        continue          # empty sub-frames: skip the noise
+                    for line in l360_probe.summarize(fr):
+                        self._append_log("  " + line)
+                try:
+                    import json as _json
+                    from datetime import datetime as _dt
+                    from src import config as _cfg
+                    out = _cfg.PROJECT_ROOT / "data_analysis" / (
+                        f"l360_dom_{_dt.now():%Y%m%d_%H%M}.json")
+                    out.parent.mkdir(exist_ok=True)
+                    out.write_text(_json.dumps(frames, indent=1),
+                                   encoding="utf-8")
+                    self._append_log(f"  full structure saved → {out}")
+                except Exception as e:
+                    self._append_log(f"  (couldn't save the structure: {e})")
+            try:
+                self.root.after(0, ui)
+            except Exception:
+                pass
+
+        self._append_log("🔬 Probing the open Learner360 tab…")
+        self.worker.submit_l360_probe(on_done)
 
     # ----- Learner360 startup jobs + endpoint watcher (Settings) -----
 

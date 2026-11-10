@@ -539,6 +539,11 @@ class BrowserWorker:
         False = open it in a background tab without raising the browser."""
         self.q.put(("L360_OPEN", on_done, surface))
 
+    def submit_l360_probe(self, on_done: Callable[[dict], None]) -> None:
+        """READ-ONLY: DOM STRUCTURE of the open Learner360 tab (tags, roles,
+        classes, layout — no values; see src/l360_probe)."""
+        self.q.put(("L360_PROBE", on_done))
+
     def submit_l360_team_roster(self, on_done: Callable[[dict], None],
                                 surface: bool = True) -> None:
         """READ-ONLY: the team's caseloads from Learner360 (see
@@ -1254,6 +1259,25 @@ class BrowserWorker:
                 res = {"ok": True}
             except Exception as e:
                 res = {"error": f"couldn't open Learner360: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "L360_PROBE":
+            _, on_done = cmd
+            res = {}
+            try:
+                from src.l360_probe import PROBE_JS
+                page = self._learner360_page(ctx)
+                if page is None:
+                    raise RuntimeError("no Learner360 tab open — l360open: first")
+                frames = []
+                for fr in page.frames:
+                    try:
+                        frames.append(fr.evaluate(PROBE_JS))
+                    except Exception:
+                        continue    # cross-origin / detached frame
+                res = {"ok": True, "frames": frames}
+            except Exception as e:
+                res = {"error": f"Learner360 probe failed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "L360_ROSTER":
@@ -3755,6 +3779,10 @@ class BrowserWorker:
                             str(it.get("preferredName") or it.get("firstName")
                                 or ""), str(it.get("lastName") or "")) if x),
                         "email": str(it.get("wguEmail") or ""),
+                        # For `l360cohort: <course> intake` (counts only).
+                        "assign_start": l3.norm_date(
+                            it.get("assignmentStartDate")),
+                        "assign_end": l3.norm_date(it.get("assignmentEndDate")),
                     }
                 pg += 1
         return {"ok": True, "rows": list(rows.values()), "teams": team_info}

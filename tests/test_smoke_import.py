@@ -66,6 +66,7 @@ SRC_MODULES = [
     "src.course_assess",
     "src.assess_summary",
     "src.cohort_view",
+    "src.l360_probe",
 ]
 
 
