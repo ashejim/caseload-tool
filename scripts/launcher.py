@@ -4044,7 +4044,10 @@ class CaseloadPanel:
             self.detail_body.grid_columnconfigure(0, weight=3)
             self.detail_body.grid_columnconfigure(1, weight=5)
             self.detail_body.grid_rowconfigure(0, weight=1)
-            self.qv_col = ctk.CTkFrame(self.detail_body, fg_color="transparent")
+            # Scrollable, so a tall profile (Assessments box, EA, Success
+            # Path) can still be reached when it outgrows the pane.
+            self.qv_col = ctk.CTkScrollableFrame(
+                self.detail_body, fg_color="transparent")
             self.qv_col.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
             self.notes_col = ctk.CTkScrollableFrame(
                 self.detail_body, fg_color=("gray94", "gray16"))
@@ -6417,10 +6420,17 @@ class CaseloadPanel:
             return "break"
         if q.lower().startswith(("l360cohort", "1360cohort")):
             parts = q.split(":", 1)[1].split() if ":" in q else []
-            course = next((p.upper() for p in parts
-                           if p.lower() not in ("save", "dry")), "")
-            self.app._l360_cohort(course, save="save" in [p.lower()
-                                                          for p in parts])
+            flags = [p.lower() for p in parts]
+            courses = [p.upper() for p in parts
+                       if p.lower() not in ("save", "dry", "intake")]
+            if "intake" in flags:
+                # "l360cohort: C769 C964 D502 intake" — counts of learners per
+                # team/instructor/assignment-start date, written to CSV.
+                for c in courses:
+                    self.app._l360_cohort(c, intake=True)
+                return "break"
+            self.app._l360_cohort(courses[0] if courses else "",
+                                  save="save" in flags)
             return "break"
         # "l360plan:" — import Learner360 degree plans + program mentors;
         # "l360plan: dry" = read 10 learners and report labels/counts only.
@@ -7356,44 +7366,103 @@ class CaseloadPanel:
             pass
 
     def _show_cohort_quick_view(self, row: dict) -> None:
-        """Student info for a course-cohort row: who/where + their
-        Assessments box for that course. Read-only."""
+        """Student info for a course-cohort row, laid out like the live
+        caseload view: general info LEFT + contact RIGHT (side by side when
+        there's room), and the Assessments box in the notes column (cohort
+        students have no notes here) so it's never pushed out of view.
+        Read-only."""
         self._qv_row = row
         for w in self.qv_body.winfo_children():
             w.destroy()
         for w in self.qv_notehead.winfo_children():
             w.destroy()
+        # Caseload-only panels — clear anything left from a previous student.
+        try:
+            for w in self.qv_ea_frame.winfo_children():
+                w.destroy()
+        except Exception:
+            pass
+        try:
+            self.qv_path_frame.grid_remove()
+        except Exception:
+            pass
         self.qv_name.configure(text=f"👥 {row.get('Name') or '(name not loaded)'}")
-        self._qv_grid = self.qv_body
-        r = 0
-        for label, key in (("Student ID", "StudentID"), ("Course", "CourseCode"),
-                           ("Assigned CI", "CourseMentor"), ("Team", "Team"),
-                           ("Program", "Program"), ("Momentum", "Momentum"),
-                           ("Term end", "TermEndDate"),
-                           ("Course status", "Course Status"),
-                           ("Last activity", "Last Activity"),
-                           ("Email", "StudentEmail"), ("Mobile", "MobilePhone"),
-                           ("Source", "Source")):
+
+        two_col = not self._narrow
+        self._qv_twocol = two_col
+        if two_col:
+            wrapper = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+            wrapper.grid(row=0, column=0, columnspan=2, sticky="new")
+            wrapper.grid_columnconfigure(0, weight=1, uniform="qv")
+            wrapper.grid_columnconfigure(1, weight=1, uniform="qv")
+            left = ctk.CTkFrame(wrapper, fg_color="transparent")
+            left.grid(row=0, column=0, sticky="new", padx=(0, 8))
+            right = ctk.CTkFrame(wrapper, fg_color="transparent")
+            right.grid(row=0, column=1, sticky="new")
+        else:
+            left = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+            left.grid(row=0, column=0, columnspan=2, sticky="new")
+            right = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+            right.grid(row=1, column=0, columnspan=2, sticky="new")
+        full = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        full.grid(row=2, column=0, columnspan=2, sticky="new")
+        for col in (left, right, full):
+            col.grid_columnconfigure(1, weight=1)
+        wrap = 150 if two_col else (320 if not self._narrow else 180)
+
+        def line(parent, rr, label, key, *, copy=False, tel=False):
             v = str(row.get(key) or "").strip()
             if not v:
-                continue
-            ctk.CTkLabel(self.qv_body, text=f"{label}:", anchor="nw",
+                return rr
+            ctk.CTkLabel(parent, text=f"{label}:", anchor="nw",
                          font=ctk.CTkFont(size=11, weight="bold"),
-                         text_color=("gray35", "gray70"), width=90).grid(
-                row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
-            ctk.CTkLabel(self.qv_body, text=v, anchor="w", justify="left",
-                         font=ctk.CTkFont(size=12)).grid(
-                row=r, column=1, sticky="w", pady=1)
-            r += 1
+                         text_color=("gray35", "gray70"), width=70).grid(
+                row=rr, column=0, sticky="nw", padx=(0, 6), pady=1)
+            vf = ctk.CTkFrame(parent, fg_color="transparent")
+            vf.grid(row=rr, column=1, sticky="ew", pady=1)
+            vf.grid_columnconfigure(2, weight=1)
+            kw = ({"text_color": ("#1f6feb", "#58a6ff"), "cursor": "hand2"}
+                  if tel else {})
+            lbl = ctk.CTkLabel(vf, text=v, anchor="w", justify="left",
+                               wraplength=wrap, font=ctk.CTkFont(size=12), **kw)
+            lbl.grid(row=0, column=0, sticky="w")
+            if tel:
+                lbl.bind("<Button-1>", lambda e, m=v: self._open_tel(m))
+            if copy:
+                self._copy_icon_btn(vf, v).grid(row=0, column=1, padx=(4, 0))
+            return rr + 1
+
+        rL = 0
+        for label, key, cp in (("Student ID", "StudentID", True),
+                               ("Course", "CourseCode", False),
+                               ("Assigned CI", "CourseMentor", False),
+                               ("Team", "Team", False),
+                               ("Program", "Program", False),
+                               ("Momentum", "Momentum", False),
+                               ("Term end", "TermEndDate", False),
+                               ("Status", "Course Status", False),
+                               ("Last activity", "Last Activity", False),
+                               ("Source", "Source", False)):
+            rL = line(left, rL, label, key, copy=cp)
+        ctk.CTkLabel(right, text="Contact", anchor="w",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=("gray45", "gray60")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 1))
+        rR = line(right, 1, "Mobile", "MobilePhone", copy=True, tel=True)
+        rR = line(right, rR, "Email", "StudentEmail", copy=True)
         tasks = [f"T{n}: {row[f'PA Task {n}']}" for n in range(1, 6)
                  if str(row.get(f"PA Task {n}") or "").strip()]
         if tasks:
-            ctk.CTkLabel(self.qv_body, text="Tasks:  " + "   ".join(tasks),
+            ctk.CTkLabel(full, text="Tasks:  " + "   ".join(tasks),
                          anchor="w", font=ctk.CTkFont(size=12)).grid(
-                row=r, column=0, columnspan=2, sticky="w", pady=(4, 0))
-            r += 1
-        self._qv_assessments(r, str(row.get("StudentID") or ""),
+                row=0, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        # Assessments → the notes column (right pane when wide; below the
+        # info when narrow — both scroll).
+        self._qv_grid = self.qv_notehead
+        self._qv_assessments(0, str(row.get("StudentID") or ""),
                              fixed_course=str(row.get("_course") or ""))
+        self._qv_grid = self.qv_body
+        self._notes_hint()
         try:
             self._ensure_detail_height()
         except Exception:
@@ -13936,10 +14005,13 @@ class App:
 
         self.worker.submit_l360_assess_probe(course, tg, on_done)
 
-    def _l360_cohort(self, course: str, save: bool = False) -> None:
+    def _l360_cohort(self, course: str, save: bool = False,
+                     intake: bool = False) -> None:
         """`l360cohort: C949 [save]` — learners enrolled in ``course`` across
         all my Learner360 teams. Logs counts per team (no student values);
-        ``save`` stores the roster (history.l360_cohort)."""
+        ``save`` stores the roster (history.l360_cohort). ``intake`` writes
+        learner COUNTS per team/instructor/assignment-start date to
+        data_analysis/john_b/intake_<course>_<date>.csv (no student values)."""
         if not course:
             self._append_log("Usage: l360cohort: C949   (add 'save' to store "
                              "the roster)")
@@ -13967,6 +14039,25 @@ class App:
                 self._append_log(f"Learner360 {course}: {len(rows)} unique "
                                  f"student(s), {with_pidm} with a PIDM, "
                                  f"{progs} degree program(s).")
+                if intake:
+                    import csv
+                    from collections import Counter
+                    cnt = Counter((r.get("team") or "", r.get("owner") or "",
+                                   r.get("assign_start") or "",
+                                   r.get("assign_end") or "") for r in rows)
+                    from src import config as _cfg
+                    out_dir = _cfg.PROJECT_ROOT / "data_analysis" / "john_b"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    out = out_dir / (f"intake_{course}_"
+                                     f"{datetime.now():%Y%m%d_%H%M}.csv")
+                    with open(out, "w", newline="", encoding="utf-8") as f:
+                        w = csv.writer(f)
+                        w.writerow(["course", "team", "owner", "assign_start",
+                                    "assign_end", "learners"])
+                        for (t, o, a, e), n in sorted(cnt.items()):
+                            w.writerow([course, t, o, a, e, n])
+                    self._append_log(f"  ✓ {course} intake counts → {out}")
+                    return
                 if save:
                     try:
                         n = history.replace_l360_cohort(course, rows)

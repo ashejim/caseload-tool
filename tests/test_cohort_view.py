@@ -94,6 +94,9 @@ def test_cohort_quick_view_renders():
         p.qv_name = ctk.CTkLabel(root, text="")
         p._cell = lambda row, k: str((row or {}).get(k, "") or "")
         p._ensure_detail_height = lambda: None
+        p._narrow = False
+        p._notes_hint = lambda: None
+        p._copy_icon_btn = lambda parent, v: ctk.CTkLabel(parent, text="⧉")
         p.app = types.SimpleNamespace(_open_wgu_url=lambda u: None,
                                       _refresh_one_assess=lambda s, c: None)
         rows = cohort_view.build_rows(["C949", "C769"], COHORT, ROSTER, SUMM)
@@ -115,8 +118,14 @@ def test_cohort_quick_view_renders():
                         pass
                     walk(c)
             walk(p.qv_body)
+            info = " | ".join(texts)
+            # Info (left/right columns) in qv_body; the Assessments box in the
+            # notes column (qv_notehead) so it isn't pushed below the info.
+            assert "CI One" in info and "Assessments" not in info
+            texts.clear()
+            walk(p.qv_notehead)
             joined = " | ".join(texts)
-            assert "CI One" in joined and "Assessments · C949" in joined
+            assert "Assessments · C949" in joined
             assert "3 of 4 used" in joined
             assert p.qv_name.cget("text") == "👥 Ann A"
             pa = next(r for r in rows if r["StudentID"] == "000888")
