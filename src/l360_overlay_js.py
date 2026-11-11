@@ -16,7 +16,7 @@ OVERLAY_JS = r"""
   if (location.host !== 'learner360.wgu.edu' || window.__cnOverlay) return;
 
   const S = { data: null, v: -1, on: true, queued: false, matched: 0,
-              outbox: [] };
+              outbox: [], colTables: new Set() };
   try { S.on = localStorage.getItem('cnOverlayOn') !== '0'; } catch (e) {}
 
   // ---- design tokens (matched to Learner360's palette) -------------------
@@ -164,12 +164,13 @@ OVERLAY_JS = r"""
     mountPill();
     const on = S.on && S.data;
     let matched = 0;
+    const rowEntry = new Map();          // tr → {e: entry, k: sid:course}
     for (const tr of document.querySelectorAll(
         'table tbody tr, [role="rowgroup"] > [role="row"], [role="grid"] [role="row"]')) {
       let host = tr.querySelector('[data-cn="badge"]');
       if (!on) { if (host) host.remove(); continue; }
       const cells = tr.querySelectorAll(
-        ':scope > td, :scope > [role="cell"], :scope > [role="gridcell"]');
+        ':scope > td:not([data-cn]), :scope > [role="cell"], :scope > [role="gridcell"]');
       if (cells.length < 2) continue;
       let sid = '';
       for (const td of cells) {
@@ -181,6 +182,11 @@ OVERLAY_JS = r"""
       if (!entry) { if (host) host.remove(); continue; }
       matched++;
       const key = S.v + ':' + sid + ':' + entry.course;
+      if (tr.tagName === 'TR') {
+        rowEntry.set(tr, { e: entry, k: sid + ':' + entry.course });
+        const tb = tr.closest('table');
+        if (tb) S.colTables.add(tb);
+      }
       if (host && host.dataset.key === key) continue;
       if (!host) {
         host = document.createElement('div');
@@ -191,6 +197,11 @@ OVERLAY_JS = r"""
       host.dataset.key = key;
       host.shadowRoot.innerHTML = badgeHtml(entry);
     }
+    for (const tb of Array.from(S.colTables)) {
+      if (!tb.isConnected) { S.colTables.delete(tb); continue; }
+      syncTable(tb, rowEntry);
+      if (!on) S.colTables.delete(tb);
+    }
     S.matched = matched;
     pill.classList.toggle('off', !S.on);
     pillRoot.querySelector('.txt').textContent = !S.data ? 'CaseloadNotes · waiting for data'
@@ -198,6 +209,167 @@ OVERLAY_JS = r"""
     renderPanel();
   }
 
+
+  // ---- extra list columns (⚙ Columns) -----------------------------------
+  // Learner360's list is a plain Angular Material table (probed: no virtual
+  // scroll, 20 rows/page). We append real <th>/<td> cells AFTER Angular's
+  // own (its cell outlet inserts before its anchor, so ours stay last),
+  // borrowing the native cell classes so they look native. Every body row
+  // gets cells (blank when not ours) so the columns line up.
+  const KIND_STYLE = {
+    pass: 'background:#e3f4ea;color:#135c32;border:1px solid #9fd3b1',
+    fail: 'background:#fdecea;color:#8a1f14;border:1px solid #f2b1aa',
+    mid: 'background:#fff4dc;color:#7a5600;border:1px solid #f0d08b' };
+  const stripCols = cn => String(cn || '').split(/\s+/).filter(t => t &&
+    !/^(cdk-column-|mat-column-|mat-sort-header|cdk-.*sticky|mat-.*sticky)/.test(t)).join(' ');
+
+  function colTd(proto, v) {
+    const td = document.createElement('td');
+    td.setAttribute('data-cn', 'col');
+    td.className = stripCols(proto.className);
+    if (v) {
+      const span = document.createElement('span');
+      span.textContent = v[0];
+      const st = KIND_STYLE[v[1]];
+      span.style.cssText = (st ? st + ';border-radius:9px;padding:1px 6px;' : '')
+        + 'white-space:nowrap;font-size:12px';
+      if (v[2]) td.title = v[2];
+      td.appendChild(span);
+    }
+    return td;
+  }
+
+  function syncTable(table, rowEntry) {
+    const show = !!(S.on && S.data);
+    const cols = show ? (S.data.list_cols || []) : [];
+    const sig = show ? S.v + '|' + cols.map(c => c[0]).join(',') : '';
+    const hr = table.tHead && table.tHead.rows[0];
+    if (hr && (hr.dataset.cnCols || '') !== sig) {
+      hr.querySelectorAll(':scope > [data-cn="col"]').forEach(x => x.remove());
+      const proto = hr.querySelector(':scope > th:not([data-cn])');
+      if (show && proto) {
+        for (const [, label] of cols) {
+          const th = document.createElement('th');
+          th.setAttribute('data-cn', 'col');
+          th.className = stripCols(proto.className);
+          th.textContent = label;
+          th.title = 'CaseloadNotes column';
+          hr.appendChild(th);
+        }
+        const g = document.createElement('th');
+        g.setAttribute('data-cn', 'col');
+        g.className = stripCols(proto.className);
+        g.innerHTML = `<button type="button" title="Choose CaseloadNotes columns"
+          style="border:1px solid #d5dde8;background:#fff;border-radius:6px;cursor:pointer;
+          padding:2px 7px;font:600 12px/1.2 inherit;color:#002855;white-space:nowrap">⚙ Columns${cols.length ? ' (' + cols.length + ')' : ''}</button>`;
+        g.querySelector('button').addEventListener('click', ev => {
+          ev.stopPropagation();
+          openColPicker();
+        });
+        hr.appendChild(g);
+      }
+      hr.dataset.cnCols = sig;
+    }
+    for (const body of table.tBodies) {
+      for (const tr of body.rows) {
+        const re = rowEntry.get(tr);
+        const key = sig + '#' + (re ? re.k : '');
+        if ((tr.dataset.cnCols || '') === key) continue;
+        tr.querySelectorAll(':scope > td[data-cn="col"]').forEach(x => x.remove());
+        const proto = tr.querySelector(':scope > td:not([data-cn])');
+        // Skip placeholder rows ("No data" spanning the table).
+        if (show && proto && proto.colSpan <= 1) {
+          for (const [k] of cols) tr.appendChild(colTd(proto, re && (re.e.cols || {})[k]));
+          tr.appendChild(colTd(proto, null));          // under ⚙ Columns
+        }
+        tr.dataset.cnCols = key;
+      }
+    }
+  }
+
+  const pickHost = document.createElement('div');
+  pickHost.setAttribute('data-cn', 'colpick');
+  const pickRoot = pickHost.attachShadow({ mode: 'open' });
+  const KCSS = `
+    :host { all: initial; }
+    * { box-sizing: border-box; }
+    .back { position: fixed; inset: 0; background: rgba(0,20,45,.25);
+      z-index: 2147483001; display: flex; align-items: center; justify-content: center;
+      font: 13px/1.35 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: #1b2a3a; }
+    .dlg { background: #fff; border-radius: 10px; width: 440px; max-width: 92vw;
+      max-height: 78vh; display: flex; flex-direction: column;
+      box-shadow: 0 12px 40px rgba(0,40,85,.3); }
+    .hd { padding: 12px 14px 6px; font-weight: 700; color: #002855; }
+    .sub { padding: 0 14px 6px; color: #5b6b7f; font-size: 12px; }
+    .q { margin: 0 14px 6px; height: 28px; border: 1px solid #d5dde8;
+      border-radius: 6px; padding: 0 8px; font: inherit; }
+    .ls { overflow: auto; padding: 0 14px; flex: 1; }
+    .grp { margin: 8px 0 2px; font-size: 11px; font-weight: 700; color: #5b6b7f;
+      text-transform: uppercase; letter-spacing: .04em; }
+    label { display: flex; gap: 6px; align-items: center; padding: 2px 0; cursor: pointer; }
+    label .n { margin-left: auto; color: #8a97a8; font-size: 11px; }
+    .ft { display: flex; gap: 6px; padding: 10px 14px; border-top: 1px solid #eef2f7; }
+    .ft .sp { flex: 1; }
+    button { height: 28px; padding: 0 12px; border-radius: 6px; cursor: pointer;
+      border: 1px solid #d5dde8; background: #fff; font: inherit; }
+    button.pri { background: #002855; border-color: #002855; color: #fff; }
+  `;
+
+  function openColPicker() {
+    if (!S.data) return;
+    const cat = S.data.list_catalog || [];
+    const label = Object.fromEntries(cat);
+    let chosen = (S.data.list_cols || []).map(c => c[0]).filter(k => k in label);
+    const MAX = 12;
+    const row = ([k, d]) => {
+      const i = chosen.indexOf(k);
+      return `<label><input type="checkbox" value="${esc(k)}"${i >= 0 ? ' checked' : ''}${i < 0 && chosen.length >= MAX ? ' disabled' : ''}> ${esc(d)}${i >= 0 ? `<span class="n">#${i + 1}</span>` : ''}</label>`;
+    };
+    const draw = q => {
+      const m = ([, d]) => !q || d.toLowerCase().includes(q);
+      const bi = cat.filter(([k]) => k.startsWith('@')).filter(m);
+      const fl = cat.filter(([k]) => !k.startsWith('@')).filter(m);
+      return (bi.length ? `<div class="grp">CaseloadNotes</div>${bi.map(row).join('')}` : '')
+        + (fl.length ? `<div class="grp">Caseload fields</div>${fl.map(row).join('')}` : '');
+    };
+    pickRoot.innerHTML = `<style>${KCSS}</style><div class="back"><div class="dlg" role="dialog" aria-label="CaseloadNotes columns">
+      <div class="hd">CaseloadNotes columns</div>
+      <div class="sub">Added to the right of Learner360's own columns, in the order you tick them (max ${MAX}).</div>
+      <input class="q" placeholder="Search fields…">
+      <div class="ls">${draw('')}</div>
+      <div class="ft"><button data-b="clear">Clear all</button><span class="sp"></span>
+        <button data-b="cancel">Cancel</button><button class="pri" data-b="save">Save</button></div></div></div>`;
+    if (!pickHost.isConnected) document.body.appendChild(pickHost);
+    const ls = pickRoot.querySelector('.ls');
+    const q = pickRoot.querySelector('.q');
+    const close = () => { pickHost.remove(); };
+    ls.addEventListener('change', ev => {
+      const k = ev.target.value;
+      chosen = ev.target.checked ? chosen.concat([k]).slice(0, MAX) : chosen.filter(x => x !== k);
+      ls.innerHTML = draw(q.value.trim().toLowerCase());
+    });
+    q.addEventListener('input', () => { ls.innerHTML = draw(q.value.trim().toLowerCase()); });
+    pickRoot.querySelector('.back').addEventListener('click', ev => {
+      if (ev.target.classList.contains('back')) close();
+    });
+    pickRoot.querySelector('.dlg').addEventListener('keydown', ev => {
+      if (ev.key === 'Escape') close();
+    });
+    pickRoot.querySelector('[data-b="cancel"]').addEventListener('click', close);
+    pickRoot.querySelector('[data-b="clear"]').addEventListener('click', () => {
+      chosen = [];
+      ls.innerHTML = draw(q.value.trim().toLowerCase());
+    });
+    pickRoot.querySelector('[data-b="save"]').addEventListener('click', () => {
+      S.outbox.push({ type: 'list_cols', keys: chosen });
+      // Headers now (the column keys are part of each cell's signature, so
+      // rows redraw); the values arrive with the app's next snapshot.
+      S.data.list_cols = chosen.map(k => [k, label[k]]);
+      close();
+      schedule();
+    });
+    q.focus();
+  }
 
   // ---- student panel (learner pages) ------------------------------------
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;

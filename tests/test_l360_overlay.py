@@ -404,6 +404,137 @@ def test_panel_fields_catalog_values_and_picker():
         b.close()
 
 
+MAT_PAGE = """<!doctype html><html><body><div class="table-wrapper">
+<table role="table" class="mat-mdc-table cdk-table"><thead role="rowgroup">
+<tr role="row" class="mat-mdc-header-row cdk-header-row">
+<th class="mat-sort-header mat-mdc-header-cell cdk-header-cell cdk-column-name mat-column-name">Name</th>
+<th class="mat-sort-header mat-mdc-header-cell cdk-header-cell cdk-column-studentId mat-column-studentId">Id</th>
+<th class="mat-mdc-header-cell cdk-header-cell cdk-column-courses mat-column-courses">Active Courses</th>
+</tr></thead><tbody role="rowgroup" id="b">
+<tr role="row" class="mat-mdc-row cdk-row"><td class="mat-mdc-cell cdk-cell cdk-column-name mat-column-name"><a>Pat Lee</a></td>
+<td class="mat-mdc-cell cdk-cell cdk-column-studentId mat-column-studentId">000123456</td>
+<td class="mat-mdc-cell cdk-cell cdk-column-courses mat-column-courses">C769</td></tr>
+<tr role="row" class="mat-mdc-row cdk-row"><td class="mat-mdc-cell cdk-cell cdk-column-name mat-column-name"><a>Not Mine</a></td>
+<td class="mat-mdc-cell cdk-cell cdk-column-studentId mat-column-studentId">000555555</td>
+<td class="mat-mdc-cell cdk-cell cdk-column-courses mat-column-courses">C769</td></tr>
+</tbody></table></div></body></html>"""
+
+LIST_ASSESS = {"123456": {"C769": {
+    "cut": 65,
+    "oa": {"used": 2, "max": 4, "passed": False, "next": None, "sittings": [
+        {"n": 1, "date": "2026-09-01", "score": 55, "passed": False},
+        {"n": 2, "date": "2026-10-01", "score": None, "passed": False}]},
+    "attempts": [{"n": 1, "comps": [
+        {"num": "1", "title": "Algorithms", "pct": 40, "rating": "APPROACHING"},
+        {"num": "2", "title": "Data", "pct": 80, "rating": "COMPETENT"}]}],
+    "pre": {"sittings": 2, "first_pct": 50, "last_pct": 70}}}}
+
+
+def test_list_column_values():
+    snap = l360_overlay.build_snapshot(
+        ROWS, STEPS, version=3, extras={"assess": LIST_ASSESS},
+        list_cols=["@oa", "@oa1", "@oa2", "@oa3", "@weak", "@pre",
+                   "LastActionType", "bogus"])
+    keys = [k for k, _ in snap["list_cols"]]
+    assert keys == ["@oa", "@oa1", "@oa2", "@oa3", "@weak", "@pre",
+                    "LastActionType"]                    # unknown key dropped
+    c = snap["students"]["123456"][0]["cols"]
+    assert c["@oa"][:2] == ["2/4 · 55", "mid"] and "OA 1 · 2026-09-01" in c["@oa"][2]
+    assert c["@oa1"][:2] == ["55", "fail"] and c["@oa2"][:2] == ["✗", "fail"]
+    assert "@oa3" not in c                                # no 3rd attempt
+    assert c["@weak"][:2] == ["Algorithms · 40%", "fail"]
+    assert c["@pre"][:2] == ["70% (2)", "pass"]
+    assert c["LastActionType"][0] == "Email"
+    assert snap["students"]["999888"][0]["cols"] == {}
+    assert snap["list_catalog"][0] == ["@oa", "OA attempts"]
+    # No columns chosen → no per-entry column data at all.
+    plain = l360_overlay.build_snapshot(ROWS, STEPS, version=3)
+    assert plain["list_cols"] == [] and "cols" not in plain["students"]["123456"][0]
+
+
+def test_list_columns_in_material_table():
+    from playwright.sync_api import sync_playwright
+    snap = l360_overlay.build_snapshot(
+        ROWS, STEPS, version=9, extras={"assess": LIST_ASSESS},
+        list_cols=["@oa", "@oa1", "LastActionType"])
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context()
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html",
+                                      body=MAT_PAGE))
+        pg = ctx.new_page()
+        pg.goto("https://learner360.wgu.edu/caseload")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(500)
+        heads = pg.evaluate("() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim())")
+        assert heads == ["Name", "Id", "Active Courses", "OA attempts", "OA 1",
+                         dict(snap["list_cols"])["LastActionType"],
+                         "⚙ Columns (3)"], heads
+        cls = pg.evaluate("() => document.querySelector('thead th[data-cn]').className")
+        assert "mat-mdc-header-cell" in cls and "cdk-column" not in cls \
+            and "mat-sort-header" not in cls
+        rows = pg.evaluate("""() => [...document.querySelectorAll('#b tr')].map(tr =>
+            [...tr.querySelectorAll('td[data-cn=col]')].map(td => td.textContent.trim()))""")
+        assert rows[0] == ["2/4 · 55", "55", "Email", ""], rows
+        assert rows[1] == ["", "", "", ""], rows              # not mine: blanks
+        tip = pg.evaluate("() => document.querySelector('#b td[data-cn=col]').title")
+        assert "OA 1 · 2026-09-01 · score 55" in tip
+        # Angular re-renders a page of rows → new <tr>s get the columns too.
+        pg.evaluate("""() => { const b = document.getElementById('b');
+            const tr = b.rows[0].cloneNode(true);
+            tr.querySelectorAll('[data-cn]').forEach(x => x.remove());
+            delete tr.dataset.cnCols; b.innerHTML = ''; b.appendChild(tr); }""")
+        pg.wait_for_timeout(500)
+        again = pg.evaluate("() => [...document.querySelectorAll('#b tr td[data-cn=col]')].map(td => td.textContent.trim())")
+        assert again == ["2/4 · 55", "55", "Email", ""], again
+        # ⚙ Columns → pick → save → outbox; headers follow at once.
+        pg.evaluate("() => document.querySelector('thead th[data-cn] button, thead button').click()")
+        pg.wait_for_timeout(200)
+        proot = "document.querySelector('[data-cn=colpick]').shadowRoot"
+        pg.evaluate(f"""() => {{ const i = [...{proot}.querySelectorAll('input[type=checkbox]')]
+            .find(x => x.value === '@pre'); i.click(); }}""")
+        pg.evaluate(f"() => {proot}.querySelector('[data-b=save]').click()")
+        out = pg.evaluate("window.__cnOverlay.takeOutbox()")
+        assert out == [{"type": "list_cols",
+                        "keys": ["@oa", "@oa1", "LastActionType", "@pre"]}], out
+        pg.wait_for_timeout(300)
+        heads = pg.evaluate("() => [...document.querySelectorAll('thead th[data-cn]')].map(t => t.textContent.trim())")
+        assert heads[-2:] == ["Pre-A", "⚙ Columns (4)"], heads
+        # Overlay off (pill click) → every added cell is removed.
+        pg.evaluate("() => document.querySelector('[data-cn=pill]').shadowRoot.querySelector('.pill').click()")
+        pg.wait_for_timeout(400)
+        assert pg.evaluate("() => document.querySelectorAll('[data-cn=col]').length") == 0
+        b.close()
+
+
+def test_app_saves_only_known_list_cols():
+    import importlib.util
+    import types
+    spec = importlib.util.spec_from_file_location(
+        "launcher_lc_test", os.path.join(ROOT, "scripts", "launcher.py"))
+    L = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(L)
+    saved, logs = [], []
+    real = L.save_settings
+    try:
+        L.save_settings = lambda s: saved.append(s.l360_list_cols)
+        a = types.SimpleNamespace(
+            _caseload_rows=ROWS, _overlay_extras_cache={},
+            settings=types.SimpleNamespace(l360_list_cols=""),
+            _append_log=lambda m, **kw: logs.append(m),
+            _push_overlay_snapshot=lambda: logs.append("push"))
+        L.App._set_list_cols(a, ["@oa", "@oa", "nope", "LastActionType", 7])
+        assert saved == ['["@oa", "LastActionType"]'] and "push" in logs
+        assert L.App._list_cols(a) == ["@oa", "LastActionType"]
+    finally:
+        L.save_settings = real
+
+
 def test_pronoun_edit_round_trip():
     import types
     from playwright.sync_api import sync_playwright

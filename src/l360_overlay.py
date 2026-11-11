@@ -95,6 +95,92 @@ def field_catalog(rows: list, extras: Optional[dict] = None) -> list:
     return sorted(([k, _disp(k)] for k in keys), key=lambda kd: kd[1].lower())
 
 
+# Extra COLUMNS for Learner360's caseload list (⚙ Columns): these built-ins
+# (from the assessment summary) + any field_catalog key. Values go to the
+# page as [text, kind, tooltip]; kind ∈ pass / fail / mid / "" colours it.
+LIST_BUILTINS = [["@oa", "OA attempts"], ["@oa1", "OA 1"], ["@oa2", "OA 2"],
+                 ["@oa3", "OA 3"], ["@oa4", "OA 4"],
+                 ["@weak", "Weakest competency"], ["@pre", "Pre-A"]]
+LIST_MAX = 12
+_RATING_RANK = {"unsat": 1, "appro": 2, "compe": 3, "exemp": 4}
+
+
+def list_catalog(rows: list, extras: Optional[dict] = None) -> list:
+    """[[key, label]] the list's ⚙ Columns picker offers (built-ins first)."""
+    return [list(b) for b in LIST_BUILTINS] + field_catalog(rows, extras)
+
+
+def _sit_tip(t: dict) -> str:
+    return (f"OA {t.get('n')} · {t.get('date') or '?'}"
+            + (f" · score {t['score']}" if t.get("score") is not None else "")
+            + (" · passed" if t.get("passed") else ""))
+
+
+def _list_value(key: str, row: Optional[dict], roster: dict, sid: str,
+                course: str, a: Optional[dict]):
+    """[text, kind, tooltip] for one list column, or None when empty."""
+    if not key.startswith("@"):
+        v = _field_value(key, row, roster, sid, course)
+        return [v[:80], "", v if len(v) > 80 else ""] if v else None
+    a = a or {}
+    oa = a.get("oa") or {}
+    sits = oa.get("sittings") or []
+    cut = a.get("cut")
+    if key == "@oa":
+        if not (oa.get("used") or oa.get("passed")):
+            return None
+        tip = "\n".join(_sit_tip(t) for t in sits) + (f"\ncut {cut}" if cut else "")
+        nx = oa.get("next") or {}
+        if nx.get("scheduled"):
+            tip += f"\nnext scheduled {nx['scheduled']}"
+        if oa.get("passed"):
+            return ["✓ passed", "pass", tip.strip()]
+        last = next((t["score"] for t in reversed(sits)
+                     if t.get("score") is not None), None)
+        txt = f"{oa['used']}/{oa.get('max') or 4}" + (f" · {last}" if last is not None else "")
+        return [txt, "fail" if oa["used"] >= 3 else "mid", tip.strip()]
+    if key.startswith("@oa") and key[3:].isdigit():
+        n = int(key[3:])
+        t = sits[n - 1] if 0 < n <= len(sits) else None
+        if not t:
+            return None
+        sc = t.get("score")
+        ok = t.get("passed") or (sc is not None and cut and sc >= cut)
+        txt = (str(sc) if sc is not None else "") + (" ✓" if ok else
+                                                      (" ✗" if sc is None else ""))
+        return [txt.strip(), "pass" if ok else "fail", _sit_tip(t)]
+    if key == "@weak":
+        att = [t for t in a.get("attempts") or [] if t.get("comps")]
+        if not att:
+            return None
+        worst = None
+        for x in att[-1]["comps"]:
+            r = str(x.get("rating") or "")
+            rank = (x["pct"] if x.get("pct") is not None
+                    else 25 * _RATING_RANK.get(r[:5].lower(), 0))
+            if worst is None or rank < worst[0]:
+                worst = (rank, x)
+        x = worst[1]
+        title = str(x.get("title") or x.get("num") or "")
+        val = f"{x['pct']}%" if x.get("pct") is not None else str(x.get("rating") or "")
+        kind = "pass" if (x.get("pct") or 0) >= (cut or 101) or \
+            str(x.get("rating") or "").lower()[:5] in ("compe", "exemp") else "fail"
+        return [f"{title[:28]} · {val}", kind,
+                f"Weakest on OA {att[-1].get('n')}: {title} · {val}"]
+    if key == "@pre":
+        pre = a.get("pre") or {}
+        if not pre.get("sittings"):
+            return None
+        p = pre.get("last_pct")
+        txt = (f"{p}%" if p is not None else "taken") + f" ({pre['sittings']})"
+        kind = "" if p is None or not cut else ("pass" if p >= cut else "fail")
+        return [txt, kind, f"Pre-assessment: {pre['sittings']} sitting(s)"
+                + (f", first {pre['first_pct']}%" if pre.get("first_pct") is not None else "")
+                + (f", last {p}%" if p is not None else "")
+                + (f" · since last OA: {pre['since_last_oa']}" if pre.get("since_last_oa") else "")]
+    return None
+
+
 def _field_value(key: str, row: Optional[dict], roster: dict, sid: str,
                  course: str) -> str:
     if str(key).startswith("CB:"):
@@ -104,7 +190,8 @@ def _field_value(key: str, row: Optional[dict], roster: dict, sid: str,
 
 def build_snapshot(rows: list, step_cols: Optional[dict] = None,
                    version: int = 0, extras: Optional[dict] = None,
-                   fields: Optional[list] = None) -> dict:
+                   fields: Optional[list] = None,
+                   list_cols: Optional[list] = None) -> dict:
     """{"v": version, "students": {student id without leading zeros:
     [entry per course]}, "uuid_map", "notes", "momi"} from the caseload rows
     (after derived columns, task status and EAs are applied). ``step_cols`` =
@@ -114,6 +201,7 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
     step_cols = step_cols or {}
     roster = (extras or {}).get("roster") or {}
     out: dict = {}
+    src_row: dict = {}            # (sid, course) → caseload row, for list columns
     for r in rows or []:
         sid = _nsid(r.get("StudentID") or r.get("Student ID"))
         if not sid:
@@ -134,7 +222,8 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
                           "date": date,
                           "count": str(r.get(f"Task{n}Count") or "")})
         risk = _num(r.get("MomentumRisk"))
-        chosen = [[_disp(k), v] for k in fields or []
+        src_row.setdefault((sid, course), r)
+        chosen =[[_disp(k), v] for k in fields or []
                   if (v := _field_value(k, r, roster, sid, course))]
         out.setdefault(sid, []).append({
             "fields": chosen,
@@ -193,8 +282,24 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
             if a:
                 e["assess"] = a
             out.setdefault(sid, []).append(e)
+    # Extra list columns: only non-empty values travel to the page.
+    cat = list_catalog(rows, extras)
+    label = {k: d for k, d in cat}
+    cols = [[k, label[k]] for k in list_cols or [] if k in label][:LIST_MAX]
+    if cols:
+        for sid, ents in out.items():
+            for e in ents:
+                vals = {}
+                for k, _d in cols:
+                    v = _list_value(k, src_row.get((sid, e["course"])), roster,
+                                    sid, e["course"], e.get("assess"))
+                    if v:
+                        vals[k] = v
+                e["cols"] = vals
     return {"v": version, "students": out,
-            "field_catalog": field_catalog(rows, extras),
+            "field_catalog": cat[len(LIST_BUILTINS):],
+            "list_catalog": cat,
+            "list_cols": cols,
             "panel_fields": list(fields or []),
             "uuid_map": dict(ex.get("uuid_map") or {}),
             "notes": dict(ex.get("notes") or {}),

@@ -84,7 +84,8 @@ PROBE_JS = r"""
     seen.add(g);
     const rows = Array.from(g.querySelectorAll('tr, [role="row"]'))
       .filter(r => r.closest('table, [role="grid"], [role="table"], [role="treegrid"]') === g);
-    const heads = Array.from(g.querySelectorAll('th, [role="columnheader"]'))
+    // Learner360's own cells only — not the overlay's added columns.
+    const heads = Array.from(g.querySelectorAll('th:not([data-cn]), [role="columnheader"]'))
       .filter(h => h.closest('table, [role="grid"], [role="table"], [role="treegrid"]') === g);
     const body = rows.filter(r => !r.querySelector('th, [role="columnheader"]'));
     const L = { el: desc(g), style: st(g),
@@ -102,7 +103,7 @@ PROBE_JS = r"""
                 row_samples: [], ancestors: [] };
     for (const r of body.slice(0, 3)) {
       const cells = Array.from(r.querySelectorAll(
-        ':scope > td, :scope > th, :scope > [role="cell"], :scope > [role="gridcell"]'));
+        ':scope > td:not([data-cn]), :scope > th:not([data-cn]), :scope > [role="cell"], :scope > [role="gridcell"]'));
       const s = st(r);
       L.row_samples.push({
         el: desc(r), parent: desc(r.parentElement), style: s,

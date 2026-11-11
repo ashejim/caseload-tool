@@ -10654,9 +10654,10 @@ class App:
             # MOMI trend, learner-id map) take ~1 s of DB work → background
             # thread, then a second, complete snapshot.
             fields = self._panel_fields()
+            list_cols = self._list_cols()
             first = l360_overlay.build_snapshot(
                 rows, step_cols, version=ver, extras=self._overlay_extras_cache,
-                fields=fields)
+                fields=fields, list_cols=list_cols)
             self.worker.set_overlay_snapshot(first)
             # One diagnostic line per session: how much the overlay gets.
             ents = [e for v in first["students"].values() for e in v]
@@ -10700,7 +10701,8 @@ class App:
                 self.worker.set_overlay_snapshot(
                     l360_overlay.build_snapshot(rows, step_cols,
                                                 version=App._overlay_version,
-                                                extras=ex, fields=fields))
+                                                extras=ex, fields=fields,
+                                                list_cols=list_cols))
 
             threading.Thread(target=work, daemon=True,
                              name="overlay-extras").start()
@@ -10722,6 +10724,9 @@ class App:
             for a in acts or []:
                 if isinstance(a, dict) and a.get("type") == "panel_fields":
                     self._set_panel_fields(a.get("keys"))
+                    continue
+                if isinstance(a, dict) and a.get("type") == "list_cols":
+                    self._set_list_cols(a.get("keys"))
                     continue
                 if isinstance(a, dict) and a.get("type") == "refresh_assess":
                     self._refresh_one_assess(str(a.get("sid") or ""),
@@ -10811,6 +10816,34 @@ class App:
         self.settings.l360_panel_fields = _json.dumps(keys)
         save_settings(self.settings)
         self._append_log(f"Learner360 panel: showing {len(keys)} extra field(s).")
+        self._push_overlay_snapshot()
+
+    def _list_cols(self) -> list:
+        """Keys of the extra columns chosen for Learner360's caseload list."""
+        import json as _json
+        try:
+            v = _json.loads(getattr(self.settings, "l360_list_cols", "") or "[]")
+            return [str(k) for k in v if isinstance(k, str)]
+        except ValueError:
+            return []
+
+    def _set_list_cols(self, keys) -> None:
+        """⚙ Columns on Learner360's list: keep known keys (built-ins +
+        caseload columns, max LIST_MAX, picked order), save, re-push."""
+        import json as _json
+        from src import l360_overlay
+        valid = {k for k, _d in l360_overlay.list_catalog(
+            self._caseload_rows or [],
+            getattr(self, "_overlay_extras_cache", None) or {})}
+        seen, out = set(), []
+        for k in keys or []:
+            if isinstance(k, str) and k in valid and k not in seen:
+                seen.add(k)
+                out.append(k)
+        out = out[:l360_overlay.LIST_MAX]
+        self.settings.l360_list_cols = _json.dumps(out)
+        save_settings(self.settings)
+        self._append_log(f"Learner360 list: showing {len(out)} extra column(s).")
         self._push_overlay_snapshot()
 
     def _refresh_one_assess(self, sid: str, course: str) -> None:
