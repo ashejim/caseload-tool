@@ -3,6 +3,23 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## Unreleased
+
+- **Course Planning Tool (CPT) scores, scraped from the vendor** (`cpt:`).
+  The CPT (course-entry readiness check, code XTFO) reports Experience /
+  Confidence / Knowledge, but the scores live only on the external vendor
+  (SmarterMeasure) — WGU's own gateways expose just an `isTaken` flag. `cpt:
+  C949` navigates the faculty redirect per student and reads that course's
+  scores (latest take reliably; first take parsed from the "previous attempts"
+  history), storing them in a new read-only `cpt_results` table. Keywords:
+  `labeled` targets only learners with a resolved OA pass/fail (the predictive
+  set), `dry` reads ~10 and logs value-free panel structure without storing,
+  `all` re-scrapes even recently-done students, and `cpt: cancel` stops a run.
+  Background batches that yield to the user; resumable (7-day skip). No token
+  harvest — the signed-in browser context provisions the vendor via the
+  redirect. (Waits for the vendor page before reading, since the my.wgu.edu →
+  vendomatic → SmarterMeasure redirect completes client-side after load.)
+
 ## 0.27.0 — 2026-11-01
 
 - **Learner360 data (WGU's new caseload app), read-only, alongside Salesforce.**

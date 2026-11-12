@@ -356,6 +356,34 @@ CREATE TABLE IF NOT EXISTS course_assess (
     updated_at        TEXT,
     PRIMARY KEY (course, student_id)
 );
+-- COURSE PLANNING TOOL (CPT, code XTFO): the course-entry readiness check
+-- whose Experience/Confidence/Knowledge scores live ONLY on the external
+-- vendor (SmarterMeasure), reachable via the faculty redirect. One row per
+-- learner+course. latest_* = the most-recent take (always captured, reliable);
+-- first_* = the earliest take parsed from the "previous attempts" history
+-- (best-effort; first_resolved flags whether it was). attempts_json holds the
+-- full per-take history oldest->newest. Local + encrypted only — never
+-- exported; aggregates only in any report (FERPA).
+CREATE TABLE IF NOT EXISTS cpt_results (
+    course              TEXT NOT NULL,
+    student_id          TEXT NOT NULL,   -- without leading zeros
+    pidm                TEXT,
+    taken               INTEGER,         -- 1 if a CPT report for this course was found
+    n_attempts          INTEGER,
+    multi_take          INTEGER,         -- 1 if the page offered "previous attempts"
+    latest_date         TEXT,
+    latest_experience   REAL,
+    latest_confidence   REAL,
+    latest_knowledge    REAL,
+    first_date          TEXT,
+    first_experience    REAL,
+    first_confidence    REAL,
+    first_knowledge     REAL,
+    first_resolved      INTEGER,         -- 1 if first take parsed from history
+    attempts_json       TEXT,            -- [{date,experience,confidence,knowledge}] oldest->newest
+    updated_at          TEXT,
+    PRIMARY KEY (course, student_id)
+);
 -- Pre-assessment items: the SAME for every student, stored once (stem,
 -- options, correct answer). Local + encrypted only — never exported.
 CREATE TABLE IF NOT EXISTS preA_item (
@@ -1529,6 +1557,108 @@ def mark_course_assess_imported(course: str, *, db_path=HISTORY_DB,
                          (f"course_assess_last:{str(course).upper()}", ts))
     finally:
         conn.close()
+
+
+def persist_cpt_results(course: str, by_student: dict, *,
+                        db_path=HISTORY_DB,
+                        now: Optional[datetime] = None) -> dict:
+    """Store the worker's _cpt_fetch output: {student_id: rec} where rec has
+    pidm, taken, n_attempts, multi_take, latest{date,experience,confidence,
+    knowledge}, first{...}, first_resolved, attempts[]. One row per
+    learner+course. Returns counts."""
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    c = str(course or "").strip().upper()
+    dumps = lambda o: json.dumps(o, separators=(",", ":"))  # noqa: E731
+    rows, n_taken = [], 0
+    for sid, d in (by_student or {}).items():
+        sid = str(sid).lstrip("0")
+        if not sid or d is None:
+            continue
+        lt = d.get("latest") or {}
+        ft = d.get("first") or {}
+        taken = 1 if d.get("taken") else 0
+        n_taken += taken
+        rows.append((
+            c, sid, d.get("pidm") or "", taken,
+            d.get("n_attempts"),
+            1 if d.get("multi_take") else 0,
+            lt.get("date"), lt.get("experience"),
+            lt.get("confidence"), lt.get("knowledge"),
+            ft.get("date"), ft.get("experience"),
+            ft.get("confidence"), ft.get("knowledge"),
+            1 if d.get("first_resolved") else 0,
+            dumps(d.get("attempts") or []),
+            ts))
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO cpt_results VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        return {"students": len(rows), "taken": n_taken}
+    finally:
+        conn.close()
+
+
+def load_cpt_results(course: str, *, db_path=HISTORY_DB) -> dict:
+    """{student_id: row-dict} of stored CPT results for ``course``."""
+    conn = _connect(db_path)
+    try:
+        out = {}
+        for r in conn.execute("SELECT * FROM cpt_results WHERE course = ?",
+                              (str(course or "").strip().upper(),)):
+            d = dict(r)
+            try:
+                d["attempts"] = json.loads(d.get("attempts_json") or "null")
+            except ValueError:
+                d["attempts"] = None
+            out[r["student_id"]] = d
+        return out
+    finally:
+        conn.close()
+
+
+def cpt_recent(course: str, days: float = 7, *, db_path=HISTORY_DB) -> set:
+    """Student ids whose ``course`` CPT result was stored within ``days`` — so
+    an interrupted scrape can resume where it stopped. 7-day default: CPT
+    scores don't change often and the scrape is slow (one vendor page each)."""
+    from datetime import timedelta
+    cut = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT student_id FROM cpt_results WHERE course = ? AND "
+            "updated_at >= ?", (str(course or "").strip().upper(), cut))}
+    finally:
+        conn.close()
+
+
+def mark_cpt_imported(course: str, *, db_path=HISTORY_DB,
+                      now: Optional[datetime] = None) -> None:
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    conn = _connect(db_path)
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                         (f"cpt_last:{str(course).upper()}", ts))
+    finally:
+        conn.close()
+
+
+def load_course_outcome_pidms(course: str, *, db_path=HISTORY_DB) -> dict:
+    """{pidm: student_id} for ``course`` learners with >=1 SCORED OA attempt in
+    course_assess (i.e. a resolved pass/fail label) — the target set for a
+    CPT scrape aimed at the predictive question."""
+    out = {}
+    for sid, d in load_course_assess(course, db_path=db_path).items():
+        oa = ((d.get("assessments") or {}).get("oa") or {})
+        atts = oa.get("attempts") or []
+        if any(str(a.get("score", "")).strip() not in ("", "None")
+               for a in atts):
+            pidm = str(d.get("pidm") or "").strip()
+            if pidm:
+                out[pidm] = sid
+    return out
 
 
 def upsert_l360_cohort(course: str, rows: list, *, db_path=HISTORY_DB,

@@ -6419,6 +6419,28 @@ class CaseloadPanel:
             self.app._start_course_assess(course, dry="dry" in low,
                                           everyone="all" in low, source=source)
             return "break"
+        # "cpt: C949 [dry] [all] [labeled]" — scrape the Course Planning Tool
+        # (Experience/Confidence/Knowledge) scores from the external vendor
+        # (SmarterMeasure) via the faculty redirect, in background batches.
+        # Default targets = all roster students for the course; 'labeled' =
+        # only those with a resolved OA pass/fail (the predictive set); 'dry' =
+        # read ~10 and log panel structure without storing; 'all' = re-scrape
+        # even students done in the last 7 days.
+        if q.lower().startswith("cpt:") or q.lower().strip() == "cpt" \
+                or q.lower().startswith("cpt "):
+            rest = q.split(":", 1)[1] if ":" in q else q[3:]
+            parts = rest.split()
+            low = [p.lower() for p in parts]
+            if "cancel" in low or "stop" in low:
+                self.app._cancel_cpt_scrape()
+                return "break"
+            _kw = ("dry", "all", "labeled", "roster", "cancel", "stop")
+            course = next((p.upper() for p in parts
+                           if p.lower() not in _kw), "C949")
+            self.app._start_cpt_scrape(course, dry="dry" in low,
+                                       everyone="all" in low,
+                                       labeled="labeled" in low)
+            return "break"
         if q.lower().startswith(("l360assessprobe", "1360assessprobe")):
             parts = q.split(":", 1)[1].split() if ":" in q else []
             self.app._l360_assess_probe((parts[0] if parts else "C949").upper())
@@ -14051,6 +14073,210 @@ class App:
             self._append_log(f"  {st['course']} assessments: {st['i']}/"
                              f"{len(st['targets'])} students…")
         self.root.after(1000, self._cabg_step)
+
+    # ---- Course Planning Tool (CPT) vendor scrape -----------------------
+    _CPT_BATCH = 3            # ~12 s per student; keep the worker responsive
+
+    def _cpt_targets(self, course: str, labeled: bool = False) -> tuple:
+        """([('', student_id, pidm)], note) for a CPT scrape. labeled=True →
+        only learners with a resolved OA pass/fail (from course_assess), the
+        set that answers the predictive question; else ALL roster students for
+        the course (coursescan_roster.json). Deduped by student id."""
+        crs = str(course or "").strip().upper()
+        if labeled:
+            try:
+                pm = history.load_course_outcome_pidms(crs)
+            except Exception as e:
+                return [], f"Couldn't read OA outcomes: {e}"
+            tg = [("", sid, pidm) for pidm, sid in pm.items()]
+            if not tg:
+                return [], (f"No {crs} learners with a scored OA attempt yet — "
+                            f"run l360assess: {crs} (and its passer sources) "
+                            "first.")
+            return tg, (f"{crs} CPT scrape (labeled): {len(tg)} learner(s) "
+                        "with an OA outcome.")
+        import json as _json
+        path = USER_CONFIG_DIR / "coursescan_roster.json"
+        if not path.exists():
+            return [], ("No roster capture yet — run 'coursescan: capture' "
+                        "then 'coursescan: export' on the Any Course view.")
+        try:
+            with open(path, encoding="utf-8") as f:
+                rows = _json.load(f)
+        except Exception as e:
+            return [], f"Couldn't read the roster capture: {e}"
+        tg, seen = [], set()
+        for r in rows:
+            if str(r.get("CourseCode") or "").strip().upper() != crs:
+                continue
+            sid = str(r.get("StudentID") or "").strip()
+            pidm = str(r.get("PIDM") or "").strip()
+            if not (sid and pidm) or sid in seen:
+                continue
+            seen.add(sid)
+            tg.append(("", sid, pidm))
+        if not tg:
+            return [], (f"No {crs} students with a PIDM in the roster "
+                        "capture — re-scan the Any Course view for it first.")
+        return tg, f"{crs} CPT scrape (roster): {len(tg)} student(s)."
+
+    def _start_cpt_scrape(self, course: str, dry: bool = False,
+                          everyone: bool = False, labeled: bool = False,
+                          on_finish=None) -> bool:
+        """Scrape CPT Experience/Confidence/Knowledge for ``course`` from the
+        vendor in small background batches that yield to the user. ``labeled``
+        targets only OA-resolved learners; ``dry`` reads 10 and logs panel
+        structure without storing; students scraped in the last 7 days are
+        skipped (resume) unless ``everyone``."""
+        if getattr(self, "_cptbg", None):
+            self._append_log("A CPT scrape is already running.")
+            return False
+        if getattr(self, "_offline", False) or not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return False
+        tg, note = self._cpt_targets(course, labeled=labeled)
+        if not tg:
+            self._append_log(note)
+            return False
+        self._append_log(note)
+        skipped = 0
+        if not dry and not everyone:
+            try:
+                done = history.cpt_recent(course)
+            except Exception:
+                done = set()
+            before = len(tg)
+            tg = [t for t in tg if str(t[1]).lstrip("0") not in done]
+            skipped = before - len(tg)
+            if not tg:
+                self._append_log(f"{course} CPT: all {before} were scraped in "
+                                 f"the last 7 days — type cpt: {course} all to "
+                                 "re-scrape.")
+                return False
+        if dry:
+            tg = tg[:10]
+        from collections import Counter
+        self._cptbg = {"course": course, "targets": tg, "i": 0, "dry": dry,
+                       "counts": Counter(), "stored": Counter(),
+                       "t0": time.time(), "on_finish": on_finish}
+        self._append_log(
+            f"{course} CPT: {'dry run on' if dry else 'scraping'} {len(tg)} "
+            "student(s) from the vendor in the background"
+            + (f" (skipping {skipped} done in the last 7 days)"
+               if skipped else "")
+            + f", {self._CPT_BATCH} at a time. ~12 s each — this is slow; keep "
+            "the app's browser signed in to WGU.")
+        self._cptbg_step()
+        return True
+
+    def _cancel_cpt_scrape(self) -> None:
+        """Stop an in-progress CPT scrape. The in-flight batch's callback
+        no-ops once ``_cptbg`` is cleared; already-stored rows are kept."""
+        st = getattr(self, "_cptbg", None)
+        if not st:
+            self._append_log("No CPT scrape is running.")
+            return
+        self._cptbg = None
+        _run_on_finish(self.root, st)
+        self._append_log(f"✓ {st['course']} CPT scrape cancelled at "
+                         f"{st['i']}/{len(st['targets'])} student(s). Type "
+                         f"cpt: {st['course']} labeled to resume (already-"
+                         "stored students are skipped).")
+
+    def _cptbg_step(self) -> None:
+        st = getattr(self, "_cptbg", None)
+        if not st:
+            return
+        if st["i"] >= len(st["targets"]):
+            self._cptbg = None
+            _run_on_finish(self.root, st)
+            mins = (time.time() - st["t0"]) / 60
+            c = dict(st["counts"])
+            if not st["dry"]:
+                try:
+                    history.mark_cpt_imported(st["course"])
+                except Exception:
+                    pass
+            self._append_log(
+                f"✓ {st['course']} CPT {'(dry run) ' if st['dry'] else ''}"
+                f"done in {mins:.0f} min: {c}"
+                + ("" if st["dry"] else f"; stored {dict(st['stored'])}"))
+            return
+        if (getattr(self, "_is_busy", False)
+                or not self.worker.ready_event.is_set()):
+            self.root.after(30_000, self._cptbg_step)
+            return
+        part = st["targets"][st["i"]:st["i"] + self._CPT_BATCH]
+
+        def on_done(res):
+            try:
+                self.root.after(0, lambda: self._cptbg_got(len(part), res))
+            except Exception:
+                pass
+
+        self.worker.submit_cpt_fetch(st["course"], part, on_done, dry=st["dry"])
+
+    def _cptbg_got(self, n: int, res) -> None:
+        st = getattr(self, "_cptbg", None)
+        if not st:
+            return
+        res = res or {}
+        if res.get("error"):
+            st["retries"] = st.get("retries", 0) + 1
+            if st["retries"] <= 3:
+                self._append_log(f"  {st['course']} CPT: batch failed "
+                                 f"({str(res['error'])[:120]}) — retrying in "
+                                 f"1 min ({st['retries']}/3)…")
+                self.root.after(60_000, self._cptbg_step)
+                return
+            self._cptbg = None
+            _run_on_finish(self.root, st)
+            self._append_log(f"{st['course']} CPT stopped after {st['i']} "
+                             f"students: {res['error']} — type cpt: "
+                             f"{st['course']} to resume.", error=True)
+            return
+        st["retries"] = 0
+        st["counts"].update(res.get("counts") or {})
+        if st["dry"]:
+            for d in (res.get("dry_report") or []):
+                self._append_log(
+                    f"    multi={d['multi_take']} "
+                    f"attempts_parsed={d['n_attempts_found']} "
+                    f"panel={d.get('panel')}")
+            st["i"] += n
+            self.root.after(500, self._cptbg_step)
+            return
+        by = res.get("by_student") or {}
+
+        def work():
+            try:
+                r = history.persist_cpt_results(st["course"], by)
+            except Exception as e:
+                r = {"error": str(e)}
+            try:
+                self.root.after(0, lambda: self._cptbg_saved(n, r))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True, name="cpt-save").start()
+
+    def _cptbg_saved(self, n: int, r: dict) -> None:
+        st = getattr(self, "_cptbg", None)
+        if not st:
+            return
+        if (r or {}).get("error"):
+            self._cptbg = None
+            _run_on_finish(self.root, st)
+            self._append_log(f"{st['course']} CPT couldn't save: {r['error']}",
+                             error=True)
+            return
+        st["stored"].update({k: v for k, v in r.items()
+                             if isinstance(v, int)})
+        st["i"] += n
+        if st["i"] % 60 < n:
+            self._append_log(f"  {st['course']} CPT: {st['i']}/"
+                             f"{len(st['targets'])} students…")
+        self.root.after(1000, self._cptbg_step)
 
     def _l360_assess_probe(self, course: str) -> None:
         rows = history.load_l360_cohort(course)

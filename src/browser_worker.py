@@ -572,6 +572,15 @@ class BrowserWorker:
         _course_assess_fetch)."""
         self.q.put(("COURSE_ASSESS", course, targets, on_done))
 
+    def submit_cpt_fetch(self, course: str, targets: list,
+                         on_done: Callable[[dict], None],
+                         dry: bool = False) -> None:
+        """READ-ONLY: scrape Course-Planning-Tool (CPT) scores for some
+        learners from the external vendor via the faculty redirect (see
+        _cpt_fetch). ``dry`` reads without storing and returns panel structure
+        (value-free) to help finalize first-take parsing."""
+        self.q.put(("CPT", course, targets, on_done, dry))
+
     def submit_l360_assess_probe(self, course: str, targets: list,
                                  on_done: Callable[[dict], None]) -> None:
         """READ-ONLY probe of the course-assessment feeds (statuses only)."""
@@ -1296,6 +1305,15 @@ class BrowserWorker:
                 res = self._course_assess_fetch(ctx, course, targets)
             except Exception as e:
                 res = {"error": f"course assessment import crashed: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "CPT":
+            _, course, targets, on_done, dry = cmd
+            res = {}
+            try:
+                res = self._cpt_fetch(ctx, course, targets, dry=dry)
+            except Exception as e:
+                res = {"error": f"CPT scrape crashed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "L360_ASSESS_PROBE":
@@ -3473,6 +3491,162 @@ class BrowserWorker:
                     counts[f"coaching:{c.get('status')}"] += 1
             by[sid] = rec
         return {"ok": True, "by_student": by, "counts": dict(counts)}
+
+    # Runs in the vendor (SmarterMeasure) page. Reads ONLY this course's
+    # rendered Course-Planning-Tool report — no tokens, no storage access.
+    # Returns {taken, latest{date,experience,confidence,knowledge}, multi_take,
+    # attempts[], panel_debug{...}} (panel_debug is value-free structure).
+    _CPT_EXTRACT_JS = r"""
+    async () => {
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
+      const RX = /C949|Data Structures and Algorithms I\b/;
+      const findArt = () => Array.from(document.querySelectorAll('article')).find(a => {
+        const h = a.querySelector('h2,h3,[role="heading"]');
+        return RX.test((h && h.textContent) || '');
+      });
+      let art = null;
+      for (let i = 0; i < 24; i++) { art = findArt(); if (art) break; await sleep(500); }
+      if (!art) return { taken: false };
+      const parse = (txt) => {
+        const g = l => { const m = txt.match(new RegExp(l + '\\s*([0-9.]+)%'));
+                         return m ? Math.round(parseFloat(m[1]) * 10) / 10 : null; };
+        const date = (txt.match(/Completed:\s*([0-9/]+ [0-9:]+ [AP]M)/) || [])[1] || null;
+        return { date, experience: g('Experience'), confidence: g('Confidence'), knowledge: g('Knowledge') };
+      };
+      const latest = parse(art.textContent.replace(/\s+/g, ' '));
+      const out = { taken: true, latest, multi_take: false, attempts: [], panel_debug: null };
+      const prevBtn = Array.from(art.querySelectorAll('button'))
+        .find(b => /previous attempts/i.test(b.textContent || ''));
+      if (prevBtn) {
+        out.multi_take = true;
+        try { prevBtn.click(); } catch (e) {}
+        const nComp = el => ((el.textContent || '').match(/Completed:/g) || []).length;
+        let panel = null;
+        for (let i = 0; i < 16; i++) {
+          await sleep(400);
+          let best = null, bestLen = Infinity;
+          document.querySelectorAll('*').forEach(el => {
+            const tx = el.textContent || '';
+            if (!RX.test(tx) || nComp(el) < 2 || tx.length >= bestLen) return;
+            best = el; bestLen = tx.length;
+          });
+          if (best) { panel = best; break; }
+        }
+        if (panel) {
+          const tx = panel.textContent.replace(/\s+/g, ' ');
+          const re = /Completed:\s*([0-9/]+ [0-9:]+ [AP]M)[\s\S]*?Experience\s*([0-9.]+)%\s*Confidence\s*([0-9.]+)%\s*Knowledge\s*([0-9.]+)%/g;
+          let m; const seen = new Set();
+          while ((m = re.exec(tx)) !== null) {
+            if (seen.has(m[1])) continue; seen.add(m[1]);
+            out.attempts.push({ date: m[1], experience: +m[2], confidence: +m[3],
+                                knowledge: Math.round(+m[4] * 10) / 10 });
+          }
+          out.panel_debug = {
+            tag: panel.tagName,
+            cls: String(panel.className || '').slice(0, 40),
+            nCompleted: nComp(panel),
+            nTriples: out.attempts.length,
+            nPercents: (tx.match(/[0-9.]+%/g) || []).length,
+            htmlLen: (panel.innerHTML || '').length
+          };
+        }
+      }
+      if (!out.attempts.length && latest) out.attempts = [latest];
+      return out;
+    }
+    """
+
+    def _cpt_fetch(self, ctx, course: str, targets: list,
+                   dry: bool = False) -> dict:
+        """READ-ONLY: per target (_, student_id, pidm[, cv]) navigate the
+        faculty CPT redirect and read ``course``'s Experience/Confidence/
+        Knowledge from the external vendor page. Latest take is captured
+        reliably; first take is parsed best-effort from the 'previous attempts'
+        history (first_resolved flags whether it was). Returns {ok, by_student,
+        counts[, dry_report]}. The persistent context's WGU SSO cookies
+        provision the vendor session via the redirect — no token harvest."""
+        from collections import Counter
+        from datetime import datetime as _dt
+        REDIR = ("https://my.wgu.edu/redirect?faculty=true&vendomatic=true"
+                 "&ssoId=201&assessmentCode=XTFO&pidm=")
+
+        def _d(a):
+            try:
+                return _dt.strptime(a.get("date", ""), "%m/%d/%y %I:%M %p")
+            except Exception:
+                return None
+
+        by, counts = {}, Counter()
+        dry_report = []
+        pg = ctx.new_page()
+        try:
+            for t in targets:
+                sid, pidm = str(t[1]), str(t[2])
+                rec = {"pidm": pidm, "taken": False}
+                try:
+                    pg.goto(REDIR + pidm, wait_until="domcontentloaded",
+                            timeout=45_000)
+                    # The redirect chain (my.wgu.edu -> vendomatic -> vendor)
+                    # finishes CLIENT-SIDE after goto returns. Wait for the
+                    # vendor page first, or evaluate runs on the "redirecting…"
+                    # interstitial and the redirect destroys its context.
+                    try:
+                        pg.wait_for_url("**plus.smartermeasure.com**",
+                                        timeout=30_000)
+                    except Exception:
+                        pass
+                    pg.wait_for_timeout(1500)
+                    data = pg.evaluate(self._CPT_EXTRACT_JS) or {}
+                except Exception as e:
+                    # A late redirect can destroy the first eval's context —
+                    # one retry on the settled page.
+                    try:
+                        pg.wait_for_timeout(2000)
+                        data = pg.evaluate(self._CPT_EXTRACT_JS) or {}
+                    except Exception:
+                        counts[f"error:{type(e).__name__}"] += 1
+                        by[sid] = rec
+                        continue
+                if not data.get("taken"):
+                    counts["no_cpt"] += 1
+                    by[sid] = rec
+                    continue
+                latest = data.get("latest")
+                multi = bool(data.get("multi_take"))
+                dated = sorted((a for a in (data.get("attempts") or [])
+                                if _d(a)), key=_d)
+                if not multi:
+                    first, first_resolved = latest, bool(latest)
+                    n_attempts = 1 if latest else 0
+                elif len(dated) >= 2:
+                    first, first_resolved = dated[0], True
+                    n_attempts = len(dated)
+                else:
+                    first, first_resolved = latest, False  # history unparsed
+                    n_attempts = None
+                rec.update(taken=True, latest=latest, first=first,
+                           multi_take=multi, first_resolved=first_resolved,
+                           n_attempts=n_attempts,
+                           attempts=(dated or ([latest] if latest else [])))
+                counts["taken"] += 1
+                if multi:
+                    counts["multi_take"] += 1
+                if first_resolved and multi:
+                    counts["first_resolved"] += 1
+                if dry:
+                    dry_report.append({"multi_take": multi,
+                                       "n_attempts_found": len(dated),
+                                       "panel": data.get("panel_debug")})
+                by[sid] = rec
+        finally:
+            try:
+                pg.close()
+            except Exception:
+                pass
+        out = {"ok": True, "by_student": by, "counts": dict(counts)}
+        if dry:
+            out["dry_report"] = dry_report
+        return out
 
     def _learner360_page(self, ctx):
         """The open Learner360 tab in the launcher's context, or None."""
