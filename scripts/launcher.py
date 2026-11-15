@@ -10677,9 +10677,12 @@ class App:
             # thread, then a second, complete snapshot.
             fields = self._panel_fields()
             list_cols = self._list_cols()
+            list_sets = self._list_sets()
+            list_set = getattr(self.settings, "l360_list_set", "") or ""
             first = l360_overlay.build_snapshot(
                 rows, step_cols, version=ver, extras=self._overlay_extras_cache,
-                fields=fields, list_cols=list_cols)
+                fields=fields, list_cols=list_cols, list_sets=list_sets,
+                list_set=list_set)
             self.worker.set_overlay_snapshot(first)
             # One diagnostic line per session: how much the overlay gets.
             ents = [e for v in first["students"].values() for e in v]
@@ -10724,7 +10727,9 @@ class App:
                     l360_overlay.build_snapshot(rows, step_cols,
                                                 version=App._overlay_version,
                                                 extras=ex, fields=fields,
-                                                list_cols=list_cols))
+                                                list_cols=list_cols,
+                                                list_sets=list_sets,
+                                                list_set=list_set))
 
             threading.Thread(target=work, daemon=True,
                              name="overlay-extras").start()
@@ -10748,7 +10753,13 @@ class App:
                     self._set_panel_fields(a.get("keys"))
                     continue
                 if isinstance(a, dict) and a.get("type") == "list_cols":
-                    self._set_list_cols(a.get("keys"))
+                    self._set_list_cols(a.get("keys"), a.get("set"))
+                    continue
+                if isinstance(a, dict) and a.get("type") == "list_set_use":
+                    self._use_list_set(a.get("name"))
+                    continue
+                if isinstance(a, dict) and a.get("type") == "list_set_delete":
+                    self._delete_list_set(a.get("name"))
                     continue
                 if isinstance(a, dict) and a.get("type") == "refresh_assess":
                     self._refresh_one_assess(str(a.get("sid") or ""),
@@ -10849,10 +10860,23 @@ class App:
         except ValueError:
             return []
 
-    def _set_list_cols(self, keys) -> None:
-        """⚙ Columns on Learner360's list: keep known keys (built-ins +
-        caseload columns, max LIST_MAX, picked order), save, re-push."""
+    _LIST_SETS_MAX = 20
+
+    def _list_sets(self) -> dict:
+        """Named column sets for Learner360's list: {name: [keys]}."""
         import json as _json
+        try:
+            v = _json.loads(getattr(self.settings, "l360_list_sets", "") or "{}")
+        except ValueError:
+            return {}
+        if not isinstance(v, dict):
+            return {}
+        return {str(n): [str(k) for k in ks if isinstance(k, str)]
+                for n, ks in v.items() if isinstance(ks, list)}
+
+    def _clean_list_keys(self, keys) -> list:
+        """Known column keys (built-ins + caseload columns), de-duplicated,
+        picked order, max LIST_MAX."""
         from src import l360_overlay
         valid = {k for k, _d in l360_overlay.list_catalog(
             self._caseload_rows or [],
@@ -10862,10 +10886,56 @@ class App:
             if isinstance(k, str) and k in valid and k not in seen:
                 seen.add(k)
                 out.append(k)
-        out = out[:l360_overlay.LIST_MAX]
+        return out[:l360_overlay.LIST_MAX]
+
+    def _set_list_cols(self, keys, set_name=None) -> None:
+        """⚙ Columns on Learner360's list: save the shown columns; with
+        ``set_name`` also store them as that named set (new or updated) and
+        make it the active set, else the columns are 'unsaved'. Re-pushes."""
+        import json as _json
+        out = self._clean_list_keys(keys)
+        name = " ".join(str(set_name or "").split())[:40]
+        sets = self._list_sets()
+        if name and (name in sets or len(sets) < self._LIST_SETS_MAX):
+            sets[name] = out
+            self.settings.l360_list_sets = _json.dumps(sets)
+        elif name:
+            self._append_log(f"Learner360 list: at most {self._LIST_SETS_MAX} "
+                             "column sets — delete one first.", error=True)
+            name = ""
         self.settings.l360_list_cols = _json.dumps(out)
+        self.settings.l360_list_set = name
         save_settings(self.settings)
-        self._append_log(f"Learner360 list: showing {len(out)} extra column(s).")
+        self._append_log(f"Learner360 list: showing {len(out)} extra column(s)"
+                         + (f" — saved as set “{name}”." if name else "."))
+        self._push_overlay_snapshot()
+
+    def _use_list_set(self, name) -> None:
+        """Switch Learner360's list to a saved column set."""
+        name = str(name or "")
+        sets = self._list_sets()
+        if name not in sets:
+            return
+        import json as _json
+        self.settings.l360_list_cols = _json.dumps(self._clean_list_keys(sets[name]))
+        self.settings.l360_list_set = name
+        save_settings(self.settings)
+        self._append_log(f"Learner360 list: column set “{name}”.")
+        self._push_overlay_snapshot()
+
+    def _delete_list_set(self, name) -> None:
+        """Delete a saved column set (the columns on screen stay)."""
+        import json as _json
+        name = str(name or "")
+        sets = self._list_sets()
+        if name not in sets:
+            return
+        del sets[name]
+        self.settings.l360_list_sets = _json.dumps(sets)
+        if getattr(self.settings, "l360_list_set", "") == name:
+            self.settings.l360_list_set = ""
+        save_settings(self.settings)
+        self._append_log(f"Learner360 list: deleted column set “{name}”.")
         self._push_overlay_snapshot()
 
     def _refresh_one_assess(self, sid: str, course: str) -> None:

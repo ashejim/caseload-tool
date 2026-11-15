@@ -500,7 +500,7 @@ def test_list_columns_in_material_table():
             .find(x => x.value === '@pre'); i.click(); }}""")
         pg.evaluate(f"() => {proot}.querySelector('[data-b=save]').click()")
         out = pg.evaluate("window.__cnOverlay.takeOutbox()")
-        assert out == [{"type": "list_cols",
+        assert out == [{"type": "list_cols", "set": None,
                         "keys": ["@oa", "@oa1", "LastActionType", "@pre"]}], out
         pg.wait_for_timeout(300)
         heads = pg.evaluate("() => [...document.querySelectorAll('thead th[data-cn]')].map(t => t.textContent.trim())")
@@ -528,9 +528,123 @@ def test_app_saves_only_known_list_cols():
             settings=types.SimpleNamespace(l360_list_cols=""),
             _append_log=lambda m, **kw: logs.append(m),
             _push_overlay_snapshot=lambda: logs.append("push"))
+        for n in ("_list_sets", "_clean_list_keys"):
+            setattr(a, n, getattr(L.App, n).__get__(a))
+        a._LIST_SETS_MAX = 20
+        a.settings.l360_list_sets = a.settings.l360_list_set = ""
         L.App._set_list_cols(a, ["@oa", "@oa", "nope", "LastActionType", 7])
         assert saved == ['["@oa", "LastActionType"]'] and "push" in logs
         assert L.App._list_cols(a) == ["@oa", "LastActionType"]
+    finally:
+        L.save_settings = real
+
+
+def test_list_column_sets_switch_save_delete():
+    from playwright.sync_api import sync_playwright
+    sets = {"OA review": ["@oa", "@oa1", "@oa2"], "Outreach": ["LastActionType"],
+            "Stale": ["@oa", "gone-field"]}
+    snap = l360_overlay.build_snapshot(
+        ROWS, STEPS, version=11, extras={"assess": LIST_ASSESS},
+        list_cols=["@oa", "@oa1", "@oa2"], list_sets=sets, list_set="OA review")
+    assert snap["list_set"] == "OA review"
+    assert snap["list_sets"]["Stale"] == ["@oa"]           # unknown key dropped
+    assert l360_overlay.build_snapshot(ROWS, STEPS, list_sets=sets,
+                                       list_set="nope")["list_set"] == ""
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context()
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html",
+                                      body=MAT_PAGE))
+        pg = ctx.new_page()
+        pg.goto("https://learner360.wgu.edu/caseload")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(500)
+        heads = "() => [...document.querySelectorAll('thead th[data-cn]')].map(t => t.textContent.trim())"
+        opts = pg.evaluate("() => [...document.querySelectorAll('thead select option')].map(o => [o.value, o.selected])")
+        assert opts == [["OA review", True], ["Outreach", False], ["Stale", False]], opts
+        # Header switcher → that set's columns at once + a message to the app.
+        pg.evaluate("""() => { const s = document.querySelector('thead select');
+            s.value = 'Outreach'; s.dispatchEvent(new Event('change')); }""")
+        pg.wait_for_timeout(400)
+        h = pg.evaluate(heads)
+        assert h[0] == dict(snap["list_catalog"])["LastActionType"] and len(h) == 2, h
+        assert pg.evaluate("window.__cnOverlay.takeOutbox()") == [
+            {"type": "list_set_use", "name": "Outreach"}]
+        # Picker: choose a set to edit, add a column, Save “Outreach”.
+        proot = "document.querySelector('[data-cn=colpick]').shadowRoot"
+        pg.evaluate("() => document.querySelector('thead button').click()")
+        pg.wait_for_timeout(200)
+        assert pg.evaluate(f"() => {proot}.querySelector('[data-b=save]').textContent")             == "Save “Outreach”"
+        pg.evaluate(f"""() => [...{proot}.querySelectorAll('input[type=checkbox]')]
+            .find(x => x.value === '@pre').click()""")
+        pg.evaluate(f"() => {proot}.querySelector('[data-b=save]').click()")
+        assert pg.evaluate("window.__cnOverlay.takeOutbox()") == [
+            {"type": "list_cols", "keys": ["LastActionType", "@pre"], "set": "Outreach"}]
+        # Save as new set…
+        pg.wait_for_timeout(300)
+        pg.evaluate("() => document.querySelector('thead button').click()")
+        pg.wait_for_timeout(200)
+        pg.evaluate(f"() => {proot}.querySelector('[data-b=saveas]').click()")
+        pg.evaluate(f"""() => {{ const n = {proot}.querySelector('.nm');
+            n.value = '  Weekly   check '; }}""")
+        pg.evaluate(f"() => {proot}.querySelector('[data-b=asok]').click()")
+        assert pg.evaluate("window.__cnOverlay.takeOutbox()") == [
+            {"type": "list_cols", "keys": ["LastActionType", "@pre"], "set": "Weekly check"}]
+        pg.wait_for_timeout(300)
+        opts = pg.evaluate("() => [...document.querySelectorAll('thead select option')].map(o => o.value)")
+        assert "Weekly check" in opts, opts
+        # Delete the selected set (columns stay on screen).
+        pg.evaluate("() => document.querySelector('thead button').click()")
+        pg.wait_for_timeout(200)
+        pg.evaluate(f"() => {proot}.querySelector('[data-b=del]').click()")
+        assert pg.evaluate("window.__cnOverlay.takeOutbox()") == [
+            {"type": "list_set_delete", "name": "Weekly check"}]
+        assert pg.evaluate(f"() => {proot}.querySelector('[data-b=save]').textContent") == "Apply"
+        b.close()
+
+
+def test_app_list_sets_save_use_delete():
+    import importlib.util
+    import json
+    import types
+    spec = importlib.util.spec_from_file_location(
+        "launcher_ls_test", os.path.join(ROOT, "scripts", "launcher.py"))
+    L = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(L)
+    logs = []
+    real = L.save_settings
+    try:
+        L.save_settings = lambda s: None
+        st = types.SimpleNamespace(l360_list_cols="", l360_list_sets="",
+                                   l360_list_set="")
+        a = types.SimpleNamespace(
+            _caseload_rows=ROWS, _overlay_extras_cache={}, settings=st,
+            _LIST_SETS_MAX=2,
+            _append_log=lambda m, **kw: logs.append(m),
+            _push_overlay_snapshot=lambda: logs.append("push"))
+        for n in ("_list_sets", "_clean_list_keys", "_list_cols"):
+            setattr(a, n, getattr(L.App, n).__get__(a))
+        L.App._set_list_cols(a, ["@oa", "bad"], "  OA   review ")
+        assert json.loads(st.l360_list_sets) == {"OA review": ["@oa"]}
+        assert st.l360_list_set == "OA review" and a._list_cols() == ["@oa"]
+        L.App._set_list_cols(a, ["LastActionType"], "Outreach")
+        L.App._set_list_cols(a, ["@pre"], "Third")            # over the cap
+        assert set(json.loads(st.l360_list_sets)) == {"OA review", "Outreach"}
+        assert st.l360_list_set == "" and a._list_cols() == ["@pre"]
+        L.App._use_list_set(a, "OA review")
+        assert a._list_cols() == ["@oa"] and st.l360_list_set == "OA review"
+        L.App._use_list_set(a, "missing")                    # ignored
+        assert st.l360_list_set == "OA review"
+        L.App._delete_list_set(a, "OA review")
+        assert set(json.loads(st.l360_list_sets)) == {"Outreach"}
+        assert st.l360_list_set == "" and a._list_cols() == ["@oa"]   # cols stay
+        L.App._set_list_cols(a, ["@oa1"])                    # plain Apply
+        assert st.l360_list_set == "" and a._list_cols() == ["@oa1"]
     finally:
         L.save_settings = real
 

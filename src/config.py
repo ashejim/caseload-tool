@@ -427,6 +427,10 @@ class Settings:
     # Extra COLUMNS in Learner360's caseload list (JSON list of keys: "@oa…"
     # built-ins or caseload columns), chosen with the list's ⚙ Columns.
     l360_list_cols: str = ""
+    # Named column sets for that list (JSON {name: [keys]}) + the active one
+    # ("" = the current columns aren't a saved set).
+    l360_list_sets: str = ""
+    l360_list_set: str = ""
     course_watch_courses: str = ""
     # Stage 2 (beta): draw CaseloadNotes badges into Learner360 pages in the
     # app's own browser (read-only). Off by default.

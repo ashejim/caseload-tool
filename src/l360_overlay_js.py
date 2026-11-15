@@ -242,7 +242,9 @@ OVERLAY_JS = r"""
   function syncTable(table, rowEntry) {
     const show = !!(S.on && S.data);
     const cols = show ? (S.data.list_cols || []) : [];
-    const sig = show ? S.v + '|' + cols.map(c => c[0]).join(',') : '';
+    const sets = show ? (S.data.list_sets || {}) : {};
+    const sig = show ? S.v + '|' + cols.map(c => c[0]).join(',') + '|'
+      + (S.data.list_set || '') + '|' + Object.keys(sets).join('/') : '';
     const hr = table.tHead && table.tHead.rows[0];
     if (hr && (hr.dataset.cnCols || '') !== sig) {
       hr.querySelectorAll(':scope > [data-cn="col"]').forEach(x => x.remove());
@@ -266,6 +268,23 @@ OVERLAY_JS = r"""
           ev.stopPropagation();
           openColPicker();
         });
+        // Quick switch between saved column sets.
+        const names = Object.keys(sets);
+        if (names.length) {
+          const cur = S.data.list_set || '';
+          const sel = document.createElement('select');
+          sel.title = 'Switch CaseloadNotes column set';
+          sel.style.cssText = 'margin-left:4px;height:24px;border:1px solid #d5dde8;'
+            + 'border-radius:6px;font:12px inherit;color:#002855;max-width:140px';
+          sel.innerHTML = (cur ? '' : '<option value="">(unsaved)</option>')
+            + names.map(n => `<option value="${esc(n)}"${n === cur ? ' selected' : ''}>${esc(n)}</option>`).join('');
+          sel.addEventListener('click', ev => ev.stopPropagation());
+          sel.addEventListener('change', ev => {
+            ev.stopPropagation();
+            useSet(sel.value);
+          });
+          g.appendChild(sel);
+        }
         hr.appendChild(g);
       }
       hr.dataset.cnCols = sig;
@@ -313,12 +332,34 @@ OVERLAY_JS = r"""
     button { height: 28px; padding: 0 12px; border-radius: 6px; cursor: pointer;
       border: 1px solid #d5dde8; background: #fff; font: inherit; }
     button.pri { background: #002855; border-color: #002855; color: #fff; }
+    button:disabled { opacity: .45; cursor: default; }
+    .sets { display: flex; gap: 6px; align-items: center; padding: 0 14px 8px; }
+    .sets span { color: #5b6b7f; font-size: 12px; }
+    .sets select { flex: 1; height: 28px; border: 1px solid #d5dde8; border-radius: 6px;
+      font: inherit; padding: 0 6px; }
+    .asnew { display: flex; gap: 6px; padding: 8px 14px 0; }
+    .asnew[hidden] { display: none; }
+    .asnew input { flex: 1; height: 28px; border: 1px solid #d5dde8; border-radius: 6px;
+      padding: 0 8px; font: inherit; }
   `;
+
+  // Apply a saved column set (header switcher): optimistic, app saves it.
+  function useSet(name) {
+    const sets = S.data.list_sets || {};
+    if (!(name in sets)) return;
+    const label = Object.fromEntries(S.data.list_catalog || []);
+    S.outbox.push({ type: 'list_set_use', name: name });
+    S.data.list_cols = sets[name].filter(k => k in label).map(k => [k, label[k]]);
+    S.data.list_set = name;
+    schedule();
+  }
 
   function openColPicker() {
     if (!S.data) return;
     const cat = S.data.list_catalog || [];
     const label = Object.fromEntries(cat);
+    const sets = S.data.list_sets || {};
+    let setName = S.data.list_set || '';
     let chosen = (S.data.list_cols || []).map(c => c[0]).filter(k => k in label);
     const MAX = 12;
     const row = ([k, d]) => {
@@ -332,40 +373,82 @@ OVERLAY_JS = r"""
       return (bi.length ? `<div class="grp">CaseloadNotes</div>${bi.map(row).join('')}` : '')
         + (fl.length ? `<div class="grp">Caseload fields</div>${fl.map(row).join('')}` : '');
     };
+    const setOpts = () => `<option value="">(unsaved)</option>` + Object.keys(sets).map(n =>
+      `<option value="${esc(n)}"${n === setName ? ' selected' : ''}>${esc(n)}</option>`).join('');
     pickRoot.innerHTML = `<style>${KCSS}</style><div class="back"><div class="dlg" role="dialog" aria-label="CaseloadNotes columns">
       <div class="hd">CaseloadNotes columns</div>
+      <div class="sets"><span>Set</span><select class="set">${setOpts()}</select>
+        <button data-b="del" title="Delete this saved set (the columns on screen stay)">Delete set</button></div>
       <div class="sub">Added to the right of Learner360's own columns, in the order you tick them (max ${MAX}).</div>
       <input class="q" placeholder="Search fields…">
       <div class="ls">${draw('')}</div>
+      <div class="asnew" hidden><input class="nm" maxlength="40" placeholder="Name for this set, e.g. OA review">
+        <button class="pri" data-b="asok">Save set</button><button data-b="ascancel">✕</button></div>
       <div class="ft"><button data-b="clear">Clear all</button><span class="sp"></span>
-        <button data-b="cancel">Cancel</button><button class="pri" data-b="save">Save</button></div></div></div>`;
+        <button data-b="cancel">Cancel</button><button data-b="saveas">Save as new set…</button>
+        <button class="pri" data-b="save"></button></div></div></div>`;
     if (!pickHost.isConnected) document.body.appendChild(pickHost);
-    const ls = pickRoot.querySelector('.ls');
-    const q = pickRoot.querySelector('.q');
+    const $ = s => pickRoot.querySelector(s);
+    const ls = $('.ls'), q = $('.q'), sel = $('.set');
+    const redraw = () => { ls.innerHTML = draw(q.value.trim().toLowerCase()); };
+    const sync = () => {
+      $('[data-b="save"]').textContent = setName ? `Save “${setName}”` : 'Apply';
+      $('[data-b="del"]').disabled = !setName;
+    };
+    sync();
     const close = () => { pickHost.remove(); };
+    const commit = name => {
+      S.outbox.push({ type: 'list_cols', keys: chosen, set: name || null });
+      // Optimistic: headers now (the column keys are part of each cell's
+      // signature, so rows redraw); values arrive with the next snapshot.
+      if (name) sets[name] = chosen.slice();
+      S.data.list_sets = sets;
+      S.data.list_set = name || '';
+      S.data.list_cols = chosen.map(k => [k, label[k]]);
+      close();
+      schedule();
+    };
+    sel.addEventListener('change', () => {
+      setName = sel.value;
+      if (setName) chosen = (sets[setName] || []).filter(k => k in label);
+      redraw();
+      sync();
+    });
     ls.addEventListener('change', ev => {
       const k = ev.target.value;
       chosen = ev.target.checked ? chosen.concat([k]).slice(0, MAX) : chosen.filter(x => x !== k);
-      ls.innerHTML = draw(q.value.trim().toLowerCase());
+      redraw();
     });
-    q.addEventListener('input', () => { ls.innerHTML = draw(q.value.trim().toLowerCase()); });
-    pickRoot.querySelector('.back').addEventListener('click', ev => {
+    q.addEventListener('input', redraw);
+    $('.back').addEventListener('click', ev => {
       if (ev.target.classList.contains('back')) close();
     });
-    pickRoot.querySelector('.dlg').addEventListener('keydown', ev => {
+    $('.dlg').addEventListener('keydown', ev => {
       if (ev.key === 'Escape') close();
     });
-    pickRoot.querySelector('[data-b="cancel"]').addEventListener('click', close);
-    pickRoot.querySelector('[data-b="clear"]').addEventListener('click', () => {
-      chosen = [];
-      ls.innerHTML = draw(q.value.trim().toLowerCase());
+    $('[data-b="cancel"]').addEventListener('click', close);
+    $('[data-b="clear"]').addEventListener('click', () => { chosen = []; redraw(); });
+    $('[data-b="save"]').addEventListener('click', () => commit(setName));
+    $('[data-b="saveas"]').addEventListener('click', () => {
+      $('.asnew').hidden = false;
+      $('.nm').focus();
     });
-    pickRoot.querySelector('[data-b="save"]').addEventListener('click', () => {
-      S.outbox.push({ type: 'list_cols', keys: chosen });
-      // Headers now (the column keys are part of each cell's signature, so
-      // rows redraw); the values arrive with the app's next snapshot.
-      S.data.list_cols = chosen.map(k => [k, label[k]]);
-      close();
+    $('[data-b="ascancel"]').addEventListener('click', () => { $('.asnew').hidden = true; });
+    const saveNew = () => {
+      const n = $('.nm').value.trim().replace(/\s+/g, ' ').slice(0, 40);
+      if (n) commit(n);
+    };
+    $('[data-b="asok"]').addEventListener('click', saveNew);
+    $('.nm').addEventListener('keydown', ev => { if (ev.key === 'Enter') saveNew(); });
+    $('[data-b="del"]').addEventListener('click', () => {
+      if (!setName) return;
+      S.outbox.push({ type: 'list_set_delete', name: setName });
+      delete sets[setName];
+      S.data.list_sets = sets;
+      if (S.data.list_set === setName) S.data.list_set = '';
+      setName = '';
+      sel.innerHTML = setOpts();
+      sync();
       schedule();
     });
     q.focus();

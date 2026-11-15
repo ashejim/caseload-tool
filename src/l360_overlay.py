@@ -191,7 +191,9 @@ def _field_value(key: str, row: Optional[dict], roster: dict, sid: str,
 def build_snapshot(rows: list, step_cols: Optional[dict] = None,
                    version: int = 0, extras: Optional[dict] = None,
                    fields: Optional[list] = None,
-                   list_cols: Optional[list] = None) -> dict:
+                   list_cols: Optional[list] = None,
+                   list_sets: Optional[dict] = None,
+                   list_set: str = "") -> dict:
     """{"v": version, "students": {student id without leading zeros:
     [entry per course]}, "uuid_map", "notes", "momi"} from the caseload rows
     (after derived columns, task status and EAs are applied). ``step_cols`` =
@@ -300,6 +302,10 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
             "field_catalog": cat[len(LIST_BUILTINS):],
             "list_catalog": cat,
             "list_cols": cols,
+            # Named column sets (known keys only) + the active one.
+            "list_sets": {n: [k for k in ks if k in label][:LIST_MAX]
+                          for n, ks in (list_sets or {}).items()},
+            "list_set": list_set if list_set in (list_sets or {}) else "",
             "panel_fields": list(fields or []),
             "uuid_map": dict(ex.get("uuid_map") or {}),
             "notes": dict(ex.get("notes") or {}),
