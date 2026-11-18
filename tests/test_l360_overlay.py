@@ -838,7 +838,8 @@ def test_default_layout_hides_moves_and_explains():
             .filter(t => getComputedStyle(t).display !== 'none').map(t => t.textContent.trim())""")
         aci = dict(snap["list_catalog"])["MyCourseContact"]
         assert visible == ["Name", "Preferred Name", "Pronouns", "Id ▲", "Active Courses",
-                           aci, "Pre-A", "OA attempts", "⚙ Columns (7)"], visible
+                           aci, "Pre-A", "OA attempts", "EA (open Essential Action)",
+                           "⚙ Columns (8)"], visible
         cells = pg.evaluate("""() => [...document.querySelectorAll('#b tr')].map(tr =>
             [...tr.children].filter(t => getComputedStyle(t).display !== 'none')
               .map(t => [t.textContent.trim(), t.title]))""")

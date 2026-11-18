@@ -659,7 +659,7 @@ _OVERLAY_JS = r"""
       <div class="ls">${draw('')}</div>
       <div class="asnew" hidden><input class="nm" maxlength="40" placeholder="Name for this set, e.g. OA review">
         <button class="pri" data-b="asok">Save set</button><button data-b="ascancel">✕</button></div>
-      <div class="ft"><button data-b="clear">Clear all</button><button data-b="reset" title="Name, preferred name, pronouns, ID, active course, last ACI contact, pre-A, OA attempts — Learner360's other columns hidden">Reset to recommended</button><span class="sp"></span>
+      <div class="ft"><button data-b="clear">Clear all</button><button data-b="reset" title="Name, preferred name, pronouns, ID, active course, last ACI contact, pre-A, OA attempts, EA — Learner360's other columns hidden">Reset to recommended</button><span class="sp"></span>
         <button data-b="cancel">Cancel</button><button data-b="saveas">Save as new set…</button>
         <button class="pri" data-b="save"></button></div></div></div>`;
     if (!pickHost.isConnected) document.body.appendChild(pickHost);

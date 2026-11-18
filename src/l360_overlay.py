@@ -109,9 +109,10 @@ LIST_MAX = 12
 NATIVE_RE = re.compile(r"^L360:[A-Za-z][A-Za-z0-9_]{0,40}$")
 # The recommended layout (new installs; ⚙ Columns ▸ Reset to recommended):
 # after Name — preferred name, pronouns, ID, active course, last ACI contact,
-# pre-assessment, OA attempts. Learner360's other columns are hidden.
+# pre-assessment, OA attempts, open Essential Action. Learner360's other
+# columns are hidden.
 DEFAULT_LIST_COLS = ["L360:preferredName", "@pron", "L360:studentId",
-                     "L360:courses", "MyCourseContact", "@pre", "@oa"]
+                     "L360:courses", "MyCourseContact", "@pre", "@oa", "@ea"]
 # Caseload columns that only fill in with a background feature (→ the hover
 # on an empty cell names it; src/features.py keys).
 _FEATURE_COLS = {
