@@ -22,7 +22,9 @@ _OVERLAY_JS = r"""
     .forEach(i => i.addEventListener('error', () => { i.remove(); if (onFail) onFail(); }));
 
   const S = { data: null, v: -1, on: true, queued: false, matched: 0,
-              outbox: [], colTables: new Set(), colRev: 0, nativeCat: [] };
+              outbox: [], colTables: new Set(), colRev: 0, nativeCat: [],
+              sort: { key: '', dir: 0 } };
+  try { Object.assign(S.sort, JSON.parse(localStorage.getItem('cnListSort') || '{}')); } catch (e) {}
   try { S.on = localStorage.getItem('cnOverlayOn') !== '0'; } catch (e) {}
 
   // ---- design tokens (matched to Learner360's palette) -------------------
@@ -415,7 +417,7 @@ _OVERLAY_JS = r"""
     const sorts = [...moved].map(f => byF[f] ? (byF[f].th.getAttribute('aria-sort') || '') : '').join(',');
     const sig = show ? S.v + '|' + cols.map(c => c[0]).join(',') + '|'
       + (S.data.list_set || '') + '|' + Object.keys(sets).join('/') + '|' + hide
-      + '|' + S.colRev + '|' + sorts : '';
+      + '|' + S.colRev + '|' + sorts + '|' + S.sort.key + S.sort.dir : '';
     if (hr && (hr.dataset.cnCols || '') !== sig) {
       hr.querySelectorAll(':scope > [data-cn="col"]').forEach(x => x.remove());
       const proto = hr.querySelector(':scope > th:not([data-cn])');
@@ -431,11 +433,23 @@ _OVERLAY_JS = r"""
             th.textContent = nat.label + (dir === 'ascending' ? ' ▲' : dir === 'descending' ? ' ▼' : '');
             th.title = 'Learner360 column — click to sort';
             th.style.cursor = 'pointer';
-            th.addEventListener('click', ev => { ev.stopPropagation(); nat.th.click(); });
+            th.addEventListener('click', ev => { ev.stopPropagation(); setSort('', 0); nat.th.click(); });
           } else {
-            th.textContent = label || k.replace(/^L360:/, '');
-            th.title = k.startsWith('L360:') ? 'Learner360 isn’t showing this column on this page'
-              : 'CaseloadNotes column';
+            const on = S.sort.key === k && S.sort.dir;
+            th.textContent = (label || k.replace(/^L360:/, ''))
+              + (on ? (S.sort.dir > 0 ? ' ▲' : ' ▼') : '');
+            if (k.startsWith('L360:')) {
+              th.title = 'Learner360 isn’t showing this column on this page';
+            } else {
+              th.title = 'CaseloadNotes column — click to sort the rows on this page '
+                + '(▲, ▼, then Learner360’s order)';
+              th.style.cursor = 'pointer';
+              th.addEventListener('click', ev => {
+                ev.stopPropagation();
+                const d = S.sort.key !== k ? 1 : S.sort.dir === 1 ? -1 : 0;
+                setSort(d ? k : '', d);
+              });
+            }
           }
           hr.insertBefore(th, anchor);
         }
@@ -474,6 +488,13 @@ _OVERLAY_JS = r"""
       }
       hr.dataset.cnCols = sig;
     }
+    if (hr && !hr.dataset.cnSortWired) {
+      hr.dataset.cnSortWired = '1';
+      hr.addEventListener('click', ev => {
+        const th = ev.target.closest && ev.target.closest('th');
+        if (th && !th.hasAttribute('data-cn') && S.sort.key) setSort('', 0);
+      }, true);
+    }
     for (const body of table.tBodies) {
       for (const tr of body.rows) {
         const re = rowEntry.get(tr);
@@ -500,6 +521,41 @@ _OVERLAY_JS = r"""
         }
         tr.dataset.cnCols = key;
       }
+    }
+    applySort(table, rowEntry, show ? cols : []);
+  }
+
+  // ---- sorting by a CaseloadNotes column (rows on this page) -------------
+  // Learner360 pages server-side, so only the rows it shows can be ordered.
+  // Each row remembers its Learner360 position (data-cn-ord, taken when first
+  // seen) so "off" restores it. Empty values always go last.
+  function setSort(key, dir) {
+    S.sort = { key: key, dir: dir };
+    try { localStorage.setItem('cnListSort', JSON.stringify(S.sort)); } catch (e) {}
+    schedule();
+  }
+  function applySort(table, rowEntry, cols) {
+    const k = S.sort.key, d = S.sort.dir;
+    const active = d && k && cols.some(c => c[0] === k);
+    for (const body of table.tBodies) {
+      const rows = Array.from(body.rows);
+      rows.forEach((tr, i) => { if (tr.dataset.cnOrd === undefined) tr.dataset.cnOrd = String(i); });
+      const ord = tr => +tr.dataset.cnOrd;
+      const val = tr => {
+        const re = rowEntry.get(tr);
+        const v = re && (re.e.sort || {})[k];
+        return v === undefined ? null : v;
+      };
+      const want = rows.slice().sort((a, b) => {
+        if (!active) return ord(a) - ord(b);
+        const x = val(a), y = val(b);
+        if (x === null || y === null)
+          return x === y ? ord(a) - ord(b) : (x === null ? 1 : -1);
+        const c = (typeof x === 'number' && typeof y === 'number') ? x - y
+          : String(x).localeCompare(String(y));
+        return c ? c * d : ord(a) - ord(b);
+      });
+      if (want.some((tr, i) => tr !== rows[i])) for (const tr of want) body.appendChild(tr);
     }
   }
 

@@ -1098,6 +1098,72 @@ def test_app_open_ea_only_for_my_students():
     assert calls == [("000123456", "Pat Lee")], calls
 
 
+SORT_PAGE = """<!doctype html><html><body><table class="mat-mdc-table"><thead><tr>
+<th class="mat-mdc-header-cell cdk-column-name">Name</th>
+<th class="mat-mdc-header-cell cdk-column-studentId">Id</th></tr></thead><tbody id="b">
+<tr><td class="mat-mdc-cell cdk-column-name">Ann</td><td class="mat-mdc-cell cdk-column-studentId">000000111</td></tr>
+<tr><td class="mat-mdc-cell cdk-column-name">Bo</td><td class="mat-mdc-cell cdk-column-studentId">000000222</td></tr>
+<tr><td class="mat-mdc-cell cdk-column-name">Cy</td><td class="mat-mdc-cell cdk-column-studentId">000000333</td></tr>
+<tr><td class="mat-mdc-cell cdk-column-name">Di</td><td class="mat-mdc-cell cdk-column-studentId">000000444</td></tr>
+</tbody></table></body></html>"""
+
+
+def test_sort_values():
+    sv = l360_overlay.sort_value
+    a = {"oa": {"used": 2, "sittings": [{"score": 55}, {"score": None}]},
+         "pre": {"last_pct": 70}}
+    assert sv("@oa", ["2/4 · 55"], a) == 2055 and sv("@oa", ["✓"], {"oa": {"passed": True}}) == 9000
+    assert sv("@oa1", ["55"], a) == 55 and sv("@oa2", ["✗"], a) == -1
+    assert sv("@pre", ["70% (2)"], a) == 70
+    assert sv("MyCourseContact", ["11/01/2026 3:00 PM"], None) == "2026-11-01"
+    assert sv("X", ["12"], None) == 12.0 and sv("X", ["Email"], None) == "email"
+    assert sv("X", None, None) is None
+
+
+def test_click_header_sorts_this_page():
+    from playwright.sync_api import sync_playwright
+    rows = [{"StudentID": "000000111", "Name": "Ann", "CourseCode": "C769", "MyCourseContact": "10/05/2026"},
+            {"StudentID": "000000222", "Name": "Bo", "CourseCode": "C769", "MyCourseContact": ""},
+            {"StudentID": "000000333", "Name": "Cy", "CourseCode": "C769", "MyCourseContact": "09/01/2026"}]
+    snap = l360_overlay.build_snapshot(rows, {}, version=2, list_cols=["MyCourseContact"])
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context()
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html", body=SORT_PAGE))
+        pg = ctx.new_page()
+        pg.goto("https://learner360.wgu.edu/caseload")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(400)
+        order = "() => [...document.querySelectorAll('#b tr')].map(t => t.cells[0].textContent.trim())"
+        head = "() => document.querySelector('thead th[data-cn]')"
+        assert pg.evaluate(order) == ["Ann", "Bo", "Cy", "Di"]
+        pg.evaluate(f"() => ({head})().click()")                       # ▲
+        pg.wait_for_timeout(300)
+        # Dates ascending; empty (Bo) and not-mine (Di) last, in original order.
+        assert pg.evaluate(order) == ["Cy", "Ann", "Bo", "Di"], pg.evaluate(order)
+        assert pg.evaluate(f"() => ({head})().textContent").endswith("▲")
+        pg.evaluate(f"() => ({head})().click()")                       # ▼
+        pg.wait_for_timeout(300)
+        assert pg.evaluate(order) == ["Ann", "Cy", "Bo", "Di"], pg.evaluate(order)
+        pg.evaluate(f"() => ({head})().click()")                       # off
+        pg.wait_for_timeout(300)
+        assert pg.evaluate(order) == ["Ann", "Bo", "Cy", "Di"], pg.evaluate(order)
+        # Sort again, then a Learner360 header click clears ours.
+        pg.evaluate(f"() => ({head})().click()")
+        pg.wait_for_timeout(300)
+        assert pg.evaluate(order)[0] == "Cy"
+        pg.evaluate("() => document.querySelector('th.cdk-column-name').click()")
+        pg.wait_for_timeout(300)
+        assert pg.evaluate(order) == ["Ann", "Bo", "Cy", "Di"], pg.evaluate(order)
+        assert pg.evaluate("() => localStorage.getItem('cnListSort')") == '{"key":"","dir":0}'
+        b.close()
+
+
 def test_pronoun_edit_round_trip():
     import types
     from playwright.sync_api import sync_playwright

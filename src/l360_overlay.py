@@ -188,6 +188,43 @@ def _sit_tip(t: dict) -> str:
             + (" · passed" if t.get("passed") else ""))
 
 
+_US_DATE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})")
+_NUM = re.compile(r"^-?\d+(?:\.\d+)?%?$")
+
+
+def sort_value(key: str, v, a: Optional[dict]):
+    """A sortable value for one list cell (the page sorts the rows it shows
+    by it): a number when the column is numeric (OA attempts, scores, %),
+    an ISO date for dates, else lower-case text. None = empty (sorts last)."""
+    if not v:
+        return None
+    oa = ((a or {}).get("oa") or {})
+    if key == "@oa":
+        if oa.get("passed"):
+            return 9000                     # passed → after every attempt count
+        sits = oa.get("sittings") or []
+        last = next((t["score"] for t in reversed(sits)
+                     if t.get("score") is not None), 0)
+        return int(oa.get("used") or 0) * 1000 + int(last or 0)
+    if key.startswith("@oa") and key[3:].isdigit():
+        n = int(key[3:])
+        sits = oa.get("sittings") or []
+        t = sits[n - 1] if 0 < n <= len(sits) else {}
+        if t.get("score") is not None:
+            return int(t["score"])
+        return 101 if t.get("passed") else -1
+    if key == "@pre":
+        p = ((a or {}).get("pre") or {}).get("last_pct")
+        return int(p) if p is not None else -1
+    text = str(v[0]).strip()
+    m = _US_DATE.match(text)
+    if m:
+        return f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+    if _NUM.match(text):
+        return float(text.rstrip("%"))
+    return text.lower()
+
+
 def _ema_url(full_sid: str, ema: dict) -> str:
     from src.ema_links import build_ema_url
     if not (full_sid and ema.get("course_id") and ema.get("task_id")):
@@ -460,6 +497,9 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
                         why[k] = why_empty(k, e.get("assess"), e["course"], feats)
                 e["cols"] = vals
                 e["why"] = why
+                e["sort"] = {k: sv for k, val in vals.items()
+                             if (sv := sort_value(k, val, e.get("assess")))
+                             is not None}
     return {"v": version, "students": out,
             "field_catalog": cat[len(LIST_BUILTINS):],
             "list_catalog": cat,
