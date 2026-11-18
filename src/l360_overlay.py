@@ -184,8 +184,53 @@ def _sit_tip(t: dict) -> str:
             + (" · passed" if t.get("passed") else ""))
 
 
+def _ema_url(full_sid: str, ema: dict) -> str:
+    from src.ema_links import build_ema_url
+    if not (full_sid and ema.get("course_id") and ema.get("task_id")):
+        return ""
+    return build_ema_url(full_sid, str(ema["course_id"]), str(ema["task_id"]))
+
+
+def safe_url(u) -> str:
+    """``u`` if it's an https link on a wgu.edu host (EMA / coaching / course
+    pages), else "" — only these become clickable in Learner360."""
+    from urllib.parse import urlsplit
+    try:
+        sp = urlsplit(str(u or ""))
+    except ValueError:
+        return ""
+    host = (sp.hostname or "").lower()
+    return str(u) if sp.scheme == "https" and (
+        host == "wgu.edu" or host.endswith(".wgu.edu")) else ""
+
+
+def _assess_url(a: Optional[dict], key: str) -> str:
+    """Where clicking an assessment cell goes: the coaching report (OA cells)
+    or the pre-assessment report (Pre-A), else the course page."""
+    links = (a or {}).get("links") or {}
+    want = "preA" if key == "@pre" else "coaching"
+    return safe_url(links.get(want)) or safe_url(links.get("cos"))
+
+
 def _list_value(key: str, row: Optional[dict], roster: dict, sid: str,
                 course: str, a: Optional[dict]):
+    """[text, kind, tooltip(, url)] for one list column, or None when empty.
+    Assessment cells carry a 4th element — the report they open."""
+    v = _list_value_raw(key, row, roster, sid, course, a)
+    if v and key in ("@oa", "@oa1", "@oa2", "@oa3", "@oa4", "@weak", "@pre"):
+        url = _assess_url(a, key)
+        if url:
+            links = (a or {}).get("links") or {}
+            what = ("pre-assessment report" if key == "@pre" and links.get("preA")
+                    else "coaching report" if key != "@pre" and links.get("coaching")
+                    else "course page")
+            tip = (v[2] + "\n" if v[2] else "") + f"Click to open the {what}."
+            v = [v[0], v[1], tip, url]
+    return v
+
+
+def _list_value_raw(key: str, row: Optional[dict], roster: dict, sid: str,
+                    course: str, a: Optional[dict]):
     """[text, kind, tooltip] for one list column, or None when empty."""
     if key == "@pron":
         v = str((row or {}).get("Pronouns") or "").strip()
@@ -272,7 +317,8 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
                    list_cols: Optional[list] = None,
                    list_sets: Optional[dict] = None,
                    list_set: str = "", list_hide_native: bool = False,
-                   features: Optional[dict] = None) -> dict:
+                   features: Optional[dict] = None,
+                   ema_map: Optional[dict] = None) -> dict:
     """{"v": version, "students": {student id without leading zeros:
     [entry per course]}, "uuid_map", "notes", "momi"} from the caseload rows
     (after derived columns, task status and EAs are applied). ``step_cols`` =
@@ -299,9 +345,15 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
                                   else "pending")
             if n > 3 and kind == "none":
                 continue
+            ema = ((ema_map or {}).get(course) or {}).get(str(n)) or {}
+            full_sid = str(r.get("StudentID") or r.get("Student ID") or "").strip()
             tasks.append({"n": n, "status": status, "kind": kind,
                           "date": date,
-                          "count": str(r.get(f"Task{n}Count") or "")})
+                          "count": str(r.get(f"Task{n}Count") or ""),
+                          # EMA Score Report (same per-course map as the
+                          # Caseload Tool's task badges); "" = not learned
+                          # yet → clicking asks the app to learn it.
+                          "url": safe_url(_ema_url(full_sid, ema))})
         risk = _num(r.get("MomentumRisk"))
         src_row.setdefault((sid, course), r)
         chosen =[[_disp(k), v] for k in fields or []

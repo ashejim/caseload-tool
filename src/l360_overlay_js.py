@@ -46,6 +46,8 @@ _OVERLAY_JS = r"""
     .ea   { background: #fff; border-color: #c2410c; color: #c2410c; }
     .muted { color: #5b6b7f; background: transparent; border-color: transparent;
       padding: 0 2px; }
+    .lnk { cursor: pointer; }
+    .lnk:hover { filter: brightness(.94); text-decoration: underline; }
     .pill { position: fixed; left: 16px; bottom: 16px; z-index: 2147483000;
       display: flex; align-items: center; gap: 6px; padding: 6px 9px;
       border-radius: 20px; background: #002855; color: #fff;
@@ -203,7 +205,7 @@ _OVERLAY_JS = r"""
     for (const t of (e.tasks || []).slice(0, 4)) {
       const tip = `Task ${t.n}: ${t.status || (t.date ? 'submitted' : 'no attempt')}`
         + (t.date ? ` · ${t.date}` : '') + (t.count ? ` (${t.count})` : '');
-      parts.push(`<span class="chip t-${esc(t.kind)}" title="${esc(tip)}">T${t.n}</span>`);
+      parts.push(`<span class="chip t-${esc(t.kind)} lnk" data-task="${esc(t.n)}" data-url="${esc(t.url || '')}" title="${esc(tip + '\nClick: EMA score report')}">T${t.n}</span>`);
     }
     if (e.risk != null)
       parts.push(`<span class="chip ${riskCls(e.risk)}" title="${esc(RISK_TIP)}">${Math.round(e.risk)}%</span>`);
@@ -277,6 +279,7 @@ _OVERLAY_JS = r"""
       }
       host.dataset.key = key;
       host.shadowRoot.innerHTML = badgeHtml(entry);
+      wireTaskChips(host.shadowRoot, sid, entry.course);
     }
     for (const tb of Array.from(S.colTables)) {
       if (!tb.isConnected) { S.colTables.delete(tb); continue; }
@@ -352,6 +355,11 @@ _OVERLAY_JS = r"""
       span.style.cssText = (st ? st + ';border-radius:9px;padding:1px 6px;' : '')
         + 'white-space:nowrap;font-size:12px';
       if (v[2]) td.title = v[2];
+      if (v[3]) {                      // assessment cell → its report
+        span.style.cursor = 'pointer';
+        span.style.textDecoration = 'underline dotted';
+        span.addEventListener('click', ev => { ev.stopPropagation(); openUrl(v[3]); });
+      }
       td.appendChild(span);
     } else if (why && quiet) {
       td.title = why;                  // not ours: blank, the hover says why
@@ -486,6 +494,23 @@ _OVERLAY_JS = r"""
         tr.dataset.cnCols = key;
       }
     }
+  }
+
+  // ---- clickable assessments ----------------------------------------------
+  // Report links come from the app's snapshot (wgu.edu https only). A task
+  // whose EMA link isn't learned yet asks the app, which prompts once for a
+  // score-report URL (same as the Caseload Tool's task badges).
+  const openUrl = u => { if (/^https:\/\/([\w-]+\.)*wgu\.edu\//i.test(u || '')) window.open(u, '_blank', 'noopener'); };
+  function openTask(sid, course, n, url) {
+    if (url) openUrl(url);
+    else S.outbox.push({ type: 'open_task', sid: sid, course: course, n: n });
+  }
+  function wireTaskChips(root, sid, course) {
+    root.querySelectorAll('[data-task]').forEach(ch => ch.addEventListener('click', ev => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      openTask(sid, course || ch.dataset.course || '', +ch.dataset.task, ch.dataset.url || '');
+    }));
   }
 
   // ---- pronouns from the list (click a Pronouns cell) -------------------
@@ -768,6 +793,8 @@ _OVERLAY_JS = r"""
       padding: 2px 0; }
     .row .k { color: #5b6b7f; }
     .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .lnk { cursor: pointer; }
+    .lnk:hover { filter: brightness(.94); text-decoration: underline; }
     .chip { display: inline-flex; align-items: center; height: 20px;
       padding: 0 7px; border-radius: 10px; font-size: 11px; font-weight: 600;
       background: #eef2f7; border: 1px solid #d5dde8; white-space: nowrap; }
@@ -852,7 +879,7 @@ _OVERLAY_JS = r"""
 
   function taskChips(e) {
     return (e.tasks || []).map(t =>
-      `<span class="chip t-${esc(t.kind)}" title="${esc(t.status || '')}">T${t.n}${t.date ? ' · ' + esc(t.date.slice(5)) : ''}${t.count ? ' (' + esc(t.count) + ')' : ''}</span>`).join('');
+      `<span class="chip t-${esc(t.kind)} lnk" data-task="${esc(t.n)}" data-url="${esc(t.url || '')}" data-course="${esc(e.course)}" title="${esc((t.status || '') + (t.status ? '\n' : '') + 'Click: EMA score report')}">T${t.n}${t.date ? ' · ' + esc(t.date.slice(5)) : ''}${t.count ? ' (' + esc(t.count) + ')' : ''}</span>`).join('');
   }
 
   // Competency × attempt grid: Pre-A first/last + every OA attempt.
@@ -1063,6 +1090,7 @@ _OVERLAY_JS = r"""
     panelKey = key;
     panelRoot.innerHTML = panelHtml(sid, entries);
     owlFallback(panelRoot);
+    wireTaskChips(panelRoot, sid, '');
     panelRoot.querySelector('.tab').addEventListener('click', () => {
       panelCollapsed = !panelCollapsed;
       try { localStorage.setItem('cnPanelCollapsed', panelCollapsed ? '1' : '0'); } catch (e) {}

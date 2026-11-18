@@ -10690,7 +10690,7 @@ class App:
                 rows, step_cols, version=ver, extras=self._overlay_extras_cache,
                 fields=fields, list_cols=list_cols, list_sets=list_sets,
                 list_set=list_set, list_hide_native=hide_native,
-                features=feats)
+                features=feats, ema_map=self._load_ema_map())
             self.worker.set_overlay_snapshot(first)
             # One diagnostic line per session: how much the overlay gets.
             ents = [e for v in first["students"].values() for e in v]
@@ -10740,7 +10740,8 @@ class App:
                                                 list_sets=list_sets,
                                                 list_set=list_set,
                                                 list_hide_native=hide_native,
-                                                features=feats))
+                                                features=feats,
+                                                ema_map=self._load_ema_map()))
 
             threading.Thread(target=work, daemon=True,
                              name="overlay-extras").start()
@@ -10766,6 +10767,22 @@ class App:
                 if isinstance(a, dict) and a.get("type") == "list_cols":
                     self._set_list_cols(a.get("keys"), a.get("set"),
                                         a.get("hide_native"))
+                    continue
+                if isinstance(a, dict) and a.get("type") == "open_task":
+                    # A task chip in Learner360 whose EMA link isn't learned
+                    # yet → the Caseload Tool's open/learn flow. Mine only.
+                    try:
+                        n = int(a.get("n"))
+                    except (TypeError, ValueError):
+                        continue
+                    hit = by_nsid.get(str(a.get("sid") or "").lstrip("0"))
+                    if not hit:
+                        continue
+                    course = str(a.get("course")
+                                 or hit[1].get("CourseCode") or "").strip().upper()
+                    if 1 <= n <= 15 and course:
+                        self._open_task_report(hit[0], course, n,
+                                               hit[1].get("Name") or hit[0])
                     continue
                 if isinstance(a, dict) and a.get("type") == "list_set_use":
                     self._use_list_set(a.get("name"))
@@ -27946,6 +27963,8 @@ class App:
         import json
         self.settings.ema_report_map = json.dumps(m)
         save_settings(self.settings)
+        # Learner360's task chips link straight to the report from now on.
+        self._push_overlay_snapshot()
 
     def _open_task_report(self, student_id: str, course_code: str,
                           task_num: int, label: str) -> None:

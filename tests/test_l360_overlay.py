@@ -957,6 +957,92 @@ def test_app_accepts_learner360_keys_and_hide_flag():
         L.save_settings = real
 
 
+EMA = {"C769": {"1": {"course_id": "33860018", "task_id": "4521"}}}
+LINKED_ASSESS = {"123456": {"C769": dict(LIST_ASSESS["123456"]["C769"], links={
+    "coaching": "https://my.wgu.edu/coaching-report/v4-0/studentPidm/1/assessmentId/2/courseVersionId/3",
+    "preA": "https://my.wgu.edu/pre-assessment/report/9",
+    "cos": "https://my.wgu.edu/courses/course/3/for/1"})}}
+
+
+def test_assessment_links_in_snapshot():
+    snap = l360_overlay.build_snapshot(
+        ROWS, STEPS, version=6, extras={"assess": LINKED_ASSESS},
+        list_cols=["@oa", "@oa1", "@pre", "LastActionType"], ema_map=EMA)
+    e = snap["students"]["123456"][0]
+    t1, t2 = e["tasks"][0], e["tasks"][1]
+    assert t1["url"] == ("https://tasks.wgu.edu/student/000123456/course/33860018"
+                         "/task/4521/score-report")
+    assert t2["url"] == ""                                  # not learned yet
+    assert e["cols"]["@oa"][3].startswith("https://my.wgu.edu/coaching-report")
+    assert "coaching report" in e["cols"]["@oa1"][2]
+    assert e["cols"]["@pre"][3] == "https://my.wgu.edu/pre-assessment/report/9"
+    assert len(e["cols"]["LastActionType"]) == 3            # plain field: no link
+    for bad in ("http://my.wgu.edu/x", "https://evil.example/x",
+                "https://wgu.edu.evil.com/x", "javascript:alert(1)"):
+        assert l360_overlay.safe_url(bad) == "", bad
+    assert l360_overlay.safe_url("https://tasks.wgu.edu/a") == "https://tasks.wgu.edu/a"
+
+
+def test_clicking_tasks_and_assessments():
+    from playwright.sync_api import sync_playwright
+    snap = l360_overlay.build_snapshot(
+        ROWS, STEPS, version=7, extras={"assess": LINKED_ASSESS},
+        list_cols=["@oa", "@pre"], ema_map=EMA)
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context()
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.add_init_script("window.__opened = []; window.open = (u) => { window.__opened.push(u); return null; };")
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html",
+                                      body=MAT_PAGE))
+        pg = ctx.new_page()
+        pg.goto("https://learner360.wgu.edu/caseload")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(500)
+        chips = "document.querySelector('[data-cn=badge]').shadowRoot"
+        pg.evaluate(f"() => {chips}.querySelector('[data-task=\"1\"]').click()")   # learned
+        pg.evaluate(f"() => {chips}.querySelector('[data-task=\"2\"]').click()")   # not yet
+        assert pg.evaluate("window.__cnOverlay.takeOutbox()") == [
+            {"type": "open_task", "sid": "123456", "course": "C769", "n": 2}]
+        pg.evaluate("""() => document.querySelector('#b tr td[data-cn=col] span').click()""")
+        pg.evaluate("""() => document.querySelectorAll('#b tr')[0]
+            .querySelectorAll('td[data-cn=col] span')[1].click()""")
+        opened = pg.evaluate("window.__opened")
+        assert opened == [("https://tasks.wgu.edu/student/000123456/course/"
+                           "33860018/task/4521/score-report"),
+                          LINKED_ASSESS["123456"]["C769"]["links"]["coaching"],
+                          LINKED_ASSESS["123456"]["C769"]["links"]["preA"]], opened
+        b.close()
+
+
+def test_app_open_task_only_for_my_students():
+    import importlib.util
+    import types
+    spec = importlib.util.spec_from_file_location(
+        "launcher_ot_test", os.path.join(ROOT, "scripts", "launcher.py"))
+    L = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(L)
+    calls = []
+    a = types.SimpleNamespace(
+        _caseload_rows=[{"StudentID": "000123456", "Name": "Pat Lee",
+                         "CourseCode": "C769"}],
+        _append_log=lambda m, **kw: None,
+        _open_task_report=lambda *x: calls.append(x),
+        root=types.SimpleNamespace(after=lambda ms, fn: fn()))
+    L.App._on_overlay_actions(a, [
+        {"type": "open_task", "sid": "123456", "course": "C769", "n": 2},
+        {"type": "open_task", "sid": "999999", "course": "C769", "n": 1},   # not mine
+        {"type": "open_task", "sid": "123456", "course": "", "n": 99},      # bad n
+        {"type": "open_task", "sid": "123456", "n": "x"},
+        {"type": "open_task", "sid": "123456", "n": 3}])                    # course from row
+    assert calls == [("000123456", "C769", 2, "Pat Lee"),
+                     ("000123456", "C769", 3, "Pat Lee")], calls
+
+
 def test_pronoun_edit_round_trip():
     import types
     from playwright.sync_api import sync_playwright
