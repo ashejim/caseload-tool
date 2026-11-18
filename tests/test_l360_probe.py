@@ -75,6 +75,7 @@ def test_plain_table_with_overlay():
     cells = L["row_samples"][0]["cells"]
     assert cells[1]["sid"] == "yes" and cells[0]["badge"] == "yes"
     assert res["prefixes"].get("mat") and res["badges"] == 1
+    assert res["owl_badge"] is False and isinstance(res["logo"], list)
     text = "\n".join(summarize(res))
     assert "headers: Name" in text and "SID" in text
     for s in SECRETS:

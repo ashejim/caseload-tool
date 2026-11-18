@@ -68,6 +68,19 @@ PROBE_JS = r"""
   if (document.querySelector('[data-reactroot]') || Array.from(document.querySelectorAll('body *')).slice(0, 50)
         .some(e => Object.keys(e).some(k => k.startsWith('__react')))) out.frameworks.push('react');
   if (Array.from(document.querySelectorAll('body > *')).some(e => e.__vue_app__ || e.__vue__)) out.frameworks.push('vue');
+  // Header logo candidates (top-left images / logo-ish elements): shape
+  // only + whether it's labelled WGU — never the alt text itself.
+  out.logo = Array.from(document.querySelectorAll(
+      'img, svg, [class*="logo" i], [class*="brand" i]'))
+    .filter(el => !el.closest('[data-cn]'))
+    .map(el => ({ el, r: el.getBoundingClientRect() }))
+    .filter(({ r }) => r.width >= 12 && r.height >= 12 && r.top < 120 && r.left < innerWidth / 2)
+    .slice(0, 6).map(({ el, r }) => ({
+      el: desc(el), parent: desc(el.parentElement),
+      wgu: /wgu|western governors/i.test((el.getAttribute('alt') || '') + ' '
+        + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('class') || '')) ? 'yes' : '',
+      box: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] }));
+  out.owl_badge = !!document.querySelector('[data-cn="owlbadge"]');
   const badges = document.querySelectorAll('[data-cn="badge"]');
   out.badges = badges.length;
 
@@ -161,6 +174,11 @@ def summarize(res: dict) -> list:
                 or "none")
              + f" · iframes {res.get('frames', 0)} · shadow hosts "
              f"{res.get('shadow_hosts', 0)} · overlay badges {res.get('badges', 0)}"]
+    for c in res.get("logo") or []:
+        lines.append(f"header candidate: {c['el']} in {c['parent']}  box(x,y,w,h)="
+                     f"{c['box']}" + ("  [labelled WGU]" if c.get("wgu") else ""))
+    if "owl_badge" in res:
+        lines.append(f"owl badge on the logo: {'yes' if res['owl_badge'] else 'NO (logo not found)'}")
     lists = res.get("lists") or []
     if not lists:
         lines.append("no table / grid found on this page — open the caseload list "

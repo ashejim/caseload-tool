@@ -722,6 +722,52 @@ def test_owl_icon_and_fallback():
         b.close()
 
 
+def test_owl_badge_on_wgu_logo():
+    from playwright.sync_api import sync_playwright
+    head = ('<mat-toolbar style="display:flex;align-items:center;height:56px;padding:0 12px">'
+            '<svg width="24" height="24" class="menu-icon"></svg>'
+            '<img alt="WGU" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" '
+            'style="width:90px;height:32px;margin-left:12px"></mat-toolbar>')
+    snap = l360_overlay.build_snapshot(ROWS, STEPS, version=1)
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        for body, want in ((head + MAT_PAGE, True), (MAT_PAGE, False)):
+            ctx = b.new_context(viewport={"width": 1200, "height": 700})
+            ctx.add_init_script(OVERLAY_JS)
+            def serve(route, html=body):
+                route.fulfill(status=200, content_type="text/html", body=html)
+            ctx.route("https://learner360.wgu.edu/**", lambda r: serve(r))
+            pg = ctx.new_page()
+            pg.goto("https://learner360.wgu.edu/caseload")
+            pg.wait_for_timeout(500)
+            root = "document.querySelector('[data-cn=owlbadge]')"
+            if not want:                       # no logo → no badge
+                assert pg.evaluate(f"() => !{root}")
+                ctx.close()
+                continue
+            pos = pg.evaluate(f"""() => {{
+                const b = {root}.shadowRoot.querySelector('.b').getBoundingClientRect(),
+                      l = document.querySelector('img[alt=WGU]').getBoundingClientRect();
+                return {{bl: b.left, br: b.right, bt: b.top, bb: b.bottom,
+                         lr: l.right, lt: l.top, lb: l.bottom}}; }}""")
+            # Overlaps the logo's right edge, vertically within the logo's band.
+            assert pos["bl"] < pos["lr"] < pos["br"], pos
+            assert pos["bt"] >= pos["lt"] - 4 and pos["bb"] <= pos["lb"] + 4, pos
+            assert "waiting" in pg.evaluate(f"() => {root}.shadowRoot.querySelector('.b').title")
+            pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+            pg.wait_for_timeout(300)
+            pg.evaluate(f"() => {root}.shadowRoot.querySelector('.b').click()")   # hide
+            pg.wait_for_timeout(300)
+            st = pg.evaluate(f"""() => [{root}.shadowRoot.querySelector('.b').className,
+                document.querySelectorAll('[data-cn=badge]').length]""")
+            assert "off" in st[0] and st[1] == 0, st
+            ctx.close()
+        b.close()
+
+
 def test_pronoun_edit_round_trip():
     import types
     from playwright.sync_api import sync_playwright

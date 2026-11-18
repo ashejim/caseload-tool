@@ -121,12 +121,73 @@ _OVERLAY_JS = r"""
       try { localStorage.setItem('cnPillPos', JSON.stringify({x: r.left, y: r.top})); } catch (e) {}
     }
   });
-  pill.addEventListener('click', () => {
-    if (justDragged) { justDragged = false; return; }
+  const toggleOverlay = () => {
     S.on = !S.on;
     try { localStorage.setItem('cnOverlayOn', S.on ? '1' : '0'); } catch (e) {}
     schedule();
+  };
+  pill.addEventListener('click', () => {
+    if (justDragged) { justDragged = false; return; }
+    toggleOverlay();
   });
+
+  // ---- owl badge on Learner360's WGU logo: "CaseloadNotes is active" ----
+  const badgeHost = document.createElement('div');
+  badgeHost.setAttribute('data-cn', 'owlbadge');
+  const badgeRoot = badgeHost.attachShadow({ mode: 'open' });
+  badgeRoot.innerHTML = `<style>
+    :host { all: initial; }
+    .b { position: fixed; z-index: 2147483000; width: 26px; height: 26px;
+      border-radius: 50%; cursor: pointer; background: #fff;
+      box-shadow: 0 0 0 2px #5dd39e, 0 2px 6px rgba(0,40,85,.35);
+      transition: filter .15s ease, box-shadow .15s ease; }
+    .b.off { filter: grayscale(1); opacity: .7;
+      box-shadow: 0 0 0 2px #c7d0db, 0 2px 6px rgba(0,40,85,.25); }
+    .owl { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block; }
+  </style><div class="b" role="button" title="CaseloadNotes is active — click to show/hide">${owlImg('owl')}</div>`;
+  const badge = badgeRoot.querySelector('.b');
+  badge.addEventListener('click', ev => { ev.stopPropagation(); toggleOverlay(); });
+  owlFallback(badgeRoot, () => { badgeHost.remove(); S.noBadge = true; });
+  // The header logo: strongest hints first (labelled WGU / "logo" class),
+  // then any image in the top bar. Top-left area only.
+  const LOGO_SEL = [
+    'img[alt*="WGU" i], img[alt*="Western Governors" i], svg[aria-label*="WGU" i], [aria-label*="Western Governors" i]',
+    'img[class*="logo" i], svg[class*="logo" i], [class*="logo" i] img, [class*="logo" i] svg, a[class*="brand" i] img',
+    'mat-toolbar img, header img, [role="banner"] img'];
+  let logoEl = null;
+  function findLogo() {
+    for (const sel of LOGO_SEL) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (el.closest('[data-cn]')) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width >= 16 && r.height >= 12 && r.top < 120 && r.left < window.innerWidth / 2)
+          return el;
+      }
+    }
+    return null;
+  }
+  function placeBadge() {
+    if (!OWL || S.noBadge || !document.body) return;
+    if (!logoEl || !logoEl.isConnected) logoEl = findLogo();
+    if (!logoEl) { if (badgeHost.isConnected) badgeHost.remove(); return; }
+    if (!badgeHost.isConnected) document.body.appendChild(badgeHost);
+    const r = logoEl.getBoundingClientRect();
+    // Just past the logo's right edge, overlapping it by ~8px, centred.
+    badge.style.left = Math.round(r.right - 8) + 'px';
+    badge.style.top = Math.round(r.top + r.height / 2 - 13) + 'px';
+    badge.style.display = (r.bottom < 0 || !r.width) ? 'none' : '';
+    badge.classList.toggle('off', !S.on);
+    badge.title = !S.data ? 'CaseloadNotes is running — waiting for data from the app'
+      : S.on ? 'CaseloadNotes is active — click to hide' : 'CaseloadNotes is hidden — click to show';
+  }
+  let placeQueued = false;
+  const schedulePlace = () => {
+    if (placeQueued) return;
+    placeQueued = true;
+    requestAnimationFrame(() => { placeQueued = false; placeBadge(); });
+  };
+  window.addEventListener('resize', schedulePlace);
+  window.addEventListener('scroll', schedulePlace, true);
   const mountPill = () => {
     if (document.body && !pillHost.isConnected) document.body.appendChild(pillHost);
   };
@@ -226,6 +287,7 @@ _OVERLAY_JS = r"""
     pill.classList.toggle('off', !S.on);
     pillRoot.querySelector('.txt').textContent = !S.data ? 'CaseloadNotes · waiting for data'
       : S.on ? `CaseloadNotes · ${matched} on this page` : 'CaseloadNotes · hidden';
+    placeBadge();
     renderPanel();
   }
 
