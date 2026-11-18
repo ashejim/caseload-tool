@@ -423,6 +423,10 @@ class Settings:
     # courses, independent of the inbox labeler — feeds OA attempts, pre-A
     # taken and the CB · fields (src/features.py). Off unless chosen.
     course_scan_auto: bool = False
+    # Light OA-approval check: every N HOURS re-ask WGU's assessment service
+    # (attempts only, one call per student) about students with a failed,
+    # not-yet-passed OA, so "OA approval requested" stays current. 0 = off.
+    approval_check_hours: int = 3
     # Learner360 list: hide Learner360's own columns that aren't in the chosen
     # layout (display only), so the CaseloadNotes layout is all you see.
     l360_list_hide_native: bool = False

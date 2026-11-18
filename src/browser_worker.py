@@ -544,6 +544,13 @@ class BrowserWorker:
         classes, layout — no values; see src/l360_probe)."""
         self.q.put(("L360_PROBE", on_done))
 
+    def submit_approval_check(self, items: list,
+                              on_done: Callable[[dict], None]) -> None:
+        """READ-ONLY light OA-approval check: [(student_id, course, pidm,
+        course_version)] → only the assessment-attempts call per student
+        (see _approval_check)."""
+        self.q.put(("APPROVAL_CHECK", items, on_done))
+
     def submit_l360_team_roster(self, on_done: Callable[[dict], None],
                                 surface: bool = True) -> None:
         """READ-ONLY: the team's caseloads from Learner360 (see
@@ -1268,6 +1275,15 @@ class BrowserWorker:
                 res = {"ok": True}
             except Exception as e:
                 res = {"error": f"couldn't open Learner360: {e}"}
+            finally:
+                on_done(res)
+        elif cmd[0] == "APPROVAL_CHECK":
+            _, items, on_done = cmd
+            res = {}
+            try:
+                res = self._approval_check(ctx, items)
+            except Exception as e:
+                res = {"error": f"OA approval check crashed: {e}"}
             finally:
                 on_done(res)
         elif cmd[0] == "L360_PROBE":
@@ -3384,6 +3400,37 @@ class BrowserWorker:
             r.pop("body", None)
             return r
         return {"status": 401}
+
+    def _approval_check(self, ctx, items: list) -> dict:
+        """READ-ONLY: for each (student_id, course, pidm, course_version) ask
+        WGU's assessment service for the OA attempts only (one call — no
+        degree plan, engagement, pre-A or coaching). Needs the signed-in
+        student-portal gateway; opens a course page for it if missing.
+        → {ok, by_course: {course: {student_id: parsed}}, counts} or
+        {error[, need_portal]}."""
+        from collections import Counter
+        from src import course_assess as ca, learner360 as l3
+        ai, _lx = l3.ASSESS_HOSTS
+        self._ctx_for_portal = ctx
+        if self._portal_route(ai, ctx)[0] is None and items:
+            sid, course, pidm, cv = items[0]
+            self._open_portal_course_page(ctx, course, ("", sid, pidm, cv))
+        if self._portal_route(ai, ctx)[0] is None:
+            return {"error": "no signed-in student-portal page for the "
+                    "assessment service", "need_portal": True}
+        by, counts = {}, Counter()
+        for sid, course, pidm, cv in items:
+            a = self._portal_get(ai, ca.assessments_url(pidm, cv))
+            if a.get("status") == "no-portal-page":
+                return {"error": "lost the student-portal page",
+                        "need_portal": True, "by_course": by,
+                        "counts": dict(counts)}
+            if a.get("status") != 200:
+                counts[f"assessments:{a.get('status')}"] += 1
+                continue
+            by.setdefault(course, {})[sid] = l3.parse_assessments(a.get("json"))
+            counts["checked"] += 1
+        return {"ok": True, "by_course": by, "counts": dict(counts)}
 
     def _course_assess_fetch(self, ctx, course: str, targets: list,
                              background: bool = True) -> dict:

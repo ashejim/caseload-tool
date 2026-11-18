@@ -165,6 +165,16 @@ def summarize(course: str, ca: Optional[dict], pre_rows: list,
                for i, x in enumerate(ri["oa_list"])]
     pending = [t for t in oa.get("attempts") or []
                if not t.get("result") and (t.get("scheduled") or t.get("approval"))]
+    # An OA attempt waiting on approval (WGU's pendingApproval flag, e.g.
+    # after a fail the student "Requested Approval") — as of the last import
+    # or light approval check. Not the Essential Action itself.
+    appr = next((t for t in reversed(oa.get("attempts") or [])
+                 if t.get("pending") and not t.get("result")), None)
+    approval = None
+    if appr:
+        approval = {"n": appr.get("n"), "status": str(appr.get("approval") or ""),
+                    "as_of": max(str(a.get("_checked_at") or ""),
+                                 str(ca.get("updated_at") or ""))[:16]}
     nxt = None
     if pending:
         p = pending[-1]
@@ -222,12 +232,12 @@ def summarize(course: str, ca: Optional[dict], pre_rows: list,
         links["coaching"] = (f"{coach_base}/studentPidm/{pidm}/assessmentId/"
                              f"{oa['id']}/courseVersionId/{cv}")
     links = {k: v for k, v in links.items() if v}
-    if not (sit or pre or nxt or latest or links):
+    if not (sit or pre or nxt or latest or links or approval):
         return None
     return {
         "course": course, "cut": _int(oa.get("cut")), "oa_code": oa.get("code") or "",
         "oa": {"used": used, "max": OA_MAX, "passed": passed, "sittings": sit,
-               "next": nxt},
+               "next": nxt, "approval": approval},
         "pre": {"sittings": pre_n, "rows": pre[-8:],
                 "first_pct": next((p["pct"] for p in pre if p.get("pct") is not None), None),
                 "last_pct": next((p["pct"] for p in reversed(pre)

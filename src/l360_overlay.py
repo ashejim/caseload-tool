@@ -141,7 +141,8 @@ def why_empty(key: str, a: Optional[dict], course: str,
     nothing, and what would fill it. ``feats`` = {course_scan, course_watch,
     activity, plans: bool, types: {course: {oa, pa}}}."""
     if key == "@ea":
-        return "No open Essential Action for this student."
+        return ("No open Essential Action, and no OA attempt waiting on "
+                "approval in the assessment data.")
     if key == "@pron":
         return ("Pronouns not set — click to set them (saved in CaseloadNotes; "
                 "the Caseload Tool shows them too).")
@@ -242,8 +243,20 @@ def _list_value_raw(key: str, row: Optional[dict], roster: dict, sid: str,
         v = str((row or {}).get("EssentialAction") or "").strip()
         # 4th element "app:ea" = the page asks the app to open the EA
         # dashboard (approve / reject), not a URL.
-        return [v[:40], "mid", f"Open Essential Action: {v}\nClick to open the "
-                "EA dashboard (approve / reject).", "app:ea"] if v else None
+        if v:
+            return [v[:40], "mid", f"Open Essential Action: {v}\nClick to open "
+                    "the EA dashboard (approve / reject).", "app:ea"]
+        # No EA record (e.g. it's routed to another CI): an OA attempt waiting
+        # on approval in the assessment data — labelled as such, with its date.
+        ap = (((a or {}).get("oa") or {}).get("approval")) or None
+        if ap:
+            return ["OA approval requested", "mid",
+                    f"From assessment data, as of {ap.get('as_of') or '?'}: OA "
+                    f"attempt {ap.get('n')} — {ap.get('status') or 'pending approval'}."
+                    "\nNot a live Essential Action — the EA goes to the assigned "
+                    "CI.\nClick to re-check this student now.",
+                    "app:refresh:" + course]
+        return None
     if NATIVE_RE.match(key):
         return None                          # the page mirrors Learner360's own
     if not key.startswith("@"):

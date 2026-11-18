@@ -9336,6 +9336,9 @@ class App:
             # roster automatically when it's stale. Deferred a minute so the
             # scan queues behind the startup caseload/EA/task work.
             self.root.after(60_000, self._maybe_auto_roster_refresh)
+            # Light OA-approval check (failed, unpassed OAs only), ~8 min
+            # after startup; re-arms itself.
+            self.root.after(8 * 60_000, self._maybe_approval_check)
             # Learner360 weekly MOMI history + change watch, when due. After
             # the startup caseload/EA/task scans settle; re-arms itself.
             self.root.after(180_000, self._maybe_auto_l360_momi)
@@ -24570,6 +24573,8 @@ class App:
                 self.root.after(30_000, self._maybe_course_watch)
             if "roster" in new_on:
                 self.root.after(20_000, self._maybe_auto_l360_roster)
+            if "approval" in new_on:
+                self.root.after(60_000, self._maybe_approval_check)
             if on_close:
                 on_close()
 
@@ -27821,6 +27826,65 @@ class App:
         """Course codes on my loaded caseload, sorted ([] before it loads)."""
         return sorted({str(r.get("CourseCode") or "").strip().upper()
                        for r in (self._caseload_rows or [])} - {""})
+
+    def _maybe_approval_check(self) -> None:
+        """Light OA-approval check (settings.approval_check_hours; 0 = off):
+        for students with a failed, not-yet-passed OA (caseload or cohort,
+        already imported), re-ask WGU's assessment service for the attempts
+        only, so "OA approval requested" stays current. Background, yields to
+        the user, logs counts only (no ids). Never raises."""
+        try:
+            hours = int(getattr(self.settings, "approval_check_hours", 3) or 0)
+        except (TypeError, ValueError):
+            hours = 0
+        if hours <= 0 or getattr(self, "_offline", False):
+            return
+        rearm = max(1, hours) * 3600_000
+        try:
+            if (getattr(self, "_approval_bg", False) or getattr(self, "_is_busy", False)
+                    or getattr(self, "_cw", None)
+                    or not self.worker.ready_event.is_set()):
+                self.root.after(10 * 60_000, self._maybe_approval_check)
+                return
+            items = history.approval_check_targets(min_hours=hours * 0.8)
+            if not items:
+                self.root.after(rearm, self._maybe_approval_check)
+                return
+            self._approval_bg = True
+            t0 = time.time()
+
+            def on_done(res):
+                def ui():
+                    self._approval_bg = False
+                    res_ = res or {}
+                    if res_.get("error"):
+                        self._diag_once("approval-check", "  [approval check] "
+                                        f"skipped: {res_['error']}")
+                    else:
+                        n = pend = 0
+                        for course, by in (res_.get("by_course") or {}).items():
+                            n += history.update_course_assess_attempts(course, by)
+                            pend += sum(1 for p in by.values() if any(
+                                t.get("pending") for t in
+                                ((p or {}).get("oa") or {}).get("attempts") or []))
+                        self._append_log(
+                            f"OA approval check: {n} student(s) with a failed OA "
+                            f"re-checked in {time.time() - t0:.0f}s — {pend} "
+                            "waiting on approval.")
+                        if n:
+                            self._push_overlay_snapshot()
+                    self.root.after(rearm, self._maybe_approval_check)
+                try:
+                    self.root.after(0, ui)
+                except Exception:
+                    pass
+            self.worker.submit_approval_check(items, on_done)
+        except Exception:
+            self._approval_bg = False
+            try:
+                self.root.after(rearm, self._maybe_approval_check)
+            except Exception:
+                pass
 
     def _roster_rearm(self, ms: int) -> None:
         """(Re)schedule the roster staleness check — one pending timer only."""

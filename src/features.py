@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from typing import Optional
 
-# Days between runs used when a weekly/daily import is switched ON here.
+# Interval used when a periodic job is switched ON here (days, or hours for
+# approval_check_hours).
 _ON_DAYS = {"l360_auto_momi_days": 7, "l360_auto_notes_days": 7,
             "l360_auto_activity_days": 7, "l360_auto_plan_days": 7,
-            "l360_auto_roster_days": 1}
+            "l360_auto_roster_days": 1, "approval_check_hours": 3}
 
 FEATURES = [
     {"key": "l360", "title": "Learner360 extension",
@@ -33,6 +34,14 @@ FEATURES = [
      "time": "1–2 minutes, once a day — drives the Salesforce browser",
      "default": True,
      "settings": ["course_scan_auto"]},
+    {"key": "approval", "title": "OA approval check",
+     "adds": "Shows “OA approval requested” in the EA column when a student "
+             "who failed an OA has asked to retake — even when the Essential "
+             "Action goes to another CI. Re-checks only students with a "
+             "failed, not-yet-passed OA (one quick request each).",
+     "time": "under a minute, every 3 hours (background)",
+     "default": True,
+     "settings": ["approval_check_hours"]},
     {"key": "course_watch", "title": "Course watch (assessment details)",
      "adds": "OA scores, pre-assessment %, weakest competency and the "
              "competency grid; keeps passers for pass-rate reports.",

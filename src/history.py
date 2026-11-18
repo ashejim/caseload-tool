@@ -1499,6 +1499,80 @@ def persist_course_assess(course: str, by_student: dict, *,
         conn.close()
 
 
+def approval_check_targets(*, cap: int = 40, min_hours: float = 2.5,
+                           db_path=HISTORY_DB,
+                           now: Optional[datetime] = None) -> list:
+    """Who the light OA-approval check re-asks WGU about: stored students
+    (caseload or cohort) with a FAILED, not-yet-passed OA in a course, a
+    stored course version + pidm, and no check in the last ``min_hours``.
+    Pending approvals first, then the most recent fail. → [(student_id,
+    course, pidm, course_version)], at most ``cap``."""
+    now = now or datetime.now()
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT course, student_id, pidm, course_version, assessments_json, "
+            "updated_at FROM course_assess WHERE pidm != '' AND "
+            "course_version != ''").fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        try:
+            a = json.loads(r["assessments_json"] or "{}") or {}
+        except ValueError:
+            continue
+        oa = a.get("oa") or {}
+        atts = oa.get("attempts") or []
+        if not atts or any(t.get("passed") for t in atts):
+            continue
+        failed = [t for t in atts if t.get("status") == "Not Passed"]
+        if not failed:
+            continue
+        last = max(str(a.get("_checked_at") or ""), str(r["updated_at"] or ""))
+        try:
+            age_h = (now - datetime.fromisoformat(last)).total_seconds() / 3600
+        except ValueError:
+            age_h = 1e9
+        if age_h < min_hours:
+            continue
+        out.append((any(t.get("pending") for t in atts),
+                    str(failed[-1].get("result") or ""),
+                    (r["student_id"], r["course"], r["pidm"], r["course_version"])))
+    # Pending approvals first, then the most recent fail.
+    out.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [t[2] for t in out][:cap]
+
+
+def update_course_assess_attempts(course: str, by_student: dict, *,
+                                  db_path=HISTORY_DB,
+                                  now: Optional[datetime] = None) -> int:
+    """The light approval check's result: replace ONLY the assessment
+    attempts of existing course_assess rows ({student_id: parse_assessments
+    output}), stamping "_checked_at" inside them. updated_at (the full
+    import's timestamp, used by the course watch's staleness pick) and the
+    coaching / engagement / pre-A data are left alone. → rows updated."""
+    ts = (now or datetime.now()).isoformat(timespec="seconds")
+    c = str(course or "").strip().upper()
+    n = 0
+    conn = _connect(db_path)
+    try:
+        with conn:
+            for sid, parsed in (by_student or {}).items():
+                if not isinstance(parsed, dict) or not parsed.get("oa"):
+                    continue
+                parsed = dict(parsed, _checked_at=ts)
+                cur = conn.execute(
+                    "UPDATE course_assess SET assessments_json = ? WHERE "
+                    "course = ? AND student_id = ?",
+                    (json.dumps(parsed, separators=(",", ":")), c,
+                     str(sid).lstrip("0")))
+                n += cur.rowcount
+        return n
+    finally:
+        conn.close()
+
+
 def load_course_assess(course: str, *, db_path=HISTORY_DB) -> dict:
     """{student_id: {pidm, cv, assessments, engagement, coaching,
     plan_history, preA_code, updated_at}} for ``course``."""
@@ -2097,7 +2171,8 @@ def assess_raw(student_ids=None, *, cohort_days: int = 30,
             if n not in ids:
                 continue
             d = {"pidm": r["pidm"], "cv": r["course_version"],
-                 "preA_code": r["preA_report_code"]}
+                 "preA_code": r["preA_report_code"],
+                 "updated_at": r["updated_at"]}
             for k, col in (("assessments", "assessments_json"),
                            ("engagement", "engagement_json"),
                            ("coaching", "coaching_json")):

@@ -361,7 +361,10 @@ _OVERLAY_JS = r"""
         span.addEventListener('click', ev => {
           ev.stopPropagation();
           if (v[3] === 'app:ea') openEa(sid);
-          else openUrl(v[3]);
+          else if (v[3].startsWith('app:refresh:')) {
+            S.outbox.push({ type: 'refresh_assess', sid: sid, course: v[3].slice(12) });
+            span.textContent = 'checking…';
+          } else openUrl(v[3]);
         });
       }
       td.appendChild(span);
@@ -1047,7 +1050,8 @@ _OVERLAY_JS = r"""
         <div class="chips">${tasks}
         ${e.risk != null ? `<span class="chip ${riskCls(e.risk)}" title="${esc(RISK_TIP)}">risk ${Math.round(e.risk)}%</span>` : ''}
         ${e.momentum ? `<span class="chip">${esc(e.momentum)}</span>` : ''}</div>
-        ${e.ea ? `<div class="row ea"><span>Open EA</span><span>${esc(e.ea)}</span></div>` : ''}`;
+        ${e.ea ? `<div class="row ea"><span>Open EA</span><span>${esc(e.ea)}</span></div>`
+          : (e.assess && e.assess.oa && e.assess.oa.approval) ? `<div class="row ea" title="From assessment data — not a live Essential Action (the EA goes to the assigned CI)"><span>OA approval</span><span>requested (attempt ${esc(e.assess.oa.approval.n)}) · as of ${esc(e.assess.oa.approval.as_of || '?')}</span></div>` : ''}`;
       if ((e.fields || []).length)
         h += `<div class="flds">` + e.fields.map(([k, v]) =>
           `<div class="row"><span class="k">${esc(k)}</span><span>${esc(v)}</span></div>`).join('') + `</div>`;

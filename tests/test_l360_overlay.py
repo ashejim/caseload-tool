@@ -915,15 +915,16 @@ def test_features_mapping():
                                l360_auto_roster_days=1, course_scan_auto=False,
                                course_watch_enabled=False, l360_auto_momi_days=7,
                                l360_auto_notes_days=7, l360_auto_activity_days=7,
-                               l360_auto_plan_days=7)
+                               l360_auto_plan_days=7, approval_check_hours=0)
     d = features.defaults()
     assert d == {"l360": True, "roster": True, "course_scan": True,
-                 "course_watch": False, "momi": False, "notes": False,
-                 "activity": False, "plans": False}
+                 "approval": True, "course_watch": False, "momi": False,
+                 "notes": False, "activity": False, "plans": False}
     changed = features.apply(st, d)
     assert st.l360_overlay_enabled and st.l360_open_on_startup and st.course_scan_auto
     assert st.l360_auto_roster_days == 1 and st.l360_auto_momi_days == 0
     assert st.l360_auto_plan_days == 0 and not st.course_watch_enabled
+    assert st.approval_check_hours == 3                    # switched on → every 3 h
     assert "Team roster (Learner360)" not in changed          # already on
     features.apply(st, {"plans": True})
     assert st.l360_auto_plan_days == 7 and features.is_on(st, "plans")
@@ -1049,7 +1050,7 @@ def test_ea_column_click_and_search():
     snap = l360_overlay.build_snapshot(ROWS, STEPS, version=8, list_cols=["@ea"])
     e1, e2 = snap["students"]["123456"][0], snap["students"]["999888"][0]
     assert e1["cols"]["@ea"][:2] == ["Task unlock", "mid"] and e1["cols"]["@ea"][3] == "app:ea"
-    assert e2["why"]["@ea"] == "No open Essential Action for this student."
+    assert e2["why"]["@ea"].startswith("No open Essential Action, and no OA attempt")
     with sync_playwright() as p:
         try:
             b = p.chromium.launch()
