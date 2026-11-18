@@ -686,6 +686,42 @@ def test_columns_button_pinned_and_on_unmatched_list():
         b.close()
 
 
+def test_owl_icon_and_fallback():
+    from playwright.sync_api import sync_playwright
+    from src import l360_overlay_js as m
+    assert m.OVERLAY_JS.count("data:image/png;base64,") == 1
+    broken = m._OVERLAY_JS.replace("__CN_OWL__", "data:image/png;base64,AAAA")
+    snap = l360_overlay.build_snapshot(ROWS, STEPS, version=1, extras=EXTRAS)
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        for js, good in ((m.OVERLAY_JS, True), (broken, False)):
+            ctx = b.new_context()
+            ctx.add_init_script(js)
+            ctx.route("https://learner360.wgu.edu/**",
+                      lambda r: r.fulfill(status=200, content_type="text/html",
+                                          body="<html><body></body></html>"))
+            pg = ctx.new_page()
+            pg.goto(f"https://learner360.wgu.edu/learner/{UUID}")
+            pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+            pg.wait_for_timeout(700)
+            pill = "document.querySelector('[data-cn=pill]').shadowRoot"
+            panel = "document.querySelector('[data-cn=panel]').shadowRoot"
+            got = pg.evaluate(f"""() => ({{
+                owl: !!{pill}.querySelector('img.owl'),
+                loaded: ({pill}.querySelector('img.owl') || {{}}).naturalWidth || 0,
+                dot: !!{pill}.querySelector('.dot'),
+                tab: !!{panel}.querySelector('.tab img.towl') }})""")
+            if good:
+                assert got["owl"] and got["loaded"] == 64 and not got["dot"] and got["tab"], got
+            else:
+                assert not got["owl"] and got["dot"] and not got["tab"], got
+            ctx.close()
+        b.close()
+
+
 def test_pronoun_edit_round_trip():
     import types
     from playwright.sync_api import sync_playwright

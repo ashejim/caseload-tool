@@ -11,9 +11,15 @@ snapshot version the page has (-1 = none); ``setData(snapshot)`` installs a
 l360_overlay.build_snapshot() dict.
 """
 
-OVERLAY_JS = r"""
+_OVERLAY_JS = r"""
 (() => {
   if (location.host !== 'learner360.wgu.edu' || window.__cnOverlay) return;
+  // The desktop app's owl (data URI filled in by Python; '' = none).
+  const OWL = '__CN_OWL__';
+  const owlImg = cls => OWL ? `<img class="${cls}" src="${OWL}" alt="">` : '';
+  // If the page's security policy blocks the image, fall back quietly.
+  const owlFallback = (root, onFail) => root.querySelectorAll('img.owl, img.towl')
+    .forEach(i => i.addEventListener('error', () => { i.remove(); if (onFail) onFail(); }));
 
   const S = { data: null, v: -1, on: true, queued: false, matched: 0,
               outbox: [], colTables: new Set() };
@@ -53,6 +59,11 @@ OVERLAY_JS = r"""
     .pill.drag { cursor: grabbing; opacity: .85; }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #5dd39e; }
     .pill.off .dot { background: #c7d0db; }
+    .owl { width: 22px; height: 22px; border-radius: 50%; object-fit: cover;
+      display: block; box-shadow: 0 0 0 2px #5dd39e; }
+    .pill.off .owl { filter: grayscale(1); opacity: .75; box-shadow: 0 0 0 2px #c7d0db; }
+    .pill.has-owl { padding: 4px; gap: 0; }
+    .pill.has-owl:hover, .pill.has-owl.drag { gap: 6px; padding-right: 10px; }
   `;
 
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
@@ -64,8 +75,15 @@ OVERLAY_JS = r"""
   const pillRoot = pillHost.attachShadow({ mode: 'open' });
   pillRoot.innerHTML = `<style>${CSS}</style>
     <div class="pill" title="CaseloadNotes overlay — click to show/hide, drag to move">
-      <span class="dot"></span><b>CN</b><span class="txt">CaseloadNotes</span></div>`;
+      ${OWL ? owlImg('owl') : '<span class="dot"></span><b>CN</b>'}<span class="txt">CaseloadNotes</span></div>`;
   const pill = pillRoot.querySelector('.pill');
+  if (OWL) {
+    pill.classList.add('has-owl');
+    owlFallback(pillRoot, () => {
+      pill.classList.remove('has-owl');
+      pill.insertAdjacentHTML('afterbegin', '<span class="dot"></span><b>CN</b>');
+    });
+  }
   // Draggable (position remembered) so it never sits on the page's own
   // buttons; a click without movement toggles the overlay.
   const placePill = (x, y) => {
@@ -324,7 +342,9 @@ OVERLAY_JS = r"""
     .dlg { background: #fff; border-radius: 10px; width: 440px; max-width: 92vw;
       max-height: 78vh; display: flex; flex-direction: column;
       box-shadow: 0 12px 40px rgba(0,40,85,.3); }
-    .hd { padding: 12px 14px 6px; font-weight: 700; color: #002855; }
+    .hd { padding: 12px 14px 6px; font-weight: 700; color: #002855;
+      display: flex; align-items: center; gap: 8px; }
+    .owl { width: 22px; height: 22px; border-radius: 50%; object-fit: cover; }
     .sub { padding: 0 14px 6px; color: #5b6b7f; font-size: 12px; }
     .q { margin: 0 14px 6px; height: 28px; border: 1px solid #d5dde8;
       border-radius: 6px; padding: 0 8px; font: inherit; }
@@ -382,7 +402,7 @@ OVERLAY_JS = r"""
     const setOpts = () => `<option value="">(unsaved)</option>` + Object.keys(sets).map(n =>
       `<option value="${esc(n)}"${n === setName ? ' selected' : ''}>${esc(n)}</option>`).join('');
     pickRoot.innerHTML = `<style>${KCSS}</style><div class="back"><div class="dlg" role="dialog" aria-label="CaseloadNotes columns">
-      <div class="hd">CaseloadNotes columns</div>
+      <div class="hd">${owlImg('owl')}CaseloadNotes columns</div>
       <div class="sets"><span>Set</span><select class="set">${setOpts()}</select>
         <button data-b="del" title="Delete this saved set (the columns on screen stay)">Delete set</button></div>
       <div class="sub">Added to the right of Learner360's own columns, in the order you tick them (max ${MAX}).</div>
@@ -394,6 +414,7 @@ OVERLAY_JS = r"""
         <button data-b="cancel">Cancel</button><button data-b="saveas">Save as new set…</button>
         <button class="pri" data-b="save"></button></div></div></div>`;
     if (!pickHost.isConnected) document.body.appendChild(pickHost);
+    owlFallback(pickRoot);
     const $ = s => pickRoot.querySelector(s);
     const ls = $('.ls'), q = $('.q'), sel = $('.set');
     const redraw = () => { ls.innerHTML = draw(q.value.trim().toLowerCase()); };
@@ -478,7 +499,9 @@ OVERLAY_JS = r"""
       background: #002855; color: #fff; cursor: pointer; border: none;
       border-radius: 10px 0 0 10px; writing-mode: vertical-rl;
       font: 600 11px/1 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
-      letter-spacing: .06em; }
+      letter-spacing: .06em; gap: 8px; }
+    .towl { width: 20px; height: 20px; border-radius: 50%; object-fit: cover;
+      box-shadow: 0 0 0 1.5px #fff; }
     .body { margin-left: 28px; flex: 1; overflow-y: auto; padding: 14px 14px 18px;
       scrollbar-width: thin; }
     h2 { font-size: 15px; margin: 0 0 2px; color: #002855; }
@@ -800,7 +823,7 @@ OVERLAY_JS = r"""
       h += `<div class="sec"><div class="lbl">Recent notes</div>` + notes.map(n =>
         `<div class="note"><div class="meta">${esc(n.date)} · ${esc(n.type)}${n.direction === 'inbound' ? ' · from student' : ''}${n.author ? ' · ' + esc(n.author) : ''}</div>${esc(n.text)}</div>`).join('') + `</div>`;
     return `<style>${PCSS}</style><div class="panel${panelCollapsed ? ' collapsed' : ''}">
-      <button class="tab" title="Show/hide CaseloadNotes">CASELOADNOTES</button>
+      <button class="tab" title="Show/hide CaseloadNotes">${owlImg('towl')}CASELOADNOTES</button>
       <div class="body">${h}</div></div>`;
   }
 
@@ -818,6 +841,7 @@ OVERLAY_JS = r"""
     if (key === panelKey) return;
     panelKey = key;
     panelRoot.innerHTML = panelHtml(sid, entries);
+    owlFallback(panelRoot);
     panelRoot.querySelector('.tab').addEventListener('click', () => {
       panelCollapsed = !panelCollapsed;
       try { localStorage.setItem('cnPanelCollapsed', panelCollapsed ? '1' : '0'); } catch (e) {}
@@ -922,3 +946,25 @@ OVERLAY_JS = r"""
   };
 })();
 """
+
+
+def _owl_data_uri(px: int = 64) -> str:
+    """The desktop app's owl (resources/app.ico, the ``px`` frame) as a PNG
+    data URI for the overlay; "" when the icon or Pillow isn't available."""
+    try:
+        import base64
+        import io
+        from PIL import Image
+        from src.config import APP_ICON
+        im = Image.open(APP_ICON)
+        if (px, px) in (im.info.get("sizes") or ()):
+            im.size = (px, px)              # pick that frame of the .ico
+        im = im.convert("RGBA").resize((px, px))
+        buf = io.BytesIO()
+        im.save(buf, "PNG", optimize=True)
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return ""
+
+
+OVERLAY_JS = _OVERLAY_JS.replace("__CN_OWL__", _owl_data_uri())
