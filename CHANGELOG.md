@@ -3,8 +3,61 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
-## Unreleased
+## 0.28.0 — 2026-11-18
 
+- **CaseloadNotes inside Learner360 (the app's own browser, read-only).**
+  - **Your columns in Learner360's caseload list** (⚙ Columns, pinned at the
+    right of the header): OA attempts, OA 1–4 (score, pass/fail colour, date),
+    Weakest competency, Pre-A, **EA (open Essential Action)**, **Pronouns**
+    (click a cell to set them — same value as the Caseload Tool), plus any
+    caseload column (e.g. Last Assigned CI Contact) or caseload-browser field.
+  - **A recommended layout:** Name · Preferred name · Pronouns · Id · Active
+    courses · Last ACI contact · Pre-A · OA attempts · EA, with Learner360's
+    other columns hidden (display only; ⚙ Columns ▸ Reset to recommended, or
+    untick “Hide Learner360 columns I haven't picked”). Moved Learner360
+    columns still sort in Learner360.
+  - **Named column sets** — save, switch from the header, delete.
+  - **Click to sort** a CaseloadNotes column (▲ / ▼ / Learner360's order) —
+    the rows on the current page, since Learner360 pages server-side.
+  - **Clickable reports:** task chips open the EMA Score Report (same
+    per-course links as the Caseload Tool's task badges — a task not learned
+    yet asks for one score-report URL once); OA cells open the coaching report;
+    Pre-A opens the pre-assessment report; EA opens the EA dashboard.
+  - **Empty cells say why** on hover — e.g. which background feature would
+    fill them, “no attempt 3 yet”, a performance-assessed course, or a student
+    who isn't on your caseload.
+  - **“OA approval requested”** in the EA column when a student who failed an
+    OA has asked to retake — from WGU's assessment data, labelled with its
+    date (not a live EA, which goes to the assigned CI). A light background
+    check (every 3 h, students with a failed, unpassed OA only, one quick
+    request each) keeps it current.
+  - **Student panel on learner pages:** pronouns (editable), MOMI trend,
+    recent notes, next success-path step, and an **Assessments box** (OA /
+    pre-A / tasks, competency × attempt grid) — also for course-cohort
+    students on your team. ⚙ Fields adds any caseload column to it.
+  - **Badges** on each row (tasks, risk %, OA, next step, EA, days since
+    contact / activity), an owl badge on the WGU logo showing the extension is
+    on, and the CN pill (bottom-left) to hide / show everything.
+- **First run: “Choose what runs in the background.”** A checklist of the
+  background features with what each adds and roughly how long it takes —
+  recommended: Learner360 extension, team roster, a daily course scan of your
+  courses, and the OA approval check; course watch, MOMI history, notes,
+  academic activity and degree plans stay off until you turn them on. Also in
+  ❔ Help ▸ Background features…, ⚙ Settings ▸ Caseload & Data, and the
+  `features:` keyword. Existing settings are not changed.
+- **New background data (opt-in):** Learner360 **degree plans + program
+  mentor** (courses left this term, next planned course, degree %); **course
+  watch** (daily assessment detail for chosen courses, or your caseload
+  courses when none are listed); a **daily course scan** of your own courses
+  without needing the inbox labeler; Learner360 **action signals** columns
+  (not opened, working but no submission…).
+- **Caseload Tool student view:** an Assessments box (tabs: Summary / Tasks /
+  Pre-A / OA n, competency × attempt grid) for caseload and off-caseload
+  students; the info column now scrolls when it's taller than the pane.
+- **👥 Course cohort view** in the viewer — your team's students in chosen
+  courses with OA / competency columns (read-only for actions).
+- **Contextual actions:** firing on selected students offers only the
+  actions that fit their courses.
 - **Course Planning Tool (CPT) scores, scraped from the vendor** (`cpt:`).
   The CPT (course-entry readiness check, code XTFO) reports Experience /
   Confidence / Knowledge, but the scores live only on the external vendor
@@ -19,6 +72,12 @@ Notable changes per release. Versions follow the scheme in `src/version.py`
   harvest — the signed-in browser context provisions the vendor via the
   redirect. (Waits for the vendor page before reading, since the my.wgu.edu →
   vendomatic → SmarterMeasure redirect completes client-side after load.)
+- **Fixes:** the app's browser pages now follow the window size (resizing or
+  maximizing gives Learner360 / Salesforce the room — previously pinned at
+  1400×900); the inbox labeler's Learner360 team roster corrects instructors
+  and fills Unassigned; roster-scan recovery when a leftover dialog covers the
+  course search; background Learner360 jobs re-check when due instead of up to
+  6 h later; discovery logs mask ids / usernames.
 
 ## 0.27.0 — 2026-11-01
 
