@@ -220,7 +220,7 @@ _OVERLAY_JS = r"""
     if (e.next_step)
       parts.push(`<span class="chip step" title="Success path: next step">${esc(e.next_step)}</span>`);
     if (e.ea)
-      parts.push(`<span class="chip ea" title="Open Essential Action: ${esc(e.ea)}">EA</span>`);
+      parts.push(`<span class="chip ea lnk" data-ea="1" title="Open Essential Action: ${esc(e.ea)}\nClick to open the EA dashboard (approve / reject)">EA</span>`);
     const bits = [];
     if (e.days_contact != null) bits.push(`contact ${Math.round(e.days_contact)}d`);
     if (e.days_course_activity != null) bits.push(`activity ${Math.round(e.days_course_activity)}d`);
@@ -344,7 +344,7 @@ _OVERLAY_JS = r"""
     if (css && !hideStyle.isConnected) (document.head || document.documentElement).appendChild(hideStyle);
   }
 
-  function colTd(proto, v, why, pronSid, quiet) {
+  function colTd(proto, v, why, pronSid, quiet, sid) {
     const td = document.createElement('td');
     td.setAttribute('data-cn', 'col');
     td.className = stripCols(proto.className);
@@ -358,7 +358,11 @@ _OVERLAY_JS = r"""
       if (v[3]) {                      // assessment cell → its report
         span.style.cursor = 'pointer';
         span.style.textDecoration = 'underline dotted';
-        span.addEventListener('click', ev => { ev.stopPropagation(); openUrl(v[3]); });
+        span.addEventListener('click', ev => {
+          ev.stopPropagation();
+          if (v[3] === 'app:ea') openEa(sid);
+          else openUrl(v[3]);
+        });
       }
       td.appendChild(span);
     } else if (why && quiet) {
@@ -486,7 +490,7 @@ _OVERLAY_JS = r"""
             if (k.startsWith('L360:')) td = mirrorTd(proto, nat(k.slice(5)));
             else if (!re) td = colTd(proto, null, NOT_OURS, '', true);
             else td = colTd(proto, (re.e.cols || {})[k], (re.e.why || {})[k],
-                            k === '@pron' ? sid : '');
+                            k === '@pron' ? sid : '', false, sid);
             tr.insertBefore(td, anchor);
           }
           tr.appendChild(colTd(proto, null));          // under ⚙ Columns
@@ -505,7 +509,14 @@ _OVERLAY_JS = r"""
     if (url) openUrl(url);
     else S.outbox.push({ type: 'open_task', sid: sid, course: course, n: n });
   }
+  // Essential Action → the app opens the EA dashboard (approve / reject).
+  const openEa = sid => { if (sid) S.outbox.push({ type: 'open_ea', sid: sid }); };
   function wireTaskChips(root, sid, course) {
+    root.querySelectorAll('[data-ea]').forEach(ch => ch.addEventListener('click', ev => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      openEa(sid);
+    }));
     root.querySelectorAll('[data-task]').forEach(ch => ch.addEventListener('click', ev => {
       ev.stopPropagation();
       ev.preventDefault();

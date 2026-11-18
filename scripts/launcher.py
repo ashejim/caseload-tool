@@ -10768,6 +10768,13 @@ class App:
                     self._set_list_cols(a.get("keys"), a.get("set"),
                                         a.get("hide_native"))
                     continue
+                if isinstance(a, dict) and a.get("type") == "open_ea":
+                    # EA cell / chip in Learner360 → the EA dashboard (the
+                    # Caseload Tool's "Unlock tasks" action). Mine only.
+                    hit = by_nsid.get(str(a.get("sid") or "").lstrip("0"))
+                    if hit:
+                        self._open_ea_dashboard(hit[0], hit[1].get("Name") or "")
+                    continue
                 if isinstance(a, dict) and a.get("type") == "open_task":
                     # A task chip in Learner360 whose EMA link isn't learned
                     # yet → the Caseload Tool's open/learn flow. Mine only.

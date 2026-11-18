@@ -98,7 +98,7 @@ def field_catalog(rows: list, extras: Optional[dict] = None) -> list:
 # Extra COLUMNS for Learner360's caseload list (⚙ Columns): these built-ins
 # (from the assessment summary) + any field_catalog key. Values go to the
 # page as [text, kind, tooltip]; kind ∈ pass / fail / mid / "" colours it.
-LIST_BUILTINS = [["@pron", "Pronouns"],
+LIST_BUILTINS = [["@pron", "Pronouns"], ["@ea", "EA (open Essential Action)"],
                  ["@oa", "OA attempts"], ["@oa1", "OA 1"], ["@oa2", "OA 2"],
                  ["@oa3", "OA 3"], ["@oa4", "OA 4"],
                  ["@weak", "Weakest competency"], ["@pre", "Pre-A"]]
@@ -139,6 +139,8 @@ def why_empty(key: str, a: Optional[dict], course: str,
     """Hover text for an EMPTY list cell of one of my students: why there's
     nothing, and what would fill it. ``feats`` = {course_scan, course_watch,
     activity, plans: bool, types: {course: {oa, pa}}}."""
+    if key == "@ea":
+        return "No open Essential Action for this student."
     if key == "@pron":
         return ("Pronouns not set — click to set them (saved in CaseloadNotes; "
                 "the Caseload Tool shows them too).")
@@ -235,6 +237,12 @@ def _list_value_raw(key: str, row: Optional[dict], roster: dict, sid: str,
     if key == "@pron":
         v = str((row or {}).get("Pronouns") or "").strip()
         return [v, "", "Click to change"] if v else None
+    if key == "@ea":
+        v = str((row or {}).get("EssentialAction") or "").strip()
+        # 4th element "app:ea" = the page asks the app to open the EA
+        # dashboard (approve / reject), not a URL.
+        return [v[:40], "mid", f"Open Essential Action: {v}\nClick to open the "
+                "EA dashboard (approve / reject).", "app:ea"] if v else None
     if NATIVE_RE.match(key):
         return None                          # the page mirrors Learner360's own
     if not key.startswith("@"):

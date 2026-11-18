@@ -1043,6 +1043,59 @@ def test_app_open_task_only_for_my_students():
                      ("000123456", "C769", 3, "Pat Lee")], calls
 
 
+def test_ea_column_click_and_search():
+    from playwright.sync_api import sync_playwright
+    snap = l360_overlay.build_snapshot(ROWS, STEPS, version=8, list_cols=["@ea"])
+    e1, e2 = snap["students"]["123456"][0], snap["students"]["999888"][0]
+    assert e1["cols"]["@ea"][:2] == ["Task unlock", "mid"] and e1["cols"]["@ea"][3] == "app:ea"
+    assert e2["why"]["@ea"] == "No open Essential Action for this student."
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context()
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html",
+                                      body=MAT_PAGE))
+        pg = ctx.new_page()
+        pg.goto("https://learner360.wgu.edu/caseload")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(500)
+        pg.evaluate("() => document.querySelector('#b tr td[data-cn=col] span').click()")
+        pg.evaluate("() => document.querySelector('[data-cn=badge]').shadowRoot.querySelector('[data-ea]').click()")
+        assert pg.evaluate("window.__cnOverlay.takeOutbox()") == [
+            {"type": "open_ea", "sid": "123456"}, {"type": "open_ea", "sid": "123456"}]
+        # The picker finds it by "EA".
+        pg.evaluate("() => document.querySelector('thead button').click()")
+        pg.wait_for_timeout(200)
+        proot = "document.querySelector('[data-cn=colpick]').shadowRoot"
+        pg.evaluate(f"""() => {{ const q = {proot}.querySelector('.q');
+            q.value = 'ea'; q.dispatchEvent(new Event('input')); }}""")
+        found = pg.evaluate(f"() => [...{proot}.querySelectorAll('label')].map(l => l.textContent.trim())")
+        assert any(t.startswith("EA (open Essential Action)") for t in found), found
+        b.close()
+
+
+def test_app_open_ea_only_for_my_students():
+    import importlib.util
+    import types
+    spec = importlib.util.spec_from_file_location(
+        "launcher_ea_test", os.path.join(ROOT, "scripts", "launcher.py"))
+    L = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(L)
+    calls = []
+    a = types.SimpleNamespace(
+        _caseload_rows=[{"StudentID": "000123456", "Name": "Pat Lee"}],
+        _append_log=lambda m, **kw: None,
+        _open_ea_dashboard=lambda *x: calls.append(x),
+        root=types.SimpleNamespace(after=lambda ms, fn: fn()))
+    L.App._on_overlay_actions(a, [{"type": "open_ea", "sid": "123456"},
+                                  {"type": "open_ea", "sid": "999999"}])
+    assert calls == [("000123456", "Pat Lee")], calls
+
+
 def test_pronoun_edit_round_trip():
     import types
     from playwright.sync_api import sync_playwright
