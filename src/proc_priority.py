@@ -21,8 +21,10 @@ PROCESS_SET_INFORMATION = 0x0200
 NORMAL_PRIORITY_CLASS = 0x00000020
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 _INVALID_HANDLE = ctypes.c_void_p(-1).value
-# The launcher drives Edge (channel="msedge") with a bundled-Chromium fallback.
-_BROWSER_EXES = {"msedge.exe", "chrome.exe"}
+# The launcher drives Edge (channel="msedge") by default; Settings can pick
+# Chrome / Brave / another Chromium .exe instead (src/browser_engines.py),
+# with a bundled-Chromium fallback.
+_BROWSER_EXES = {"msedge.exe", "chrome.exe", "brave.exe"}
 
 
 class _PROCESSENTRY32(ctypes.Structure):

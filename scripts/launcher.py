@@ -22539,6 +22539,60 @@ class App:
             font=ctk.CTkFont(size=13, weight="bold"),
         ).pack(anchor="w", padx=20, pady=(8, 4))
 
+        # Automation browser (src/browser_engines.py): Edge by default, or
+        # another installed Chromium-family browser. Next start.
+        from src import browser_engines as _be
+        _be_opts = list(_be.installed())             # [(key, label)]
+        if not any(k == "edge" for k, _ in _be_opts):
+            _be_opts.insert(0, ("edge", _be.ENGINES["edge"]["label"]))
+        _be_custom_lbl = "Other Chromium browser (.exe)…"
+        _be_by_label = {lbl: k for k, lbl in _be_opts}
+        _be_cur = str(getattr(self.settings, "browser_engine", "edge") or "edge")
+        _be_path = {"v": str(getattr(self.settings, "browser_exe_path", "") or "")}
+        _be_label_of = {k: lbl for k, lbl in _be_opts}
+        be_var = ctk.StringVar(value=(
+            f"{_be_custom_lbl[:-1]}: {os.path.basename(_be_path['v'])}"
+            if _be_cur == _be.CUSTOM and _be_path["v"]
+            else _be_label_of.get(_be_cur, _be_label_of["edge"])))
+        be_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        be_row.pack(fill="x", padx=20, pady=(6, 0))
+        ctk.CTkLabel(be_row, text="Automation browser:",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
+        be_note = ctk.CTkLabel(
+            dialog, text="", font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"), wraplength=520, justify="left",
+            anchor="w")
+
+        def _be_note_for(choice: str) -> None:
+            key = _be_by_label.get(choice, _be.CUSTOM)
+            text = ("The tested default. " if key == "edge" else
+                    _be.UNTESTED_NOTE + " ")
+            text += ("Each browser has its own CaseloadNotes profile — sign in "
+                     "to WGU (and Mongoose) once in it. Takes effect the next "
+                     "time you start CaseloadNotes. (Firefox can't be used.)")
+            be_note.configure(text=text)
+
+        def _be_pick(choice: str) -> None:
+            if choice == _be_custom_lbl:
+                from tkinter import filedialog
+                path = filedialog.askopenfilename(
+                    parent=win, title="Choose a Chromium-based browser (.exe)",
+                    filetypes=[("Programs", "*.exe")])
+                if not path:
+                    be_var.set(_be_label_of.get(_be_cur, _be_label_of["edge"]))
+                    _be_note_for(be_var.get())
+                    return
+                _be_path["v"] = path
+                be_var.set(f"{_be_custom_lbl[:-1]}: {os.path.basename(path)}")
+            _be_note_for(be_var.get())
+
+        ctk.CTkOptionMenu(
+            be_row, variable=be_var, width=280, command=_be_pick,
+            values=[lbl for _k, lbl in _be_opts] + [_be_custom_lbl],
+        ).pack(side="left", padx=(8, 0))
+        be_note.pack(fill="x", padx=44, pady=(2, 6))
+        _be_note_for(be_var.get())
+
         ctk.CTkLabel(
             dialog,
             text=(
@@ -23699,6 +23753,17 @@ class App:
             new_mode = advanced_var.get()
             changed = (new_mode != self.settings.advanced_mode)
             self.settings.advanced_mode = new_mode
+            # Automation browser — applies on the next start.
+            _be_key = _be_by_label.get(be_var.get(), _be.CUSTOM)
+            _be_new_path = _be_path["v"] if _be_key == _be.CUSTOM else ""
+            if (_be_key, _be_new_path) != (
+                    str(getattr(self.settings, "browser_engine", "edge") or "edge"),
+                    str(getattr(self.settings, "browser_exe_path", "") or "")):
+                self.settings.browser_engine = _be_key
+                self.settings.browser_exe_path = _be_new_path
+                self._append_log(
+                    f"Automation browser set to {_be.label_for(self.settings)} — "
+                    "restart CaseloadNotes to switch (sign in to WGU once in it).")
             # Required-columns check ignore-list.
             try:
                 self.settings.required_columns_ignore = req_ignore_var.get().strip()

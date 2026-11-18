@@ -764,6 +764,13 @@ class BrowserWorker:
         (return True — _run reopens a fresh context). The login profile is
         persisted on disk, so a restart preserves the SSO session."""
         with persistent_context() as ctx:
+            from src.browser import ACTIVE_ENGINE
+            if ACTIVE_ENGINE.get("note") or ACTIVE_ENGINE.get("key") not in (None, "edge"):
+                self.on_status(
+                    f"Browser: {ACTIVE_ENGINE.get('label') or ACTIVE_ENGINE.get('key')}"
+                    + (f" — {ACTIVE_ENGINE['note']}" if ACTIVE_ENGINE.get("note")
+                       else " (untested with CaseloadNotes — switch back to Edge "
+                       "in ⚙ Settings if anything misbehaves)"))
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             if CASELOAD_URL:
                 # A failed FIRST navigation (no network / VPN down / DNS can't
@@ -5132,6 +5139,10 @@ class BrowserWorker:
         names = self._process_exe_names()
         if not names:
             return False
+        # The browser this session drives (Edge unless Settings picked
+        # another — see src/browser_engines.py).
+        from src.browser import ACTIVE_ENGINE
+        engine_exe = (ACTIVE_ENGINE.get("exe") or "msedge.exe").lower()
         try:
             ours = self._descendant_pids()
         except Exception:
@@ -5156,7 +5167,7 @@ class BrowserWorker:
                 user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
                 if pid.value in ours:
                     return True
-                if names.get(pid.value, "") == "msedge.exe":
+                if names.get(pid.value, "") == engine_exe:
                     hit["v"] = True
                     return False  # found one — stop enumerating
             except Exception:

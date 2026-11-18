@@ -67,6 +67,8 @@ SRC_MODULES = [
     "src.assess_summary",
     "src.cohort_view",
     "src.l360_probe",
+    "src.browser_engines",
+    "src.features",
 ]
 
 

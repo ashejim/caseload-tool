@@ -423,6 +423,12 @@ class Settings:
     # courses, independent of the inbox labeler — feeds OA attempts, pre-A
     # taken and the CB · fields (src/features.py). Off unless chosen.
     course_scan_auto: bool = False
+    # Which browser the app automates: "edge" (tested default), "chrome",
+    # "brave", or "custom" (browser_exe_path = a Chromium-based browser's
+    # .exe). Each has its own CaseloadNotes profile; takes effect
+    # on the next start (src/browser_engines.py).
+    browser_engine: str = "edge"
+    browser_exe_path: str = ""
     # Light OA-approval check: every N HOURS re-ask WGU's assessment service
     # (attempts only, one call per student) about students with a failed,
     # not-yet-passed OA, so "OA approval requested" stays current. 0 = off.
