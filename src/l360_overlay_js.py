@@ -178,15 +178,17 @@ OVERLAY_JS = r"""
         if (SID_RE.test(t)) { sid = t.replace(/^0+/, ''); break; }
       }
       if (!sid) continue;
+      // Any student list gets the ⚙ Columns header, even when none of its
+      // students are ours (it needs the app's data for the picker).
+      if (tr.tagName === 'TR') {
+        const tb = tr.closest('table');
+        if (tb) S.colTables.add(tb);
+      }
       const entry = pickEntry((S.data.students || {})[sid], tr.textContent || '');
       if (!entry) { if (host) host.remove(); continue; }
       matched++;
       const key = S.v + ':' + sid + ':' + entry.course;
-      if (tr.tagName === 'TR') {
-        rowEntry.set(tr, { e: entry, k: sid + ':' + entry.course });
-        const tb = tr.closest('table');
-        if (tb) S.colTables.add(tb);
-      }
+      if (tr.tagName === 'TR') rowEntry.set(tr, { e: entry, k: sid + ':' + entry.course });
       if (host && host.dataset.key === key) continue;
       if (!host) {
         host = document.createElement('div');
@@ -261,6 +263,10 @@ OVERLAY_JS = r"""
         const g = document.createElement('th');
         g.setAttribute('data-cn', 'col');
         g.className = stripCols(proto.className);
+        // Pinned to the right edge of the table's scroll area, so it's
+        // visible without scrolling across Learner360's ~18 columns.
+        g.style.cssText = 'position:sticky;right:0;z-index:3;background:#fff;'
+          + 'box-shadow:-6px 0 8px -6px rgba(0,40,85,.25);white-space:nowrap';
         g.innerHTML = `<button type="button" title="Choose CaseloadNotes columns"
           style="border:1px solid #d5dde8;background:#fff;border-radius:6px;cursor:pointer;
           padding:2px 7px;font:600 12px/1.2 inherit;color:#002855;white-space:nowrap">⚙ Columns${cols.length ? ' (' + cols.length + ')' : ''}</button>`;

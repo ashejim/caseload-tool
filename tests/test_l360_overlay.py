@@ -649,6 +649,43 @@ def test_app_list_sets_save_use_delete():
         L.save_settings = real
 
 
+def test_columns_button_pinned_and_on_unmatched_list():
+    from playwright.sync_api import sync_playwright
+    ths = "".join(f'<th class="mat-mdc-header-cell cdk-column-c{i}">Col {i}</th>'
+                  for i in range(16))
+    tds = "".join(f'<td class="mat-mdc-cell cdk-column-c{i}">v</td>' for i in range(16))
+    page = f"""<!doctype html><html><body>
+    <div class="table-wrapper" style="width:700px;overflow:auto">
+    <table class="mat-mdc-table" style="width:2400px"><thead><tr>
+    <th class="mat-mdc-header-cell cdk-column-name">Name</th>
+    <th class="mat-mdc-header-cell cdk-column-studentId">Id</th>{ths}</tr></thead>
+    <tbody><tr><td class="mat-mdc-cell"><a>Nobody</a></td>
+    <td class="mat-mdc-cell">000777777</td>{tds}</tr></tbody></table></div></body></html>"""
+    snap = l360_overlay.build_snapshot(ROWS, STEPS, version=2)   # 777777 not ours
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context(viewport={"width": 1000, "height": 600})
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html", body=page))
+        pg = ctx.new_page()
+        pg.goto("https://learner360.wgu.edu/caseload")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(500)
+        btn = pg.evaluate("""() => { const b = document.querySelector('thead th[data-cn] button');
+            if (!b) return null;
+            const r = b.getBoundingClientRect(),
+                  w = document.querySelector('.table-wrapper').getBoundingClientRect();
+            return {text: b.textContent.trim(), right: r.right, wrapRight: w.right,
+                    pos: getComputedStyle(b.closest('th')).position}; }""")
+        assert btn and btn["text"] == "⚙ Columns", btn
+        assert btn["pos"] == "sticky" and btn["right"] <= btn["wrapRight"] + 1, btn
+        b.close()
+
+
 def test_pronoun_edit_round_trip():
     import types
     from playwright.sync_api import sync_playwright
