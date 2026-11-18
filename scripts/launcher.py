@@ -22571,6 +22571,37 @@ class App:
         ).pack(fill="x", padx=32, pady=(0, 14))
 
         dialog = tab_caseload
+        # Background features (the first-run "Choose what runs in the
+        # background" checklist). Several of its switches are also fields in
+        # this dialog, so Settings is saved and closed first — otherwise this
+        # dialog's Save would write its older copies back over the choices.
+        def _open_features_from_settings() -> None:
+            _do_save()
+            try:
+                still_open = bool(win.winfo_exists())
+            except Exception:
+                still_open = False
+            if not still_open:            # saved + closed (not a validation stop)
+                self.root.after(150, self._show_features_dialog)
+        feat_row = ctk.CTkFrame(dialog, fg_color=("gray92", "gray18"),
+                                corner_radius=6)
+        feat_row.pack(fill="x", padx=16, pady=(8, 12))
+        ctk.CTkLabel(
+            feat_row, text="Background features",
+            font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=12, pady=(8, 0))
+        ctk.CTkLabel(
+            feat_row,
+            text=("What runs in the background, what each adds and how long it "
+                  "takes — the same checklist new users see on first run. "
+                  "Saves these Settings first."),
+            font=ctk.CTkFont(size=11), text_color=("gray35", "gray70"),
+            wraplength=520, justify="left", anchor="w",
+        ).pack(fill="x", padx=12, pady=(0, 4))
+        ctk.CTkButton(
+            feat_row, text="⚙  Choose what runs in the background…",
+            command=_open_features_from_settings,
+        ).pack(anchor="w", padx=12, pady=(0, 10))
         # Caseload Tool view section — status + setup button.
         ctk.CTkLabel(
             dialog, text="Salesforce Caseload view",
