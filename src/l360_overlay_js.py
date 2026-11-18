@@ -22,7 +22,7 @@ _OVERLAY_JS = r"""
     .forEach(i => i.addEventListener('error', () => { i.remove(); if (onFail) onFail(); }));
 
   const S = { data: null, v: -1, on: true, queued: false, matched: 0,
-              outbox: [], colTables: new Set() };
+              outbox: [], colTables: new Set(), colRev: 0, nativeCat: [] };
   try { S.on = localStorage.getItem('cnOverlayOn') !== '0'; } catch (e) {}
 
   // ---- design tokens (matched to Learner360's palette) -------------------
@@ -294,18 +294,54 @@ _OVERLAY_JS = r"""
 
   // ---- extra list columns (⚙ Columns) -----------------------------------
   // Learner360's list is a plain Angular Material table (probed: no virtual
-  // scroll, 20 rows/page). We append real <th>/<td> cells AFTER Angular's
-  // own (its cell outlet inserts before its anchor, so ours stay last),
-  // borrowing the native cell classes so they look native. Every body row
-  // gets cells (blank when not ours) so the columns line up.
+  // scroll, 20 rows/page). We add real <th>/<td> cells borrowing the native
+  // cell classes so they look native. Angular's cell outlet inserts before
+  // its anchor (the row's end), so cells we put elsewhere stay put. Layout:
+  //   • "L360:<field>" entries are copies of Learner360's own columns (label
+  //     + sorting from Learner360; the original is hidden);
+  //   • with "hide others" on, Learner360's columns not in the layout are
+  //     hidden too (display only) — the first column (Name) always stays;
+  //   • the layout goes right after Name when it uses Learner360 columns or
+  //     hides others, else at the end. ⚙ Columns stays pinned right.
+  // Every body row gets cells (blank when not ours) so the columns line up.
   const KIND_STYLE = {
     pass: 'background:#e3f4ea;color:#135c32;border:1px solid #9fd3b1',
     fail: 'background:#fdecea;color:#8a1f14;border:1px solid #f2b1aa',
     mid: 'background:#fff4dc;color:#7a5600;border:1px solid #f0d08b' };
   const stripCols = cn => String(cn || '').split(/\s+/).filter(t => t &&
     !/^(cdk-column-|mat-column-|mat-sort-header|cdk-.*sticky|mat-.*sticky)/.test(t)).join(' ');
+  const NOT_OURS = 'Not on your caseload — CaseloadNotes has no data for this student.';
+  let tableSeq = 0;
+  const hideRules = new Map();          // table id → [hidden native fields]
+  const hideStyle = document.createElement('style');
+  hideStyle.setAttribute('data-cn', 'hide');
 
-  function colTd(proto, v) {
+  // Learner360's own columns in a header row: [{f: field, label, th}].
+  function nativeCols(hr) {
+    const out = [];
+    for (const th of hr.querySelectorAll(':scope > th:not([data-cn])')) {
+      const m = /(?:^|\s)cdk-column-([A-Za-z0-9_]+)/.exec(th.className || '');
+      if (m) out.push({ f: m[1], th,
+        label: (th.textContent || '').trim().replace(/\s+/g, ' ') || m[1] });
+    }
+    return out;
+  }
+
+  function applyHide(table, fields) {
+    if (!table.dataset.cnT) table.dataset.cnT = String(++tableSeq);
+    const id = table.dataset.cnT;
+    const cur = (hideRules.get(id) || []).join(',');
+    if (cur === fields.join(',')) return;
+    if (fields.length) hideRules.set(id, fields); else hideRules.delete(id);
+    let css = '';
+    for (const [tid, fs] of hideRules)
+      css += fs.map(f => `table[data-cn-t="${tid}"] > * > tr > .cdk-column-${f}`).join(',\n')
+        + ' { display: none !important; }\n';
+    hideStyle.textContent = css;
+    if (css && !hideStyle.isConnected) (document.head || document.documentElement).appendChild(hideStyle);
+  }
+
+  function colTd(proto, v, why, pronSid, quiet) {
     const td = document.createElement('td');
     td.setAttribute('data-cn', 'col');
     td.className = stripCols(proto.className);
@@ -317,6 +353,33 @@ _OVERLAY_JS = r"""
         + 'white-space:nowrap;font-size:12px';
       if (v[2]) td.title = v[2];
       td.appendChild(span);
+    } else if (why && quiet) {
+      td.title = why;                  // not ours: blank, the hover says why
+    } else if (why) {
+      const span = document.createElement('span');
+      span.textContent = '—';
+      span.style.cssText = 'color:#a7b2c0;font-size:12px';
+      td.title = why;
+      td.appendChild(span);
+    }
+    if (pronSid) {
+      td.style.cursor = 'pointer';
+      td.addEventListener('click', ev => { ev.stopPropagation(); openPronMenu(td, pronSid); });
+    }
+    return td;
+  }
+
+  // A copy of one of Learner360's own cells (text + markup, our bits removed).
+  function mirrorTd(proto, src) {
+    const td = document.createElement('td');
+    td.setAttribute('data-cn', 'col');
+    td.className = stripCols((src || proto).className);
+    if (src) {
+      for (const n of src.childNodes) {
+        const c = n.cloneNode(true);
+        if (c.querySelectorAll) c.querySelectorAll('[data-cn]').forEach(x => x.remove());
+        td.appendChild(c);
+      }
     }
     return td;
   }
@@ -325,26 +388,47 @@ _OVERLAY_JS = r"""
     const show = !!(S.on && S.data);
     const cols = show ? (S.data.list_cols || []) : [];
     const sets = show ? (S.data.list_sets || {}) : {};
-    const sig = show ? S.v + '|' + cols.map(c => c[0]).join(',') + '|'
-      + (S.data.list_set || '') + '|' + Object.keys(sets).join('/') : '';
+    const hide = show && !!S.data.list_hide_native;
     const hr = table.tHead && table.tHead.rows[0];
+    const natives = hr ? nativeCols(hr) : [];
+    const byF = Object.fromEntries(natives.map(n => [n.f, n]));
+    if (natives.length) S.nativeCat = natives.slice(1).map(n => ['L360:' + n.f, n.label]);
+    const moved = new Set(cols.filter(c => c[0].startsWith('L360:')).map(c => c[0].slice(5)));
+    applyHide(table, show ? natives.slice(1).filter(n => hide || moved.has(n.f)).map(n => n.f) : []);
+    const front = show && (hide || moved.size > 0);
+    const nameF = natives[0] ? natives[0].f : '';
+    const sorts = [...moved].map(f => byF[f] ? (byF[f].th.getAttribute('aria-sort') || '') : '').join(',');
+    const sig = show ? S.v + '|' + cols.map(c => c[0]).join(',') + '|'
+      + (S.data.list_set || '') + '|' + Object.keys(sets).join('/') + '|' + hide
+      + '|' + S.colRev + '|' + sorts : '';
     if (hr && (hr.dataset.cnCols || '') !== sig) {
       hr.querySelectorAll(':scope > [data-cn="col"]').forEach(x => x.remove());
       const proto = hr.querySelector(':scope > th:not([data-cn])');
       if (show && proto) {
-        for (const [, label] of cols) {
+        const anchor = front && byF[nameF] ? byF[nameF].th.nextSibling : null;
+        for (const [k, label] of cols) {
           const th = document.createElement('th');
           th.setAttribute('data-cn', 'col');
           th.className = stripCols(proto.className);
-          th.textContent = label;
-          th.title = 'CaseloadNotes column';
-          hr.appendChild(th);
+          const nat = k.startsWith('L360:') ? byF[k.slice(5)] : null;
+          if (nat) {
+            const dir = nat.th.getAttribute('aria-sort');
+            th.textContent = nat.label + (dir === 'ascending' ? ' ▲' : dir === 'descending' ? ' ▼' : '');
+            th.title = 'Learner360 column — click to sort';
+            th.style.cursor = 'pointer';
+            th.addEventListener('click', ev => { ev.stopPropagation(); nat.th.click(); });
+          } else {
+            th.textContent = label || k.replace(/^L360:/, '');
+            th.title = k.startsWith('L360:') ? 'Learner360 isn’t showing this column on this page'
+              : 'CaseloadNotes column';
+          }
+          hr.insertBefore(th, anchor);
         }
         const g = document.createElement('th');
         g.setAttribute('data-cn', 'col');
         g.className = stripCols(proto.className);
         // Pinned to the right edge of the table's scroll area, so it's
-        // visible without scrolling across Learner360's ~18 columns.
+        // visible without scrolling across Learner360's columns.
         g.style.cssText = 'position:sticky;right:0;z-index:3;background:#fff;'
           + 'box-shadow:-6px 0 8px -6px rgba(0,40,85,.25);white-space:nowrap';
         g.innerHTML = `<button type="button" title="Choose CaseloadNotes columns"
@@ -378,18 +462,74 @@ _OVERLAY_JS = r"""
     for (const body of table.tBodies) {
       for (const tr of body.rows) {
         const re = rowEntry.get(tr);
-        const key = sig + '#' + (re ? re.k : '');
+        const nat = f => tr.querySelector(`:scope > td.cdk-column-${f}:not([data-cn])`);
+        const mirrorText = show ? [...moved].map(f => { const c = nat(f); return c ? c.textContent : ''; }).join('\u0001') : '';
+        const key = sig + '#' + (re ? re.k : '') + '#' + mirrorText;
         if ((tr.dataset.cnCols || '') === key) continue;
         tr.querySelectorAll(':scope > td[data-cn="col"]').forEach(x => x.remove());
         const proto = tr.querySelector(':scope > td:not([data-cn])');
         // Skip placeholder rows ("No data" spanning the table).
         if (show && proto && proto.colSpan <= 1) {
-          for (const [k] of cols) tr.appendChild(colTd(proto, re && (re.e.cols || {})[k]));
+          const nameTd = nameF ? nat(nameF) : null;
+          const anchor = front && nameTd ? nameTd.nextSibling : null;
+          const sid = re ? re.k.split(':')[0] : '';
+          for (const [k] of cols) {
+            let td;
+            if (k.startsWith('L360:')) td = mirrorTd(proto, nat(k.slice(5)));
+            else if (!re) td = colTd(proto, null, NOT_OURS, '', true);
+            else td = colTd(proto, (re.e.cols || {})[k], (re.e.why || {})[k],
+                            k === '@pron' ? sid : '');
+            tr.insertBefore(td, anchor);
+          }
           tr.appendChild(colTd(proto, null));          // under ⚙ Columns
         }
         tr.dataset.cnCols = key;
       }
     }
+  }
+
+  // ---- pronouns from the list (click a Pronouns cell) -------------------
+  const pronHost = document.createElement('div');
+  pronHost.setAttribute('data-cn', 'pronmenu');
+  const pronRoot = pronHost.attachShadow({ mode: 'open' });
+  function setListPronouns(sid, value) {
+    S.outbox.push({ type: 'pronouns', sid: sid, value: value });
+    for (const e of (S.data.students || {})[sid] || []) {          // optimistic
+      e.pronouns = value;
+      e.cols = e.cols || {}; e.why = e.why || {};
+      if (value) { e.cols['@pron'] = [value, '', 'Click to change']; delete e.why['@pron']; }
+      else { delete e.cols['@pron']; e.why['@pron'] = 'Pronouns not set — click to set them.'; }
+    }
+    S.colRev++;
+    panelKey = '';
+    schedule();
+  }
+  function openPronMenu(td, sid) {
+    const r = td.getBoundingClientRect();
+    pronRoot.innerHTML = `<style>
+      :host { all: initial; }
+      .m { position: fixed; z-index: 2147483002; background: #fff; border: 1px solid #d5dde8;
+        border-radius: 8px; box-shadow: 0 6px 20px rgba(0,40,85,.22); padding: 4px;
+        font: 13px/1.3 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: #1b2a3a; }
+      button { display: block; width: 100%; text-align: left; border: none; background: none;
+        padding: 5px 10px; border-radius: 5px; cursor: pointer; font: inherit; color: inherit; }
+      button:hover { background: #eef2f7; }
+      .clr { color: #8a1f14; }
+    </style><div class="m" role="menu">${PRON_CHOICES.map(c =>
+      `<button data-v="${esc(c)}">${esc(c)}</button>`).join('')}
+      <button class="clr" data-v="">Clear</button></div>`;
+    const m = pronRoot.querySelector('.m');
+    m.style.left = Math.round(Math.min(r.left, innerWidth - 140)) + 'px';
+    m.style.top = Math.round(Math.min(r.bottom + 2, innerHeight - 160)) + 'px';
+    if (!pronHost.isConnected) document.body.appendChild(pronHost);
+    const close = () => { pronHost.remove(); document.removeEventListener('click', outside, true); };
+    const outside = ev => { if (!ev.composedPath().includes(pronHost)) close(); };
+    setTimeout(() => document.addEventListener('click', outside, true), 0);
+    m.querySelectorAll('button').forEach(b => b.addEventListener('click', ev => {
+      ev.stopPropagation();
+      close();
+      setListPronouns(sid, b.dataset.v);
+    }));
   }
 
   const pickHost = document.createElement('div');
@@ -401,13 +541,14 @@ _OVERLAY_JS = r"""
     .back { position: fixed; inset: 0; background: rgba(0,20,45,.25);
       z-index: 2147483001; display: flex; align-items: center; justify-content: center;
       font: 13px/1.35 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: #1b2a3a; }
-    .dlg { background: #fff; border-radius: 10px; width: 440px; max-width: 92vw;
-      max-height: 78vh; display: flex; flex-direction: column;
+    .dlg { background: #fff; border-radius: 10px; width: 460px; max-width: 92vw;
+      max-height: 82vh; display: flex; flex-direction: column;
       box-shadow: 0 12px 40px rgba(0,40,85,.3); }
     .hd { padding: 12px 14px 6px; font-weight: 700; color: #002855;
       display: flex; align-items: center; gap: 8px; }
     .owl { width: 22px; height: 22px; border-radius: 50%; object-fit: cover; }
     .sub { padding: 0 14px 6px; color: #5b6b7f; font-size: 12px; }
+    .hide { padding: 0 14px 8px; }
     .q { margin: 0 14px 6px; height: 28px; border: 1px solid #d5dde8;
       border-radius: 6px; padding: 0 8px; font: inherit; }
     .ls { overflow: auto; padding: 0 14px; flex: 1; }
@@ -415,7 +556,7 @@ _OVERLAY_JS = r"""
       text-transform: uppercase; letter-spacing: .04em; }
     label { display: flex; gap: 6px; align-items: center; padding: 2px 0; cursor: pointer; }
     label .n { margin-left: auto; color: #8a97a8; font-size: 11px; }
-    .ft { display: flex; gap: 6px; padding: 10px 14px; border-top: 1px solid #eef2f7; }
+    .ft { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px; border-top: 1px solid #eef2f7; }
     .ft .sp { flex: 1; }
     button { height: 28px; padding: 0 12px; border-radius: 6px; cursor: pointer;
       border: 1px solid #d5dde8; background: #fff; font: inherit; }
@@ -431,24 +572,31 @@ _OVERLAY_JS = r"""
       padding: 0 8px; font: inherit; }
   `;
 
+  // Labels for every key the picker / sets can hold (incl. Learner360's own).
+  const allLabels = () => Object.assign(Object.fromEntries(S.data.list_catalog || []),
+    Object.fromEntries((S.nativeCat || []).map(([k, d]) => [k, 'Learner360 · ' + d])));
+  const knownKey = (k, label) => k in label || k.startsWith('L360:');
+
   // Apply a saved column set (header switcher): optimistic, app saves it.
   function useSet(name) {
     const sets = S.data.list_sets || {};
     if (!(name in sets)) return;
-    const label = Object.fromEntries(S.data.list_catalog || []);
+    const label = allLabels();
     S.outbox.push({ type: 'list_set_use', name: name });
-    S.data.list_cols = sets[name].filter(k => k in label).map(k => [k, label[k]]);
+    S.data.list_cols = sets[name].filter(k => knownKey(k, label)).map(k => [k, label[k] || '']);
     S.data.list_set = name;
     schedule();
   }
 
   function openColPicker() {
     if (!S.data) return;
+    const label = allLabels();
+    const nat = (S.nativeCat || []).map(([k, d]) => [k, d]);
     const cat = S.data.list_catalog || [];
-    const label = Object.fromEntries(cat);
     const sets = S.data.list_sets || {};
     let setName = S.data.list_set || '';
-    let chosen = (S.data.list_cols || []).map(c => c[0]).filter(k => k in label);
+    let hide = !!S.data.list_hide_native;
+    let chosen = (S.data.list_cols || []).map(c => c[0]).filter(k => knownKey(k, label));
     const MAX = 12;
     const row = ([k, d]) => {
       const i = chosen.indexOf(k);
@@ -456,9 +604,11 @@ _OVERLAY_JS = r"""
     };
     const draw = q => {
       const m = ([, d]) => !q || d.toLowerCase().includes(q);
+      const ln = nat.filter(m);
       const bi = cat.filter(([k]) => k.startsWith('@')).filter(m);
       const fl = cat.filter(([k]) => !k.startsWith('@')).filter(m);
-      return (bi.length ? `<div class="grp">CaseloadNotes</div>${bi.map(row).join('')}` : '')
+      return (ln.length ? `<div class="grp">Learner360 columns</div>${ln.map(row).join('')}` : '')
+        + (bi.length ? `<div class="grp">CaseloadNotes</div>${bi.map(row).join('')}` : '')
         + (fl.length ? `<div class="grp">Caseload fields</div>${fl.map(row).join('')}` : '');
     };
     const setOpts = () => `<option value="">(unsaved)</option>` + Object.keys(sets).map(n =>
@@ -467,12 +617,13 @@ _OVERLAY_JS = r"""
       <div class="hd">${owlImg('owl')}CaseloadNotes columns</div>
       <div class="sets"><span>Set</span><select class="set">${setOpts()}</select>
         <button data-b="del" title="Delete this saved set (the columns on screen stay)">Delete set</button></div>
-      <div class="sub">Added to the right of Learner360's own columns, in the order you tick them (max ${MAX}).</div>
+      <label class="hide"><input type="checkbox" class="hn"${hide ? ' checked' : ''}> Hide Learner360 columns I haven't picked</label>
+      <div class="sub">Shown after Name, in the order you tick them (max ${MAX}). Learner360 columns you tick move into that order.</div>
       <input class="q" placeholder="Search fields…">
       <div class="ls">${draw('')}</div>
       <div class="asnew" hidden><input class="nm" maxlength="40" placeholder="Name for this set, e.g. OA review">
         <button class="pri" data-b="asok">Save set</button><button data-b="ascancel">✕</button></div>
-      <div class="ft"><button data-b="clear">Clear all</button><span class="sp"></span>
+      <div class="ft"><button data-b="clear">Clear all</button><button data-b="reset" title="Name, preferred name, pronouns, ID, active course, last ACI contact, pre-A, OA attempts — Learner360's other columns hidden">Reset to recommended</button><span class="sp"></span>
         <button data-b="cancel">Cancel</button><button data-b="saveas">Save as new set…</button>
         <button class="pri" data-b="save"></button></div></div></div>`;
     if (!pickHost.isConnected) document.body.appendChild(pickHost);
@@ -487,19 +638,21 @@ _OVERLAY_JS = r"""
     sync();
     const close = () => { pickHost.remove(); };
     const commit = name => {
-      S.outbox.push({ type: 'list_cols', keys: chosen, set: name || null });
+      S.outbox.push({ type: 'list_cols', keys: chosen, set: name || null, hide_native: hide });
       // Optimistic: headers now (the column keys are part of each cell's
       // signature, so rows redraw); values arrive with the next snapshot.
       if (name) sets[name] = chosen.slice();
       S.data.list_sets = sets;
       S.data.list_set = name || '';
-      S.data.list_cols = chosen.map(k => [k, label[k]]);
+      S.data.list_hide_native = hide;
+      S.data.list_cols = chosen.map(k => [k, label[k] || '']);
       close();
       schedule();
     };
+    $('.hn').addEventListener('change', ev => { hide = ev.target.checked; });
     sel.addEventListener('change', () => {
       setName = sel.value;
-      if (setName) chosen = (sets[setName] || []).filter(k => k in label);
+      if (setName) chosen = (sets[setName] || []).filter(k => knownKey(k, label));
       redraw();
       sync();
     });
@@ -517,6 +670,12 @@ _OVERLAY_JS = r"""
     });
     $('[data-b="cancel"]').addEventListener('click', close);
     $('[data-b="clear"]').addEventListener('click', () => { chosen = []; redraw(); });
+    $('[data-b="reset"]').addEventListener('click', () => {
+      chosen = (S.data.list_default || []).slice();
+      hide = true;
+      $('.hn').checked = true;
+      redraw();
+    });
     $('[data-b="save"]').addEventListener('click', () => commit(setName));
     $('[data-b="saveas"]').addEventListener('click', () => {
       $('.asnew').hidden = false;

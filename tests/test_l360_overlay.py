@@ -446,7 +446,7 @@ def test_list_column_values():
     assert c["@pre"][:2] == ["70% (2)", "pass"]
     assert c["LastActionType"][0] == "Email"
     assert snap["students"]["999888"][0]["cols"] == {}
-    assert snap["list_catalog"][0] == ["@oa", "OA attempts"]
+    assert snap["list_catalog"][0] == ["@pron", "Pronouns"]
     # No columns chosen → no per-entry column data at all.
     plain = l360_overlay.build_snapshot(ROWS, STEPS, version=3)
     assert plain["list_cols"] == [] and "cols" not in plain["students"]["123456"][0]
@@ -500,7 +500,7 @@ def test_list_columns_in_material_table():
             .find(x => x.value === '@pre'); i.click(); }}""")
         pg.evaluate(f"() => {proot}.querySelector('[data-b=save]').click()")
         out = pg.evaluate("window.__cnOverlay.takeOutbox()")
-        assert out == [{"type": "list_cols", "set": None,
+        assert out == [{"type": "list_cols", "set": None, "hide_native": False,
                         "keys": ["@oa", "@oa1", "LastActionType", "@pre"]}], out
         pg.wait_for_timeout(300)
         heads = pg.evaluate("() => [...document.querySelectorAll('thead th[data-cn]')].map(t => t.textContent.trim())")
@@ -584,7 +584,8 @@ def test_list_column_sets_switch_save_delete():
             .find(x => x.value === '@pre').click()""")
         pg.evaluate(f"() => {proot}.querySelector('[data-b=save]').click()")
         assert pg.evaluate("window.__cnOverlay.takeOutbox()") == [
-            {"type": "list_cols", "keys": ["LastActionType", "@pre"], "set": "Outreach"}]
+            {"type": "list_cols", "keys": ["LastActionType", "@pre"], "set": "Outreach",
+         "hide_native": False}]
         # Save as new set…
         pg.wait_for_timeout(300)
         pg.evaluate("() => document.querySelector('thead button').click()")
@@ -594,7 +595,8 @@ def test_list_column_sets_switch_save_delete():
             n.value = '  Weekly   check '; }}""")
         pg.evaluate(f"() => {proot}.querySelector('[data-b=asok]').click()")
         assert pg.evaluate("window.__cnOverlay.takeOutbox()") == [
-            {"type": "list_cols", "keys": ["LastActionType", "@pre"], "set": "Weekly check"}]
+            {"type": "list_cols", "keys": ["LastActionType", "@pre"], "set": "Weekly check",
+         "hide_native": False}]
         pg.wait_for_timeout(300)
         opts = pg.evaluate("() => [...document.querySelectorAll('thead select option')].map(o => o.value)")
         assert "Weekly check" in opts, opts
@@ -766,6 +768,193 @@ def test_owl_badge_on_wgu_logo():
             assert "off" in st[0] and st[1] == 0, st
             ctx.close()
         b.close()
+
+
+WIDE_PAGE = """<!doctype html><html><body><div class="table-wrapper">
+<table class="mat-mdc-table"><thead><tr>
+<th class="mat-mdc-header-cell cdk-column-name">Name</th>
+<th class="mat-mdc-header-cell cdk-column-studentId" aria-sort="ascending">Id</th>
+<th class="mat-mdc-header-cell cdk-column-program">Program</th>
+<th class="mat-mdc-header-cell cdk-column-courses">Active Courses</th>
+<th class="mat-mdc-header-cell cdk-column-preferredName">Preferred Name</th>
+</tr></thead><tbody id="b">
+<tr><td class="mat-mdc-cell cdk-column-name"><a>Pat Lee</a></td>
+<td class="mat-mdc-cell cdk-column-studentId">000123456</td>
+<td class="mat-mdc-cell cdk-column-program">BSCS</td>
+<td class="mat-mdc-cell cdk-column-courses">C769</td>
+<td class="mat-mdc-cell cdk-column-preferredName">Pat</td></tr>
+<tr><td class="mat-mdc-cell cdk-column-name"><a>Not Mine</a></td>
+<td class="mat-mdc-cell cdk-column-studentId">000555555</td>
+<td class="mat-mdc-cell cdk-column-program">BSIT</td>
+<td class="mat-mdc-cell cdk-column-courses">C769</td>
+<td class="mat-mdc-cell cdk-column-preferredName">Nim</td></tr>
+</tbody></table></div></body></html>"""
+
+
+def test_why_empty_reasons():
+    W = l360_overlay.why_empty
+    off = {}
+    assert "Course scan" in W("@oa", None, "C949", off)
+    assert "click to set" in W("@pron", None, "C949", off)
+    on = {"course_scan": True}
+    assert W("@oa", None, "C949", on) == "No OA attempts recorded for C949."
+    assert "performance-assessed" in W("@oa", None, "C769",
+                                       {"types": {"C769": {"oa": False}}})
+    assert "Course watch" in W("@weak", {"oa": {}}, "C949", on)
+    assert W("@oa3", {"oa": {"used": 2}}, "C949", on) == "No attempt 3 yet."
+    assert "Academic activity" in W("DaysSinceCourseActivity", None, "C769", off)
+    assert "Degree plans" in W("NextPlannedCourse", None, "C769", off)
+    assert W("NextPlannedCourse", None, "C769", {"plans": True}).startswith("Blank")
+    assert "course scan" in W("CB:TermSAP", None, "C769", off).lower()
+
+
+def test_default_layout_hides_moves_and_explains():
+    from playwright.sync_api import sync_playwright
+    rows = [dict(ROWS[0], MyCourseContact="2026-11-01", Pronouns="")]
+    snap = l360_overlay.build_snapshot(
+        rows, STEPS, version=4, extras={"assess": {}},
+        list_cols=l360_overlay.DEFAULT_LIST_COLS, list_hide_native=True,
+        features={})
+    e = snap["students"]["123456"][0]
+    assert "@pre" in e["why"] and "Course scan" in e["why"]["@pre"]
+    assert "@pron" in e["why"] and e["cols"]["MyCourseContact"][0] == "2026-11-01"
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context(viewport={"width": 1400, "height": 600})
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html",
+                                      body=WIDE_PAGE))
+        pg = ctx.new_page()
+        pg.goto("https://learner360.wgu.edu/caseload")
+        pg.evaluate("""() => { window.__sorts = 0; document.querySelector(
+            'th.cdk-column-studentId').addEventListener('click', () => window.__sorts++); }""")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(600)
+        visible = pg.evaluate("""() => [...document.querySelectorAll('thead th')]
+            .filter(t => getComputedStyle(t).display !== 'none').map(t => t.textContent.trim())""")
+        aci = dict(snap["list_catalog"])["MyCourseContact"]
+        assert visible == ["Name", "Preferred Name", "Pronouns", "Id ▲", "Active Courses",
+                           aci, "Pre-A", "OA attempts", "⚙ Columns (7)"], visible
+        cells = pg.evaluate("""() => [...document.querySelectorAll('#b tr')].map(tr =>
+            [...tr.children].filter(t => getComputedStyle(t).display !== 'none')
+              .map(t => [t.textContent.trim(), t.title]))""")
+        mine, other = cells
+        assert [c[0] for c in mine[:6]] == ["Pat Lee", "Pat", "—", "000123456", "C769",
+                                            "2026-11-01"], mine
+        assert mine[1][0] == "Pat" and mine[3][0] == "000123456" and mine[4][0] == "C769"
+        assert "click to set" in mine[2][1] and "Course scan" in mine[6][1], mine
+        assert other[1][0] == "Nim" and other[3][0] == "000555555", other   # copies for all rows
+        assert other[2][1].startswith("Not on your caseload"), other
+        # Program is hidden; its data is still in the DOM (untouched).
+        assert pg.evaluate("() => getComputedStyle(document.querySelector('td.cdk-column-program')).display") == "none"
+        # Clicking a moved column's header sorts in Learner360.
+        pg.evaluate("""() => [...document.querySelectorAll('thead th[data-cn]')]
+            .find(t => t.textContent.startsWith('Id')).click()""")
+        assert pg.evaluate("window.__sorts") == 1
+        # Click-to-set pronouns from the list.
+        pg.evaluate("""() => { const tr = document.querySelector('#b tr');
+            [...tr.children].filter(t => t.dataset.cn === 'col')[1].click(); }""")
+        pg.wait_for_timeout(200)
+        pg.evaluate("""() => [...document.querySelector('[data-cn=pronmenu]').shadowRoot
+            .querySelectorAll('button')].find(b => b.dataset.v === 'they/them').click()""")
+        assert pg.evaluate("window.__cnOverlay.takeOutbox()") == [
+            {"type": "pronouns", "sid": "123456", "value": "they/them"}]
+        pg.wait_for_timeout(300)
+        pron = pg.evaluate("""() => [...document.querySelector('#b tr').children]
+            .filter(t => t.dataset.cn === 'col')[1].textContent.trim()""")
+        assert pron == "they/them", pron
+        # Overlay off → Learner360's own columns come back, ours go.
+        pg.evaluate("() => document.querySelector('[data-cn=pill]').shadowRoot.querySelector('.pill').click()")
+        pg.wait_for_timeout(400)
+        assert pg.evaluate("() => getComputedStyle(document.querySelector('td.cdk-column-program')).display") != "none"
+        assert pg.evaluate("() => document.querySelectorAll('[data-cn=col]').length") == 0
+        b.close()
+
+
+def test_picker_reset_to_recommended_and_learner360_group():
+    from playwright.sync_api import sync_playwright
+    snap = l360_overlay.build_snapshot(ROWS, STEPS, version=5, list_cols=["@oa"])
+    with sync_playwright() as p:
+        try:
+            b = p.chromium.launch()
+        except Exception:
+            b = p.chromium.launch(channel="msedge")
+        ctx = b.new_context()
+        ctx.add_init_script(OVERLAY_JS)
+        ctx.route("https://learner360.wgu.edu/**",
+                  lambda r: r.fulfill(status=200, content_type="text/html",
+                                      body=WIDE_PAGE))
+        pg = ctx.new_page()
+        pg.goto("https://learner360.wgu.edu/caseload")
+        pg.evaluate("d => window.__cnOverlay.setData(d)", snap)
+        pg.wait_for_timeout(400)
+        pg.evaluate("() => document.querySelector('thead th[data-cn] button, thead button').click()")
+        pg.wait_for_timeout(200)
+        proot = "document.querySelector('[data-cn=colpick]').shadowRoot"
+        groups = pg.evaluate(f"() => [...{proot}.querySelectorAll('.grp')].map(g => g.textContent)")
+        assert groups[0] == "Learner360 columns", groups
+        opts = pg.evaluate(f"() => [...{proot}.querySelectorAll('input[type=checkbox]')].map(i => i.value)")
+        assert "L360:preferredName" in opts and "L360:name" not in opts     # Name always stays
+        pg.evaluate(f"() => {proot}.querySelector('[data-b=reset]').click()")
+        pg.evaluate(f"() => {proot}.querySelector('[data-b=save]').click()")
+        assert pg.evaluate("window.__cnOverlay.takeOutbox()") == [
+            {"type": "list_cols", "keys": l360_overlay.DEFAULT_LIST_COLS, "set": None,
+             "hide_native": True}]
+        b.close()
+
+
+def test_features_mapping():
+    import types
+    from src import features
+    st = types.SimpleNamespace(l360_overlay_enabled=False, l360_open_on_startup=False,
+                               l360_auto_roster_days=1, course_scan_auto=False,
+                               course_watch_enabled=False, l360_auto_momi_days=7,
+                               l360_auto_notes_days=7, l360_auto_activity_days=7,
+                               l360_auto_plan_days=7)
+    d = features.defaults()
+    assert d == {"l360": True, "roster": True, "course_scan": True,
+                 "course_watch": False, "momi": False, "notes": False,
+                 "activity": False, "plans": False}
+    changed = features.apply(st, d)
+    assert st.l360_overlay_enabled and st.l360_open_on_startup and st.course_scan_auto
+    assert st.l360_auto_roster_days == 1 and st.l360_auto_momi_days == 0
+    assert st.l360_auto_plan_days == 0 and not st.course_watch_enabled
+    assert "Team roster (Learner360)" not in changed          # already on
+    features.apply(st, {"plans": True})
+    assert st.l360_auto_plan_days == 7 and features.is_on(st, "plans")
+    assert features.why_off(st, "plans") is None and "MOMI" in features.why_off(st, "momi")
+
+
+def test_app_accepts_learner360_keys_and_hide_flag():
+    import importlib.util
+    import types
+    spec = importlib.util.spec_from_file_location(
+        "launcher_nk_test", os.path.join(ROOT, "scripts", "launcher.py"))
+    L = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(L)
+    real = L.save_settings
+    try:
+        L.save_settings = lambda s: None
+        st = types.SimpleNamespace(l360_list_cols="", l360_list_sets="",
+                                   l360_list_set="", l360_list_hide_native=False)
+        a = types.SimpleNamespace(
+            _caseload_rows=ROWS, _overlay_extras_cache={}, settings=st,
+            _LIST_SETS_MAX=20, _append_log=lambda m, **kw: None,
+            _push_overlay_snapshot=lambda: None)
+        for n in ("_list_sets", "_clean_list_keys", "_list_cols"):
+            setattr(a, n, getattr(L.App, n).__get__(a))
+        L.App._set_list_cols(a, ["L360:preferredName", "L360:bad key", "@pron",
+                                 "L360:x;drop"], None, True)
+        assert a._list_cols() == ["L360:preferredName", "@pron"]
+        assert st.l360_list_hide_native is True
+        L.App._set_list_cols(a, ["@oa"])                      # flag left as is
+        assert st.l360_list_hide_native is True
+    finally:
+        L.save_settings = real
 
 
 def test_pronoun_edit_round_trip():

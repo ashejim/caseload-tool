@@ -419,6 +419,13 @@ class Settings:
     # Comma/space separated course codes. Runs only when
     # course_watch_enabled (off by default — it's heavy background work).
     course_watch_enabled: bool = False
+    # Daily course scan (Salesforce "Any Course" roster) for MY caseload
+    # courses, independent of the inbox labeler — feeds OA attempts, pre-A
+    # taken and the CB · fields (src/features.py). Off unless chosen.
+    course_scan_auto: bool = False
+    # Learner360 list: hide Learner360's own columns that aren't in the chosen
+    # layout (display only), so the CaseloadNotes layout is all you see.
+    l360_list_hide_native: bool = False
     # Courses last chosen in the viewer's "👥 Course cohort" view.
     cohort_view_courses: str = ""
     # Extra caseload columns shown in the Learner360 student panel (JSON list

@@ -6372,6 +6372,10 @@ class CaseloadPanel:
         if q.lower().startswith(("l360discover", "1360discover")):
             self.app._l360_discover("stop" not in q.lower())
             return "break"
+        # "features:" — the background-features checklist (❔ Help has it too).
+        if q.lower().startswith("features"):
+            self.app._show_features_dialog()
+            return "break"
         # "l360probe:" — log how the open Learner360 page is BUILT (tags /
         # roles / classes / layout + column header labels; no student data).
         if q.lower().startswith(("l360probe", "1360probe")):
@@ -10679,10 +10683,14 @@ class App:
             list_cols = self._list_cols()
             list_sets = self._list_sets()
             list_set = getattr(self.settings, "l360_list_set", "") or ""
+            hide_native = bool(getattr(self.settings, "l360_list_hide_native",
+                                       False))
+            feats = self._overlay_feature_flags()
             first = l360_overlay.build_snapshot(
                 rows, step_cols, version=ver, extras=self._overlay_extras_cache,
                 fields=fields, list_cols=list_cols, list_sets=list_sets,
-                list_set=list_set)
+                list_set=list_set, list_hide_native=hide_native,
+                features=feats)
             self.worker.set_overlay_snapshot(first)
             # One diagnostic line per session: how much the overlay gets.
             ents = [e for v in first["students"].values() for e in v]
@@ -10706,6 +10714,7 @@ class App:
                     ax = assess_summary.load([r.get("StudentID") for r in rows])
                     ex["uuid_map"].update(ax["uuid_map"])
                     ex["assess"], ex["cohort"] = ax["assess"], ax["cohort"]
+                    ex["types"] = ax.get("types") or {}
                     # Caseload-browser fields for the panel's ⚙ Fields picker
                     # (stays app-side; only chosen values go to the page).
                     import json as _json
@@ -10729,7 +10738,9 @@ class App:
                                                 extras=ex, fields=fields,
                                                 list_cols=list_cols,
                                                 list_sets=list_sets,
-                                                list_set=list_set))
+                                                list_set=list_set,
+                                                list_hide_native=hide_native,
+                                                features=feats))
 
             threading.Thread(target=work, daemon=True,
                              name="overlay-extras").start()
@@ -10753,7 +10764,8 @@ class App:
                     self._set_panel_fields(a.get("keys"))
                     continue
                 if isinstance(a, dict) and a.get("type") == "list_cols":
-                    self._set_list_cols(a.get("keys"), a.get("set"))
+                    self._set_list_cols(a.get("keys"), a.get("set"),
+                                        a.get("hide_native"))
                     continue
                 if isinstance(a, dict) and a.get("type") == "list_set_use":
                     self._use_list_set(a.get("name"))
@@ -10874,26 +10886,46 @@ class App:
         return {str(n): [str(k) for k in ks if isinstance(k, str)]
                 for n, ks in v.items() if isinstance(ks, list)}
 
+    def _overlay_feature_flags(self) -> dict:
+        """Which background features have data for the Learner360 list's
+        "why is this empty?" hovers (src/features.py keys)."""
+        from src import features
+        from src.inbox_labeler import ROSTER_PATH
+        try:
+            roster = ROSTER_PATH.exists()
+        except Exception:
+            roster = False
+        s = self.settings
+        return {"course_scan": roster or features.is_on(s, "course_scan"),
+                "course_watch": features.is_on(s, "course_watch"),
+                "activity": features.is_on(s, "activity"),
+                "plans": features.is_on(s, "plans")}
+
     def _clean_list_keys(self, keys) -> list:
-        """Known column keys (built-ins + caseload columns), de-duplicated,
-        picked order, max LIST_MAX."""
+        """Known column keys (built-ins, caseload columns and Learner360's own
+        "L360:<field>"), de-duplicated, picked order, max LIST_MAX."""
         from src import l360_overlay
         valid = {k for k, _d in l360_overlay.list_catalog(
             self._caseload_rows or [],
             getattr(self, "_overlay_extras_cache", None) or {})}
         seen, out = set(), []
         for k in keys or []:
-            if isinstance(k, str) and k in valid and k not in seen:
+            if isinstance(k, str) and (k in valid or l360_overlay.NATIVE_RE.match(k)) \
+                    and k not in seen:
                 seen.add(k)
                 out.append(k)
         return out[:l360_overlay.LIST_MAX]
 
-    def _set_list_cols(self, keys, set_name=None) -> None:
+    def _set_list_cols(self, keys, set_name=None, hide_native=None) -> None:
         """⚙ Columns on Learner360's list: save the shown columns; with
         ``set_name`` also store them as that named set (new or updated) and
-        make it the active set, else the columns are 'unsaved'. Re-pushes."""
+        make it the active set, else the columns are 'unsaved'.
+        ``hide_native`` (when given) = hide Learner360's own columns that
+        aren't in the layout. Re-pushes."""
         import json as _json
         out = self._clean_list_keys(keys)
+        if hide_native is not None:
+            self.settings.l360_list_hide_native = bool(hide_native)
         name = " ".join(str(set_name or "").split())[:40]
         sets = self._list_sets()
         if name and (name in sets or len(sets) < self._LIST_SETS_MAX):
@@ -13600,17 +13632,20 @@ class App:
                                                 str(text or ""))]
 
     def _maybe_course_watch(self) -> None:
-        """Daily course watch (settings.course_watch_courses; blank = off):
-        due once a day, re-checks when due (max 6 h). Never raises."""
+        """Daily course watch (settings.course_watch_courses; blank = my
+        caseload courses): due once a day, re-checks when due (max 6 h).
+        Never raises."""
         rearm = 6 * 3600_000
         try:
             if getattr(self, "_offline", False):
                 return
             if not getattr(self.settings, "course_watch_enabled", False):
                 return                       # off — and don't re-arm
-            courses = self._parse_courses(
+            courses = (self._parse_courses(
                 getattr(self.settings, "course_watch_courses", ""))
-            if not courses:
+                or self._my_caseload_courses())
+            if not courses:                  # caseload not loaded yet
+                self.root.after(5 * 60_000, self._maybe_course_watch)
                 return
             from src import learner360 as l3
             last = history.course_watch_last()
@@ -13641,8 +13676,9 @@ class App:
             if manual:
                 self._append_log("Browser not ready yet — wait and try again.")
             return False
-        courses = courses or self._parse_courses(
+        courses = (courses or self._parse_courses(
             getattr(self.settings, "course_watch_courses", ""))
+            or self._my_caseload_courses())
         if not courses:
             if manual:
                 self._append_log("No courses to watch — add them in Settings ▸ "
@@ -22997,7 +23033,7 @@ class App:
         cw_var = ctk.StringVar(
             value=getattr(self.settings, "course_watch_courses", "") or "")
         cw_entry = ctk.CTkEntry(cw_row, width=200, textvariable=cw_var,
-                                placeholder_text="e.g. C949, C769, C964")
+                                placeholder_text="blank = my caseload courses")
         cw_entry.pack(side="left", padx=(8, 0))
         ctk.CTkButton(
             cw_row, text="Run now", width=100,
@@ -23645,13 +23681,13 @@ class App:
             # Learner360 degree plans + program mentor, days; 0 = off.
             self.settings.l360_auto_plan_days = _L3_LABELS.get(
                 l3p_var.get().strip(), 7)
-            # Course watch courses (blank = off).
+            # Course watch courses (blank = my caseload courses).
             _cw_new = ", ".join(self._parse_courses(cw_var.get()))
             _cw_was_on = bool(getattr(self.settings, "course_watch_enabled",
                                       False))
             self.settings.course_watch_courses = _cw_new
             self.settings.course_watch_enabled = bool(cw_on_var.get())
-            if self.settings.course_watch_enabled and _cw_new and not _cw_was_on:
+            if self.settings.course_watch_enabled and not _cw_was_on:
                 self.root.after(5000, self._maybe_course_watch)
             # Learner360 team roster (inbox labeler overlay), days; 0 = off.
             self.settings.l360_auto_roster_days = _L3R_LABELS.get(
@@ -24128,6 +24164,18 @@ class App:
             command=lambda: _launch_tour("batch"),
         ).pack(side="left", expand=True, fill="x", padx=(4, 0))
 
+        def _open_features() -> None:
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+            self.root.after(150, self._show_features_dialog)
+        ctk.CTkButton(
+            dialog, text="⚙  Background features…  (what runs, what it adds, "
+                         "how long it takes)",
+            height=32, command=_open_features, **SECONDARY_BTN_KWARGS,
+        ).pack(fill="x", padx=20, pady=(0, 10))
+
         body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=12, pady=(0, 4))
         body.grid_columnconfigure(0, weight=1)
@@ -24377,6 +24425,11 @@ class App:
             except Exception: pass
             try: dialog.destroy()
             except Exception: pass
+            # Step 2: which background features to run (with run times).
+            self.root.after(200, lambda: self._show_features_dialog(
+                first_run=True, on_close=_after_features))
+
+        def _after_features() -> None:
             # Offer the guided tour — but only once startup has finished (splash
             # down, caseload loaded), so it never pops over the splash or mid-
             # load. If startup already finished (user lingered here), offer now.
@@ -24394,6 +24447,121 @@ class App:
         dialog.protocol("WM_DELETE_WINDOW", _continue)
         # Don't bind Escape — this is the first-run welcome and
         # should be saved-and-closed via the explicit button.
+
+    def _show_features_dialog(self, first_run: bool = False,
+                              on_close=None) -> None:
+        """"Choose background features" (src/features.py): one checklist of
+        what CaseloadNotes can do in the background — what each adds and
+        roughly how long it takes. Step 2 of the first-run welcome (with the
+        recommended choices pre-ticked) and ❔ Help ▸ Background features…
+        (the current state). Saving applies the choices and kicks off newly
+        enabled jobs; a first run also sets up the recommended Learner360
+        column layout."""
+        from src import features
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Background features — Caseload Notes")
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.geometry("680x680")
+        dialog.lift()
+        dialog.focus_force()
+        dialog.after(150, lambda: (dialog.lift(), dialog.focus_force()))
+
+        ctk.CTkLabel(
+            dialog, text="Choose what runs in the background",
+            font=ctk.CTkFont(size=18, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(18, 4))
+        ctk.CTkLabel(
+            dialog,
+            text=("Each feature fills in more of CaseloadNotes. Background jobs "
+                  "wait whenever you're using the app. Times are approximate. "
+                  "Change these any time from ❔ Help ▸ Background features…"),
+            font=ctk.CTkFont(size=12), text_color=("gray35", "gray70"),
+            wraplength=630, justify="left", anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 10))
+
+        current = features.defaults() if first_run else {
+            f["key"]: features.is_on(self.settings, f["key"])
+            for f in features.FEATURES}
+        vars_ = {}
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        for f in features.FEATURES:
+            card = ctk.CTkFrame(body, fg_color=("gray92", "gray18"),
+                                corner_radius=6)
+            card.pack(fill="x", padx=4, pady=(0, 8))
+            v = ctk.BooleanVar(value=bool(current.get(f["key"])))
+            vars_[f["key"]] = v
+            ctk.CTkCheckBox(
+                card, variable=v, text=f["title"],
+                font=ctk.CTkFont(size=13, weight="bold"),
+            ).pack(anchor="w", padx=12, pady=(10, 2))
+            ctk.CTkLabel(
+                card, text=f["adds"], font=ctk.CTkFont(size=12),
+                wraplength=520, justify="left", anchor="w",
+            ).pack(fill="x", padx=42, pady=(0, 2))
+            ctk.CTkLabel(
+                card, text="⏱  " + f["time"], font=ctk.CTkFont(size=11),
+                text_color=("gray35", "gray70"), anchor="w",
+            ).pack(fill="x", padx=42, pady=(0, 10))
+
+        def _recommended() -> None:
+            for k, on in features.defaults().items():
+                vars_[k].set(on)
+
+        def _close() -> None:
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        def _save() -> None:
+            choices = {k: bool(v.get()) for k, v in vars_.items()}
+            was = {k: features.is_on(self.settings, k) for k in choices}
+            changed = features.apply(self.settings, choices)
+            if first_run:
+                # The recommended Learner360 layout: your columns, in order,
+                # with Learner360's other columns hidden (⚙ Columns undoes).
+                import json as _json
+                from src import l360_overlay
+                self.settings.l360_list_cols = _json.dumps(
+                    l360_overlay.DEFAULT_LIST_COLS)
+                self.settings.l360_list_hide_native = True
+            save_settings(self.settings)
+            _close()
+            if changed:
+                self._append_log("Background features: " + "; ".join(
+                    f"{f['title']} {'on' if choices[f['key']] else 'off'}"
+                    for f in features.FEATURES if f["title"] in changed) + ".")
+            # Start what was just switched on (the rest run on their timers).
+            new_on = {k for k, on in choices.items() if on and not was[k]}
+            if "l360" in new_on or first_run:
+                self._apply_overlay_setting()
+                if choices.get("l360"):
+                    self.root.after(5000, self._l360_startup_jobs)
+            if "course_scan" in new_on:
+                self._roster_rearm(15_000)
+            if "course_watch" in new_on:
+                self.root.after(30_000, self._maybe_course_watch)
+            if "roster" in new_on:
+                self.root.after(20_000, self._maybe_auto_l360_roster)
+            if on_close:
+                on_close()
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(4, 16), side="bottom")
+        ctk.CTkButton(btn_row, text="Continue" if first_run else "Save",
+                      command=_save, width=140).pack(side="right")
+        ctk.CTkButton(btn_row, text="Use recommended", command=_recommended,
+                      width=140, **SECONDARY_BTN_KWARGS).pack(side="left")
+        if first_run:
+            dialog.protocol("WM_DELETE_WINDOW", _save)
+        else:
+            ctk.CTkButton(btn_row, text="Cancel", command=_close, width=100,
+                          **SECONDARY_BTN_KWARGS).pack(side="right", padx=(0, 8))
+            dialog.protocol("WM_DELETE_WINDOW", _close)
+            dialog.bind("<Escape>", lambda e: _close())
 
     def _confirm_csv_email_present_or_proceed(
         self, scenario: ScenarioConfig,
@@ -27625,21 +27793,48 @@ class App:
         for c, n in by_course.most_common(8):
             self._append_log(f"  {c}: {n}")
 
+    def _my_caseload_courses(self) -> list:
+        """Course codes on my loaded caseload, sorted ([] before it loads)."""
+        return sorted({str(r.get("CourseCode") or "").strip().upper()
+                       for r in (self._caseload_rows or [])} - {""})
+
+    def _roster_rearm(self, ms: int) -> None:
+        """(Re)schedule the roster staleness check — one pending timer only."""
+        prev = getattr(self, "_roster_after", None)
+        if prev:
+            try:
+                self.root.after_cancel(prev)
+            except Exception:
+                pass
+        self._roster_after = self.root.after(ms, self._maybe_auto_roster_refresh)
+
     def _maybe_auto_roster_refresh(self) -> None:
-        """Startup staleness check: when the labeler is on and the roster
-        export is older than inbox_labeler_roster_max_age_hours (default 24,
-        0 = off), kick off the automated roster scan. Keeps identification
-        current against WGU's rolling course starts without the user
-        remembering to run 'rosterscan:'."""
+        """Staleness check, ~1 min after startup then every 6 h: when the
+        labeler is on, or the Course scan feature (course_scan_auto) is, and
+        the roster export is older than inbox_labeler_roster_max_age_hours
+        (default 24, 0 = off), kick off the automated roster scan. The labeler
+        scans its own course list; the Course scan alone scans MY caseload
+        courses. Keeps identification current against WGU's rolling course
+        starts without the user remembering to run 'rosterscan:'."""
+        rearm_ms = 6 * 3600_000
         try:
             if getattr(self, "_offline", False):
                 return
-            if not getattr(self.settings, "inbox_labeler_enabled", False):
+            labeler = bool(getattr(self.settings, "inbox_labeler_enabled", False))
+            scan = bool(getattr(self.settings, "course_scan_auto", False))
+            if not (labeler or scan):
                 return
+            self._roster_rearm(rearm_ms)
             max_age_h = int(getattr(
                 self.settings, "inbox_labeler_roster_max_age_hours", 24) or 0)
             if max_age_h <= 0:
                 return
+            courses = None
+            if not labeler:
+                courses = self._my_caseload_courses()
+                if not courses:          # caseload not loaded yet — soon
+                    self._roster_rearm(2 * 60_000)
+                    return
             from src.inbox_labeler import ROSTER_PATH
             if ROSTER_PATH.exists():
                 age_h = (time.time() - ROSTER_PATH.stat().st_mtime) / 3600
@@ -27654,7 +27849,7 @@ class App:
                     "No roster export yet — capturing one now (the browser "
                     "will drive itself for a couple of minutes)…",
                     error=False)
-            self._roster_scan_auto()
+            self._roster_scan_auto(courses)
         except Exception:
             pass
 

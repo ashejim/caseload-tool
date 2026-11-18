@@ -98,10 +98,78 @@ def field_catalog(rows: list, extras: Optional[dict] = None) -> list:
 # Extra COLUMNS for Learner360's caseload list (⚙ Columns): these built-ins
 # (from the assessment summary) + any field_catalog key. Values go to the
 # page as [text, kind, tooltip]; kind ∈ pass / fail / mid / "" colours it.
-LIST_BUILTINS = [["@oa", "OA attempts"], ["@oa1", "OA 1"], ["@oa2", "OA 2"],
+LIST_BUILTINS = [["@pron", "Pronouns"],
+                 ["@oa", "OA attempts"], ["@oa1", "OA 1"], ["@oa2", "OA 2"],
                  ["@oa3", "OA 3"], ["@oa4", "OA 4"],
                  ["@weak", "Weakest competency"], ["@pre", "Pre-A"]]
 LIST_MAX = 12
+# Learner360's OWN columns can be part of the layout as "L360:<field>" (the
+# field = its cdk-column-<field> class, e.g. preferredName). The page moves a
+# copy of that column into place (header label + sorting from Learner360).
+NATIVE_RE = re.compile(r"^L360:[A-Za-z][A-Za-z0-9_]{0,40}$")
+# The recommended layout (new installs; ⚙ Columns ▸ Reset to recommended):
+# after Name — preferred name, pronouns, ID, active course, last ACI contact,
+# pre-assessment, OA attempts. Learner360's other columns are hidden.
+DEFAULT_LIST_COLS = ["L360:preferredName", "@pron", "L360:studentId",
+                     "L360:courses", "MyCourseContact", "@pre", "@oa"]
+# Caseload columns that only fill in with a background feature (→ the hover
+# on an empty cell names it; src/features.py keys).
+_FEATURE_COLS = {
+    "activity": {"DaysSinceCourseActivity", "CourseActivityDays14",
+                 "DaysSinceAnyActivity", "PASubmissions", "PAReturns",
+                 "PAPasses", "OAAttempts", "PreAssessments", "ApprovalRequests",
+                 "FacultyDiscussions30", "Signals", "SigNotOpened",
+                 "SigWorkingNoSubmit", "SigActiveElsewhere", "SigFinishedOther",
+                 "SigFinishedDays"},
+    "plans": {"TermCoursesLeft", "OtherCoursesLeft", "LastCourseInTerm",
+              "NextPlannedCourse", "TermCUsLeft", "PlanWeeksLeft",
+              "DegreePctComplete", "ProgramMentorEmail"},
+}
+_FEATURE_TITLE = {"course_scan": "Course scan", "course_watch": "Course watch",
+                  "activity": "Academic activity", "plans": "Degree plans"}
+
+
+def _turn_on(feat: str) -> str:
+    return (f"turn on “{_FEATURE_TITLE[feat]}” in ❔ Help ▸ Background "
+            "features…")
+
+
+def why_empty(key: str, a: Optional[dict], course: str,
+              feats: dict) -> str:
+    """Hover text for an EMPTY list cell of one of my students: why there's
+    nothing, and what would fill it. ``feats`` = {course_scan, course_watch,
+    activity, plans: bool, types: {course: {oa, pa}}}."""
+    if key == "@pron":
+        return ("Pronouns not set — click to set them (saved in CaseloadNotes; "
+                "the Caseload Tool shows them too).")
+    if key in ("@oa", "@oa1", "@oa2", "@oa3", "@oa4", "@pre", "@weak"):
+        ty = (feats.get("types") or {}).get(course) or {}
+        if ty.get("oa") is False:
+            return f"{course} has no objective assessment (it's performance-assessed)."
+        if key == "@weak":
+            return ("No coaching report stored — " + _turn_on("course_watch")
+                    if not feats.get("course_watch") else
+                    "No coaching report yet (no OA attempt with a report).")
+        if not a:
+            if not (feats.get("course_scan") or feats.get("course_watch")):
+                return (f"No assessment data for {course} yet — "
+                        + _turn_on("course_scan") + " (attempts) or Course "
+                        "watch (scores).")
+            return (f"No {'pre-assessment' if key == '@pre' else 'OA'} "
+                    f"attempts recorded for {course}.")
+        if key.startswith("@oa") and key[3:].isdigit():
+            return f"No attempt {key[3:]} yet."
+        return (f"No {'pre-assessment' if key == '@pre' else 'OA'} attempts "
+                f"recorded for {course}.")
+    if key.startswith("CB:"):
+        return ("Caseload-browser fields come from the course scan — "
+                + _turn_on("course_scan") if not feats.get("course_scan")
+                else "Blank in the course scan for this student.")
+    for feat, keys in _FEATURE_COLS.items():
+        if key in keys and not feats.get(feat):
+            return "Filled by a background import — " + _turn_on(feat)
+    return "Blank in your caseload data for this student."
+
 _RATING_RANK = {"unsat": 1, "appro": 2, "compe": 3, "exemp": 4}
 
 
@@ -119,6 +187,11 @@ def _sit_tip(t: dict) -> str:
 def _list_value(key: str, row: Optional[dict], roster: dict, sid: str,
                 course: str, a: Optional[dict]):
     """[text, kind, tooltip] for one list column, or None when empty."""
+    if key == "@pron":
+        v = str((row or {}).get("Pronouns") or "").strip()
+        return [v, "", "Click to change"] if v else None
+    if NATIVE_RE.match(key):
+        return None                          # the page mirrors Learner360's own
     if not key.startswith("@"):
         v = _field_value(key, row, roster, sid, course)
         return [v[:80], "", v if len(v) > 80 else ""] if v else None
@@ -148,7 +221,9 @@ def _list_value(key: str, row: Optional[dict], roster: dict, sid: str,
         ok = t.get("passed") or (sc is not None and cut and sc >= cut)
         txt = (str(sc) if sc is not None else "") + (" ✓" if ok else
                                                       (" ✗" if sc is None else ""))
-        return [txt.strip(), "pass" if ok else "fail", _sit_tip(t)]
+        return [txt.strip(), "pass" if ok else "fail", _sit_tip(t)
+                + ("" if sc is not None else
+                   "\nScore: needs Course watch (❔ Help ▸ Background features…)")]
     if key == "@weak":
         att = [t for t in a.get("attempts") or [] if t.get("comps")]
         if not att:
@@ -173,11 +248,14 @@ def _list_value(key: str, row: Optional[dict], roster: dict, sid: str,
             return None
         p = pre.get("last_pct")
         txt = (f"{p}%" if p is not None else "taken") + f" ({pre['sittings']})"
+        need = "" if p is not None else \
+            " · % needs Course watch (❔ Help ▸ Background features…)"
         kind = "" if p is None or not cut else ("pass" if p >= cut else "fail")
         return [txt, kind, f"Pre-assessment: {pre['sittings']} sitting(s)"
                 + (f", first {pre['first_pct']}%" if pre.get("first_pct") is not None else "")
                 + (f", last {p}%" if p is not None else "")
-                + (f" · since last OA: {pre['since_last_oa']}" if pre.get("since_last_oa") else "")]
+                + (f" · since last OA: {pre['since_last_oa']}" if pre.get("since_last_oa") else "")
+                + need]
     return None
 
 
@@ -193,7 +271,8 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
                    fields: Optional[list] = None,
                    list_cols: Optional[list] = None,
                    list_sets: Optional[dict] = None,
-                   list_set: str = "") -> dict:
+                   list_set: str = "", list_hide_native: bool = False,
+                   features: Optional[dict] = None) -> dict:
     """{"v": version, "students": {student id without leading zeros:
     [entry per course]}, "uuid_map", "notes", "momi"} from the caseload rows
     (after derived columns, task status and EAs are applied). ``step_cols`` =
@@ -287,24 +366,35 @@ def build_snapshot(rows: list, step_cols: Optional[dict] = None,
     # Extra list columns: only non-empty values travel to the page.
     cat = list_catalog(rows, extras)
     label = {k: d for k, d in cat}
-    cols = [[k, label[k]] for k in list_cols or [] if k in label][:LIST_MAX]
+    ok = lambda k: isinstance(k, str) and (k in label or NATIVE_RE.match(k))  # noqa: E731
+    # Learner360's own columns get their label from the page's header.
+    cols = [[k, label.get(k, "")] for k in list_cols or [] if ok(k)][:LIST_MAX]
+    feats = dict(features or {})
+    feats.setdefault("types", (extras or {}).get("types") or {})
     if cols:
         for sid, ents in out.items():
             for e in ents:
-                vals = {}
+                vals, why = {}, {}
                 for k, _d in cols:
+                    if NATIVE_RE.match(k):
+                        continue
                     v = _list_value(k, src_row.get((sid, e["course"])), roster,
                                     sid, e["course"], e.get("assess"))
                     if v:
                         vals[k] = v
+                    else:
+                        why[k] = why_empty(k, e.get("assess"), e["course"], feats)
                 e["cols"] = vals
+                e["why"] = why
     return {"v": version, "students": out,
             "field_catalog": cat[len(LIST_BUILTINS):],
             "list_catalog": cat,
             "list_cols": cols,
             # Named column sets (known keys only) + the active one.
-            "list_sets": {n: [k for k in ks if k in label][:LIST_MAX]
+            "list_sets": {n: [k for k in ks if ok(k)][:LIST_MAX]
                           for n, ks in (list_sets or {}).items()},
+            "list_hide_native": bool(list_hide_native),
+            "list_default": list(DEFAULT_LIST_COLS),
             "list_set": list_set if list_set in (list_sets or {}) else "",
             "panel_fields": list(fields or []),
             "uuid_map": dict(ex.get("uuid_map") or {}),
