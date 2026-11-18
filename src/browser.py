@@ -80,11 +80,19 @@ def persistent_context(headless: bool = False) -> Iterator[BrowserContext]:
     #   until a Playwright action shifts focus. They do NOT fully fix
     #   the about:blank popup hang on fresh launch — see launcher.py
     #   TODO and the README workaround.
+    # Page size: a visible browser follows its WINDOW (no_viewport), so
+    # resizing / maximizing it gives pages the room — a fixed viewport pinned
+    # every page at 1400×900 whatever the window size. It still opens at the
+    # old size (--window-size) so automation sees the width it always had.
+    # Headless has no window, so it keeps the fixed viewport.
+    size = ({"viewport": {"width": 1400, "height": 900}} if headless
+            else {"no_viewport": True})
     launch_kwargs = dict(
         user_data_dir=str(BROWSER_DATA_DIR),
         headless=headless,
-        viewport={"width": 1400, "height": 900},
+        **size,
         args=[
+            *([] if headless else ["--window-size=1400,950"]),
             "--disable-blink-features=AutomationControlled",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
