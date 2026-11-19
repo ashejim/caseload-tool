@@ -22568,8 +22568,8 @@ class App:
             text = ("The tested default. " if key == "edge" else
                     _be.UNTESTED_NOTE + " ")
             text += ("Each browser has its own CaseloadNotes profile — sign in "
-                     "to WGU (and Mongoose) once in it. Takes effect the next "
-                     "time you start CaseloadNotes. (Firefox can't be used.)")
+                     "to WGU (and Mongoose) once in it. Switches when you click "
+                     "Save. (Firefox can't be used.)")
             be_note.configure(text=text)
 
         def _be_pick(choice: str) -> None:
@@ -23761,9 +23761,7 @@ class App:
                     str(getattr(self.settings, "browser_exe_path", "") or "")):
                 self.settings.browser_engine = _be_key
                 self.settings.browser_exe_path = _be_new_path
-                self._append_log(
-                    f"Automation browser set to {_be.label_for(self.settings)} — "
-                    "restart CaseloadNotes to switch (sign in to WGU once in it).")
+                self.root.after(500, self._switch_browser_now)
             # Required-columns check ignore-list.
             try:
                 self.settings.required_columns_ignore = req_ignore_var.get().strip()
@@ -24462,7 +24460,7 @@ class App:
         dialog.transient(self.root)
         dialog.attributes("-topmost", True)
         dialog.grab_set()
-        dialog.geometry("600x400")
+        dialog.geometry("600x540")
         dialog.lift()
         dialog.focus_force()
         # Repeat focus claw-back so the dialog can't get buried
@@ -24532,6 +24530,34 @@ class App:
             wraplength=480, justify="left",
         ).pack(anchor="w", padx=44, pady=(0, 12))
 
+        # --- Browser picker: which browser CaseloadNotes drives (Edge is the
+        # tested default; installed Chromium browsers can be chosen).
+        from src import browser_engines as _be
+        br_frame = ctk.CTkFrame(dialog, fg_color=("gray92", "gray18"),
+                                corner_radius=6)
+        br_frame.pack(fill="x", padx=16, pady=(0, 12))
+        ctk.CTkLabel(br_frame, text="Browser", anchor="w",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     ).pack(fill="x", padx=12, pady=(10, 4))
+        br_opts = _be.installed() or [("edge", _be.ENGINES["edge"]["label"])]
+        br_by_label = {lbl: k for k, lbl in br_opts}
+        cur_key = str(getattr(self.settings, "browser_engine", "edge") or "edge")
+        br_var = ctk.StringVar(value=next(
+            (lbl for k, lbl in br_opts if k == cur_key), br_opts[0][1]))
+        ctk.CTkOptionMenu(br_frame, variable=br_var, width=300,
+                          values=[lbl for _k, lbl in br_opts],
+                          ).pack(anchor="w", padx=24, pady=(0, 2))
+        ctk.CTkLabel(
+            br_frame,
+            text=("CaseloadNotes opens its own window of this browser (separate "
+                  "from your personal one) for Salesforce, Learner360 and "
+                  "Mongoose. Microsoft Edge is recommended — it's the most "
+                  "tested. Others are untested; you can switch any time in "
+                  "⚙ Settings."),
+            font=ctk.CTkFont(size=11), text_color=("gray35", "gray70"),
+            wraplength=500, justify="left",
+        ).pack(anchor="w", padx=24, pady=(0, 10))
+
         # The Caseload Tool view setup used to live here as step 2. It's gone
         # now — the caseload loads from the live grid API, so a new user needs
         # no Salesforce setup to start. The view (which speeds up batch-email
@@ -24542,7 +24568,15 @@ class App:
         def _continue() -> None:
             self.settings.advanced_mode = (mode_var.get() == "advanced")
             self.settings.first_run_complete = True
+            new_br = br_by_label.get(br_var.get(), "edge")
+            switch = new_br != str(getattr(self.settings, "browser_engine",
+                                           "edge") or "edge")
+            self.settings.browser_engine = new_br
+            if new_br != _be.CUSTOM:
+                self.settings.browser_exe_path = ""
             save_settings(self.settings)
+            if switch:
+                self._switch_browser_now()
             self._apply_advanced_mode()
             try: dialog.grab_release()
             except Exception: pass
@@ -27981,6 +28015,37 @@ class App:
                 self.root.after(rearm, self._maybe_approval_check)
             except Exception:
                 pass
+
+    def _switch_browser_now(self) -> None:
+        """Re-open the app's browser with the browser chosen in Settings /
+        the first-run welcome (src/browser_engines.py). The worker's restart
+        re-reads the setting; the new browser has its own profile, so the
+        user signs in to WGU (and Mongoose) once there."""
+        from src import browser_engines
+        label = browser_engines.label_for(self.settings)
+        if getattr(self, "_offline", False) or not self.worker.ready_event.is_set():
+            self._append_log(f"Automation browser set to {label} — it'll be "
+                             "used from the next start.")
+            return
+        self._append_log(f"Switching the app's browser to {label}… (sign in to "
+                         "WGU once in it if asked)")
+
+        def on_done(res):
+            def ui():
+                from src.browser import ACTIVE_ENGINE
+                if (res or {}).get("error"):
+                    self._append_log(f"⚠ Couldn't switch the browser: {res['error']}",
+                                     error=True)
+                    return
+                note = ACTIVE_ENGINE.get("note") or ""
+                self._append_log(
+                    f"✓ Browser: {ACTIVE_ENGINE.get('label') or label}"
+                    + (f" — {note}" if note else "."), error=bool(note))
+            try:
+                self.root.after(0, ui)
+            except Exception:
+                pass
+        self.worker.submit_restart_browser(on_done)
 
     def _roster_rearm(self, ms: int) -> None:
         """(Re)schedule the roster staleness check — one pending timer only."""

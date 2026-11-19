@@ -104,6 +104,49 @@ def test_help_open_shows_current_state_and_cancel_changes_nothing():
         root.destroy()
 
 
+def test_welcome_browser_choice_switches_now():
+    import customtkinter as ctk
+    from src import browser_engines
+    from src.config import Settings
+    L = _launcher()
+    saved, calls = [], []
+    real_s, real_i = L.save_settings, browser_engines.installed
+    root = ctk.CTk()
+    root.withdraw()
+    try:
+        L.save_settings = lambda s: saved.append(s.browser_engine)
+        browser_engines.installed = lambda: [("edge", "Microsoft Edge (recommended)"),
+                                             ("chrome", "Google Chrome")]
+        st = Settings()
+        a = types.SimpleNamespace(
+            root=root, settings=st,
+            _apply_advanced_mode=lambda: None,
+            _switch_browser_now=lambda: calls.append("switch"),
+            _show_features_dialog=lambda **kw: calls.append("features"))
+        L.App._show_first_run_setup(a)
+        root.update()
+        dlg = [w for w in root.winfo_children() if isinstance(w, ctk.CTkToplevel)][-1]
+        menu = next(w for w in _walk(dlg) if isinstance(w, ctk.CTkOptionMenu))
+        assert menu.get() == "Microsoft Edge (recommended)"      # Edge preselected
+        menu.set("Google Chrome")
+        menu._variable.set("Google Chrome")
+        _find(dlg, ctk.CTkButton, "Continue").invoke()
+        root.update()
+        root.after(300, root.quit)
+        root.mainloop()
+        assert st.browser_engine == "chrome" and saved == ["chrome"]
+        assert calls[0] == "switch" and "features" in calls
+    finally:
+        L.save_settings, browser_engines.installed = real_s, real_i
+        root.destroy()
+
+
+def _walk(w):
+    for c in w.winfo_children():
+        yield c
+        yield from _walk(c)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
