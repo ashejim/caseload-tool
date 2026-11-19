@@ -69,6 +69,7 @@ SRC_MODULES = [
     "src.l360_probe",
     "src.browser_engines",
     "src.features",
+    "src.column_groups",
 ]
 
 

@@ -1832,22 +1832,30 @@ def prompt_mongoose_stale(parent, age_str: str) -> str:
     return result["value"]
 
 
+def _cg_matches(q: str, text: str) -> bool:
+    from src.column_groups import matches
+    return matches(q, text)
+
+
 def prompt_column_picker(parent, sections, *, near=None):
     """Searchable, grouped column picker. `sections` is an ordered list of
-    (header, items) where items is a list of (label, key) pairs. Returns the
-    chosen `key` (str), or None if cancelled. A live search box filters across
-    every section by label; empty sections hide while filtering."""
+    (header, items) where items are (label, key) or (label, key, search_text)
+    — search_text (src/column_groups) adds the group name and nicknames such
+    as "EA" / "ACI" / "pre". Returns the chosen `key` (str), or None if
+    cancelled. A live search box filters across every section; empty sections
+    hide while filtering."""
     dialog = ctk.CTkToplevel(parent)
     dialog.title("Choose a column")
     dialog.transient(parent)
     dialog.attributes("-topmost", True)
     dialog.grab_set()
-    dialog.geometry("460x520")
+    dialog.geometry("480x600")
     result = {"key": None}
 
     search_var = tk.StringVar()
     ctk.CTkEntry(
-        dialog, textvariable=search_var, placeholder_text="Search columns…",
+        dialog, textvariable=search_var,
+        placeholder_text="Search columns or groups — e.g. pre, OA, EA, ACI, risk",
     ).pack(fill="x", padx=12, pady=(12, 6))
 
     listwrap = ctk.CTkScrollableFrame(dialog)
@@ -1867,8 +1875,9 @@ def prompt_column_picker(parent, sections, *, near=None):
         q = search_var.get().strip().lower()
         r = 0
         for header, items in sections:
-            shown = [(lab, key) for (lab, key) in items
-                     if not q or q in lab.lower()]
+            shown = [(it[0], it[1]) for it in items
+                     if not q or _cg_matches(
+                         q, (it[2] if len(it) > 2 else it[0]) + " " + header)]
             if not shown:
                 continue
             ctk.CTkLabel(

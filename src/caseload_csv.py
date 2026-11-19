@@ -108,6 +108,16 @@ DISPLAY_TO_CSV: dict[str, str] = {
     "Term CUs Left": "TermCUsLeft",
     "Weeks Left (Plan)": "PlanWeeksLeft",
     "Degree % Complete": "DegreePctComplete",
+    # Assessment data (App._apply_assess_columns ← src/assess_summary): OA /
+    # pre-assessment results where the course has them (imported via course
+    # watch / l360assess, else the course scan). Blank otherwise.
+    "Pre-A First %": "PreAFirstPct",               # first pre-assessment score
+    "Pre-A Last %": "PreALastPct",
+    "Pre-A Sittings": "PreASittings",
+    "OA Attempts Used": "OAUsed",
+    "OA Last Score": "OALastScore",
+    "OA Passed": "OAPassed",                       # Yes / No
+    "OA Approval Requested": "OAApprovalRequested",  # Yes when pending
     # (The program mentor's EMAIL from Learner360 fills "ProgramMentorEmail",
     # one of PM_EMAIL_COLS, so the CC-the-PM paths pick it up.)
 }

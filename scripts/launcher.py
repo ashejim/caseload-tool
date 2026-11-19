@@ -421,20 +421,12 @@ _COL_SEARCH_SENTINEL = "🔎  Search all columns…"
 
 def _column_picker_sections(all_cols, view_cols, sp_opts):
     """Ordered sections for prompt_column_picker: ★ current-view, Success path
-    (by course), then All caseload columns."""
-    sections = []
-    vc = [c for c in (view_cols or []) if c in all_cols]
-    if vc:
-        sections.append(("★ In current view", [(c, c) for c in vc]))
-    if sp_opts:
-        by_course: dict = {}
-        for o in sp_opts:
-            by_course.setdefault(o["course"], []).append(
-                (o["label"], o["column"]))
-        for course in sorted(by_course):
-            sections.append((f"Success path · {course}", by_course[course]))
-    sections.append(("All caseload columns", [(c, c) for c in all_cols]))
-    return sections
+    (by course), then every column under its group — Tasks & assessments,
+    Momentum & risk, Engagement, Degree plan, Outreach, Student & contact,
+    Course & term, Other (src/column_groups; search also matches the group
+    and nicknames like EA / ACI / pre)."""
+    from src import column_groups
+    return column_groups.sections(all_cols, view_cols, sp_opts)
 
 
 def _curated_column_pairs(all_cols, view_cols, sp_opts):
@@ -503,9 +495,14 @@ class FilterRow:
             command=self._on_column_change,
         )
         self.column_combo.pack(side="left")
-        # No separate 🔎 button — the curated dropdown's first row
-        # ("🔎  Search all columns…") opens the same searchable picker, so a
-        # standalone button would be redundant.
+        # A visible 🔎 next to the dropdown opens the grouped, searchable
+        # picker (also the dropdown's first row) — the long column list was
+        # hard to find behind the sentinel alone.
+        if open_picker is not None:
+            ctk.CTkButton(
+                col_wrap, text="🔎", width=28, height=26,
+                command=self._browse_column, **SECONDARY_BTN_KWARGS,
+            ).pack(side="left", padx=(2, 0))
         if curated_provider is not None:
             self._apply_curated(keep_current=False)
         self.op_combo = ctk.CTkComboBox(
@@ -19829,6 +19826,16 @@ class App:
             plan_map = history.l360_degree_plans()
         except Exception:
             plan_map = {}
+        # Assessment summaries (src/assess_summary: imported OA attempts /
+        # coaching / pre-A reports, else the course-scan roster), for the
+        # Pre-A / OA filter columns. Blank where a course has no such data.
+        try:
+            from src import assess_summary
+            _ids = [str(r.get("StudentID", "") or r.get("Student ID", "")).strip()
+                    for r in rows]
+            assess_map = assess_summary.load(_ids, only=_ids).get("assess") or {}
+        except Exception:
+            assess_map = {}
 
         def _num(v):
             return "" if v is None else v
@@ -19882,6 +19889,9 @@ class App:
             eg = eng_map.get((sid.lstrip("0"), course)) or {}
             for col, key in self._ENGAGEMENT_COLS:
                 r[col] = _num(eg.get(key))
+            # Assessment data (OA attempts / scores, pre-assessment %).
+            self._apply_assess_columns(
+                r, (assess_map.get(sid.lstrip("0")) or {}).get(course.upper()))
             # Plan first: the Signals summary reads LastCourseInTerm.
             self._apply_plan_columns(r, plan_map.get(sid.lstrip("0")), course)
             self._apply_signal_columns(r, eg)
@@ -19889,6 +19899,31 @@ class App:
             # by the panel email-click CC (real address vs the name fallback).
             pm = pm_by_sid.get(sid)
             r["_pm_email_logged"] = pm[1] if pm else ""
+
+    @staticmethod
+    def _apply_assess_columns(r: dict, a) -> None:
+        """Pre-assessment / OA filter columns from one assessment summary
+        (src/assess_summary), blank when the course has none:
+          PreAFirstPct / PreALastPct — % on the first / latest pre-assessment
+            (needs the pre-A report: course watch or l360assess)
+          PreASittings — pre-assessments taken
+          OAUsed / OALastScore — OA attempts used, latest score
+          OAPassed — Yes / No
+          OAApprovalRequested — Yes when an attempt waits on approval."""
+        a = a or {}
+        pre, oa = a.get("pre") or {}, a.get("oa") or {}
+        sits = oa.get("sittings") or []
+
+        def blank(v):
+            return "" if v is None else v
+        r["PreAFirstPct"] = blank(pre.get("first_pct"))
+        r["PreALastPct"] = blank(pre.get("last_pct"))
+        r["PreASittings"] = pre.get("sittings") or ("" if not a else 0)
+        r["OAUsed"] = oa.get("used") if (oa.get("used") or oa.get("passed")) else ""
+        r["OALastScore"] = blank(next((t["score"] for t in reversed(sits)
+                                       if t.get("score") is not None), None))
+        r["OAPassed"] = ("Yes" if oa.get("passed") else "No") if sits else ""
+        r["OAApprovalRequested"] = "Yes" if oa.get("approval") else ""
 
     @staticmethod
     def _apply_plan_columns(r: dict, plan, course: str) -> None:
