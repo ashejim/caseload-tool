@@ -83,6 +83,10 @@ class EmailConfig:
     signature_file: str = ""
     inline_images: list[str] = field(default_factory=list)
     cc_pm: bool = False
+    # CC the student's ASSIGNED course instructor (ACI) — for course-cohort
+    # actions, whose students belong to other CIs. The ACI's email comes from
+    # the local directory (asked once per CI, Settings ▸ Manage ACI emails).
+    cc_aci: bool = False
     # When True, the user is asked to pick which template (and confirm the
     # subject) at fire time, instead of always using `body_html_file`.
     # Lets one "send email" scenario cover many templates.
@@ -132,6 +136,11 @@ class BatchConfig:
     and date/number value formats. Filters AND together."""
     filters: list[dict] = field(default_factory=list)
     preview: bool = True  # show review/confirm dialog before running
+    # Where the students come from: "caseload" (my caseload, the default) or
+    # "cohort" — my team's students in `courses` (the 👥 Course cohort view:
+    # Learner360 team roster + assessment data), e.g. ["C949"].
+    source: str = "caseload"
+    courses: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -245,6 +254,7 @@ def _email_from_dict(d: Optional[dict]) -> Optional[EmailConfig]:
         signature_file=d.get("signature_file", ""),
         inline_images=list(d.get("inline_images") or []),
         cc_pm=bool(d.get("cc_pm", False)),
+        cc_aci=bool(d.get("cc_aci", False)),
         pick_template=bool(d.get("pick_template", False)),
         font_family=str(d.get("font_family", "") or ""),
         font_size=font_size,
@@ -302,6 +312,7 @@ def _email_to_dict(e: Optional[EmailConfig]) -> Optional[dict]:
         "signature_file": e.signature_file,
         "inline_images": list(e.inline_images or []),
         "cc_pm": e.cc_pm, "pick_template": e.pick_template,
+        **({"cc_aci": True} if e.cc_aci else {}),
         "font_family": e.font_family, "font_size": e.font_size,
     }
 
@@ -349,9 +360,13 @@ def _branch_to_dict(bc: "BranchConfig") -> dict:
 def _batch_from_dict(d: Optional[dict]) -> Optional[BatchConfig]:
     if d is None:  # `batch:` key absent — not a batch scenario
         return None
+    src = str(d.get("source", "") or "caseload").strip().lower()
     return BatchConfig(
         filters=list(d.get("filters") or []),
         preview=bool(d.get("preview", True)),
+        source="cohort" if src == "cohort" else "caseload",
+        courses=[str(c).strip().upper() for c in (d.get("courses") or [])
+                 if str(c).strip()],
     )
 
 

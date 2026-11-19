@@ -1344,6 +1344,7 @@ class ScenarioEditor:
         get_view_columns: Optional[Callable[[], list[str]]] = None,
         get_sp_options: Optional[Callable[[], list]] = None,
         pick_template: Optional[Callable] = None,
+        get_cohort_columns: Optional[Callable[[list], list[str]]] = None,
     ):
         # (parent, course) -> chosen NoteTemplate | None; forwarded to each
         # NoteEditor so a note can bind a default template.
@@ -1375,6 +1376,8 @@ class ScenarioEditor:
         # returns whatever's cached now; `refresh_columns` triggers a
         # fresh CSV download (blocking) and returns the updated list.
         self._get_columns = get_columns or (lambda: [])
+        # courses → the course-cohort columns (for cohort-source batches).
+        self._get_cohort_columns = get_cohort_columns
         self._refresh_columns = refresh_columns or (lambda: [])
         self._get_value_suggestions = get_value_suggestions
         # Filter picker data sources: the viewer's currently-shown columns (for
@@ -1730,12 +1733,30 @@ class ScenarioEditor:
         frame.grid_columnconfigure(0, weight=1)
         self._batch_section = frame
 
+        fhead = ctk.CTkFrame(frame, fg_color="transparent")
+        fhead.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 0))
         self._filters_label = ctk.CTkLabel(
-            frame, text="Filters",
+            fhead, text="Filters",
             font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self._filters_label.grid(row=0, column=0, sticky="w", padx=8,
-                                 pady=(6, 0))
+        self._filters_label.pack(side="left")
+        # Batch only: where the students come from — my caseload, or my
+        # team's course cohort (students of other CIs, e.g. C949).
+        self._source_wrap = ctk.CTkFrame(fhead, fg_color="transparent")
+        self._source_wrap.pack(side="left", padx=(16, 0))
+        ctk.CTkLabel(self._source_wrap, text="Students from:").pack(side="left")
+        self.batch_source_var = ctk.StringVar(value="My caseload")
+        ctk.CTkOptionMenu(
+            self._source_wrap, variable=self.batch_source_var, width=150,
+            values=["My caseload", "Course cohort"],
+            command=lambda _v: self._sync_source_controls(),
+        ).pack(side="left", padx=(6, 0))
+        self.batch_courses_entry = ctk.CTkEntry(
+            self._source_wrap, width=120, placeholder_text="e.g. C949")
+        self._source_hint = ctk.CTkLabel(
+            self._source_wrap, text="team students (other CIs) — filter on "
+            "OA Used, Pre-A First %…", font=ctk.CTkFont(size=11),
+            text_color=("gray40", "gray65"))
 
         self.filters_container = ctk.CTkFrame(frame, fg_color="transparent")
         self.filters_container.grid(
@@ -1761,13 +1782,51 @@ class ScenarioEditor:
         """Friendly label for a success-path filter key (sp:<course>:<step>)."""
         return _sp_label_for_key(key, self._get_sp_options() or [])
 
+    def _is_cohort_source(self) -> bool:
+        try:
+            return (bool(self.batch_mode_var.get())
+                    and self.batch_source_var.get() == "Course cohort")
+        except Exception:
+            return False
+
+    def _source_courses(self) -> list:
+        import re as _re
+        try:
+            raw = self.batch_courses_entry.get()
+        except Exception:
+            raw = ""
+        return [c.upper() for c in _re.findall(r"[A-Za-z]{1,2}\d{3}", raw or "")]
+
+    def _sync_source_controls(self) -> None:
+        """Show the course box + hint only for a Course-cohort source."""
+        try:
+            if self._is_cohort_source():
+                self.batch_courses_entry.pack(side="left", padx=(6, 0))
+                self._source_hint.pack(side="left", padx=(6, 0))
+            else:
+                self.batch_courses_entry.pack_forget()
+                self._source_hint.pack_forget()
+        except Exception:
+            pass
+
+    def _filter_columns(self) -> list:
+        """Columns the filters can use: the course cohort's (OA Used, Pre-A
+        First %, …) for a cohort-source batch, else the caseload's."""
+        if self._is_cohort_source() and self._get_cohort_columns is not None:
+            cols = self._get_cohort_columns(self._source_courses()) or []
+            if cols:
+                return cols
+        return self._get_columns() or []
+
     def _open_column_picker(self, near=None):
         """Grouped, searchable column picker → chosen column key (or None)."""
         return prompt_column_picker(
             self.frame.winfo_toplevel(),
-            _column_picker_sections(self._get_columns() or [],
-                                    self._get_view_columns() or [],
-                                    self._get_sp_options() or []),
+            _column_picker_sections(self._filter_columns(),
+                                    [] if self._is_cohort_source()
+                                    else self._get_view_columns() or [],
+                                    [] if self._is_cohort_source()
+                                    else self._get_sp_options() or []),
             near=near)
 
     def _curated_columns(self) -> list:
@@ -1778,7 +1837,7 @@ class ScenarioEditor:
                                      self._get_sp_options() or [])
 
     def _add_filter_row(self, prefilled: Optional[dict] = None) -> FilterRow:
-        cols = self._get_columns() or []
+        cols = self._filter_columns()
         row = FilterRow(
             self.filters_container, cols, on_delete=self._delete_filter_row,
             value_provider=self._get_value_suggestions,
@@ -1855,6 +1914,14 @@ class ScenarioEditor:
         self.filter_single_checkbox.grid()
         batch = self.batch_mode_var.get()
         single = self.filter_single_var.get()
+        try:
+            if batch:
+                self._source_wrap.pack(side="left", padx=(16, 0))
+            else:
+                self._source_wrap.pack_forget()
+            self._sync_source_controls()
+        except Exception:
+            pass
         if batch or single:
             self._batch_section.grid(
                 row=self._batch_section_row, column=0,
@@ -2084,13 +2151,20 @@ class ScenarioEditor:
             font=ctk.CTkFont(size=10), text_color=("gray45", "gray65"),
         ).pack(side="left", padx=(10, 0))
 
-        # CC Program Mentor
+        # CC Program Mentor / the student's assigned CI (cohort actions).
+        cc_row = ctk.CTkFrame(frame, fg_color="transparent")
+        cc_row.grid(row=6, column=0, columnspan=2, sticky="w",
+                    padx=_OPT_INDENT, pady=(6, 4))
         self.email_cc_pm_var = ctk.BooleanVar(value=False)
         _option_checkbox(
-            frame, "CC Program Mentor",
+            cc_row, "CC Program Mentor",
             self.email_cc_pm_var,
-        ).grid(row=6, column=0, columnspan=2, sticky="w",
-               padx=_OPT_INDENT, pady=(6, 4))
+        ).pack(side="left")
+        self.email_cc_aci_var = ctk.BooleanVar(value=False)
+        _option_checkbox(
+            cc_row, "CC the student's assigned CI (course-cohort actions)",
+            self.email_cc_aci_var,
+        ).pack(side="left", padx=(16, 0))
 
         # Pick the template (and confirm the subject) at fire time. Lets
         # one scenario serve many templates — the Body template above is
@@ -2550,6 +2624,7 @@ class ScenarioEditor:
             "signature_file": self.email_signature_combo.get(),
             "inline_images": inline_images,
             "cc_pm": self.email_cc_pm_var.get(),
+            **({"cc_aci": True} if self.email_cc_aci_var.get() else {}),
         }
         if self.email_pick_template_var.get():
             d["pick_template"] = True
@@ -2579,6 +2654,7 @@ class ScenarioEditor:
             self.email_images_entry.insert(
                 0, ", ".join(d.get("inline_images") or []))
             self.email_cc_pm_var.set(bool(d.get("cc_pm")))
+            self.email_cc_aci_var.set(bool(d.get("cc_aci")))
             self.email_pick_template_var.set(bool(d.get("pick_template")))
             ff = (d.get("font_family") or "").strip()
             self.email_font_family_combo.set(ff if ff else EMAIL_FONT_DEFAULT_LABEL)
@@ -2591,6 +2667,7 @@ class ScenarioEditor:
             self.email_signature_combo.set("")
             self.email_images_entry.delete(0, "end")
             self.email_cc_pm_var.set(False)
+            self.email_cc_aci_var.set(False)
             self.email_pick_template_var.set(False)
             self.email_font_family_combo.set(EMAIL_FONT_DEFAULT_LABEL)
             self.email_font_size_combo.set("")
@@ -3065,6 +3142,12 @@ class ScenarioEditor:
         if scenario.batch is not None:
             self.batch_mode_var.set(True)
             self.filter_single_var.set(False)
+            cohort = getattr(scenario.batch, "source", "caseload") == "cohort"
+            self.batch_source_var.set("Course cohort" if cohort else "My caseload")
+            self.batch_courses_entry.delete(0, "end")
+            if cohort:
+                self.batch_courses_entry.insert(
+                    0, ", ".join(getattr(scenario.batch, "courses", []) or []))
             for filt in scenario.batch.filters:
                 self._add_filter_row(filt)
         elif getattr(scenario, "fire_filters", None):
@@ -3089,6 +3172,7 @@ class ScenarioEditor:
             self.email_images_entry.delete(0, "end")
             self.email_images_entry.insert(0, ", ".join(scenario.email.inline_images))
             self.email_cc_pm_var.set(scenario.email.cc_pm)
+            self.email_cc_aci_var.set(getattr(scenario.email, "cc_aci", False))
             self.email_pick_template_var.set(scenario.email.pick_template)
             ff = (scenario.email.font_family or "").strip()
             self.email_font_family_combo.set(ff if ff else EMAIL_FONT_DEFAULT_LABEL)
@@ -3101,6 +3185,7 @@ class ScenarioEditor:
             self.email_signature_combo.set("")
             self.email_images_entry.delete(0, "end")
             self.email_cc_pm_var.set(False)
+            self.email_cc_aci_var.set(False)
             self.email_pick_template_var.set(False)
             self.email_font_family_combo.set(EMAIL_FONT_DEFAULT_LABEL)
             self.email_font_size_combo.set("")
@@ -3187,6 +3272,9 @@ class ScenarioEditor:
                 "filters": self._read_conditions(),
                 "preview": self._batch_preview,
             }
+            if self._is_cohort_source():
+                out["batch"]["source"] = "cohort"
+                out["batch"]["courses"] = self._source_courses()
         elif self.filter_single_var.get():
             ff = self._read_conditions()
             if ff:
@@ -7390,6 +7478,18 @@ class CaseloadPanel:
                 pass
         threading.Thread(target=work, daemon=True, name="cohort-view").start()
 
+    def show_cohort_rows(self, rows, courses) -> None:
+        """Switch the grid to these course-cohort rows now (a cohort-source
+        batch's selection step selects within the viewer's current rows)."""
+        self._exit_special_modes(repopulate=False)
+        self._cohort_rows = list(rows or [])
+        self._cohort_courses = list(courses or [])
+        self._cohort_mode = True
+        self._show_cohort_banner()
+        self.populate()
+        self._refresh_view_menu()
+        self._refresh_filter_columns()
+
     def _exit_cohort_mode(self, repopulate: bool = True) -> None:
         self._cohort_mode = False
         self._cohort_rows = None
@@ -11553,6 +11653,7 @@ class App:
             self.editor_content, sc,
             capture_handler=self._capture_hotkey,
             get_columns=self._get_caseload_columns,
+            get_cohort_columns=self._get_cohort_columns,
             refresh_columns=self._refresh_caseload_columns_for_editor,
             get_value_suggestions=self._filter_value_suggestions,
             get_groups=lambda: [g.name for g in self.groups],
@@ -17829,6 +17930,10 @@ class App:
         self._append_log(
             f"Review the {len(matched)} matched student(s) in the viewer — "
             "deselect any you want to skip — then click ✓ Start (or Cancel).")
+        if getattr(scenario.batch, "source", "caseload") == "cohort":
+            # The viewer selects within its CURRENT rows — show the cohort.
+            panel.show_cohort_rows(getattr(self, "_cohort_batch_all", matched),
+                                   list(scenario.batch.courses or []))
         panel.enter_batch_selection(
             matched, self._action_display_name(scenario),
             on_start=self._start_batch_selection,
@@ -17855,6 +17960,86 @@ class App:
                 self._commit_batch(payload)
         finally:
             self._set_idle()
+
+    def _get_cohort_columns(self, courses) -> list:
+        """Column names of the course cohort's rows (for the action editor's
+        filters on a cohort-source batch), cached per course list."""
+        key = tuple(sorted(c.upper() for c in courses or []))
+        if not key:
+            return []
+        cache = getattr(self, "_cohort_cols_cache", None) or {}
+        if key not in cache:
+            try:
+                from src import cohort_view
+                rows = cohort_view.load(list(key))
+            except Exception:
+                rows = []
+            cols = []
+            for r in rows[:300]:
+                for k in r:
+                    if not k.startswith("_") and k not in cols:
+                        cols.append(k)
+            cache[key] = cols
+            self._cohort_cols_cache = cache
+        return cache[key]
+
+    def _cohort_batch_rows(self, scenario: ScenarioConfig) -> list:
+        """Rows for a course-cohort batch (batch.source == "cohort"): my team's
+        students in batch.courses (src/cohort_view — the 👥 Course cohort
+        view's rows), mapped to what the batch loop reads (contactID for the
+        deep link; Student ID / Name fallbacks). [] (logged) when unavailable."""
+        from src import cohort_view
+        courses = [c for c in (scenario.batch.courses or []) if c]
+        if not courses:
+            self._append_log(f"Batch {scenario.name!r}: a course-cohort action "
+                             "needs a course (e.g. C949) — set it in the editor "
+                             "next to 'Students from'.", error=True)
+            return []
+        try:
+            rows = cohort_view.load(courses)
+        except Exception as e:
+            self._append_log(f"Batch {scenario.name!r}: couldn't load the "
+                             f"{', '.join(courses)} cohort: {e}", error=True)
+            return []
+        if not rows:
+            self._append_log(f"Batch {scenario.name!r}: no {', '.join(courses)} "
+                             "cohort stored yet — run l360cohort: "
+                             f"{courses[0]} save first.", error=True)
+            return []
+        for r in rows:
+            r.setdefault("contactID", r.get("Contact id", ""))
+            r.setdefault("Student ID", r.get("StudentID", ""))
+            if not str(r.get("Name") or "").strip():
+                r["Name"] = str(r.get("StudentID") or "")
+        self._cohort_batch_all = rows
+        self._append_log(f"Batch {scenario.name!r}: course cohort "
+                         f"{', '.join(courses)} — {len(rows)} team student(s) "
+                         "(not on your caseload).")
+        return rows
+
+    def _resolve_cohort_aci_cc(self, scenario: ScenarioConfig, rows) -> None:
+        """For a CC-the-assigned-CI email (email.cc_aci): put each course-
+        cohort student's ACI email on the row (row['_aci_cc']), asking once
+        for any CI not yet in the local directory. Caseload students' ACI is
+        you, so they're skipped."""
+        if scenario.email is None or not getattr(scenario.email, "cc_aci", False):
+            return
+        asked: dict = {}
+        for r in rows or []:
+            if not r.get("_cohort"):
+                continue
+            name = str(r.get("CourseMentor") or "").strip()
+            if not name:
+                continue
+            if name not in asked:
+                asked[name] = (self._resolve_aci_email(name)
+                               or self._prompt_aci_email(name))
+            if asked[name]:
+                r["_aci_cc"] = asked[name]
+        missing = [n for n, e in asked.items() if not e]
+        if missing:
+            self._append_log(f"No email for {len(missing)} assigned CI(s) — "
+                             "their students' emails go without the CI CC.")
 
     def _cancel_batch_selection(self) -> None:
         """Viewer Cancel: drop the armed batch (the viewer restores itself)."""
@@ -17905,12 +18090,19 @@ class App:
             )
             return None
 
-        self._warn_if_caseload_stale("this batch")
+        cohort_src = getattr(scenario.batch, "source", "caseload") == "cohort"
+        if not cohort_src:
+            self._warn_if_caseload_stale("this batch")
 
         # Step 1: load the caseload rows. Prefer the CSV cache (~50ms,
         # ~100 fields available); fall back to scroll-load DOM scrape
-        # if no CSV is present (slow but always works).
-        if self._caseload_rows is not None:
+        # if no CSV is present (slow but always works). A course-cohort
+        # action uses the cohort's rows instead (students of other CIs).
+        if cohort_src:
+            rows = self._cohort_batch_rows(scenario)
+            if not rows:
+                return None
+        elif self._caseload_rows is not None:
             rows = self._caseload_rows
             age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
             self._append_log(
@@ -19212,6 +19404,7 @@ class App:
                     if not self._send_scenario_email(
                         scenario.email, ctx_info, auto_send=True,
                         body_html_override=body_overrides.get(idx - 1),
+                        extra_cc=str(row.get("_aci_cc", "") or ""),
                         cc_override=_ov.get("cc"), bcc=_ov.get("bcc", ""),
                     ):
                         skipped.append((student_name, "auto-send failed"))
@@ -20474,9 +20667,13 @@ class App:
         self._append_log(
             f"Rendering {len(rows)} email preview(s) for review…")
 
+        self._resolve_cohort_aci_cc(scenario, rows)
+
         def render(scn: ScenarioConfig) -> list[dict]:
             return [
-                self._build_email_preview_data(scn, row, prompt_vars, user_info)
+                self._build_email_preview_data(
+                    scn, row, prompt_vars, user_info,
+                    extra_cc=str(row.get("_aci_cc", "") or ""))
                 for row in rows
             ]
 

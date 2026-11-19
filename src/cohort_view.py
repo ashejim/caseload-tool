@@ -108,6 +108,13 @@ def build_rows(courses, cohort: dict, roster_rows: list,
                 row["OA Approval"] = nx.get("approval") or ""
                 row["Pre-A Sittings"] = pre.get("sittings") or 0
                 row["Pre-A First %"] = "" if pre.get("first_pct") is None else pre["first_pct"]
+                # Pass / fail of the FIRST pre-assessment sitting (later
+                # retakes aren't comparable) — with Pre-A First % this targets
+                # e.g. "passed the pre-A first time, but under 83%".
+                _pre_rows = pre.get("rows") or []
+                row["Pre-A First Passed"] = (
+                    ("Yes" if _pre_rows[0].get("passed") else "No")
+                    if _pre_rows else "")
                 row["Pre-A Last %"] = "" if pre.get("last_pct") is None else pre["last_pct"]
                 row["Pre-A Since Last OA"] = pre.get("since_last_oa") or 0
                 # Per competency: every attempt + the latest (sortable).
