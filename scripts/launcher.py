@@ -239,6 +239,22 @@ _viewer_font_registered = [False]
 _notes_font_registered = [False]
 
 
+_SECRET_PARAM_RE = re.compile(
+    r"([?&](?:sid|access_token|id_token|refresh_token|code|SAMLResponse|"
+    r"SAMLRequest|RelayState|oauth_token|token|session_id)=)[^&\s'\"<>]+",
+    re.I)
+_BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}", re.I)
+
+
+def _redact_secrets(msg) -> str:
+    """Mask session / auth tokens in a log line (e.g. a navigation error's
+    frontdoor.jsp?sid=… URL) — the activity log gets copied and pasted."""
+    s = str(msg)
+    if "=" not in s and "earer" not in s:
+        return s
+    return _BEARER_RE.sub(r"\1…", _SECRET_PARAM_RE.sub(r"\1…", s))
+
+
 def apply_caseload_tree_font(size: int) -> None:
     """Apply a text size to the caseload Treeview's global ttk style: row
     font, row height (so taller text fits), and heading font."""
@@ -26879,6 +26895,7 @@ class App:
         # Defensive: if called before _build_main_pane has created
         # the widget (e.g. very early startup), fall back to stderr
         # so we don't crash the app with AttributeError.
+        msg = _redact_secrets(msg)
         if not hasattr(self, "log") or self.log is None:
             print(msg, file=sys.stderr)
             return
@@ -28136,12 +28153,12 @@ class App:
 
     def _course_scan_capture(self, seconds: int = 60) -> None:
         """Record SF data responses for `seconds` while you manually switch the
-        browser to the 'any course' → C769 view + scroll, to discover the endpoint
+        browser to the 'any course' view of your course + scroll, to discover the endpoint
         that feeds it. Reports which responses carry StudentID and writes the full
         bodies to coursescan_report.txt."""
         self._append_log(
             f"Course-scan: recording for {seconds}s. In the browser, switch to "
-            "'any course' → C769 and SCROLL the list to load rows NOW…")
+            "'any course' → your course and SCROLL the list to load rows NOW…")
 
         def on_done(res):
             def render():

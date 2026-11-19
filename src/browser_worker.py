@@ -880,6 +880,10 @@ class BrowserWorker:
                         "Browser connection lost — reopening… "
                         f"(reason: {dead_reason[:140]})")
                     return True  # _run reopens the context, then replays
+                if self._hold_for_signin(ctx, cmd):
+                    self.q.put(cmd)          # retry after a short wait
+                    time.sleep(2)
+                    continue
                 try:
                     self._dispatch_command(ctx, cmd)
                 except Exception as e:
@@ -898,6 +902,71 @@ class BrowserWorker:
                         f"Command {cmd[0]!r} failed: {e}. Worker still "
                         "running; use \u21bb Restart browser if it's stuck."
                     )
+
+    # WGU single sign-on chain + Salesforce login pages. While one is open
+    # the user is signing in: navigating ANY tab restarts the SAML / PingID
+    # flow (seen as a redirect / "infinite loop" error on fresh profiles).
+    # Deliberately excludes generic "/login" (Mongoose's sign-in tab can sit
+    # open for a long time and must not pause everything).
+    _SIGNIN_URL_MARKERS = (
+        "login.salesforce.com", "/_ui/login", "secur/login", "access.wgu.edu",
+        "pingfed", "pingone.com", "pingid", "authenticator.ping",
+        "secur/frontdoor", "secur/contentdoor")
+    # Commands that never navigate — fine to run while the user signs in.
+    _SIGNIN_SAFE_CMDS = frozenset({"OVERLAY_CLEAR", "L360_DISCOVER", "L360_PROBE"})
+    _SIGNIN_WAIT_MAX_S = 600            # a sign-in tab left open → stop waiting
+
+    def _signin_in_progress(self, ctx) -> str:
+        """The host of an open WGU / Salesforce sign-in page in the app's
+        browser, or "" when none is open."""
+        from urllib.parse import urlsplit
+        try:
+            pages = list(ctx.pages)
+        except Exception:
+            return ""
+        for pg in pages:
+            try:
+                url = (pg.url or "").lower()
+            except Exception:
+                continue
+            if any(m in url for m in self._SIGNIN_URL_MARKERS):
+                return urlsplit(url).netloc or url[:60]
+        return ""
+
+    def _hold_for_signin(self, ctx, cmd) -> bool:
+        """True = put ``cmd`` back and wait: a sign-in page is open and the
+        command would navigate. Logs once per sign-in; gives up after
+        _SIGNIN_WAIT_MAX_S so a stale sign-in tab can't block work forever."""
+        name = cmd[0] if isinstance(cmd, tuple) and cmd else ""
+        if name in self._SIGNIN_SAFE_CMDS:
+            return False
+        host = self._signin_in_progress(ctx)
+        if not host:
+            if getattr(self, "_signin_wait_t0", None):
+                self.on_status("✓ Signed in — continuing.")
+            self._signin_wait_t0 = None
+            return False
+        t0 = getattr(self, "_signin_wait_t0", None)
+        now = time.time()
+        if t0 is None:
+            self._signin_wait_t0 = now
+            self.on_status(
+                f"⏸ Waiting for you to finish signing in ({host}) — background "
+                "work is paused so it doesn't interrupt the sign-in.")
+            try:
+                self._raise_browser_window()
+            except Exception:
+                pass
+            return True
+        if now - t0 > self._SIGNIN_WAIT_MAX_S:
+            if not getattr(self, "_signin_wait_gave_up", False):
+                self._signin_wait_gave_up = True
+                self.on_status(
+                    "A sign-in page has been open for 10+ minutes — continuing "
+                    "anyway (close it, or finish signing in).")
+            return False
+        self._signin_wait_gave_up = False
+        return True
 
     @staticmethod
     def _dead_browser_error(e: Exception) -> bool:
@@ -5700,6 +5769,9 @@ class BrowserWorker:
                 current_url = target.url or ""
             except Exception:
                 current_url = ""
+            if self._looks_like_login(target):
+                # Mid-sign-in: navigating now would restart the SSO flow.
+                break
             if CASELOAD_URL and "Caseload_App_Page" not in current_url:
                 try:
                     target.goto(CASELOAD_URL, wait_until="domcontentloaded")
