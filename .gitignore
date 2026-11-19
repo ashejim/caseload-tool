@@ -1,5 +1,8 @@
 .venv/
 browser_data/
+# Per-browser automation profiles (Settings ▸ Automation browser) — they hold
+# sign-in cookies; never commit.
+browser_data_*/
 screenshots/
 .env
 __pycache__/

@@ -3,6 +3,20 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.29.0 — 2026-11-19
+
+- **Choose your browser.** CaseloadNotes can now drive **Google Chrome**,
+  **Brave** or another Chromium-based browser (.exe) instead of Microsoft
+  Edge — pick it in the first-run welcome or **⚙ Settings ▸ General ▸
+  Automation browser** (only browsers installed on this machine are listed).
+  Edge stays the recommended, most-tested choice; others are marked untested.
+  Switching takes effect right away (the app re-opens its browser). Each
+  browser gets its own CaseloadNotes profile — separate from your personal
+  one — so you sign in to WGU (and Mongoose) once in it; Edge keeps your
+  existing sign-in. If the chosen browser doesn't start within 45 s, the app
+  falls back to Edge and says so in the log. Vivaldi isn't offered (its launch
+  hangs under the browser automation); Firefox can't be used.
+
 ## 0.28.0 — 2026-11-18
 
 - **CaseloadNotes inside Learner360 (the app's own browser, read-only).**
