@@ -3,8 +3,28 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
-## 0.29.0 — 2026-11-19
+## 0.29.0 — 2026-11-20
 
+- **Actions on a course cohort.** A batch action can now take its students
+  from **Course cohort** (e.g. C949 — your team's students, assigned to other
+  CIs) instead of your caseload: **Filters ▸ Students from**. Filters then use
+  the cohort's columns (OA Used, Pre-A First %, the new **Pre-A First Passed**,
+  …). The email can **CC each student's assigned CI** (their address is asked
+  once per CI and remembered); notes go on each student's record.
+- **Filter by pre-assessment and OA results:** new caseload columns Pre-A
+  First % (first attempt), Pre-A Last %, Pre-A Sittings, OA Attempts Used, OA
+  Last Score, OA Passed, OA Approval Requested (filled where the course has
+  assessment data).
+- **Easier column picking:** the filter / viewer column picker groups every
+  column (Tasks & assessments, Momentum & risk, Engagement, Degree plan,
+  Outreach, Student & contact, Course & term), searches group names and
+  nicknames (EA, ACI, pre, OA, PM), and has a visible 🔎 button.
+- **Fix: sign-in no longer gets interrupted.** While a WGU / Salesforce
+  sign-in page is open, CaseloadNotes pauses work that would change pages
+  ("⏸ Waiting for you to finish signing in…") instead of restarting the sign-in
+  — the cause of a redirect-loop error on a browser profile that wasn't signed
+  in yet (seen with Chrome; also affects a new user's first sign-in).
+  Session tokens are now masked in the activity log.
 - **Choose your browser.** CaseloadNotes can now drive **Google Chrome**,
   **Brave** or another Chromium-based browser (.exe) instead of Microsoft
   Edge — pick it in the first-run welcome or **⚙ Settings ▸ General ▸
